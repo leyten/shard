@@ -21,7 +21,40 @@ launch tail-first so each node connects to an already-listening successor:
 import argparse, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
-from node_kv import run_layers, send_msg, recv_msg, EDGE_ERRORS, TransportError
+from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
+
+
+def _causal_mask(q_len, kv_len, start, window, dtype, device):
+    """additive mask: query i (abs pos start+i) attends key j (abs pos j) iff
+    j <= start+i, and -- when window>0 -- also (start+i - j) < window (sliding)."""
+    rows = torch.arange(q_len, device=device) + start
+    cols = torch.arange(kv_len, device=device)
+    allow = cols[None, :] <= rows[:, None]
+    if window:
+        allow = allow & ((rows[:, None] - cols[None, :]) < window)
+    minv = torch.finfo(dtype).min
+    return torch.where(allow, torch.zeros((), dtype=dtype, device=device),
+                       torch.full((), minv, dtype=dtype, device=device))[None, None]
+
+
+def run_block(h, parts, cache, start):
+    """run this node's layer block. models with mixed attention (e.g. gpt-oss:
+    alternating full / sliding-128 layers) get the right mask per layer; dense
+    models with no sliding window fall back to plain causal everywhere."""
+    q_len = h.shape[1]
+    kv_len = start + q_len
+    pos = torch.arange(start, kv_len, device=h.device).unsqueeze(0)
+    pe = parts["rotary"](h, pos)
+    full = _causal_mask(q_len, kv_len, start, 0, h.dtype, h.device)
+    sliding = parts.get("sliding")
+    win = _causal_mask(q_len, kv_len, start, parts.get("window", 0), h.dtype, h.device) \
+        if (sliding and parts.get("window")) else full
+    for i, layer in enumerate(parts["layers"]):
+        mask = win if (sliding and sliding[i]) else full
+        out = layer(h, attention_mask=mask, position_ids=pos,
+                    past_key_values=cache, use_cache=True, position_embeddings=pe)
+        h = out[0] if isinstance(out, tuple) else out
+    return h
 
 
 def load_stage(model_id, stage, nstages, device="cuda", dtype="auto"):
@@ -58,6 +91,10 @@ def load_stage(model_id, stage, nstages, device="cuda", dtype="auto"):
     for i, layer in enumerate(kept):
         layer.self_attn.layer_idx = i
     parts["layers"] = torch.nn.ModuleList(kept)
+    layer_types = getattr(cfg, "layer_types", None)
+    parts["window"] = getattr(cfg, "sliding_window", 0) or 0
+    parts["sliding"] = ([layer_types[j] == "sliding_attention" for j in range(lo, hi)]
+                        if (layer_types and parts["window"]) else None)
     print(f"[s{stage}] loaded layers [{lo}:{hi}] ({hi-lo}/{n_layers}), "
           f"gpu_mem={torch.cuda.memory_allocated(device)/1e9:.1f}GB", flush=True)
     return parts
@@ -87,7 +124,7 @@ def serve(parts, stage, nstages, listen_port, nxt, timeout, dev):
                         cache = DynamicCache()
                         if nxt_sock: send_msg(nxt_sock, msg); recv_msg(nxt_sock)
                         send_msg(conn, "ok"); continue
-                    h = run_layers(msg["h"].to(dev), parts, cache, msg["start"])
+                    h = run_block(msg["h"].to(dev), parts, cache, msg["start"])
                     if is_tail:
                         h = parts["norm"](h)
                         tok = int(parts["lm_head"](h[:, -1, :]).argmax(-1).item())
@@ -117,7 +154,7 @@ def drive(parts, tok, nxt, prompt, max_new, dev, timeout):
     out, start, t0, t_prefill = [], 0, time.time(), None
 
     def step(token_ids, start):
-        h = run_layers(parts["embed"](token_ids), parts, cache, start)
+        h = run_block(parts["embed"](token_ids), parts, cache, start)
         send_msg(sock, {"op": "fwd", "h": h.cpu(), "start": start})
         return recv_msg(sock)
 
