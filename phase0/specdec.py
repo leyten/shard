@@ -62,7 +62,8 @@ def _rpc(sock, msg):
     return recv_msg(sock)
 
 
-def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout):
+def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout,
+             adaptive=False, k_min=1, k_max=12):
     sock.settimeout(timeout)
     eos = tok.eos_token_id
     enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
@@ -87,23 +88,24 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout):
 
         out = [cur]
         rounds, accepted_total = 0, 0
+        kc, ema_n, k_hist = K, float(K), []        # kc = current K (adapts if enabled)
         t0 = time.time()
         with torch.no_grad():
             while len(out) < max_new and cur != eos:
-                # 1. draft proposes K tokens (feed cur, d_1..d_K -> keep d_1..d_K)
+                # 1. draft proposes kc tokens (feed cur, d_1..d_kc -> keep d_1..d_kc)
                 drafts, dtok = [], cur
-                for i in range(K + 1):
+                for i in range(kc + 1):
                     dl = draft(input_ids=torch.tensor([[dtok]], device=dev),
                                past_key_values=draft_cache, use_cache=True).logits
                     dtok = int(dl[0, -1].argmax())
-                    if i < K:
+                    if i < kc:
                         drafts.append(dtok)
-                # 2. verify [cur, d_1..d_K] in one traversal
+                # 2. verify [cur, d_1..d_kc] in one traversal
                 h = embed([cur] + drafts)
-                r = _rpc(sock, {"op": "verify", "h": h.cpu(), "start": pos})   # [r_1..r_{K+1}]
+                r = _rpc(sock, {"op": "verify", "h": h.cpu(), "start": pos})   # [r_1..r_{kc+1}]
                 # 3. greedy acceptance: longest prefix with d_j == r_j
                 n = 0
-                for j in range(K):
+                for j in range(kc):
                     if drafts[j] == r[j]:
                         n += 1
                     else:
@@ -112,10 +114,14 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout):
                 out.extend(committed)
                 cur = r[n]
                 pos += n + 1
-                rounds += 1; accepted_total += n
+                rounds += 1; accepted_total += n; k_hist.append(kc)
                 # 4. roll every cache back to the accepted length
                 thead_cache.crop(pos); draft_cache.crop(pos)
                 _rpc(sock, {"op": "crop", "len": pos})
+                # 5. adaptive K: aim a couple beyond the running acceptance (EMA of n)
+                ema_n = 0.7 * ema_n + 0.3 * n
+                if adaptive:
+                    kc = max(k_min, min(k_max, round(ema_n) + 2))
                 if eos in committed:
                     break
     except EDGE_ERRORS as e:
@@ -131,6 +137,9 @@ def generate(draft, thead, tok, sock, prompt, K, max_new, dev, timeout):
         "mean_accept": accepted_total / max(rounds, 1),
         "toks_per_traversal": (accepted_total + rounds) / max(rounds, 1),
         "tok_s": len(out) / max(dt, 1e-9),
+        "mean_K": (sum(k_hist) / len(k_hist)) if k_hist else K,
+        "k_lo": min(k_hist) if k_hist else K,
+        "k_hi": max(k_hist) if k_hist else K,
     }
 
 
@@ -143,6 +152,7 @@ def main():
     ap.add_argument("--peer", default="172.17.0.3")
     ap.add_argument("--port", type=int, default=29501)
     ap.add_argument("--K", type=int, default=4)
+    ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=30.0)
@@ -161,15 +171,17 @@ def main():
     sock = socket.socket(); sock.connect((args.peer, args.port))
     print(f"[head] connected to tail {args.peer}:{args.port}; K={args.K}; generating ...", flush=True)
     try:
-        r = generate(draft, parts, tok, sock, args.prompt, args.K, args.max_new, dev, args.timeout)
+        r = generate(draft, parts, tok, sock, args.prompt, args.K, args.max_new, dev, args.timeout,
+                     adaptive=args.adaptive)
     except TransportError as e:
         print(f"\n[head] TRANSPORT FAILURE: {e}", flush=True); raise SystemExit(2)
     finally:
         sock.close()
+    kdesc = f"adaptive (mean {r['mean_K']:.1f}, {r['k_lo']}-{r['k_hi']})" if args.adaptive else f"{args.K}"
     print(f"\n[head] === OUTPUT ===\n{r['text']}\n", flush=True)
     print(f"[head] {r['n_tokens']} tokens in {r['rounds']} verify traversals | "
           f"mean accepted/round {r['mean_accept']:.2f} | {r['toks_per_traversal']:.2f} tokens/traversal "
-          f"(vs 1.0 plain) | {r['tok_s']:.2f} tok/s | draft={args.draft.split('/')[-1]} K={args.K}", flush=True)
+          f"(vs 1.0 plain) | {r['tok_s']:.2f} tok/s | draft={args.draft.split('/')[-1]} K={kdesc}", flush=True)
 
 
 if __name__ == "__main__":
