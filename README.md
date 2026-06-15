@@ -28,7 +28,9 @@ shard is c0mpute infra, so it is vetted against all three:
 
 ## status
 
-design + scaffold. nothing serves yet. the build is phased so the core is proven in days, not months. see `docs/ROADMAP.md`.
+**phase 0 done.** a model split across two nodes serves coherent tokens over our own transport, with a per-node kv-cache. proven on the case that actually needs two gpus: Qwen2.5-14B is 29.5GB in bf16 and OOMs a single 24GB 4090, but split 24/24 layers across two cards (~14.8GB each) it runs reliably — 20/20 clean completions, ~17 tok/s decode. this is the exact thing nothing off-the-shelf could do.
+
+honest caveats: the two nodes are still on a low-latency link (same-host bridge), not real wan; no speculative decoding yet. those are next — wan/nat transport (phase 1), then spec-decode (phase 2). see `docs/ROADMAP.md`.
 
 ## layout
 

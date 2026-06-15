@@ -11,7 +11,9 @@ the single hardest thing: reliably serve tokens through a multi-stage split. do 
 - no speculative decoding yet. plain token-by-token is fine, it'll be slow, that's expected.
 - **pass = a coherent completion comes out, reliably, 20 times in a row, with a measured tok/s.**
 
-if this passes we already have the thing that blocked us all day. it's the momentum milestone.
+**✓ PASSED (2026-06-15).** 2-node split with per-node kv-cache. proven on Qwen2.5-14B (29.5GB bf16, OOMs one 24GB card) split 24/24 across two 4090s: 20/20 clean completions, ~17 tok/s decode, via our own tcp transport. code in `phase0/` (`node_kv.py` = the split node, `bench.py` = the 20x reliability harness). caveat: nodes are on a low-latency same-host link, not wan yet.
+
+this was the thing that blocked us all day. it's the momentum milestone.
 
 ## phase 1 — make the transport survive wan (target: 3-5 days)
 
