@@ -7,6 +7,18 @@ order. No datacenter, no single host, and no node ever holds the whole model.
 
 Shard is the inference engine for [c0mpute](https://c0mpute.ai).
 
+## 100B+ across the swarm
+
+**gpt-oss-120b — 120 billion parameters — served across 4 nodes.** Split 9 layers
+per node across 4× RTX 4090 (~16 GB each, ~64 GB total); no single 24 GB card can
+hold it, four can. Each node loads **only its own block** — the rest of the model
+is never materialized on that node. Coherent output at 6.3 tok/s (4-stage
+pipeline, co-located).
+
+A model far too big for any consumer GPU, running across several — the whole
+point, proven. Combined with the WAN transport below (proven Norway → North
+Carolina at ~115 ms), this is the path to an internet-scale swarm.
+
 ## Status
 
 **Phase 0 complete** — a two-node split serving tokens with a per-node KV-cache,

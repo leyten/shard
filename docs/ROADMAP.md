@@ -43,6 +43,8 @@ The payoff. Add the draft-verify loop.
 - Scheduler handles joins/leaves and rebuilds the pipeline live.
 - **Pass = a stranger runs one command, their GPU joins, takes a layer block, and earns for tokens it helped produce.**
 
+**◑ PARTIAL (2026-06-15).** The "100B+ target across 4+ GPUs" piece is proven: gpt-oss-120b (120B params, MXFP4 ~57GB) split **9 layers/node across 4× RTX 4090** (~16GB each, ~64GB total — no single 24GB card holds it) via `phase0/pipeline.py`, the N-node pipeline. Each node loads ONLY its block (`device_map` → `meta` for the rest); coherent output at ~6.3 tok/s. Remaining Phase 3: permissionless one-command join, `cwt_` auth + per-token payouts, dynamic layer allocation, and live pipeline rebuild on join/leave.
+
 ## Phase 4 — privacy + hardening (ongoing)
 
 - Boundary-layer pinning (keep the leaky embedding + final layers on trusted nodes).
