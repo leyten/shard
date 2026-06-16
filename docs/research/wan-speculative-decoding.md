@@ -256,3 +256,13 @@ the way, and it has known fixes.
   success criterion of this whole track, on consumer GPUs over real WAN, in-house draft,
   output coherent. The fast verify is the lever that closed the gap the draft (P1) and
   direct-return opened.
+
+- **2026-06-16 — honest range across prompts.** Validated the headline isn't a
+  single-prompt fluke. The fast verify is prompt-INDEPENDENT (135-137 ms warm every
+  time -- the engineered CUDA-graph cut is stable); only draft acceptance varies:
+  factual "explain decentralized computing" accept 3.00 -> 4.00 tok/traversal -> **24.77
+  tok/s** warm; creative "poem about the ocean at midnight" accept 2.00 -> 3.00 -> **18.51
+  tok/s** warm. So the real claim is **~18.5-25 tok/s** for gpt-oss-120b across 4 scattered
+  consumer GPUs over WAN, prompt-dependent -- floor near 20, ceiling past it. (Framing:
+  known techniques composed for the WAN regime; strong for decentralized inference where
+  the closest comparable, Petals, is ~1-5 tok/s -- not new science.)
