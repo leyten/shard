@@ -232,3 +232,18 @@ the way, and it has known fixes.
   ~14 tok/s on 4 separate consumer GPUs, output still exact. Next: wire StaticKV+graph
   into specpipe serve (prefill eager, decode rounds graphed, rollback = write_pos), then
   deploy + measure over WAN.
+
+- **2026-06-16 — fast verify LIVE on the 4-box WAN cluster: 18.6 tok/s.** Deployed
+  serve_spec_fast/serve_tail_fast (`--fast`) to the real clustered-US topology (draft
+  in WA + 4x 120B stages: 2 in Kansas, IL, NC; direct return to the coordinator), and
+  measured end to end, K=4, output coherent:
+  **65 tok | 18.64 tok/s | 4.00 tok/traversal | accept 3.00 | draft 29 ms + verify 189 ms/round.**
+  The verify dropped **372 -> 189 ms** -- the ~5x CUDA-graph compute cut, realized over
+  real WAN -- taking the same topology from **7.83 -> 18.64 tok/s (2.4x)**. The 10 tok/s
+  goal is cleared; we're past the honest 12-15 intermediate target and approaching the
+  20 success criterion on consumer GPUs. Notes: (1) MAXLEN bumped 128->256 (our StaticKV
+  holds the full cache and applies the sliding window via the mask, like the eager path,
+  so no rolling buffer); (2) multi-generation must run in ONE coordinator process via the
+  reset op (--sweep) -- a fresh process can't reconnect because stages hold persistent
+  forward-sockets and only re-accept upstream (a known robustness TODO, not a verify bug);
+  (3) the draft env is /root/vllmenv (torch 2.11), separate from the default python3.
