@@ -195,6 +195,12 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     try: conn.close()
                     except OSError: pass
                     break
+                except Exception as e:                       # survive a bad message instead of dying
+                    k = list(msg.keys()) if isinstance(msg, dict) else "?"
+                    print(f"[s{stage}] bad msg after {verifies} verifies ({type(e).__name__}: {str(e)[:80]} keys={k}); resetting", flush=True)
+                    try: conn.close()
+                    except OSError: pass
+                    break
 
 
 def serve_tail_fast(parts, listen_port, timeout, dev):
@@ -232,6 +238,12 @@ def serve_tail_fast(parts, listen_port, timeout, dev):
                     send_msg(ret_conn, parts["lm_head"](h).argmax(-1)[0].tolist()); verifies += 1
                 except EDGE_ERRORS as e:
                     print(f"[tail] edge after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
+                    try: pred_conn.close(); ret_conn.close()
+                    except OSError: pass
+                    break
+                except Exception as e:                       # survive a bad message instead of dying
+                    k = list(msg.keys()) if isinstance(msg, dict) else "?"
+                    print(f"[tail] bad msg after {verifies} verifies ({type(e).__name__}: {str(e)[:80]} keys={k}); resetting", flush=True)
                     try: pred_conn.close(); ret_conn.close()
                     except OSError: pass
                     break

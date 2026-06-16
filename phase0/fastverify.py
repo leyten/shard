@@ -10,8 +10,9 @@ usage in a serve node, per generation:
 
 the cache owns its write position (gpt-oss calls update(k,v,idx) with no cache_position),
 so rollback on rejection is free: a round just writes at `start` (= the committed length),
-overwriting the previous round's rejected KV. MAXLEN = the sliding window (128) so every
-layer's cache is one fixed width and seq<=128 needs no rolling window.
+overwriting the previous round's rejected KV. StaticKV holds the FULL MAXLEN cache for every
+layer and the sliding window is applied purely by the mask (exactly like the eager path's
+single DynamicCache), so MAXLEN just has to cover prompt+gen -- no rolling buffer needed.
 """
 import torch
 from pipeline import _causal_mask
@@ -32,7 +33,7 @@ class StaticKV:
 
 
 class FastVerify:
-    def __init__(self, parts, maxlen=128, dev="cuda"):
+    def __init__(self, parts, maxlen=2048, dev="cuda"):
         self.parts = parts; self.maxlen = maxlen; self.dev = dev
         self.layers = parts["layers"]; self.n_layers = len(self.layers)
         self.sliding = parts.get("sliding"); self.win = parts.get("window", 0)
