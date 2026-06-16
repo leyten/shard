@@ -78,7 +78,7 @@ def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev):
 
 
 def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, timeout,
-                  adaptive=False, k_min=1, k_max=12):
+                  adaptive=False, k_min=1, k_max=12, draft_sock=None):
     """stage 0: draft proposes K tokens on its own GPU; the distributed target
     verifies [cur, d_1..d_K] in one chain traversal; greedy-accept the longest
     matching prefix. caches (draft + this node's block) crop locally; downstream
@@ -88,6 +88,7 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
     enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
                                   add_generation_prompt=True, return_tensors="pt", return_dict=True)
     ids = enc["input_ids"].to(dev)
+    prompt_ids = enc["input_ids"][0].tolist()   # for the in-house draft service (full-prefix queries)
     head_cache, draft_cache = DynamicCache(), DynamicCache()
     pos = 0
     out = []                                    # defined before any edge can fail (prefill incl.)
@@ -103,8 +104,9 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
         preds = (send_msg(sock, {"op": "verify", "h": h.cpu(), "start": 0}), recv_msg(sock))[1]
         cur = preds[-1]                                     # target's token for position L
         pos = ids.shape[1]
-        with torch.no_grad():
-            draft(input_ids=ids.to(draft_dev), past_key_values=draft_cache, use_cache=True)
+        if draft_sock is None:                              # local transformers draft fills its cache
+            with torch.no_grad():
+                draft(input_ids=ids.to(draft_dev), past_key_values=draft_cache, use_cache=True)
 
         out = [cur]
         rounds, accepted_total = 0, 0
@@ -114,15 +116,19 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
         t0 = time.time()
         with torch.no_grad():
             while len(out) < max_new and cur != eos:
-                # 1. draft proposes kc tokens (feed cur, d_1..d_kc -> keep d_1..d_kc)
+                # 1. draft proposes kc tokens
                 td = time.time()
-                drafts, dtok = [], cur
-                for i in range(kc + 1):
-                    dl = draft(input_ids=torch.tensor([[dtok]], device=draft_dev),
-                               past_key_values=draft_cache, use_cache=True).logits
-                    dtok = int(dl[0, -1].argmax())
-                    if i < kc:
-                        drafts.append(dtok)
+                if draft_sock is not None:                  # in-house vLLM draft service (full prefix; prefix-cached)
+                    send_msg(draft_sock, {"ids": prompt_ids + out, "k": kc})
+                    drafts = recv_msg(draft_sock)
+                else:                                       # local transformers draft (incremental cache)
+                    drafts, dtok = [], cur
+                    for i in range(kc + 1):
+                        dl = draft(input_ids=torch.tensor([[dtok]], device=draft_dev),
+                                   past_key_values=draft_cache, use_cache=True).logits
+                        dtok = int(dl[0, -1].argmax())
+                        if i < kc:
+                            drafts.append(dtok)
                 t_draft += time.time() - td
                 # 2. verify [cur, d_1..d_kc] in one traversal (carry the prior round's rollback)
                 tv = time.time()
@@ -144,7 +150,9 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
                 rounds += 1; accepted_total += n; k_hist.append(kc)
                 # 4. roll caches back to the accepted length: this node's + draft's now,
                 #    downstream nodes lazily on the next verify (no extra round-trip)
-                head_cache.crop(pos); draft_cache.crop(pos)
+                head_cache.crop(pos)
+                if draft_sock is None:
+                    draft_cache.crop(pos)                   # vLLM service manages its own cache
                 tail_crop = pos
                 # 5. adaptive K: aim a couple beyond the running acceptance (EMA of n)
                 ema_n = 0.7 * ema_n + 0.3 * n
@@ -180,6 +188,7 @@ def main():
     ap.add_argument("--next", default="")
     ap.add_argument("--device", default="cuda:0")           # this stage's block
     ap.add_argument("--draft-device", default="cuda:1")     # draft (head only; its own GPU)
+    ap.add_argument("--draft-server", default="", help="host:port of the in-house vLLM draft service (else local draft)")
     ap.add_argument("--K", type=int, default=6)
     ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
     ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
@@ -193,11 +202,17 @@ def main():
         serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout, args.device)
         return
 
-    print(f"[s0] loading draft {args.draft} on {args.draft_device} ...", flush=True)
-    draft = AutoModelForCausalLM.from_pretrained(args.draft, dtype="auto",
-                                                 device_map={"": args.draft_device},
-                                                 attn_implementation="eager").eval()
-    print(f"[s0] draft loaded, draft_mem={torch.cuda.memory_allocated(args.draft_device)/1e9:.1f}GB", flush=True)
+    draft, draft_sock = None, None
+    if args.draft_server:                                   # in-house vLLM draft service
+        dh, dp = args.draft_server.split(":")
+        draft_sock = socket.socket(); draft_sock.connect((dh, int(dp)))
+        print(f"[s0] using in-house draft service at {args.draft_server}", flush=True)
+    else:
+        print(f"[s0] loading draft {args.draft} on {args.draft_device} ...", flush=True)
+        draft = AutoModelForCausalLM.from_pretrained(args.draft, dtype="auto",
+                                                     device_map={"": args.draft_device},
+                                                     attn_implementation="eager").eval()
+        print(f"[s0] draft loaded, draft_mem={torch.cuda.memory_allocated(args.draft_device)/1e9:.1f}GB", flush=True)
     tok = AutoTokenizer.from_pretrained(args.model)
     host, port = args.next.split(":")
     sock = socket.socket(); sock.settimeout(args.timeout); sock.connect((host, int(port)))
@@ -207,7 +222,8 @@ def main():
             for kv in [int(x) for x in args.sweep.split(",")]:
                 adaptive = (kv == 0)
                 rr = generate_spec(draft, parts, tok, sock, args.prompt, (6 if adaptive else kv),
-                                   args.max_new, args.device, args.draft_device, args.timeout, adaptive=adaptive)
+                                   args.max_new, args.device, args.draft_device, args.timeout,
+                                   adaptive=adaptive, draft_sock=draft_sock)
                 tag = f"adaptive(mean {rr['mean_K']:.1f})" if adaptive else f"K={kv}"
                 print(f"[SWEEP {tag}] {rr['tok_s']:.2f} tok/s | {rr['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {rr['mean_accept']:.2f} | draft {rr['draft_ms']:.0f}ms + verify {rr['verify_ms']:.0f}ms/round "
@@ -217,7 +233,8 @@ def main():
         return
     try:
         r = generate_spec(draft, parts, tok, sock, args.prompt, args.K, args.max_new,
-                          args.device, args.draft_device, args.timeout, adaptive=args.adaptive)
+                          args.device, args.draft_device, args.timeout, adaptive=args.adaptive,
+                          draft_sock=draft_sock)
     except TransportError as e:
         print(f"\n[s0] TRANSPORT FAILURE: {e}", flush=True); raise SystemExit(2)
     finally:

@@ -119,3 +119,14 @@ the way, and it has known fixes.
   each round re-proposes from the committed prefix cheaply), then (a) tree spec and
   (b) run the *target* stages under vLLM kernels too, to cut the verify's compute
   half. Projected with both: 20+ tok/s on consumer GPUs over WAN, output still exact.
+- **2026-06-16 — P1 integrated and measured. It holds.** The in-house draft service
+  (`research/draft_server.py`, vLLM gpt-oss-20b behind a socket; the entry node's
+  managed draft, chosen over per-worker drafting since the draft holds no authority
+  and quality sets UX speed) is wired into `phase0/specpipe.py` via `--draft-server`.
+  Each round queries it for K tokens from the committed prefix; vLLM prefix-caching
+  is the rollback, for free. Warm over the same Sweden↔NC WAN, K=4:
+  **6.5 → 13.3 tok/s (2.04×)**, draft 309 ms → **30 ms/round**, acceptance held
+  (2.34 vs 2.49), output still token-for-token exact. The round is now verify-bound
+  (224 ms), so the linear-spec ceiling here is ~15 tok/s — the remaining gap to 20+
+  is **tree speculation** (more accepted tokens per fixed-cost traversal) and, for
+  more headroom, running the target stages under vLLM kernels too. Next: tree spec.
