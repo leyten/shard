@@ -30,6 +30,7 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
+from fastverify import FastVerify
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
@@ -136,6 +137,99 @@ def serve_tail_direct(parts, listen_port, timeout, dev):
                     h = parts["norm"](h)
                     toks = parts["lm_head"](h).argmax(-1)[0].tolist()
                     send_msg(ret_conn, toks); verifies += 1
+                except EDGE_ERRORS as e:
+                    print(f"[tail] edge after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
+                    try: pred_conn.close(); ret_conn.close()
+                    except OSError: pass
+                    break
+
+
+def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
+    """serve_spec with the FAST verify: a static-cache CUDA-graph stage forward (~5x
+    cheaper than eager). LINEAR spec only (the graph is a fixed K+1 shape; tree is
+    variable). first verify after reset = prefill (eager, prompt-length); every later
+    verify = a decode round (graphed). rollback is implicit -- a round writes at `start`
+    (the committed length), overwriting the prior round's rejects."""
+    is_tail = stage == nstages - 1
+    nxt_sock = None
+    if not is_tail:
+        host, port = nxt.split(":")
+        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(port)))
+        print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
+    fv = FastVerify(parts, dev=dev)
+    print(f"[s{stage}] listening on :{listen_port} (FAST verify, edge timeout {timeout:.0f}s)", flush=True)
+    while True:
+        conn, addr = srv.accept(); conn.settimeout(timeout)
+        print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
+        fv.reset(); first = True; verifies = 0
+        with torch.no_grad():
+            while True:
+                try:
+                    msg = recv_msg(conn)
+                    if msg["op"] == "reset":
+                        fv.reset(); first = True
+                        if nxt_sock:
+                            send_msg(nxt_sock, msg)
+                            if not direct: recv_msg(nxt_sock)
+                        if not direct: send_msg(conn, "ok")
+                        continue
+                    if "token_ids" in msg:                 # served head: embed ids here
+                        x = parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
+                    else:
+                        x = msg["h"].to(dev)
+                    h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"])
+                    first = False
+                    if is_tail:
+                        h = parts["norm"](h)
+                        send_msg(conn, parts["lm_head"](h).argmax(-1)[0].tolist())
+                    else:
+                        send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"]})
+                        if not direct:
+                            send_msg(conn, recv_msg(nxt_sock))
+                    verifies += 1
+                except EDGE_ERRORS as e:
+                    why = "stalled" if isinstance(e, socket.timeout) else "closed"
+                    print(f"[s{stage}] edge {why} after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
+                    try: conn.close()
+                    except OSError: pass
+                    break
+
+
+def serve_tail_fast(parts, listen_port, timeout, dev):
+    """direct-return tail with the FAST verify (see serve_spec_fast + serve_tail_direct)."""
+    import select
+    srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("0.0.0.0", listen_port)); srv.listen(2)
+    fv = FastVerify(parts, dev=dev)
+    print(f"[tail] listening on :{listen_port} (FAST verify, direct return, edge timeout {timeout:.0f}s)", flush=True)
+    while True:
+        c1, _ = srv.accept(); c2, _ = srv.accept()
+        ready, _, _ = select.select([c1, c2], [], [], timeout)
+        if not ready:
+            c1.close(); c2.close(); continue
+        ret_conn = ready[0]
+        try:
+            hello = recv_msg(ret_conn)
+        except EDGE_ERRORS:
+            c1.close(); c2.close(); continue
+        if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
+            c1.close(); c2.close(); continue
+        pred_conn = c2 if ret_conn is c1 else c1; pred_conn.settimeout(timeout)
+        print("[tail] predecessor + coordinator-return connected", flush=True)
+        fv.reset(); first = True; verifies = 0
+        with torch.no_grad():
+            while True:
+                try:
+                    msg = recv_msg(pred_conn)
+                    if msg["op"] == "reset":
+                        fv.reset(); first = True; send_msg(ret_conn, "ok"); continue
+                    x = msg["h"].to(dev)
+                    h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"])
+                    first = False
+                    h = parts["norm"](h)
+                    send_msg(ret_conn, parts["lm_head"](h).argmax(-1)[0].tolist()); verifies += 1
                 except EDGE_ERRORS as e:
                     print(f"[tail] edge after {verifies} verifies ({type(e).__name__}); resetting", flush=True)
                     try: pred_conn.close(); ret_conn.close()
@@ -383,6 +477,7 @@ def main():
     ap.add_argument("--draft-server", default="", help="host:port of the in-house vLLM draft service (else local draft)")
     ap.add_argument("--K", type=int, default=6)
     ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
+    ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
     ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=128)
@@ -429,8 +524,12 @@ def main():
     parts = load_stage(args.model, args.stage, args.nstages, device=args.device)
 
     if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
-        if args.direct_return and args.stage == args.nstages - 1:
-            serve_tail_direct(parts, args.listen_port, args.timeout, args.device)
+        is_tail = args.stage == args.nstages - 1
+        if args.direct_return and is_tail:
+            (serve_tail_fast if args.fast else serve_tail_direct)(parts, args.listen_port, args.timeout, args.device)
+        elif args.fast:
+            serve_spec_fast(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout,
+                            args.device, direct=args.direct_return)
         else:
             serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout,
                        args.device, direct=args.direct_return)
