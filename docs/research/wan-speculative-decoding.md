@@ -210,3 +210,25 @@ the way, and it has known fixes.
   makes the verify latency-bound so tree spec finally pays off too. Build: a static
   pre-allocated KV cache + captured stage-forward graph (the realization of the
   fast verify). The path to 10-15 tok/s on 4 separate consumer GPUs is real.
+
+- **2026-06-16 — fast verify REALIZED: static-cache CUDA graph, bit-exact, 5.3x.**
+  `research/fastverify_graph.py`: the stage forward now runs in the real incremental
+  decode against a pre-allocated static KV cache (StaticKV, MAXLEN=128 = the sliding
+  window so every layer's cache is one fixed width), captured as ONE CUDA graph and
+  replayed each round -- KV writes land at the round's position via a static index
+  buffer, and rotary + 9 layers + MoE are all inside the graph. **Replay is bit-exact
+  vs the eager static forward (max-diff 0.00000) and 5.3x faster (23.6 -> 4.4 ms).**
+  Two findings that cost the most to pin down:
+  (1) gpt-oss's attention calls `cache.update(k,v,layer_idx)` with NO cache_position,
+  so the cache must own the write position -- StaticKV takes an explicit write_pos,
+  which also makes spec-decode rollback trivial (set write_pos to the committed length;
+  rejected KV is overwritten next round).
+  (2) the static-128 forward differs from a DynamicCache forward by ~250 on hidden
+  states of magnitude ~1000 -- but this is NOT a bug: eager DynamicCache itself differs
+  batch-vs-sequential by ~250 (q_len-dependent MoE/bf16 rounding). spec-decode is exact
+  at the ARGMAX level, which tolerates it (the eager spec-decode proved this). the right
+  exactness test is end-to-end tokens, not stage hidden states.
+  Projected: verify compute /5.3 -> clustered linear-direct verify 372 -> ~180 ms ->
+  ~14 tok/s on 4 separate consumer GPUs, output still exact. Next: wire StaticKV+graph
+  into specpipe serve (prefill eager, decode rounds graphed, rollback = write_pos), then
+  deploy + measure over WAN.
