@@ -52,7 +52,24 @@ for e in range(E):
 moe.quant_method.process_weights_after_loading(moe)
 print("NVFP4 routed experts loaded + kernel set up", flush=True)
 
-# ---- the rest of the layer (bf16 in the NVFP4 ckpt): MLA, norms, gate. shared = stub. ----
+# ---- NVFP4 shared expert: run as a 1-expert FusedMoE (same proven kernel, no fp4 unpack) ----
+def shared_routing(*a, **kw):
+    hs = kw["hidden_states"]; T = hs.shape[0]
+    return (torch.ones(T, 1, dtype=torch.bfloat16, device=hs.device),
+            torch.zeros(T, 1, dtype=torch.int32, device=hs.device))
+shmoe = FusedMoE(num_experts=1, top_k=1, hidden_size=H, intermediate_size=I, params_dtype=torch.bfloat16,
+                 renormalize=False, custom_routing_function=shared_routing, quant_config=qnv,
+                 prefix=P + "mlp.shared_experts").to(dev)
+sp = dict(shmoe.named_parameters()); SP = P + "mlp.shared_experts."
+for proj, shard in [("gate_proj", "w1"), ("up_proj", "w3"), ("down_proj", "w2")]:
+    grp = "w2" if shard == "w2" else "w13"
+    for suf in ["weight", "weight_scale", "weight_scale_2", "input_scale"]:
+        n = f"{SP}{proj}.{suf}"
+        if n in idx: shmoe.weight_loader(sp[f"{grp}_{suf}"], raw(n).to(dev), n, shard, 0)
+shmoe.quant_method.process_weights_after_loading(shmoe)
+print("NVFP4 shared expert loaded (1-expert FusedMoE)", flush=True)
+
+# ---- the rest of the layer (bf16 in the NVFP4 ckpt): MLA, norms, gate. shared via shmoe above. ----
 sd = {}
 for n in ["self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight", "self_attn.kv_a_proj_with_mqa.weight",
           "self_attn.kv_b_proj.weight", "self_attn.o_proj.weight", "self_attn.q_a_layernorm.weight",
@@ -60,9 +77,6 @@ for n in ["self_attn.q_a_proj.weight", "self_attn.q_b_proj.weight", "self_attn.k
           "mlp.gate.weight"]:
     sd[n] = raw(P + n).to(torch.bfloat16).to(dev)
 sd["mlp.gate.e_score_correction_bias"] = e_bias
-bf = lambda *s: torch.zeros(*s, dtype=torch.bfloat16, device=dev)
-sd["mlp.shared_experts.gate_proj.weight"] = bf(I, H); sd["mlp.shared_experts.up_proj.weight"] = bf(I, H)
-sd["mlp.shared_experts.down_proj.weight"] = bf(H, I)
 with torch.device("meta"):
     layer = M.GlmMoeDsaDecoderLayer(cfg, LAYER)
 layer.load_state_dict(sd, strict=False, assign=True); layer.eval()
@@ -72,7 +86,8 @@ def moe_forward(self, hidden_states):
     shp = hidden_states.shape
     h = hidden_states.view(-1, H)
     router_logits = torch.nn.functional.linear(h, self.gate.weight)
-    out = moe(h, router_logits) + self.shared_experts(hidden_states).view(-1, H)
+    ones = torch.ones(h.shape[0], 1, dtype=torch.bfloat16, device=h.device)
+    out = moe(h, router_logits) + shmoe(h, ones)
     return out.view(shp)
 M.GlmMoeDsaMoE.forward = moe_forward
 
@@ -106,7 +121,7 @@ with torch.no_grad(), set_forward_context(None, vcfg):
     out = layer(h, attention_mask=mask, position_ids=pos, use_cache=False, position_embeddings=pe)[0]
     fin = torch.isfinite(out).all().item()
     mem = torch.cuda.max_memory_allocated() / 1e9
-print(f"\nNVFP4 FULL STAGE (layer {LAYER}, shared stubbed): out {tuple(out.shape)} finite={fin} "
+print(f"\nNVFP4 FULL STAGE (layer {LAYER}): out {tuple(out.shape)} finite={fin} "
       f"mean|x| {h.abs().mean():.3f}->{out.abs().mean():.3f} | peak GPU {mem:.1f} GB", flush=True)
-print("VERDICT:", "NVFP4 FULL-LAYER STAGE RUNS — MLA bf16 + NVFP4 routed MoE in one decoder layer. "
-      "Next: shared expert + multi-layer + launcher." if fin and out.abs().max() < 1e4 else "not sane — inspect.", flush=True)
+print("VERDICT:", "NVFP4 COMPLETE-LAYER STAGE RUNS — MLA bf16 + NVFP4 routed MoE + NVFP4 shared expert "
+      "in one real decoder layer. The 16-node stage is feature-complete. Next: multi-layer + launcher." if fin and out.abs().max() < 1e4 else "not sane — inspect.", flush=True)
