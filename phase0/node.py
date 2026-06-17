@@ -13,28 +13,11 @@ then head:
   python node.py --role head  --split 18 --peer 172.17.0.3 --port 29501 --prompt "..."
 """
 
-import argparse, socket, struct, pickle, time
+import argparse, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer
-
-
-# ---- tiny length-prefixed tcp transport (phase 0; quic comes in phase 1) ----
-def _recvall(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("peer closed")
-        buf += chunk
-    return buf
-
-def send_msg(sock, obj):
-    data = pickle.dumps(obj)
-    sock.sendall(struct.pack("!Q", len(data)) + data)
-
-def recv_msg(sock):
-    (n,) = struct.unpack("!Q", _recvall(sock, 8))
-    return pickle.loads(_recvall(sock, n))
+import wire
+from wire import send_msg, recv_msg   # authenticated + encrypted + pickle-free wire (was raw pickle here)
 
 
 # ---- load only this node's shard of the model ----
@@ -86,6 +69,7 @@ def main():
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=60)
     args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
     dev = "cuda"
     parts = load_parts(args.model, args.split, args.role)
 

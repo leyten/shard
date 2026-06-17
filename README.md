@@ -89,8 +89,12 @@ owns.
   enough that the WAN, not the compute, sets the floor.
 - **Transport.** The activation tensor crosses the public internet on every step. Shard
   owns this layer — supervised edges that fail fast and reconnect, per-edge health
-  logging, no opaque "broken pipe." (NAT hole-punching + relay fallback for home routers
-  is the remaining Phase 1 work; a direct open port stands in today.)
+  logging, no opaque "broken pipe." The wire is authenticated and encrypted with
+  pickle-free framing (`phase0/wire.py`; ChaCha20-Poly1305 under a shared `SHARD_PSK`),
+  so a passive observer learns nothing and a forged frame is a parse error, not code
+  execution. (NAT hole-punching + relay fallback for home routers is the remaining
+  Phase 1 work, where per-node identities + a keyed handshake replace the shared key;
+  a direct open port stands in today.)
 
 ## Design principles
 
@@ -99,11 +103,14 @@ Shard is c0mpute infrastructure, held to its three guarantees:
 - **Uncensored.** The engine runs models as-is. No content filter in the inference path.
 - **Decentralized.** Anyone can join a GPU with one command and be assigned a block of
   layers. No central inference server.
-- **Private.** No node holds the whole model — a real start, not the whole story.
-  Intermediate activations can still leak a fraction of a user's tokens to a malicious
-  node. The plan — pin leaky boundary layers to trusted nodes, per-request trusted
-  routing, never overclaim — is in [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is
-  the number-one open problem and is treated as one.
+- **Private.** No node holds the whole model — a real start, not the whole story. The
+  wire is sealed (authenticated encryption, pickle-free), so the leak is not on the
+  path; but a *participating* node must decrypt to run its layer, so it sees the
+  activations it processes. Intermediate activations can still leak a fraction of a
+  user's tokens to a malicious node. The plan — pin leaky boundary layers to trusted
+  nodes, per-request trusted routing, never overclaim — is in
+  [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is the number-one open problem and is
+  treated as one.
 
 ## Repository layout
 

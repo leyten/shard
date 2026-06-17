@@ -21,6 +21,7 @@ head: python specdec.py --role head --split 24 --peer 172.17.0.3 --port 29501 \
 import argparse, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+import wire
 from node_kv import load_parts, run_layers, send_msg, recv_msg, EDGE_ERRORS, TransportError
 
 
@@ -161,6 +162,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=30.0)
     args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
     dev = "cuda"
 
     parts = load_parts(args.model, args.split, args.role)

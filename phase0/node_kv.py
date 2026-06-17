@@ -5,40 +5,26 @@ sends only the single new token's activations each step. each node keeps a
 DynamicCache for its own layers (layer_idx reindexed 0-based per node). one
 generation per connection: a fresh head connection => fresh caches on both nodes.
 
+set the same swarm secret on both boxes first: export SHARD_PSK=$(openssl rand -hex 32)
 tail: python node_kv.py --role tail --split 24 --port 29501
 head: python node_kv.py --role head --split 24 --peer 172.17.0.3 --port 29501 --prompt "..."
 """
 
-import argparse, os, socket, struct, pickle, time
+import argparse, os, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+import wire
+from wire import send_msg, recv_msg   # authenticated + encrypted + pickle-free wire (was raw pickle here)
 
-# transport-layer errors we treat as "edge is dead/frozen" (socket.timeout and
-# every ConnectionError subclass are OSError, so this one tuple covers them all).
+# transport-layer errors we treat as "edge is dead/frozen" (socket.timeout and every
+# ConnectionError subclass are OSError, so this one tuple covers them all). wire.recv_msg
+# raises ConnectionError on an auth failure, so a tampered/forged frame lands here too
+# and resets the edge instead of being trusted.
 EDGE_ERRORS = (OSError, EOFError)
 
 
 class TransportError(Exception):
     """a pipeline edge died or stalled; carries context, never a bare hang."""
-
-
-def _recvall(sock, n):
-    buf = b""
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
-            raise ConnectionError("peer closed")
-        buf += chunk
-    return buf
-
-def send_msg(sock, obj):
-    data = pickle.dumps(obj)
-    sock.sendall(struct.pack("!Q", len(data)) + data)
-    return 8 + len(data)            # bytes on the wire, for edge instrumentation
-
-def recv_msg(sock):
-    (n,) = struct.unpack("!Q", _recvall(sock, 8))
-    return pickle.loads(_recvall(sock, n))
 
 
 def load_parts(model_id, split, role, device="cuda", dtype=torch.bfloat16):
@@ -163,6 +149,7 @@ def main():
     ap.add_argument("--timeout", type=float, default=30.0,
                     help="per-edge round-trip budget (s); exceed it => clean fail, never a hang")
     args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
     dev = "cuda"
     parts = load_parts(args.model, args.split, args.role)
 

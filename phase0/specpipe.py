@@ -15,6 +15,8 @@ holds only its block of the target. the verify op carries a lazy `crop`: the pri
 round's rejected tokens are rolled back from every node's cache on the next verify,
 piggybacked, so a round costs exactly one round-trip end to end.
 
+  # every node shares one swarm secret (same value on each box):
+  export SHARD_PSK=$(openssl rand -hex 32)
   # tail (stage N-1)
   CUDA_VISIBLE_DEVICES=1 python specpipe.py --stage 3 --nstages 4 --model M --listen-port 29503
   # middle (stage i)
@@ -27,6 +29,7 @@ piggybacked, so a round costs exactly one round-trip end to end.
 import argparse, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+import wire
 from pipeline import load_stage, run_block
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
@@ -495,6 +498,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=120.0)
     args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
 
     if args.coordinator:                                    # in-house entry node: no 120B, just tokenizer + draft + swarm
         tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer

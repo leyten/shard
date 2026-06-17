@@ -4,11 +4,15 @@ version = "0.0.0"
 description = "c0mpute's decentralized inference engine: one model, split across a swarm of consumer gpus"
 requires-python = ">=3.11"
 dependencies = [
+    # wire security (phase 0): authenticated encryption for the inter-stage transport
+    # (phase0/wire.py). required to import any node -- the wire won't load without it.
+    "cryptography>=42",
     # per-node serving engine (we wrap it, don't rebuild it)
     # "sglang",
     # transport (phase 0-1): quic in python, lift hot path to rust later
     # "aioquic",
-    # tensors / activation codec
+    # tensors / activation codec -- torch + transformers (+ numpy) are needed to run
+    # phase0/, installed by the box setup (a specific CUDA build), not resolved here.
     # "torch",
 ]
 

@@ -21,6 +21,7 @@ launch tail-first so each node connects to an already-listening successor:
 import argparse, socket, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
+import wire
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 
 
@@ -202,6 +203,7 @@ def main():
     ap.add_argument("--runs", type=int, default=1, help="generations on one load; run>0 are warm")
     ap.add_argument("--timeout", type=float, default=30.0)
     args = ap.parse_args()
+    wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
     dev = "cuda"
     parts = load_stage(args.model, args.stage, args.nstages, device=dev)
 
