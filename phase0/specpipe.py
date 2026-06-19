@@ -226,20 +226,32 @@ def serve_tail_fast(parts, listen_port, timeout, dev):
         ready, _, _ = select.select([c1, c2], [], [], timeout)
         if not ready:
             c1.close(); c2.close(); continue
-        ret_conn = ready[0]
+        # identify the return channel by CONTENT, not arrival order: the coordinator
+        # sends {"op":"hello_return"} on it. Over some transports (e.g. the libp2p
+        # sidecar) the predecessor's first forward message can race ahead of the hello,
+        # so the first-readable conn may be the predecessor — handle either order.
         try:
-            hello = recv_msg(ret_conn)
+            first_conn = ready[0]
+            m0 = recv_msg(first_conn)
+            if isinstance(m0, dict) and m0.get("op") == "hello_return":
+                ret_conn = first_conn; pred_conn = c2 if first_conn is c1 else c1
+                pending = None
+            else:                                  # first_conn is the predecessor; m0 is a real msg
+                pred_conn = first_conn; ret_conn = c2 if first_conn is c1 else c1
+                hello = recv_msg(ret_conn)
+                if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
+                    c1.close(); c2.close(); continue
+                pending = m0
         except EDGE_ERRORS:
             c1.close(); c2.close(); continue
-        if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
-            c1.close(); c2.close(); continue
-        pred_conn = c2 if ret_conn is c1 else c1; pred_conn.settimeout(timeout)
+        pred_conn.settimeout(timeout)
         print("[tail] predecessor + coordinator-return connected", flush=True)
         fv.reset(); first = True; verifies = 0
         with torch.no_grad():
             while True:
                 try:
-                    msg = recv_msg(pred_conn)
+                    msg = pending if pending is not None else recv_msg(pred_conn)
+                    pending = None
                     if msg["op"] == "reset":
                         fv.reset(); first = True; send_msg(ret_conn, "ok"); continue
                     g = msg.get("gather")

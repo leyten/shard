@@ -27,10 +27,9 @@ Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these fi
 ## Now
 **Step 1 (JOIN transport) DONE.** ✅ The real gpt-oss-120B, split across 4 scattered boxes (UT·CA·NV·WA) over **libp2p with per-node keys and no `SHARD_PSK`**, produced **bit-identical** greedy tokens to the committed `wire.py` receipt (sha `f646e0db…3f70`, 87 tokens). Proven incrementally: 1.1 key-auth round-trip → 1.2 engine↔sidecar tensors → 1.3a transparent TCP-over-libp2p tunnel → 1.3b PSK-free message codec → 1.3d-i cross-box libp2p over real WAN → 1.3d-ii the full 120B ring. Sidecar = `sidecar/main.go`; engine wire = `shard/transport.py`; the engine ran unmodified except `import wire → import shard.transport as wire`.
 
-**Loose ends before committing step 1:**
-- Prune the superseded 1.2 unix-socket bridge (sidecar `-engine` mode + `Edge`/`ActivationCodec`) — the tunnel replaced it.
-- Re-enable the **perf path** over the sidecar (direct-return + pipelining → ~40 tok/s; the relay-back sync proof ran at 22.9 tok/s). The 2-connection tail is the only fiddly bit. Correctness-independent.
-- Land a libp2p receipt (mirrors the wire.py one) as the banked proof.
+**Perf path re-enabled (direct-return + pipelining over libp2p):** **44.79 tok/s warm @ depth 2**, bit-identical (sha `f646e0db…3f70`, `tokens_match_sync=True`) — i.e. **parity-or-better vs the trusted-wire 39.8** (this window's return leg was 45 ms). Sweep: PIPE d2 warm 44.8 / d4 warm 39.3 / SYNC warm 33.5. The fix was a latent race in `serve_tail_fast` — it now identifies the return channel by content (`hello_return`), not arrival order. So libp2p adds no real tax; QUIC stays a step-2 lever, not needed for parity.
+
+Done & committed: prune of the dead 1.2 bridge, the libp2p receipt, the tail fix.
 
 **Next (step 2):** NAT traversal (home GPUs behind NAT — DCUtR + relay; today used Vast's mapped public ports) + bind each node's libp2p key ↔ its c0mpute `cwt_` account.
 
