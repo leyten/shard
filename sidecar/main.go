@@ -142,18 +142,15 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 		}))
 	}
 	if n.relayService {
-		// be a public relay (circuit-relay-v2). Force public reachability so the hop
-		// service activates immediately — otherwise libp2p waits for AutoNAT to confirm
-		// reachability, which never happens without AutoNAT-peer infrastructure.
-		opts = append(opts, libp2p.EnableRelayService(), libp2p.ForceReachabilityPublic())
+		// be a public relay (circuit-relay-v2) + an AutoNAT server (so NAT'd peers can
+		// learn their reachability + observed address from us). Force public reachability
+		// so the hop service activates immediately.
+		opts = append(opts, libp2p.EnableRelayService(), libp2p.ForceReachabilityPublic(), libp2p.EnableNATService())
 	}
-	// NAT'd nodes reserve on relays explicitly (in main) rather than via autorelay's
-	// background finder — deterministic, observable, and the scheduler hands out the
-	// circuit address anyway. Force private reachability so DCUtR knows we're the NAT'd
-	// side and initiates the hole-punch to the public peer.
-	if len(n.staticRelays) > 0 {
-		opts = append(opts, libp2p.ForceReachabilityPrivate())
-	}
+	// NAT'd nodes reserve on relays explicitly (in main) and let AutoNAT + the
+	// observed-address manager (from several observer peers) determine reachability — so
+	// DCUtR can hole-punch when the NAT is cone-type. Forcing private here is wrong: it
+	// leaves holepunch with no public address to offer ("waiting for a public address").
 	return libp2p.New(opts...)
 }
 
