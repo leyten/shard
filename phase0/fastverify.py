@@ -16,6 +16,7 @@ single DynamicCache), so MAXLEN just has to cover prompt+gen -- no rolling buffe
 """
 import torch
 from pipeline import _causal_mask
+from tree import tree_mask
 
 
 class StaticKV:
@@ -101,3 +102,75 @@ class FastVerify:
             self._set(h, start)                                 # warmup wrote the cache; restore round inputs
         self.graph.replay()
         return self.out
+
+    # ---- TREE verify: a fixed-topology tree (M nodes) graphed like the linear path ----
+    # build_tree(w,d) gives a FIXED structure (par/dep constant; only token values change),
+    # so the M-node forward is graphable. tree KV is stored at contiguous scratch slots
+    # [start, start+M); the tree mask routes each node to its ancestors' slots + the prefix.
+    def _tbuild(self, M, par, dep):
+        self.tM = M; self.tpar = list(par)
+        self.th = torch.zeros(1, M, self.hidden, dtype=torch.bfloat16, device=self.dev)
+        self.tpos = torch.zeros(1, M, dtype=torch.long, device=self.dev)
+        self.tcp = torch.zeros(M, dtype=torch.long, device=self.dev)
+        self.tmf = torch.zeros(1, 1, M, self.maxlen, dtype=torch.bfloat16, device=self.dev)
+        self.tmw = torch.zeros(1, 1, M, self.maxlen, dtype=torch.bfloat16, device=self.dev)
+        anc = torch.zeros(M, M, dtype=torch.bool, device=self.dev)           # anc[i,tj] = tj ancestor of i (incl self)
+        for i in range(M):
+            j = i
+            while j != -1:
+                anc[i, j] = True; j = par[j]
+        self.tanc = anc
+        self.tdepv = torch.tensor(dep, device=self.dev)
+
+    def _tset(self, h, start, par, dep):
+        """build the round's tree mask VECTORIZED (the topology is fixed; only `start`
+        shifts the prefix boundary) -- no per-element GPU writes."""
+        M = self.tM
+        z = torch.zeros((), dtype=torch.bfloat16, device=self.dev)
+        mnb = torch.full((), torch.finfo(torch.bfloat16).min, dtype=torch.bfloat16, device=self.dev)
+        self.th.copy_(h)
+        posM = start + self.tdepv                                            # [M] query abs positions
+        self.tpos.copy_(posM.unsqueeze(0))
+        self.tcp.copy_(torch.arange(start, start + M, device=self.dev))      # contiguous scratch slots
+        cols = torch.arange(self.maxlen, device=self.dev)
+        allow_f = torch.zeros(M, self.maxlen, dtype=torch.bool, device=self.dev)
+        allow_f[:, :start] = True                                            # full: attend all committed prefix
+        allow_f[:, start:start + M] = self.tanc                              # tree: attend ancestors (scratch slots)
+        self.tmf[0, 0] = torch.where(allow_f, z, mnb)
+        if self.win:
+            allow_w = torch.zeros(M, self.maxlen, dtype=torch.bool, device=self.dev)
+            allow_w[:, :start] = (posM[:, None] - cols[None, :start]) < self.win
+            allow_w[:, start:start + M] = self.tanc & ((posM[:, None] - posM[None, :]) < self.win)
+            self.tmw[0, 0] = torch.where(allow_w, z, mnb)
+        else:
+            self.tmw.copy_(self.tmf)
+
+    def _tbody(self):
+        self.cache.cp = self.tcp
+        return self._layers(self.th, self.tpos, self.rotary(self.th, self.tpos), self.tmf, self.tmw)
+
+    def tree_decode(self, h, start, par, dep):
+        if getattr(self, "tM", None) != h.shape[1] or getattr(self, "tpar", None) != list(par):
+            self._tbuild(h.shape[1], par, dep); self.tgraph = None
+        self._tset(h, start, par, dep)
+        if getattr(self, "tgraph", None) is None:
+            s = torch.cuda.Stream(); s.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(s):
+                for _ in range(3): self._tbody()
+            torch.cuda.current_stream().wait_stream(s)
+            self.tgraph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(self.tgraph):
+                self.tout = self._tbody()
+            self._tset(h, start, par, dep)                                   # warmup dirtied the cache; restore inputs
+        self.tgraph.replay()
+        return self.tout
+
+    def tree_gather(self, start, keep):
+        """compact the accepted path's KV (scratch slots start+keep[i]) to contiguous
+        committed positions start+i, every layer. keep[0]=0 (root). next round's prefix
+        becomes [0, start+len(keep))."""
+        src = torch.tensor([start + k for k in keep], device=self.dev)
+        dst = torch.arange(start, start + len(keep), device=self.dev)
+        for lk, lv in zip(self.cache.k, self.cache.v):
+            lk.index_copy_(2, dst, lk.index_select(2, src))
+            lv.index_copy_(2, dst, lv.index_select(2, src))

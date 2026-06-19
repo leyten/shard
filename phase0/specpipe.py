@@ -178,17 +178,25 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                             if not direct: recv_msg(nxt_sock)
                         if not direct: send_msg(conn, "ok")
                         continue
+                    g = msg.get("gather")
+                    if g:                                  # lazy: compact prev tree's accepted path KV
+                        fv.tree_gather(g[0], g[1])
                     if "token_ids" in msg:                 # served head: embed ids here
                         x = parts["embed"](torch.tensor([msg["token_ids"]], device=dev))
                     else:
                         x = msg["h"].to(dev)
-                    h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"])
-                    first = False
+                    if "par" in msg:                       # TREE verify (fixed-topology graph)
+                        h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
+                    else:                                  # LINEAR verify (prefill, then graphed decode)
+                        h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"]); first = False
                     if is_tail:
                         h = parts["norm"](h)
                         send_msg(conn, parts["lm_head"](h).argmax(-1)[0].tolist())
                     else:
-                        send_msg(nxt_sock, {"op": "verify", "h": h.cpu(), "start": msg["start"]})
+                        fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"]}
+                        if "par" in msg: fwd["par"] = msg["par"]; fwd["dep"] = msg["dep"]
+                        if g: fwd["gather"] = g
+                        send_msg(nxt_sock, fwd)
                         if not direct:
                             send_msg(conn, recv_msg(nxt_sock))
                     verifies += 1
@@ -234,9 +242,14 @@ def serve_tail_fast(parts, listen_port, timeout, dev):
                     msg = recv_msg(pred_conn)
                     if msg["op"] == "reset":
                         fv.reset(); first = True; send_msg(ret_conn, "ok"); continue
+                    g = msg.get("gather")
+                    if g:
+                        fv.tree_gather(g[0], g[1])
                     x = msg["h"].to(dev)
-                    h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"])
-                    first = False
+                    if "par" in msg:                       # TREE verify
+                        h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
+                    else:
+                        h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"]); first = False
                     h = parts["norm"](h)
                     send_msg(ret_conn, parts["lm_head"](h).argmax(-1)[0].tolist()); verifies += 1
                 except EDGE_ERRORS as e:
@@ -350,6 +363,7 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
         "mean_K": (sum(k_hist) / len(k_hist)) if k_hist else K,
         "k_lo": min(k_hist) if k_hist else K, "k_hi": max(k_hist) if k_hist else K,
         "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000,
+        "output_ids": out,
     }
 
 
@@ -413,6 +427,87 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
         "mean_K": (sum(k_hist) / len(k_hist)) if k_hist else K,
         "k_lo": min(k_hist) if k_hist else K, "k_hi": max(k_hist) if k_hist else K,
         "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000,
+        "output_ids": out,
+    }
+
+
+def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None):
+    """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
+    throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
+    GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
+    synchronous coordinate() ([tail_tok]+K drafts) so the fixed-shape CUDA graph holds;
+    the StaticKV writes at each chunk's `start`, so after a divergence the fresh chunk
+    (sent next) overwrites the stale chunks' KV and the coordinator just discards the
+    stale RESULTS. Greedy => output identical to the synchronous path. Needs the swarm
+    in --direct-return mode (fire-forward stages, tail returns straight here)."""
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    eos = tok.eos_token_id
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    prompt_ids = enc["input_ids"][0].tolist()
+    out = []
+    t_draft = t_recv = 0.0
+    try:
+        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
+        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill (eager)
+        cur = recv_msg(rx)[-1]
+        pos = len(prompt_ids)
+        out = [cur]
+        inflight = []                              # FIFO of (start_pos, drafts) sent but not yet read
+        discard = 0                                # stale post-divergence results still to drain
+        send_pos = pos                             # absolute pos where the next chunk writes
+        dprefix = prompt_ids + [cur]               # draft-server query prefix; dprefix[-1] == next tail_tok
+        valid = accepted = wasted = 0
+        t0 = time.time()
+        done = False
+        # ASYNC DRAFT: keep exactly one draft request outstanding so the draft server
+        # computes the next chunk WHILE the current verify chunks cross the WAN. Each fill
+        # collects the ready draft, sends the verify chunk, then issues the next draft request
+        # (which then runs concurrently with the verify read below). draft latency is hidden.
+        send_msg(draft_sock, {"ids": dprefix, "k": K})            # prime: one outstanding request
+        while not done:
+            while len(inflight) < depth and not done:                  # FILL the pipeline
+                td = time.time(); ds = recv_msg(draft_sock); t_draft += time.time() - td  # ready (overlapped)
+                send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
+                inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
+                send_msg(draft_sock, {"ids": dprefix, "k": K})        # issue next -> runs during the read below
+            tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr   # READ one result
+            sp, ds = inflight.pop(0)
+            if discard > 0:                                            # stale (post-divergence) -> skip
+                discard -= 1; wasted += 1; continue
+            n = 0
+            for j in range(K):
+                if ds[j] == r[j]: n += 1
+                else: break
+            valid += 1; accepted += n
+            if n == K:
+                out.extend(ds); pos += K; cur = ds[-1]
+                committed = ds
+            else:                                                      # divergence -> correct + flush in-flight
+                committed = ds[:n] + [r[n]]
+                out.extend(committed); cur = r[n]; pos += n + 1
+                discard = len(inflight)                                # every chunk still in flight is stale
+                recv_msg(draft_sock)                                   # outstanding draft is stale -> drop it
+                dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
+                send_msg(draft_sock, {"ids": dprefix, "k": K})        # re-prime from the corrected prefix
+            if len(out) >= max_new or cur == eos or eos in committed:
+                done = True
+        recv_msg(draft_sock)                                          # drain the outstanding draft request
+        while inflight:                                               # drain unread results -> sockets clean for next gen
+            recv_msg(rx); inflight.pop(0)
+    except EDGE_ERRORS as e:
+        raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    if eos in out:
+        out = out[:out.index(eos)]
+    return {
+        "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
+        "mean_accept": accepted / max(valid, 1),
+        "toks_per_traversal": (accepted + valid) / max(valid, 1),
+        "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "depth": depth, "K": K,
+        "draft_ms": t_draft / max(valid, 1) * 1000, "recv_ms": t_recv / max(valid, 1) * 1000,
+        "output_ids": out,
     }
 
 
@@ -474,6 +569,59 @@ def coordinate_tree(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, timeo
     }
 
 
+def coordinate_tree_fast(draft_sock, pipe_sock, tok, prompt, tree_cfg, max_new, timeout, ret_sock=None):
+    """SYNC tree spec on the FAST (graphed) verify. Draft a fixed-topology tree, verify all
+    its nodes in ONE traversal (FastVerify.tree_decode), accept the best root-to-leaf path,
+    and compact the accepted KV (static tree_gather). gather payload is (start_prev, kept)
+    for the static cache (vs the eager gather_cache's absolute-index list). exact greedy."""
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    eos = tok.eos_token_id
+    enc = tok.apply_chat_template([{"role": "user", "content": prompt}],
+                                  add_generation_prompt=True, return_tensors="pt", return_dict=True)
+    prompt_ids = enc["input_ids"][0].tolist()
+    out = []
+    t_draft = t_verify = 0.0
+    try:
+        send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
+        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # linear prefill
+        cur = recv_msg(rx)[-1]
+        pos = len(prompt_ids); out = [cur]
+        rounds, accepted_total, tnodes = 0, 0, 0
+        gather_prev = None
+        t0 = time.time()
+        while len(out) < max_new and cur != eos:
+            td = time.time()
+            send_msg(draft_sock, {"ids": prompt_ids + out, "tree": tree_cfg}); tr = recv_msg(draft_sock)
+            t_draft += time.time() - td
+            tk, par, dep = tr["tok"], tr["par"], tr["dep"]
+            children = [[] for _ in tk]
+            for i, p in enumerate(par):
+                if p != -1: children[p].append(i)
+            tv = time.time()
+            send_msg(pipe_sock, {"op": "verify", "token_ids": tk, "par": par, "dep": dep,
+                                 "start": pos, "gather": gather_prev})
+            targ = recv_msg(rx)                                # one argmax per tree node
+            t_verify += time.time() - tv
+            committed, kept = accept_tree(tk, par, {i: c for i, c in enumerate(children)}, targ)
+            out.extend(committed); cur = committed[-1]
+            gather_prev = (pos, kept)                          # static-cache compaction for next round
+            pos += len(kept)
+            rounds += 1; accepted_total += len(kept) - 1; tnodes += len(tk)
+            if eos in committed:
+                break
+    except EDGE_ERRORS as e:
+        raise TransportError(f"tree edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    if eos in out:
+        out = out[:out.index(eos)]
+    return {"text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
+            "mean_accept": accepted_total / max(rounds, 1),
+            "toks_per_traversal": len(out) / max(rounds, 1), "tree_nodes": tnodes / max(rounds, 1),
+            "tok_s": len(out) / max(dt, 1e-9),
+            "draft_ms": t_draft / max(rounds, 1) * 1000, "verify_ms": t_verify / max(rounds, 1) * 1000}
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stage", type=int, default=0)
@@ -494,6 +642,13 @@ def main():
     ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
     ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
     ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
+    ap.add_argument("--pipe", action="store_true", help="coordinator: PIPELINED spec-decode (depth chunks in flight; needs --direct-return)")
+    ap.add_argument("--depth", type=int, default=4, help="pipelined coordinator: verify chunks in flight")
+    ap.add_argument("--compare", action="store_true", help="coordinator: SYNC then PIPE (cold+warm) in ONE process for a clean A/B")
+    ap.add_argument("--depths", default="2,4,8", help="--compare: pipe depths to sweep (one process)")
+    ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
+    ap.add_argument("--tree-fast", default="", help="coordinator: FAST graphed tree spec 'w,d' (cold+warm)")
+    ap.add_argument("--dump", default="", help="--pipe: write {prompt, output_ids, tok_s} JSON here (for the receipt)")
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=120.0)
@@ -521,6 +676,66 @@ def main():
                 print(f"[TREE w={w},d={d}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f}/round | {r['tree_nodes']:.0f} tree nodes | "
                       f"draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
+            print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
+            return
+        if args.tree_fast:                                 # FAST graphed tree spec (cold + warm), sweep 'w,d;w,d'
+            for spec in args.tree_fast.split(";"):
+                w, d = (int(x) for x in spec.split(","))
+                cfg = {"width": w, "depth": d}
+                for i in range(2):
+                    r = coordinate_tree_fast(draft_sock, pipe_sock, tok, args.prompt, cfg, args.max_new,
+                                             args.timeout, ret_sock=ret_sock)
+                    print(f"[TREE-FAST w={w},d={d} {'warm' if i else 'cold'}] {r['tok_s']:.2f} tok/s | "
+                          f"{r['toks_per_traversal']:.2f} tok/trav | accept {r['mean_accept']:.2f} | "
+                          f"{r['tree_nodes']:.0f} nodes | draft {r['draft_ms']:.0f}ms verify {r['verify_ms']:.0f}ms", flush=True)
+            print(f"\n[coord] === OUTPUT ===\n{r['text'][:400]}\n", flush=True)
+            return
+        if args.compare:                                   # SYNC then PIPE in ONE process (clean warm A/B)
+            depths = [int(x) for x in args.depths.split(",")]
+            sync_warm = pipe_warm = None
+            for K in [int(x) for x in args.ks.split(",")]:
+                for i in range(2):                         # sync: cold (captures K+1 graph), then warm
+                    r = coordinate(draft_sock, pipe_sock, tok, args.prompt, K, args.max_new, args.timeout, ret_sock=ret_sock)
+                    if i: sync_warm = r
+                    print(f"[SYNC K={K} {'warm' if i else 'cold'}] {r['tok_s']:.2f} tok/s | "
+                          f"{r['toks_per_traversal']:.2f} tok/trav | accept {r['mean_accept']:.2f} | "
+                          f"draft {r['draft_ms']:.0f}ms verify {r['verify_ms']:.0f}ms", flush=True)
+                for d in depths:
+                    for i in range(2):                     # pipe: cold, then warm, at each depth
+                        r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, K, args.max_new,
+                                            args.timeout, d, ret_sock=ret_sock)
+                        if i: pipe_warm = r
+                        print(f"[PIPE K={K} depth={d} {'warm' if i else 'cold'}] {r['tok_s']:.2f} tok/s | "
+                              f"{r['toks_per_traversal']:.2f} tok/trav | accept {r['mean_accept']:.2f} | "
+                              f"+{r['wasted']} stale | draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms", flush=True)
+            if args.dump and sync_warm and pipe_warm:      # receipt: pipe ids + the sync-vs-pipe lossless check
+                import json, hashlib
+                sids, pids = sync_warm["output_ids"], pipe_warm["output_ids"]
+                json.dump({"prompt": args.prompt, "model": args.model,
+                           "tok_s_warm": round(pipe_warm["tok_s"], 2), "n_tokens": pipe_warm["n_tokens"],
+                           "output_ids": pids, "output_text": pipe_warm["text"],
+                           "output_sha256": hashlib.sha256(json.dumps(pids).encode()).hexdigest(),
+                           "tokens_match_sync": (sids == pids)}, open(args.dump, "w"))
+                print(f"[coord] dumped receipt run -> {args.dump} | tokens_match_sync={sids == pids}", flush=True)
+            print(f"\n[coord] === sample output ===\n{r['text'][:400]}\n", flush=True)
+            return
+        if args.pipe:                                      # PIPELINED coordinator (depth chunks in flight)
+            ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
+            for kv in ks:
+                r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, kv, args.max_new,
+                                    args.timeout, args.depth, ret_sock=ret_sock)
+                print(f"[PIPE K={kv} depth={args.depth}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
+                      f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | "
+                      f"draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms/round", flush=True)
+            if args.dump:
+                import json, hashlib
+                ids = r["output_ids"]
+                rec = {"prompt": args.prompt, "model": args.model, "K": ks[-1], "depth": args.depth,
+                       "tok_s_warm": round(r["tok_s"], 2), "n_tokens": r["n_tokens"], "output_ids": ids,
+                       "output_text": r["text"],
+                       "output_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
+                json.dump(rec, open(args.dump, "w"))
+                print(f"[coord] dumped run -> {args.dump} (sha256 {rec['output_sha256'][:16]}..)", flush=True)
             print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
             return
         ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]

@@ -79,8 +79,9 @@ skeptic checks the engine file against). `reference.token_ids` lets anyone re-ru
 
 - **GLM-5.2 744B NVFP4 at ~30 tok/s over WAN** — 7 GPUs in 6 US states, pipelined spec-decode
   + CUDA-graphed draft: [`receipts/glm52-nvfp4-wan-20260618.json`](receipts/glm52-nvfp4-wan-20260618.json).
-- **gpt-oss-120B at ~18–25 tok/s over WAN** — the earlier Phase-2 result
-  (see [README](../README.md) and [research log](research/wan-speculative-decoding.md)).
+- **gpt-oss-120B at ~40 tok/s over WAN** — 3 stages (12 layers each) + an in-region coordinator
+  across 4 US states, pipelined spec-decode; the permissionless build target:
+  [`receipts/gpt-oss-120b-wan-20260619.json`](receipts/gpt-oss-120b-wan-20260619.json).
 
 ## Scope / honesty
 

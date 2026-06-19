@@ -115,14 +115,30 @@ Shard is c0mpute infrastructure, held to its three guarantees:
   [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md). It is the number-one open problem and is
   treated as one.
 
-## Earlier milestone: gpt-oss-120B at ~18–25 tok/s over WAN
+## gpt-oss-120B at ~40 tok/s over WAN — the permissionless build target
 
-The first Phase-2 result: **120B across 4× RTX 4090 in different US states, ~18–25
-tok/s, exact** — same playbook (speculative decode + a CUDA-graph fast verify), on a
-smaller model. GLM-5.2 (above) is the current flagship: 6× the parameters, faster,
-on a longer scattered ring. Full design record:
-[docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md)
-and [docs/research/glm-5.2-on-consumer-blackwell.md](docs/research/glm-5.2-on-consumer-blackwell.md).
+120B (MXFP4, 36 layers) across **3 scattered RTX 4090s in different US states** + a
+coordinator, **~40 tok/s (peak ~42), greedy, exact**. This is the rig the permissionless
+work (Phase 3+) is built on — plain 24GB consumer cards, the hardware a real volunteer runs.
+This run's verifiable receipt (distinct GPU UUIDs / IPs / states, WAN edge RTTs, output
+hash, sync-vs-pipelined token match): [`docs/receipts/gpt-oss-120b-wan-20260619.json`](docs/receipts/gpt-oss-120b-wan-20260619.json).
+
+The climb from a latency-bound ~18 tok/s, each step measured:
+
+| Step | tok/s | What changed |
+|------|-------|--------------|
+| pipelined spec-decode (4-stage) | 25.8 | async-draft overlap + many verify chunks in flight + RTT-optimal ring order |
+| + **3-stage (12-layer) ring** | 28.8 | fatter stages → 4 WAN hops instead of 5 (12 layers fits a 24GB card) |
+| + **coordinator placed in-region** | **~40 (peak ~42)** | the coordinator holds no model layers, so it can live anywhere; moving it off the cross-country leg cut the ring 174→102 ms |
+
+The last step is the one nobody looks for: the cheapest node in the system — the
+layer-less coordinator — was sitting a continent away from the swarm, paying two long
+round-trips on every token. Putting it next to the stages, on the same scattered nodes,
+was a ~40% latency cut for free. Full record:
+[docs/research/wan-speculative-decoding.md](docs/research/wan-speculative-decoding.md).
+
+GLM-5.2 (above) remains the **frontier-size** flagship — 6× the parameters at 744B;
+gpt-oss-120B is the faster, consumer-card build target the network is bootstrapped on.
 
 ## Repository layout
 

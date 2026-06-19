@@ -44,10 +44,11 @@ def main():
         lp = o[0].outputs[0].logprobs[0]                       # {tok_id: Logprob} at position 1
         kids = [t for t, _ in sorted(lp.items(), key=lambda kv: kv[1].logprob, reverse=True)[:width]]
         tok, par, dep = [ids[-1]], [-1], [0]                   # node 0 = root = cur
-        for ct in kids:
-            spc = SamplingParams(temperature=0, max_tokens=max(depth - 1, 0), ignore_eos=True)
-            cont = llm.generate([TokensPrompt(prompt_token_ids=ids + [ct])], spc, use_tqdm=False)
-            chain = [ct] + list(cont[0].outputs[0].token_ids)
+        spc = SamplingParams(temperature=0, max_tokens=max(depth - 1, 0), ignore_eos=True)
+        conts = llm.generate([TokensPrompt(prompt_token_ids=ids + [ct]) for ct in kids],
+                             spc, use_tqdm=False)              # BATCHED: all branches in one vLLM call
+        for bi, ct in enumerate(kids):
+            chain = [ct] + list(conts[bi].outputs[0].token_ids)
             parent = 0
             for d, t in enumerate(chain):
                 tok.append(t); par.append(parent); dep.append(d + 1); parent = len(tok) - 1
