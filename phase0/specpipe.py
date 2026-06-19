@@ -750,6 +750,14 @@ def main():
                 print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
                 print(f"[coord] {r['n_tokens']} tok | {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
+        if args.dump:                                       # sync output ids + hash (for the receipt / a transport A/B)
+            import json, hashlib
+            ids = r["output_ids"]
+            json.dump({"prompt": args.prompt, "model": args.model, "K": ks[-1], "mode": "sync",
+                       "tok_s": round(r["tok_s"], 2), "n_tokens": r["n_tokens"], "output_ids": ids,
+                       "output_text": r["text"],
+                       "output_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}, open(args.dump, "w"))
+            print(f"[coord] dumped run -> {args.dump} (sha256 {hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]}..)", flush=True)
         return
 
     parts = load_stage(args.model, args.stage, args.nstages, device=args.device)
