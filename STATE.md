@@ -16,7 +16,7 @@ Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these fi
 |---|------|------|--------|
 | 0 | Engine (pipeline + spec-decode + pipelining) | SERVE | ✅ done |
 | 1 | libp2p sidecar + per-node identity + data-plane (retire `SHARD_PSK`) | JOIN | ✅ **done** |
-| 2 | NAT traversal + bind identity ↔ c0mpute account | JOIN | ◀ next |
+| 2 | NAT traversal + bind identity ↔ c0mpute account | JOIN | ◀ **building** |
 | 3 | Manifest + content-addressed weight fetch | JOIN | todo |
 | 4 | Scheduler + assignment protocol | FORM | todo |
 | 5 | Job routing + signed receipts + per-node pay | PROVE/PAY | todo |
@@ -31,7 +31,10 @@ Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these fi
 
 Done & committed: prune of the dead 1.2 bridge, the libp2p receipt, the tail fix.
 
-**Next (step 2):** NAT traversal (home GPUs behind NAT — DCUtR + relay; today used Vast's mapped public ports) + bind each node's libp2p key ↔ its c0mpute `cwt_` account.
+**Step 2 (building) — NAT + identity binding.**
+- ✅ **2.1** sidecar NAT stack: QUIC + DCUtR + circuit-relay-v2 (service + client) + AutoNAT + `-announce` + explicit `client.Reserve` + a conn monitor (RELAY/DIRECT). `sidecar/main.go`.
+- ◑ **2.2** relay join PROVEN, direct line needs real topology. Confirmed on real boxes: this dev box is genuinely NAT-blocked (direct IPv4 dial fails); it **reserves a relay slot** and **data crosses the relay both ways** to the NAT'd node. DCUtR (the direct hole-punch) stalls in-test: `waiting until we have at least one public address` — the NAT'd node can't confirm its observed/public address with only one peer (libp2p needs several observers/AutoNAT), and a Docker box is likely symmetric-NAT (un-punchable). **Not a code bug** — DCUtR needs the real multi-node network (peers + AutoNAT) and a real home (cone) NAT to activate. Validate the direct line on the actual network, not a 3-box Docker test.
+- ☐ **2.3** identity ↔ `cwt_` binding: node signs a challenge proving control of (PeerId, cwt_); c0mpute records it (c0mpute-repo change — shard signs, c0mpute records). Unblocked.
 
 ## Decisions locked
 - **Boundary law:** dependencies point one way — `c0mpute → shard`, never reverse. Shard is a pure engine.

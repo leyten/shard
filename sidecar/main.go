@@ -36,6 +36,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/host"
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
+	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -94,13 +95,66 @@ func readFrame(r io.Reader) ([]byte, error) {
 	return b, err
 }
 
-func newHost(priv crypto.PrivKey, listen string) (host.Host, error) {
+type natOpts struct {
+	quic         bool
+	relayService bool
+	announce     string
+	staticRelays []peer.AddrInfo
+}
+
+// tcpToQuic derives a QUIC listen addr from a TCP one: /ip4/x/tcp/P -> /ip4/x/udp/P/quic-v1.
+func tcpToQuic(maddr string) string {
+	i := strings.Index(maddr, "/tcp/")
+	if i < 0 {
+		return ""
+	}
+	port := maddr[i+len("/tcp/"):]
+	if j := strings.Index(port, "/"); j >= 0 {
+		port = port[:j]
+	}
+	return maddr[:i] + "/udp/" + port + "/quic-v1"
+}
+
+func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 	// libp2p defaults give Noise/TLS encryption + a stream muxer; every link is
-	// authenticated to the peer's key. TCP for now; QUIC + NAT traversal land in step 2.
-	return libp2p.New(
+	// authenticated to the peer's key. The NAT stack (DCUtR hole-punching + circuit
+	// relay) lets home GPUs behind NAT join; QUIC (udp) hole-punches more reliably.
+	listens := []string{listen}
+	if n.quic {
+		if q := tcpToQuic(listen); q != "" {
+			listens = append(listens, q)
+		}
+	}
+	opts := []libp2p.Option{
 		libp2p.Identity(priv),
-		libp2p.ListenAddrStrings(listen),
-	)
+		libp2p.ListenAddrStrings(listens...),
+		libp2p.EnableHolePunching(), // DCUtR: punch a direct hole between two NAT'd peers
+	}
+	if n.announce != "" {
+		// libp2p only sees container-internal addrs behind Vast's port mapping; advertise
+		// the real public addr so reservations/circuit addrs others get are actually dialable.
+		ann, err := multiaddr.NewMultiaddr(n.announce)
+		if err != nil {
+			return nil, err
+		}
+		opts = append(opts, libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+			return append([]multiaddr.Multiaddr{ann}, addrs...)
+		}))
+	}
+	if n.relayService {
+		// be a public relay (circuit-relay-v2). Force public reachability so the hop
+		// service activates immediately — otherwise libp2p waits for AutoNAT to confirm
+		// reachability, which never happens without AutoNAT-peer infrastructure.
+		opts = append(opts, libp2p.EnableRelayService(), libp2p.ForceReachabilityPublic())
+	}
+	// NAT'd nodes reserve on relays explicitly (in main) rather than via autorelay's
+	// background finder — deterministic, observable, and the scheduler hands out the
+	// circuit address anyway. Force private reachability so DCUtR knows we're the NAT'd
+	// side and initiates the hole-punch to the public peer.
+	if len(n.staticRelays) > 0 {
+		opts = append(opts, libp2p.ForceReachabilityPrivate())
+	}
+	return libp2p.New(opts...)
 }
 
 // fullAddrs returns this host's dialable /p2p multiaddrs (addr + /p2p/<peerid>).
@@ -122,13 +176,32 @@ func main() {
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
+	relaySvc := flag.Bool("relay", false, "run as a circuit-relay-v2 server (public rendezvous for NAT'd nodes)")
+	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
+	useQuic := flag.Bool("quic", false, "also listen on QUIC (udp) — better hole-punching + lossy links")
+	announce := flag.String("announce", "", "advertise this public multiaddr ahead of auto-detected ones (e.g. /ip4/PUBIP/tcp/PORT)")
 	flag.Parse()
 
 	priv, err := loadOrCreateKey(*keyPath)
 	if err != nil {
 		log.Fatalf("key: %v", err)
 	}
-	h, err := newHost(priv, *listenAddr)
+	var staticRelays []peer.AddrInfo
+	for _, s := range strings.Split(*relaysCSV, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		ma, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			log.Fatalf("bad -relays entry %q: %v", s, err)
+		}
+		ai, err := peer.AddrInfoFromP2pAddr(ma)
+		if err != nil {
+			log.Fatalf("bad -relays entry %q: %v", s, err)
+		}
+		staticRelays = append(staticRelays, *ai)
+	}
+	h, err := newHost(priv, *listenAddr, natOpts{quic: *useQuic, relayService: *relaySvc, announce: *announce, staticRelays: staticRelays})
 	if err != nil {
 		log.Fatalf("host: %v", err)
 	}
@@ -149,6 +222,28 @@ func main() {
 		if err := os.WriteFile(*addrFile, []byte(pick), 0o644); err != nil {
 			log.Fatalf("addrfile: %v", err)
 		}
+	}
+
+	go monitorConns(h) // log RELAY vs DIRECT connections so we can watch DCUtR upgrade
+
+	// NAT'd node: explicitly reserve a slot on each relay and keep the connection
+	// protected, so the relay can forward inbound connections to us. Clear errors,
+	// no autorelay guesswork.
+	for _, relay := range staticRelays {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		if err := h.Connect(ctx, relay); err != nil {
+			log.Printf("relay connect %s: %v", relay.ID, err)
+			cancel()
+			continue
+		}
+		res, err := relayclient.Reserve(ctx, h, relay)
+		cancel()
+		if err != nil {
+			log.Printf("relay reserve %s: %v", relay.ID, err)
+			continue
+		}
+		h.ConnManager().Protect(relay.ID, "relay")
+		log.Printf("RESERVED relay slot on %s (expires %s)", relay.ID, res.Expiration)
 	}
 
 	// Tunnel mode: a transparent TCP<->libp2p bridge. The engine keeps its own socket
@@ -248,6 +343,27 @@ func openStream(h host.Host, peerAddr string) (network.Stream, error) {
 	return h.NewStream(ctx, info.ID, activationProto)
 }
 
+// monitorConns logs each new connection and whether it's via a relay or DIRECT — so we
+// can watch DCUtR upgrade a relay rendezvous into a direct hole-punched link.
+func monitorConns(h host.Host) {
+	seen := map[string]bool{}
+	for {
+		time.Sleep(5 * time.Second)
+		for _, c := range h.Network().Conns() {
+			a := c.RemoteMultiaddr().String()
+			kind := "DIRECT"
+			if strings.Contains(a, "p2p-circuit") {
+				kind = "RELAY"
+			}
+			key := c.RemotePeer().String() + "|" + a
+			if !seen[key] {
+				seen[key] = true
+				log.Printf("CONN %s via %s [%s]", c.RemotePeer(), a, kind)
+			}
+		}
+	}
+}
+
 // pipe copies bytes bidirectionally between two streams until either side closes.
 func pipe(a, b io.ReadWriteCloser) {
 	done := make(chan struct{}, 2)
@@ -262,6 +378,17 @@ func pipe(a, b io.ReadWriteCloser) {
 // runForward listens on a local TCP addr; each accepted connection is carried to the
 // peer over a fresh libp2p stream — so the engine dials localhost and reaches the peer.
 func runForward(h host.Host, listenAddr, peerMaddr string) {
+	// pre-establish the connection so DCUtR can upgrade relay->direct BEFORE data flows
+	// (otherwise the engine's first stream lands on the slow relay connection).
+	if ma, err := multiaddr.NewMultiaddr(peerMaddr); err == nil {
+		if ai, err := peer.AddrInfoFromP2pAddr(ma); err == nil {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			if err := h.Connect(ctx, *ai); err != nil {
+				log.Printf("forward pre-connect %s: %v", ai.ID, err)
+			}
+			cancel()
+		}
+	}
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("forward listen %s: %v", listenAddr, err)
