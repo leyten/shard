@@ -21,6 +21,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"encoding/base64"
 	"encoding/binary"
 	"flag"
 	"fmt"
@@ -177,11 +178,55 @@ func main() {
 	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
 	useQuic := flag.Bool("quic", false, "also listen on QUIC (udp) — better hole-punching + lossy links")
 	announce := flag.String("announce", "", "advertise this public multiaddr ahead of auto-detected ones (e.g. /ip4/PUBIP/tcp/PORT)")
+	prove := flag.String("prove", "", "identity binding: sign this challenge with the node key; print PEERID + SIG")
+	verify := flag.String("verify", "", "identity binding: verify a proof 'peerid,nonce,b64sig' -> OK/FAIL (reference for c0mpute)")
 	flag.Parse()
+
+	// Identity-binding verify: prove a PeerId controls its key, from (peerid, nonce, sig)
+	// alone — no node key needed. This is the check c0mpute runs (ported to TS) before it
+	// records PeerId <-> account. ed25519 PeerIds embed the public key, so the verifier
+	// needs nothing but the proof.
+	if *verify != "" {
+		p := strings.SplitN(*verify, ",", 3)
+		if len(p) != 3 {
+			log.Fatalf("verify wants 'peerid,nonce,b64sig'")
+		}
+		pid, err := peer.Decode(p[0])
+		if err != nil {
+			log.Fatalf("peerid: %v", err)
+		}
+		pub, err := pid.ExtractPublicKey()
+		if err != nil {
+			log.Fatalf("extract pubkey from peerid: %v", err)
+		}
+		sig, err := base64.StdEncoding.DecodeString(p[2])
+		if err != nil {
+			log.Fatalf("sig: %v", err)
+		}
+		ok, _ := pub.Verify([]byte(p[1]), sig)
+		fmt.Printf("VERIFY %v\n", ok)
+		return
+	}
 
 	priv, err := loadOrCreateKey(*keyPath)
 	if err != nil {
 		log.Fatalf("key: %v", err)
+	}
+
+	// Identity-binding proof: sign a challenge nonce with the node key. The node-agent
+	// sends {PEERID, SIG} to c0mpute alongside its cwt_ token; c0mpute verifies the sig
+	// against the PeerId and records PeerId <-> account. Pure crypto — knows nothing of c0mpute.
+	if *prove != "" {
+		pid, err := peer.IDFromPublicKey(priv.GetPublic())
+		if err != nil {
+			log.Fatalf("peerid: %v", err)
+		}
+		sig, err := priv.Sign([]byte(*prove))
+		if err != nil {
+			log.Fatalf("sign: %v", err)
+		}
+		fmt.Printf("PEERID %s\nSIG %s\n", pid, base64.StdEncoding.EncodeToString(sig))
+		return
 	}
 	var staticRelays []peer.AddrInfo
 	for _, s := range strings.Split(*relaysCSV, ",") {

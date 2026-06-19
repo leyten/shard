@@ -16,7 +16,7 @@ Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these fi
 |---|------|------|--------|
 | 0 | Engine (pipeline + spec-decode + pipelining) | SERVE | ✅ done |
 | 1 | libp2p sidecar + per-node identity + data-plane (retire `SHARD_PSK`) | JOIN | ✅ **done** |
-| 2 | NAT traversal + bind identity ↔ c0mpute account | JOIN | ◀ **building** |
+| 2 | NAT traversal + bind identity ↔ c0mpute account | JOIN | ✅ **done** |
 | 3 | Manifest + content-addressed weight fetch | JOIN | todo |
 | 4 | Scheduler + assignment protocol | FORM | todo |
 | 5 | Job routing + signed receipts + per-node pay | PROVE/PAY | todo |
@@ -31,10 +31,12 @@ Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these fi
 
 Done & committed: prune of the dead 1.2 bridge, the libp2p receipt, the tail fix.
 
-**Step 2 (building) — NAT + identity binding.**
+**Step 2 (JOIN — NAT + identity) DONE.**
 - ✅ **2.1** sidecar NAT stack: QUIC + DCUtR + circuit-relay-v2 (service + client) + AutoNAT + `-announce` + explicit `client.Reserve` + conn monitor (RELAY/DIRECT). On **go-libp2p v0.48** / Go 1.25.11. `sidecar/main.go`.
 - ✅ **2.2** relay join AND direct hole-punch both PROVEN. Relay: a genuinely NAT-blocked node reserves a relay slot + data crosses both ways (real boxes + lab). Direct line: built a controlled two-NAT lab with Linux netns (`/tmp/netlab.sh` + `/tmp/holepunch.py`) — **two nodes each behind their own NAT formed a DIRECT QUIC line via DCUtR and moved 100 KB byte-identical** (relay caps ~2 KB, so 100 KB proves it went direct). Required: go-libp2p v0.48, full-cone (UPnP-style) NAT, and a *routable* IP range — TEST-NET (203.0.113.x) is silently `blocked observed address` by libp2p; use real public ranges (11.0.0.x). The earlier "datacenter Docker NAT un-punchable" finding stands (that box is harsher than a home router) — but a full-cone home router punches through; restricted/symmetric fall back to the (proven) relay.
-- ☐ **2.3** identity ↔ `cwt_` binding: node signs a challenge proving control of (PeerId, cwt_); c0mpute records it (c0mpute-repo change — shard signs, c0mpute records). Unblocked.
+- ✅ **2.3** identity ↔ `cwt_` binding — proven end-to-end, cross-language. **shard signs:** `sidecar -prove <nonce>` → {PeerId, sig} with the node key (`-verify` is the reference check). **c0mpute verifies + records:** `c0mpute/lib/identity.ts verifyBindingProof` (Node-native ed25519 + inline base58/PeerId decode, zero new deps), `lib/db.ts` `worker_identity` table + `bindPeerId`/`getPeerIdOwner`, `app/api/node-bind/route.ts` (cwt_-auth + HMAC challenge nonce). Tested: Go signs → TS verifies (correct=true, tampered/impersonated=false), bind→lookup round-trips. c0mpute-side committed in the c0mpute repo (not shard).
+
+**Step 2 done → JOIN is complete** (engine on the wire @ ~45 tok/s, NAT-traversable, per-node paid identity). Next verb: **FORM** (step 4 scheduler/assignment) — or step 3 (content-addressed weight fetch).
 
 ## Decisions locked
 - **Boundary law:** dependencies point one way — `c0mpute → shard`, never reverse. Shard is a pure engine.
