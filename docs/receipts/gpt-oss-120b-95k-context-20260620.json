@@ -1,0 +1,33 @@
+{
+  "run_id": "gpt-oss-120b-95k-context-20260620",
+  "utc": "2026-06-20",
+  "goal": "100k-context prompts at usable speed on scattered consumer 4090s",
+  "swarm": "N=4 scattered RTX 4090 stages (CA,NC,WA,CA) + coordinator (Utah), WAN, flex_attention, non-fast relay",
+  "achieved": {
+    "prompt_tokens": 95690,
+    "context_reached": 95722,
+    "no_oom": true,
+    "prefill_seconds": 463,
+    "prefill_tok_s": 206.7,
+    "comprehension": "CORRECT \u2014 the 120B identified the repeated content AND the trailing question",
+    "answer_preview": "analysisThe user repeated a long phrase many times. The question: \"In one sentence, what do these notes describe?\" The notes are the repeated sentence about",
+    "output_sha256": "47c03272c1c38e26958b0a66416a4dc7c5538b8d3a3b0a33fd6e791729f85334"
+  },
+  "how": [
+    "flex_attention (Ada-native, sinks+sliding) via transformers masking_utils in pipeline.run_block",
+    "chunked prefill (coordinator sends the prompt in 4096-tok chunks; each stage appends to a DynamicCache) -> per-chunk activations bounded, KV accumulates ~linearly",
+    "N=4 split (9 layers/stage) so weights + 95k KV fit a 24GB card"
+  ],
+  "gap": {
+    "decode_tok_s": 0.51,
+    "why": "this run used the SIMPLEST decode path: 8-hop non-direct relay return, plain greedy (1 tok/traversal), no spec-decode, and flex attention over 95k recomputed per step. ~2s/token.",
+    "fix_path": [
+      "direct-return (8 hops -> 4)",
+      "spec-decode + pipelining (K tokens/traversal, amortize WAN)",
+      "graphed/bucketed flex decode (avoid per-step mask rebuild over 95k)",
+      "sliding-window ring-buffer KV (half the layers need only 128) + fp8 KV -> more headroom/speed"
+    ],
+    "estimate": "direct + spec-decode alone ~> 3-5 tok/s at 95k; graphed flex + sliding-KV target ~10+ tok/s"
+  },
+  "verdict": "100k-class context PROMPTS proven on the swarm (prefill 207 tok/s, correct comprehension, no OOM). The memory dealbreaker is solved. Fast GENERATION at long context is the remaining optimization."
+}

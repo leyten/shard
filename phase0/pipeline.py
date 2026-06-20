@@ -47,11 +47,22 @@ def run_block(h, parts, cache, start, par=None, dep=None):
     q_len = h.shape[1]
     sliding = parts.get("sliding")
     win_sz = parts.get("window", 0)
-    if par is not None:                          # tree verify
+    flex = getattr(parts["_model"].config, "_attn_implementation", "eager") == "flex_attention"
+    if par is not None:                          # tree verify (eager additive mask)
         from tree import tree_mask
         pos = torch.tensor([[start + dep[i] for i in range(q_len)]], device=h.device)
         full = tree_mask(par, dep, start, 0, h.dtype, h.device)
         win = tree_mask(par, dep, start, win_sz, h.dtype, h.device) if (sliding and win_sz) else full
+    elif flex:                                   # flex_attention: O(n) prefill on Ada, sinks+sliding ok
+        import transformers.masking_utils as _mu
+        cfg = parts["_model"].config
+        cp = torch.arange(start, start + q_len, device=h.device)
+        pos = cp.unsqueeze(0)
+        full = _mu.create_causal_mask(config=cfg, input_embeds=h, attention_mask=None,
+                                      cache_position=cp, past_key_values=cache, position_ids=pos)
+        win = (_mu.create_sliding_window_causal_mask(config=cfg, input_embeds=h, attention_mask=None,
+               cache_position=cp, past_key_values=cache, position_ids=pos)
+               if (sliding and win_sz) else full)
     else:
         kv_len = start + q_len
         pos = torch.arange(start, kv_len, device=h.device).unsqueeze(0)
@@ -67,7 +78,7 @@ def run_block(h, parts, cache, start, par=None, dep=None):
     return h
 
 
-def load_stage(model_id, stage, nstages, device="cuda", dtype="auto"):
+def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eager"):
     """load ONLY this stage's contiguous block of layers onto the GPU (+ embed on
     the head, norm/lm_head on the tail). every other component is mapped to "meta"
     so it is never loaded -- this is what lets a node hold a slice of a model far
@@ -89,7 +100,7 @@ def load_stage(model_id, stage, nstages, device="cuda", dtype="auto"):
         dmap[f"model.layers.{j}"] = device if lo <= j < hi else "meta"
     print(f"[s{stage}] loading layers [{lo}:{hi}] of {model_id} ...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=dmap,
-                                                 attn_implementation="eager")
+                                                 attn_implementation=attn)
     m = model.model
     parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi, "_model": model}
     if is_head:
