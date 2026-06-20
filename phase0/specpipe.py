@@ -147,7 +147,7 @@ def serve_tail_direct(parts, listen_port, timeout, dev):
                     break
 
 
-def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
+def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False, max_ctx=2048):
     """serve_spec with the FAST verify: a static-cache CUDA-graph stage forward (~5x
     cheaper than eager). LINEAR spec only (the graph is a fixed K+1 shape; tree is
     variable). first verify after reset = prefill (eager, prompt-length); every later
@@ -161,8 +161,8 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
         print(f"[s{stage}] connected forward to stage {stage+1} at {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
-    fv = FastVerify(parts, dev=dev)
-    print(f"[s{stage}] listening on :{listen_port} (FAST verify, edge timeout {timeout:.0f}s)", flush=True)
+    fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    print(f"[s{stage}] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, edge timeout {timeout:.0f}s)", flush=True)
     while True:
         conn, addr = srv.accept(); conn.settimeout(timeout)
         print(f"[s{stage}] stage {stage-1} connected from {addr}", flush=True)
@@ -214,13 +214,13 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     break
 
 
-def serve_tail_fast(parts, listen_port, timeout, dev):
+def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
     """direct-return tail with the FAST verify (see serve_spec_fast + serve_tail_direct)."""
     import select
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(2)
-    fv = FastVerify(parts, dev=dev)
-    print(f"[tail] listening on :{listen_port} (FAST verify, direct return, edge timeout {timeout:.0f}s)", flush=True)
+    fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
+    print(f"[tail] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, direct return, edge timeout {timeout:.0f}s)", flush=True)
     while True:
         c1, _ = srv.accept(); c2, _ = srv.accept()
         ready, _, _ = select.select([c1, c2], [], [], timeout)
@@ -380,7 +380,7 @@ def generate_spec(draft, parts, tok, sock, prompt, K, max_new, dev, draft_dev, t
 
 
 def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
-               adaptive=False, k_min=1, k_max=12, ret_sock=None):
+               adaptive=False, k_min=1, k_max=12, ret_sock=None, prefill_chunk=0):
     """the in-house coordinator (c0mpute entry node): holds NO 120B layers. it
     tokenizes, queries the in-house draft for K tokens, sends token ids into the
     swarm's stage 0 (which embeds + runs), reads back the verify, greedy-accepts.
@@ -397,8 +397,17 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
     out = []
     try:
         send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
-        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
-        cur = recv_msg(rx)[-1]
+        # prefill: one shot, or CHUNKED (long prompts) so each stage's per-chunk activation
+        # stays bounded (the KV cache accumulates). flex_attention keeps each chunk O(n) on Ada.
+        if prefill_chunk and len(prompt_ids) > prefill_chunk:
+            r = None
+            for i in range(0, len(prompt_ids), prefill_chunk):
+                send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk], "start": i})
+                r = recv_msg(rx)
+            cur = r[-1]
+        else:
+            send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
+            cur = recv_msg(rx)[-1]
         pos = len(prompt_ids)
         out = [cur]
         rounds, accepted_total = 0, 0
@@ -443,7 +452,8 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
     }
 
 
-def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None):
+def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
+                    ignore_eos=False):
     """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
     throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
     GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
@@ -503,7 +513,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 recv_msg(draft_sock)                                   # outstanding draft is stale -> drop it
                 dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
                 send_msg(draft_sock, {"ids": dprefix, "k": K})        # re-prime from the corrected prefix
-            if len(out) >= max_new or cur == eos or eos in committed:
+            if len(out) >= max_new or (not ignore_eos and (cur == eos or eos in committed)):
                 done = True
         recv_msg(draft_sock)                                          # drain the outstanding draft request
         while inflight:                                               # drain unread results -> sockets clean for next gen
@@ -653,6 +663,14 @@ def main():
     ap.add_argument("--K", type=int, default=6)
     ap.add_argument("--adaptive", action="store_true", help="tune K live from the running acceptance rate")
     ap.add_argument("--fast", action="store_true", help="serve node: static-cache CUDA-graph verify (~5x, fixed-K linear)")
+    ap.add_argument("--attn", default="eager", help="attention impl for stages: eager | flex_attention "
+                    "(flex = O(n) prefill on Ada, needed for long context with gpt-oss sinks)")
+    ap.add_argument("--prompt-file", default="", help="read the prompt from this file (for 100k-token prompts)")
+    ap.add_argument("--prefill-chunk", type=int, default=0, help="chunk the prefill into this many tokens "
+                    "(0=one shot); long prompts need chunking so per-chunk activations stay bounded")
+    ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling); "
+                    "sized to the request, not a hardware limit — the KV cache is ~tens of KB/token, so a 4090 "
+                    "stage holds far more than the old 2048 default. overflow fails clean (ContextOverflow), never corrupts")
     ap.add_argument("--sweep", default="", help="comma K list to measure on one load, 0=adaptive (e.g. 2,3,4,0)")
     ap.add_argument("--pipe", action="store_true", help="coordinator: PIPELINED spec-decode (depth chunks in flight; needs --direct-return)")
     ap.add_argument("--depth", type=int, default=4, help="pipelined coordinator: verify chunks in flight")
@@ -666,6 +684,8 @@ def main():
     ap.add_argument("--timeout", type=float, default=120.0)
     args = ap.parse_args()
     wire.key_from_env()                 # shared swarm key (SHARD_PSK); fail fast before the model load
+    if args.prompt_file:                # long (100k) prompts can't fit on the CLI
+        args.prompt = open(args.prompt_file).read()
 
     if args.coordinator:                                    # in-house entry node: no 120B, just tokenizer + draft + swarm
         tok = AutoTokenizer.from_pretrained(args.model)     # 20b tokenizer == 120b tokenizer
@@ -754,7 +774,8 @@ def main():
         for kv in ks:
             adaptive = (kv == 0) or (not args.sweep and args.adaptive)
             r = coordinate(draft_sock, pipe_sock, tok, args.prompt, (6 if kv == 0 else kv),
-                           args.max_new, args.timeout, adaptive=adaptive, ret_sock=ret_sock)
+                           args.max_new, args.timeout, adaptive=adaptive, ret_sock=ret_sock,
+                           prefill_chunk=args.prefill_chunk)
             if args.sweep:
                 print(f"[SWEEP K={kv}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | draft {r['draft_ms']:.0f}ms + verify {r['verify_ms']:.0f}ms/round", flush=True)
@@ -772,15 +793,18 @@ def main():
             print(f"[coord] dumped run -> {args.dump} (sha256 {hashlib.sha256(json.dumps(ids).encode()).hexdigest()[:16]}..)", flush=True)
         return
 
-    parts = load_stage(args.model, args.stage, args.nstages, device=args.device)
+    parts = load_stage(args.model, args.stage, args.nstages, device=args.device, attn=args.attn)
 
     if args.stage != 0 or args.served_head:                 # swarm serve node (stage 0 embeds token ids)
         is_tail = args.stage == args.nstages - 1
         if args.direct_return and is_tail:
-            (serve_tail_fast if args.fast else serve_tail_direct)(parts, args.listen_port, args.timeout, args.device)
+            if args.fast:
+                serve_tail_fast(parts, args.listen_port, args.timeout, args.device, max_ctx=args.max_ctx)
+            else:
+                serve_tail_direct(parts, args.listen_port, args.timeout, args.device)
         elif args.fast:
             serve_spec_fast(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout,
-                            args.device, direct=args.direct_return)
+                            args.device, direct=args.direct_return, max_ctx=args.max_ctx)
         else:
             serve_spec(parts, args.stage, args.nstages, args.listen_port, args.next, args.timeout,
                        args.device, direct=args.direct_return)

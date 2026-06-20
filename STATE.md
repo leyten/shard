@@ -5,11 +5,48 @@ One glance, full picture. The whole network is **5 verbs**. SERVE is done; we're
 ## The map
 1. **JOIN**  — a stranger's GPU gets in *(identity, NAT transport, pull its slice of weights)*
 2. **FORM**  — the network picks nearby nodes and wires them into a swarm *(scheduler, assignment, heal)*
-3. **SERVE** — the swarm answers the request, fast — ✅ **DONE** (~40 tok/s gpt-oss-120B, ~30 GLM-5.2 744B over WAN)
+3. **SERVE** — the swarm answers the request, fast — ✅ **DONE** at the demo regime (~40 tok/s gpt-oss-120B, ~30 GLM-5.2 744B over WAN). ⚠️ **long-context hardened, not yet production** — see "Serving hardening" below.
 4. **PROVE** — each node proves it actually ran its layer *(signed receipts, layer-block spot-check)*
 5. **PAY**   — each node gets paid for its bit *(per-node, c0mpute rails)*
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
+
+## 100k context (2026-06-20) — PROVEN for prompts; fast generation is the open piece
+The "long context is a dealbreaker" worry, resolved on the real rig
+([receipt](docs/receipts/gpt-oss-120b-95k-context-20260620.json), [feasibility](docs/receipts/gpt-oss-120b-100k-feasibility-20260620.json)):
+- **A distributed gpt-oss-120B swarm (N=4 scattered 4090s) prefilled a 95,690-token prompt and
+  correctly comprehended it** — no OOM, prefill **207 tok/s** (~8 min). The memory wall is gone.
+- **How:** the gpt-oss attention sink blocks sdpa and the flash-sink kernel is Hopper-only, so eager
+  was the only option and it OOMs ~8k. **flex_attention** is Ada-native, handles sinks+sliding, and
+  is O(n) — validated cosine 0.9996 vs eager. Plus **chunked prefill** (bounded per-chunk activations,
+  KV accumulates) and an N=4 split so 95k KV fits a 24GB card. Wired in `pipeline.run_block` +
+  `specpipe` (`--attn flex_attention`, `--prompt-file`, `--prefill-chunk`).
+- **Open: generation speed at long ctx.** This run used the simplest decode (8-hop relay, plain greedy,
+  per-step flex) → 0.51 tok/s @95k (2.57 @2k). Fix path: route **decode** through the graphed eager
+  StaticKV path (eager attn with q=K+1 is cheap even at 95k → ~30 tok/s proven short-ctx) with flex
+  used only for prefill; + direct-return + spec-decode; + fp8/sliding-window-ring KV. Prefill is already fast.
+
+## Serving hardening (2026-06-20) — long-context + losslessness, real 4×4090 runs
+A reported "output breaks past ~20k context / spec-decode degrades quality" sent us back to the rig
+(4 scattered RTX 4090s: CA·NC·WA stages + Utah coord/draft). Findings, all from live runs
+([receipt](docs/receipts/gpt-oss-120b-context-20260620.json)):
+- **"Breaks past 2048" was TWO independent hard walls, both now fixed.** (1) The `--fast` path's static
+  KV cache was `maxlen=2048` with **no bounds check** → silent CUDA corruption past it. Fix: **`--max-ctx`**
+  sizes the cache + a **`ContextOverflow`** guard fails clean (proven: 2480-tok prompt at max_ctx=2048 →
+  named error, stage stays up). (2) The vLLM draft ran `max_model_len=2048` → generation past 2048 hung the
+  draft. Fix: launchers pass **`--max-len`**. **Proof:** with both lifted, the swarm sustained greedy decode to
+  **2633 context (585 past the old wall) at 23 tok/s** (sha `8a70cdee…`).
+- **Two remaining ceilings (quantified, not fixed):** eager **prefill** of a >~2k-token *prompt* OOMs on a
+  24GB/12-layer card (~3.2 GB transient, caught cleanly); and the per-step mask is **O(max_ctx)** so decode
+  slows with context (36.7 tok/s @2k → 22 @10k). KV cache ≈72 KB/token; safe `max_ctx`≈10k. **20k needs**
+  flash/chunked prefill + incremental mask + fp8 KV, or more stages (fewer layers/box).
+- **Losslessness, adjudicated:** **fixed-K is deterministic** (K4 vs K4 bit-identical; matches the trusted-wire
+  receipt) — but **cross-K diverges at a floating-point near-tie** (K4 vs K8 first-diff @ token 92), FP
+  non-associativity in the batched CUDA-graph verify, **not** quality degradation. Each output is a valid greedy
+  decode. So the critic's claim is half-right and reframed: spec-decode ≠ lossy; it's cross-K FP non-determinism.
+- **Also fixed:** the swarm bring-up's zombie-draft teardown (a `pkill -f draft_server` was self-matching the
+  kill shell → boxes never freed; now kills by port+GPU pid). Noted gap: ring **forward links don't auto-recover**
+  on coordinator churn (fault-tolerance, step 7).
 
 ## Build steps  (→ verb · status)
 | # | Step | Verb | Status |

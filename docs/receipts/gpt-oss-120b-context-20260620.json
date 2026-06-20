@@ -1,0 +1,60 @@
+{
+  "run_id": "gpt-oss-120b-context-20260620",
+  "utc": "2026-06-20",
+  "model": "gpt-oss-120b (mxfp4)",
+  "swarm": "3 scattered RTX 4090 stages over WAN + layerless coordinator/draft",
+  "topology": "CA(head, layers 0-12) -> NC(mid, 12-24) -> WA(tail, 24-36); coord+draft Utah",
+  "what": "Serving-hardening pass: found and fixed the long-context failure ('breaks past ~2k/20k') and adjudicated the spec-decode losslessness claim. Real runs on the live 4-box swarm.",
+  "headline": {
+    "tok_s_warm": 36.73,
+    "tok_s_note": "K=4 pipe depth=4 warm (launch_oss --compare) at default max_ctx=2048 -> matches prior ~40",
+    "context_breaks_past_2048": "TRUE, and had TWO independent hard walls, both fixed",
+    "losslessness": "fixed-K deterministic (bit-identical, matches trusted-wire receipt); cross-K diverges at FP near-ties (not degradation)"
+  },
+  "context_findings": {
+    "wall_1_stage_static_cache": {
+      "cause": "phase0/fastverify.py FastVerify allocated a static KV cache maxlen=2048 with NO bounds check; writing past it = silent CUDA out-of-bounds corruption",
+      "fix": "--max-ctx sizes the cache to the request; new ContextOverflow guard fails clean before any OOB write",
+      "proven": "at max_ctx=2048 a 2480-token prompt -> clean ContextOverflow, stage logs it and STAYS UP (was: silent corruption)"
+    },
+    "wall_2_draft_max_model_len": {
+      "cause": "the vLLM gpt-oss-20b draft ran with max_model_len=2048 (draft_server.py default); generation past 2048 exceeds it and the draft request hangs -> whole pipeline stalls",
+      "fix": "launchers now pass --max-len (== max_ctx) to the draft",
+      "proven": "draft.log showed 'max_model_len: 2048'; runs hung at the 2048 boundary until lifted"
+    },
+    "ceiling_3_prefill_attention_memory": {
+      "finding": "eager prefill of a >~2k-token PROMPT OOMs on a 24GB card holding 12 layers (needs ~3.24 GiB transient, ~2 GiB free after 22.2 GiB weights). Caught cleanly (OutOfMemoryError -> stage resets, stays up).",
+      "implication": "long PROMPTS (conversations) are capped ~2k here; long GENERATION (decode) is the path that scales",
+      "next": "flash/chunked prefill, or fewer layers/box (more stages)"
+    },
+    "ceiling_4_vram_and_speed": {
+      "kv_cache": "~72 KB/token; max_ctx=24576 (~1.8 GB) OOMs the prefill on 24GB/12-layer; safe ~10k",
+      "speed_tradeoff": "per-step mask is recomputed O(max_ctx): 36.7 tok/s @2k -> 22 @10k -> ~2 @24k",
+      "next": "incremental O(K+1) mask; fp8 KV; more stages -> reach 20k"
+    }
+  },
+  "context_proof_decode_path": {
+    "claim": "swarm sustained greedy decode PAST the old 2048 wall, both walls lifted",
+    "max_ctx": 4096,
+    "draft_max_len": 4096,
+    "prompt_len": 133,
+    "tokens_generated": 2500,
+    "context_reached": 2633,
+    "crossed_2048_by": 585,
+    "tok_s": 23.04,
+    "seconds": 121,
+    "output_sha256": "8a70cdee4fe651300b4175fa4ef460121e7bc48efdc29a9c4185b86cf9f44f5d"
+  },
+  "losslessness_proof": {
+    "method": "same prompt, compare output token ids by first-divergence index",
+    "fixed_K_K4_vs_K4": "first_diff = -1 (IDENTICAL, 0/221) -> deterministic at a fixed config",
+    "cross_K_K4_vs_K8": "first_diff = 92, 127/220 differ -> diverges at a floating-point near-tie, cascades",
+    "verdict": "spec-decode is bit-reproducible at a fixed config (matches trusted-wire receipt); cross-K differences are FP non-associativity in the batched CUDA-graph verify, NOT quality degradation. Each output is a valid greedy decode. True cross-K bit-exactness needs deterministic-reduction kernels."
+  },
+  "fix_files": [
+    "phase0/fastverify.py (ContextOverflow + bounds)",
+    "phase0/specpipe.py (--max-ctx plumbed to both serve paths; ignore_eos)",
+    "phase0/launch_oss.py (--max-ctx + draft --max-len passthrough)"
+  ],
+  "honest_status": "SERVE works at the demo regime and now past 2048 on the decode path with the fix. Production-grade long context (20k) is NOT there yet on 24GB/12-layer cards: bounded by eager-prefill memory and the O(max_ctx) decode-mask cost. Path is known (flash/chunked prefill, incremental mask, fp8 KV, more stages)."
+}

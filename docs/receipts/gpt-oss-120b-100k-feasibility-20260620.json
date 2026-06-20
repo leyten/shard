@@ -1,0 +1,41 @@
+{
+  "run_id": "gpt-oss-120b-100k-feasibility-20260620",
+  "utc": "2026-06-20",
+  "goal": "100k-context prompts at usable speed on scattered consumer 4090s",
+  "question": "gpt-oss has attention sinks; can it do memory-efficient (O(n)) prefill on Ada (4090)? eager is O(n^2) and OOMs ~8k; flash-attn-3 sink kernel is Hopper-only.",
+  "findings": {
+    "eager": "OOMs at ~8k even for 4 layers (O(n^2) scores). Not viable for long context.",
+    "sdpa": "UNSUPPORTED for GptOssForCausalLM (sinks block the sdpa path).",
+    "flash_attention_2/vllm-flash-attn3": "'S aux only supported on Hopper' -> dead on Ada 4090.",
+    "flex_attention": "WORKS on Ada with sinks + sliding window. THE kernel."
+  },
+  "flex_validated_on_real_weights": {
+    "correctness_vs_eager_9layers": {
+      "cosine": 0.999593,
+      "rel_err": 0.033,
+      "note": "max|d|=31 is a massive-activation outlier, not a bug; sinks handled (zeroing sinks doesn't change the gap). Faithful greedy decode."
+    },
+    "chunked_prefill_real_9layer_stage": {
+      "reached_ctx": 100352,
+      "peak_gb": 20.8,
+      "seconds": 22,
+      "chunk": 2048,
+      "scaling": "~linear, ~40KB/tok for 9 layers (KV-bound); bounded chunk activations"
+    }
+  },
+  "fit_math_24GB_card": {
+    "kv_per_tok_per_layer_KB": 2,
+    "sliding_layers_bounded_to_window_128": true,
+    "N4_9layers": "weights ~15.25GB + 100k KV ~1.8GB + chunk ~4GB = ~21GB FITS",
+    "N6_6layers": "fits with large headroom (~360k ctx)",
+    "conclusion": "100k-131k feasible at N=4; more nodes or fp8/int4 KV -> 400k+"
+  },
+  "build_plan": [
+    "run_block: build flex masks via transformers.masking_utils (create_causal_mask + create_sliding_window_causal_mask) when attn=flex; keep eager path unchanged",
+    "chunked prefill: coordinator sends the prompt in chunks of C; serve_spec runs each via run_block into a DynamicCache (bounded activations)",
+    "bring up N=4 (or N=6) swarm with --attn flex, non-fast serve_spec path (DynamicCache, grows dynamically)",
+    "prove a real 100k prompt end-to-end + tok/s receipt",
+    "later (speed): flex-ify the CUDA-graph fast decode path; incremental O(1) decode mask; fp8/int4 KV; sliding-window ring-buffer KV"
+  ],
+  "speed_expectation": "prefill 100k ~tens of seconds (chunked, pipelined); decode on the non-fast path ~5-6 tok/s (graph-less) -> usable for long-context; fast-path flex-ification is the follow-up to recover ~30 tok/s"
+}

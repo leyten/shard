@@ -19,6 +19,12 @@ from pipeline import _causal_mask
 from tree import tree_mask
 
 
+class ContextOverflow(Exception):
+    """A request needs more positions than the static cache (max_ctx) holds. Raised
+    BEFORE any out-of-bounds write, so the cache is never corrupted — the serve loop
+    catches it, resets the edge, and the node stays up (vs a silent CUDA OOB)."""
+
+
 class StaticKV:
     """fixed [1, kv_heads, MAXLEN, head_dim] K/V per layer; update() writes at the cache's
     own index buffer (self.cp) and returns the full buffer for masked attention."""
@@ -60,6 +66,9 @@ class FastVerify:
 
     def prefill(self, h, start):                                # eager, any length
         n = h.shape[1]
+        if start + n > self.maxlen:                             # fail clean, never corrupt the cache
+            raise ContextOverflow(f"prefill needs {start + n} positions > max_ctx {self.maxlen} "
+                                  f"(raise --max-ctx)")
         self.cache.cp = torch.arange(start, start + n, device=self.dev)
         pos = self.cache.cp.unsqueeze(0)
         mf = _causal_mask(n, self.maxlen, start, 0, torch.bfloat16, self.dev)
@@ -88,6 +97,9 @@ class FastVerify:
                             self.mf_buf, self.mw_buf)
 
     def decode(self, h, start):                                 # fixed q_len, graphed
+        if start + h.shape[1] > self.maxlen:                    # fail clean before any OOB write
+            raise ContextOverflow(f"decode needs {start + h.shape[1]} positions > max_ctx "
+                                  f"{self.maxlen} (raise --max-ctx)")
         if self.kp1 != h.shape[1]:                              # (re)build for this K+1, capture once
             self._build(h.shape[1]); self.graph = None
         self._set(h, start)

@@ -64,7 +64,7 @@ def fire(inst, cmd, timeout=25):
         pass
 
 
-def launch_stage(inst, stage, nstages, nxt_ep, served_head):
+def launch_stage(inst, stage, nstages, nxt_ep, served_head, max_ctx=2048):
     is_tail = stage == nstages - 1
     nextarg = f" --next {nxt_ep}" if nxt_ep else ""
     head = " --served-head" if served_head else ""
@@ -73,7 +73,7 @@ def launch_stage(inst, stage, nstages, nxt_ep, served_head):
            f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log; cd /root && "
            f"SHARD_PSK={PSK} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
            f"--model {M120} --listen-port {PORT}{nextarg}{head} --fast --direct-return "
-           f"--timeout 300 > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
+           f"--max-ctx {max_ctx} --timeout 300 > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     fire(inst, cmd)
 
 
@@ -102,6 +102,7 @@ def main():
     ap.add_argument("--tree", default="", help="run FAST graphed tree spec 'w,d' instead of the linear compare")
     ap.add_argument("--dump", action="store_true", help="write the warm run (ids+hash+sync-match) to /root/run.json for the receipt")
     ap.add_argument("--skip-draft", action="store_true", help="reuse a draft already running on coord")
+    ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling)")
     a = ap.parse_args()
 
     sids = [int(x) for x in a.stages.split(",")]
@@ -141,13 +142,13 @@ def main():
                     f"fuser -k {DRAFT_PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/draft.log; cd /root && "
                     f"SHARD_PSK={PSK} CUDA_VISIBLE_DEVICES=0 setsid bash -c "
                     f"'/root/vllmenv/bin/python draft_server.py --model {M20} --port {DRAFT_PORT} "
-                    f"> /root/draft.log 2>&1' </dev/null >/dev/null 2>&1 &")
+                    f"--max-len {a.max_ctx} > /root/draft.log 2>&1' </dev/null >/dev/null 2>&1 &")
 
     print("[launch] stages tail-first; wait each to listen before launching its predecessor "
           "(120B partial load ~1-2min/node, so a predecessor never connects to a dead successor)...", flush=True)
     for k in range(nstages - 1, -1, -1):
         nxt = f"{eps[k+1][0]}:{eps[k+1][1]}" if k < nstages - 1 else None
-        launch_stage(stages[k], k, nstages, nxt, served_head=(k == 0))
+        launch_stage(stages[k], k, nstages, nxt, served_head=(k == 0), max_ctx=a.max_ctx)
         label, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
         print(f"  {'OK ' if ok else 'FAIL '}{label}", flush=True)
         if not ok:
