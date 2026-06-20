@@ -1,0 +1,48 @@
+{
+  "run_id": "gpt-oss-120b-100k-decode-20260620",
+  "utc": "2026-06-20",
+  "swarm": "N=4 scattered RTX 4090 stages, flex_attention, fast path, direct-return",
+  "what": "usable long-context decode: flex prefill + graphed eager decode hybrid",
+  "result": {
+    "prompt_tokens": 92202,
+    "context_reached": 92251,
+    "prefill_tok_s": 157.3,
+    "decode_before": 0.51,
+    "speedup": 6.8,
+    "answer_correct": true,
+    "answer_preview": "analysisThe user repeated a description many times, then asks: \"in one sentence, what do these notes describe?\" The notes describe distributed inference splitti",
+    "output_sha256": "9e65a03684ba104ecba29a2df75c3dc8ba950769e44a9394dfec79ae0187f14d",
+    "plain_decode_tok_s": 3.49
+  },
+  "single_stage_validation": {
+    "decode_ms_per_step_at_12k": 9.4,
+    "decode_ms_per_step_at_100k": 37.7,
+    "note": "eager graphed decode; cost scales with max_ctx (full-buffer attention), not actual ctx"
+  },
+  "why_it_works": "flex recompiled per decode step as KV grew (0.5 tok/s). Decode now uses eager attention (q=K+1 is cheap even over 100k keys) on the existing CUDA-graph path (fixed shape, no recompile); flex is used only for the big-query prefill. config._attn_implementation is flipped per phase.",
+  "further_speed": [
+    "sliding-window KV: ~half the layers (window 128) only need a 128-key read, not the full buffer -> ~2x decode",
+    "spec-decode: K tokens/traversal, but needs a long-context-tuned draft (vanilla 20B draft OOMs at 100k)",
+    "fewer/faster stages, fp8 KV"
+  ],
+  "spec_decode": {
+    "what": "windowed-draft spec-decode over the hybrid swarm at 95k",
+    "decode_tok_s": 7.57,
+    "config": "draft_ctx=2048, depth=4, K=4",
+    "tok_per_traversal": 3.18,
+    "accept": 2.18,
+    "draft_ms": 97,
+    "verify_recv_ms": 254,
+    "key_insight": "a full-context draft is ~800ms/round at 95k and kills spec-decode; windowing the draft query to recent tokens (--draft-ctx) drops it to ~100ms (hidden behind the verify), while the full swarm still verifies with complete context",
+    "sweep_best": "draft_ctx 2048/512 with depth 4 ~7.9 (short-prefill estimate); depth>=16 thrashes (verify can't keep up with fill)",
+    "speedup_vs_naive": 14.8,
+    "depth_K_sweep": {
+      "best": "depth=4 K=4 ~9.7 tok/s (short-prefill estimate; favourable prompt)",
+      "confirmed_real_95k": "7.57 tok/s (depth=4 K=4, repetitive prompt)",
+      "range": "~8-10 tok/s at 95k, prompt-dependent",
+      "note": "free params (K, depth, draft_ctx) tapped; verify round-trip ~270ms is the wall"
+    }
+  },
+  "floor_now": "verify round-trip ~254ms (WAN + 4 stages eager-decode over 100k). 10+ needs sliding-window KV",
+  "path_to_reliable_10plus": "sliding-window KV: ~half the layers (window 128) read the full 100k buffer "
+}

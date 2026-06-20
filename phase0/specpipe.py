@@ -188,12 +188,12 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     if "par" in msg:                       # TREE verify (fixed-topology graph)
                         h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                     else:                                  # LINEAR verify (prefill, then graphed decode)
-                        h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"]); first = False
+                        h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
                     if is_tail:
                         h = parts["norm"](h)
                         send_msg(conn, parts["lm_head"](h).argmax(-1)[0].tolist())
                     else:
-                        fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"]}
+                        fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"], "prefill": msg.get("prefill")}
                         if "par" in msg: fwd["par"] = msg["par"]; fwd["dep"] = msg["dep"]
                         if g: fwd["gather"] = g
                         send_msg(nxt_sock, fwd)
@@ -261,7 +261,7 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                     if "par" in msg:                       # TREE verify
                         h = fv.tree_decode(x, msg["start"], msg["par"], msg["dep"])
                     else:
-                        h = fv.prefill(x, msg["start"]) if first else fv.decode(x, msg["start"]); first = False
+                        h = fv.prefill(x, msg["start"]) if (first or msg.get("prefill")) else fv.decode(x, msg["start"]); first = False
                     h = parts["norm"](h)
                     send_msg(ret_conn, parts["lm_head"](h).argmax(-1)[0].tolist()); verifies += 1
                 except EDGE_ERRORS as e:
@@ -453,7 +453,7 @@ def coordinate(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout,
 
 
 def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, depth, ret_sock=None,
-                    ignore_eos=False):
+                    ignore_eos=False, prefill_chunk=0, draft_ctx=0):
     """PIPELINED coordinator: keep `depth` verify chunks in flight over the ring, so
     throughput approaches the ring's per-chunk THROUGHPUT, not its full latency (the
     GLM-pipe lever, on the gpt-oss fast-verify path). Same K+1-token chunk as the
@@ -472,8 +472,17 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
     t_draft = t_recv = 0.0
     try:
         send_msg(pipe_sock, {"op": "reset"}); recv_msg(rx)
-        send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill (eager)
-        cur = recv_msg(rx)[-1]
+        # prefill: one shot, or chunked (long prompts) with the prefill flag so stages run flex
+        if prefill_chunk and len(prompt_ids) > prefill_chunk:
+            rr = None
+            for i in range(0, len(prompt_ids), prefill_chunk):
+                send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids[i:i + prefill_chunk],
+                                     "start": i, "prefill": True})
+                rr = recv_msg(rx)
+            cur = rr[-1]
+        else:
+            send_msg(pipe_sock, {"op": "verify", "token_ids": prompt_ids, "start": 0})   # prefill
+            cur = recv_msg(rx)[-1]
         pos = len(prompt_ids)
         out = [cur]
         inflight = []                              # FIFO of (start_pos, drafts) sent but not yet read
@@ -487,13 +496,17 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
         # computes the next chunk WHILE the current verify chunks cross the WAN. Each fill
         # collects the ready draft, sends the verify chunk, then issues the next draft request
         # (which then runs concurrently with the verify read below). draft latency is hidden.
-        send_msg(draft_sock, {"ids": dprefix, "k": K})            # prime: one outstanding request
+        # the draft only needs RECENT context to predict the next tokens (next-token is dominated by
+        # recent tokens); the full swarm still verifies with the complete context. Windowing the draft
+        # query keeps the draft fast at long context (a full-95k draft is ~800ms/round and kills spec).
+        dq = lambda: (dprefix[-draft_ctx:] if draft_ctx else dprefix)
+        send_msg(draft_sock, {"ids": dq(), "k": K})               # prime: one outstanding request
         while not done:
             while len(inflight) < depth and not done:                  # FILL the pipeline
                 td = time.time(); ds = recv_msg(draft_sock); t_draft += time.time() - td  # ready (overlapped)
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
-                send_msg(draft_sock, {"ids": dprefix, "k": K})        # issue next -> runs during the read below
+                send_msg(draft_sock, {"ids": dq(), "k": K})           # issue next -> runs during the read below
             tr = time.time(); r = recv_msg(rx); t_recv += time.time() - tr   # READ one result
             sp, ds = inflight.pop(0)
             if discard > 0:                                            # stale (post-divergence) -> skip
@@ -512,7 +525,7 @@ def coordinate_pipe(draft_sock, pipe_sock, tok, prompt, K, max_new, timeout, dep
                 discard = len(inflight)                                # every chunk still in flight is stale
                 recv_msg(draft_sock)                                   # outstanding draft is stale -> drop it
                 dprefix = prompt_ids + out; send_pos = pos             # re-draft from the corrected prefix
-                send_msg(draft_sock, {"ids": dprefix, "k": K})        # re-prime from the corrected prefix
+                send_msg(draft_sock, {"ids": dq(), "k": K})           # re-prime from the corrected prefix
             if len(out) >= max_new or (not ignore_eos and (cur == eos or eos in committed)):
                 done = True
         recv_msg(draft_sock)                                          # drain the outstanding draft request
@@ -666,6 +679,8 @@ def main():
     ap.add_argument("--attn", default="eager", help="attention impl for stages: eager | flex_attention "
                     "(flex = O(n) prefill on Ada, needed for long context with gpt-oss sinks)")
     ap.add_argument("--prompt-file", default="", help="read the prompt from this file (for 100k-token prompts)")
+    ap.add_argument("--draft-ctx", type=int, default=0, help="window the draft query to the last N tokens "
+                    "(0=full); keeps the draft fast at long context (a full-95k draft is ~800ms/round)")
     ap.add_argument("--prefill-chunk", type=int, default=0, help="chunk the prefill into this many tokens "
                     "(0=one shot); long prompts need chunking so per-chunk activations stay bounded")
     ap.add_argument("--max-ctx", type=int, default=2048, help="fast-verify static cache size (prompt+gen ceiling); "
@@ -755,7 +770,8 @@ def main():
             ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
             for kv in ks:
                 r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, kv, args.max_new,
-                                    args.timeout, args.depth, ret_sock=ret_sock)
+                                    args.timeout, args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
+                                    draft_ctx=args.draft_ctx)
                 print(f"[PIPE K={kv} depth={args.depth}] {r['tok_s']:.2f} tok/s | {r['toks_per_traversal']:.2f} tok/traversal | "
                       f"accept {r['mean_accept']:.2f} | +{r['wasted']} stale | "
                       f"draft {r['draft_ms']:.0f}ms recv {r['recv_ms']:.0f}ms/round", flush=True)

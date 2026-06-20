@@ -50,6 +50,7 @@ class FastVerify:
         kvh = getattr(cfg, "num_key_value_heads", None) or cfg.num_attention_heads
         hd = getattr(cfg, "head_dim", None) or (self.hidden // cfg.num_attention_heads)
         self.cache = StaticKV(self.n_layers, kvh, hd, maxlen, dev)
+        self.cfg = cfg                                          # flip _attn_implementation per phase
         self.kp1 = None; self.graph = None; self.out = None     # decode buffers built lazily
 
     def reset(self):
@@ -64,15 +65,29 @@ class FastVerify:
             x = o[0] if isinstance(o, tuple) else o
         return x
 
-    def prefill(self, h, start):                                # eager, any length
+    def _flex_masks(self, q, start):
+        """flex BlockMasks over [q, MAXLEN]. causal already ignores the unwritten cache tail
+        (keys > start+qi are masked), so attending over the full StaticKV buffer is correct.
+        KV_LEN is fixed at maxlen -> flex compiles per q only, not per context length."""
+        from torch.nn.attention.flex_attention import create_block_mask
+        win = self.win
+        def causal(b, h, qi, ki): return (start + qi) >= ki
+        def swin(b, h, qi, ki): return ((start + qi) >= ki) & ((start + qi) - ki < win)
+        # _compile=True builds the block mask without materialising the dense [q, maxlen] mask
+        # (which is ~3GB at maxlen=100k and OOMs) -- this is the whole point of flex.
+        mf = create_block_mask(causal, 1, None, q, self.maxlen, device=self.dev, _compile=True)
+        mw = create_block_mask(swin, 1, None, q, self.maxlen, device=self.dev, _compile=True) if win else mf
+        return mf, mw
+
+    def prefill(self, h, start):                                # FLEX, O(n) on Ada; chunk-friendly (q = a chunk)
         n = h.shape[1]
         if start + n > self.maxlen:                             # fail clean, never corrupt the cache
             raise ContextOverflow(f"prefill needs {start + n} positions > max_ctx {self.maxlen} "
                                   f"(raise --max-ctx)")
+        self.cfg._attn_implementation = "flex_attention"        # memory-efficient for the big-q prefill
         self.cache.cp = torch.arange(start, start + n, device=self.dev)
         pos = self.cache.cp.unsqueeze(0)
-        mf = _causal_mask(n, self.maxlen, start, 0, torch.bfloat16, self.dev)
-        mw = _causal_mask(n, self.maxlen, start, self.win, torch.bfloat16, self.dev) if self.win else mf
+        mf, mw = self._flex_masks(n, start)
         return self._layers(h, pos, self.rotary(h, pos), mf, mw)
 
     def _build(self, kp1):
@@ -96,10 +111,15 @@ class FastVerify:
         return self._layers(self.h_buf, self.pos_buf, self.rotary(self.h_buf, self.pos_buf),
                             self.mf_buf, self.mw_buf)
 
-    def decode(self, h, start):                                 # fixed q_len, graphed
+    def decode(self, h, start):                                 # fixed q_len, graphed EAGER
         if start + h.shape[1] > self.maxlen:                    # fail clean before any OOB write
             raise ContextOverflow(f"decode needs {start + h.shape[1]} positions > max_ctx "
                                   f"{self.maxlen} (raise --max-ctx)")
+        # eager attention with q=K+1 is cheap even at 100k kv, and (unlike flex) the additive
+        # mask + CUDA graph give a fixed-shape replay -> no per-step recompile. flip back to eager
+        # after a flex prefill (rebuild the graph the first time this phase runs).
+        if self.cfg._attn_implementation != "eager":
+            self.cfg._attn_implementation = "eager"; self.graph = None
         if self.kp1 != h.shape[1]:                              # (re)build for this K+1, capture once
             self._build(h.shape[1]); self.graph = None
         self._set(h, start)
