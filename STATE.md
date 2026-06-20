@@ -21,10 +21,14 @@ The "long context is a dealbreaker" worry, resolved on the real rig
   is O(n) — validated cosine 0.9996 vs eager. Plus **chunked prefill** (bounded per-chunk activations,
   KV accumulates) and an N=4 split so 95k KV fits a 24GB card. Wired in `pipeline.run_block` +
   `specpipe` (`--attn flex_attention`, `--prompt-file`, `--prefill-chunk`).
-- **Open: generation speed at long ctx.** This run used the simplest decode (8-hop relay, plain greedy,
-  per-step flex) → 0.51 tok/s @95k (2.57 @2k). Fix path: route **decode** through the graphed eager
-  StaticKV path (eager attn with q=K+1 is cheap even at 95k → ~30 tok/s proven short-ctx) with flex
-  used only for prefill; + direct-return + spec-decode; + fp8/sliding-window-ring KV. Prefill is already fast.
+- **Decode at long ctx — usable.** Naive decode was 0.51 tok/s @95k (flex recompiled every step as KV
+  grew). Fix: **flex for prefill, eager for decode.** Decode flips the layers to eager and uses the
+  existing CUDA-graphed path (q=K+1 eager attention is cheap even over 100k keys; fixed-shape replay, no
+  recompile); flex only does the big-query prefill. End to end on the N=4 swarm: **92k prompt, prefill
+  157 tok/s, decode 3.5 tok/s** (7× the naive path), correct output
+  ([receipt](docs/receipts/gpt-oss-120b-100k-decode-20260620.json)). Usable for long-context (non-interactive).
+- **More decode speed (next):** sliding-window ring-buffer KV (half the layers only need a 128-key read →
+  ~2×), spec-decode (needs a long-context-tuned draft; the vanilla 20B draft OOMs at 100k), fp8 KV, fewer stages.
 
 ## Serving hardening (2026-06-20) — long-context + losslessness, real 4×4090 runs
 A reported "output breaks past ~20k context / spec-decode degrades quality" sent us back to the rig
