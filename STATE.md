@@ -1,13 +1,14 @@
 # Shard — build status
 
-One glance, full picture. The whole network is **5 verbs**. SERVE is done; we're building the other four.
+One glance, full picture. The whole network is **5 verbs**. Engine side: JOIN, FORM, SERVE, and
+the PROVE primitives are now in; only PAY (c0mpute rails) and the live integration remain.
 
 ## The map
-1. **JOIN**  — a stranger's GPU gets in *(identity, NAT transport, pull its slice of weights)*
-2. **FORM**  — the network picks nearby nodes and wires them into a swarm *(scheduler, assignment, heal)*
-3. **SERVE** — the swarm answers the request, fast — ✅ **DONE** at the demo regime (~40 tok/s gpt-oss-120B, ~30 GLM-5.2 744B over WAN). ⚠️ **long-context hardened, not yet production** — see "Serving hardening" below.
-4. **PROVE** — each node proves it actually ran its layer *(signed receipts, layer-block spot-check)*
-5. **PAY**   — each node gets paid for its bit *(per-node, c0mpute rails)*
+1. **JOIN**  — a stranger's GPU gets in *(identity, NAT transport, pull its slice of weights)* — ✅ **DONE** (steps 1–3): libp2p identity, NAT, and content-addressed verified weight fetch.
+2. **FORM**  — the network picks nearby nodes and wires them into a swarm *(scheduler, assignment, heal)* — ✅ **engine done**: `shard/scheduler.py` auto-fits the model to heterogeneous VRAM (fat node first) + RTT-orders the ring; heal-by-rebuild. Live control-plane integration is next.
+3. **SERVE** — the swarm answers the request, fast — ✅ **DONE incl. long context**: ~40 tok/s short-ctx, and **28.2 tok/s decode at >100k context** via n-gram spec-decode (2026-06-23, receipt above).
+4. **PROVE** — each node proves it actually ran its layer — ✅ **primitives done + receipts demonstrated live**: signed per-stage receipts (`shard/receipt.py`, wired into the serve loop, in/out roots chain across the ring) + a tolerance-based layer-block challenge (`shard/challenge.py`). Reputation/policy is c0mpute-side.
+5. **PAY**   — each node gets paid for its bit *(per-node, c0mpute rails)* — the remaining piece, c0mpute-side (per-node `worker_earnings` keyed on verified receipts).
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
@@ -81,10 +82,10 @@ A reported "output breaks past ~20k context / spec-decode degrades quality" sent
 | 0 | Engine (pipeline + spec-decode + pipelining) | SERVE | ✅ done |
 | 1 | libp2p sidecar + per-node identity + data-plane (retire `SHARD_PSK`) | JOIN | ✅ **done** |
 | 2 | NAT traversal + bind identity ↔ c0mpute account | JOIN | ✅ **done** |
-| 3 | Manifest + content-addressed weight fetch | JOIN | todo |
-| 4 | Scheduler + assignment protocol | FORM | todo |
-| 5 | Job routing + signed receipts + per-node pay | PROVE/PAY | todo |
-| 6 | Reputation upgrade + layer-block spot-check | PROVE | todo |
+| 3 | Manifest + content-addressed weight fetch | JOIN | ✅ **done** (`shard/manifest.py`, `shard/fetch.py`, validated, path-traversal-hardened) |
+| 4 | Scheduler + assignment protocol | FORM | ✅ **engine done** (`shard/scheduler.py` VRAM-fit + RTT order; live bring-up integration next) |
+| 5 | Job routing + signed receipts + per-node pay | PROVE/PAY | ◑ **receipts done + live** (`shard/receipt.py`); per-node pay = c0mpute rails |
+| 6 | Reputation upgrade + layer-block spot-check | PROVE | ◑ **challenge primitive done** (`shard/challenge.py`); reputation = c0mpute |
 | 7 | Heal + mid-request fault tolerance | FORM | todo *(research)* |
 | 8 | P2P propagation takes over from mirror | JOIN | todo *(additive)* |
 
