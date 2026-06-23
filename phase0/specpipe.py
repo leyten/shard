@@ -35,6 +35,18 @@ from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
 from tree import accept_tree, gather_cache
 from fastverify import FastVerify
 from ngram_draft import NgramDrafter
+import os
+try:                                                    # PROVE: opt-in signed per-stage receipts
+    from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
+except Exception:
+    ReceiptSigner = None
+RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
+NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
+
+
+def _act_digest(t):
+    """A deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
+    return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
@@ -163,7 +175,10 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(1)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
-    print(f"[s{stage}] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, edge timeout {timeout:.0f}s)", flush=True)
+    node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
+    signer = None
+    print(f"[s{stage}] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, edge timeout {timeout:.0f}s"
+          f"{', signed receipts ON' if RECEIPTS else ''})", flush=True)
     while True:
         if not is_tail and nxt_sock is None:                 # forward link dropped (coordinator churn) -> rebuild it;
             for _ in range(60):                              # closing it made the NEXT stage drop its link too, so the
@@ -180,10 +195,22 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     msg = recv_msg(conn)
                     if msg["op"] == "reset":
                         fv.reset(); first = True
+                        if RECEIPTS:                     # start this job's per-stage activation hash-chain
+                            signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
+                                                   msg.get("job_id", "job"), parts["lo"], parts["hi"])
                         if nxt_sock:
                             send_msg(nxt_sock, msg)
                             if not direct: recv_msg(nxt_sock)
                         if not direct: send_msg(conn, "ok")
+                        continue
+                    if msg["op"] == "receipt":           # job done: sign + accumulate down the ring
+                        if RECEIPTS and signer is not None:
+                            msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
+                        if nxt_sock:
+                            send_msg(nxt_sock, msg)       # tail returns the full list to the coordinator (direct)
+                            if not direct: send_msg(conn, recv_msg(nxt_sock))
+                        else:
+                            send_msg(conn, msg.get("receipts", []))
                         continue
                     g = msg.get("gather")
                     if g:                                  # lazy: compact prev tree's accepted path KV
@@ -197,6 +224,8 @@ def serve_spec_fast(parts, stage, nstages, listen_port, nxt, timeout, dev, direc
                     else:                                  # LINEAR verify (prefill, then graphed decode)
                         is_pf = first or msg.get("prefill")
                         h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
+                        if RECEIPTS and signer is not None:   # attest this block's input->output transform
+                            signer.observe(_act_digest(x), _act_digest(h))
                     if is_tail:
                         # prefill: only the last token's logit is consumed -> avoid a [chunk x vocab] OOM
                         h = parts["norm"](h[:, -1:] if ("par" not in msg and is_pf) else h)
@@ -244,7 +273,10 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", listen_port)); srv.listen(8)
     fv = FastVerify(parts, maxlen=max_ctx, dev=dev)
-    print(f"[tail] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, direct return, edge timeout {timeout:.0f}s)", flush=True)
+    node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
+    signer = None
+    print(f"[tail] listening on :{listen_port} (FAST verify, max_ctx={max_ctx}, direct return, edge timeout {timeout:.0f}s"
+          f"{', signed receipts ON' if RECEIPTS else ''})", flush=True)
     pred = ret = None; pending = None; first = True
 
     def fill():                                            # block until BOTH channels are present
@@ -287,7 +319,16 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 continue
             try:
                 if msg["op"] == "reset":
-                    fv.reset(); first = True; send_msg(ret, "ok"); continue
+                    fv.reset(); first = True
+                    if RECEIPTS:
+                        signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
+                                               msg.get("job_id", "job"), parts["lo"], parts["hi"])
+                    send_msg(ret, "ok"); continue
+                if msg["op"] == "receipt":                  # job done: sign + return the full ring's receipts
+                    if RECEIPTS and signer is not None:
+                        msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
+                    send_msg(ret, msg.get("receipts", []))
+                    continue
                 g = msg.get("gather")
                 if g:
                     fv.tree_gather(g[0], g[1])
@@ -297,6 +338,8 @@ def serve_tail_fast(parts, listen_port, timeout, dev, max_ctx=2048):
                 else:
                     is_pf = first or msg.get("prefill")
                     h = fv.prefill(x, msg["start"]) if is_pf else fv.decode(x, msg["start"]); first = False
+                    if RECEIPTS and signer is not None:    # attest this block's input->output transform
+                        signer.observe(_act_digest(x), _act_digest(h))
                     # prefill: the coordinator only consumes the LAST token (next-token after the chunk),
                     # so run lm_head on just that position -- a full [chunk x vocab] logit tensor is ~1.5GB
                     # at chunk 4096 and OOMs a 24GB tail at long context. decode needs all K+1 logits.
@@ -856,6 +899,28 @@ def main():
                        "output_sha256": hashlib.sha256(json.dumps(ids).encode()).hexdigest()}
                 json.dump(rec, open(args.dump, "w"))
                 print(f"[coord] dumped run -> {args.dump} (sha256 {rec['output_sha256'][:16]}..)", flush=True)
+            if RECEIPTS:                                   # PROVE: sweep the ring once for signed per-stage receipts
+                rx = ret_sock if ret_sock is not None else pipe_sock
+                send_msg(pipe_sock, {"op": "receipt", "receipts": []})
+                recs = recv_msg(rx)
+                print(f"\n[coord] === PROVE: {len(recs)} signed per-stage receipts ===", flush=True)
+                ok = True
+                for rr in recs:
+                    body = {k: v for k, v in rr.items() if k != "stage"}
+                    try:
+                        verify_receipt(body)
+                        print(f"  stage {rr['stage']}: layers[{rr['layer_start']}:{rr['layer_end']}] "
+                              f"n={rr['n_chunks']} in_root {rr['in_root'][:12]} out_root {rr['out_root'][:12]} "
+                              f"pub {rr['pubkey'][:12]} — sig VALID", flush=True)
+                    except Exception as e:
+                        ok = False; print(f"  stage {rr['stage']}: sig FAILED ({e})", flush=True)
+                try:
+                    total = max(rr["layer_end"] for rr in recs)
+                    verify_coverage([{k: v for k, v in rr.items() if k != "stage"} for rr in recs], total)
+                    print(f"  coverage: blocks tile [0:{total}] no gap/overlap — every layer attested by a distinct signed node", flush=True)
+                except Exception as e:
+                    ok = False; print(f"  coverage FAILED: {e}", flush=True)
+                print(f"[coord] PROVE verdict: {'ALL receipts valid + full layer coverage — coordinator cannot fabricate, no node paid without proving its block' if ok else 'FAILED'}", flush=True)
             print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
             return
         ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]

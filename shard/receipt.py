@@ -100,6 +100,22 @@ def verify_receipt(receipt: dict, expected_pubkey: str | None = None) -> None:
         raise ReceiptError(f"signature verification failed: {type(e).__name__}") from e
 
 
+def load_or_make_node_key(path: str) -> ed25519.Ed25519PrivateKey:
+    """The node's stable signing identity. Loaded from `path`, or generated + persisted on first
+    use (0600). In production this is the same ed25519 key behind the node's libp2p PeerId (bound
+    to a c0mpute account in step 2.3); here a per-node key file stands in for the demo."""
+    import os
+    if os.path.exists(path):
+        return load_key(path)
+    key = gen_key()
+    save_key(key, path)
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+    return key
+
+
 def verify_coverage(receipts: list[dict], layer_count: int,
                     expected_by_signer: dict | None = None) -> None:
     """The job-level check c0mpute runs before paying: the set of per-stage receipts must

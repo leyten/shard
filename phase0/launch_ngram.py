@@ -20,14 +20,14 @@ import argparse
 from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK  # noqa: F401
 
 
-def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_ctx, timeout, window=False):
+def launch_stage_uneven(inst, stage, nstages, nxt_ep, served_head, lo, hi, max_ctx, timeout, window=False, receipts=False):
     """launch_oss.launch_stage + explicit --lo/--hi (uneven split) + a longer edge timeout for
     the multi-minute long-context prefill. window=True sets FV_WINDOW=1 so sliding-attention
     layers read only their 128-key window at decode (O(window) not O(ctx)) — the long-context
     speed lever. NEVER pkill -f specpipe (self-match); kill by GPU pid + port."""
     nextarg = f" --next {nxt_ep}" if nxt_ep else ""
     head = " --served-head" if served_head else ""
-    env = f"SHARD_PSK={PSK}" + (" FV_WINDOW=1" if window else "")
+    env = f"SHARD_PSK={PSK}" + (" FV_WINDOW=1" if window else "") + (" SHARD_RECEIPTS=1" if receipts else "")
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {PORT}/tcp 2>/dev/null; sleep 2; rm -f /root/stage.log; cd /root && "
            f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} "
@@ -51,6 +51,7 @@ def main():
     ap.add_argument("--max-new", type=int, default=256)
     ap.add_argument("--edge-timeout", type=int, default=1800, help="per-edge timeout (long prefill needs >600s)")
     ap.add_argument("--window", action="store_true", help="FV_WINDOW=1: sliding layers read only their 128-key window at decode (long-ctx speed)")
+    ap.add_argument("--receipts", action="store_true", help="SHARD_RECEIPTS=1: each stage signs a per-block receipt; coordinator collects + verifies (PROVE)")
     ap.add_argument("--no-launch", action="store_true", help="ring already warm; just run the coordinator")
     a = ap.parse_args()
 
@@ -84,7 +85,7 @@ def main():
             nxt = f"{eps[k + 1][0]}:{eps[k + 1][1]}" if k < nstages - 1 else None
             lo, hi = ranges[k]
             launch_stage_uneven(stages[k], k, nstages, nxt, served_head=(k == 0),
-                                lo=lo, hi=hi, max_ctx=a.max_ctx, timeout=a.edge_timeout, window=a.window)
+                                lo=lo, hi=hi, max_ctx=a.max_ctx, timeout=a.edge_timeout, window=a.window, receipts=a.receipts)
             label, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
             print(f"  {'OK ' if ok else 'FAIL '}{label}", flush=True)
             if not ok:
@@ -94,7 +95,8 @@ def main():
     head_ep = f"127.0.0.1:{PORT}"                       # coordinator runs ON the head box -> localhost to stage 0
     tail_ep = f"{eps[nstages - 1][0]}:{eps[nstages - 1][1]}"
     print(f"\n[coord] n-gram coordinator on head {head['id']}: --next {head_ep} --tail {tail_ep}", flush=True)
-    cmd = (f"cd /root && SHARD_PSK={PSK} python3 specpipe.py --coordinator --nstages {nstages} "
+    renv = " SHARD_RECEIPTS=1" if a.receipts else ""
+    cmd = (f"cd /root && SHARD_PSK={PSK}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
            f"--model {M120} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
            f"--next {head_ep} --direct-return --tail {tail_ep} --prompt-file {a.prompt_file} "
            f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new} "
