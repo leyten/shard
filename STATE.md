@@ -12,6 +12,41 @@ the PROVE primitives are now in; only PAY (c0mpute rails) and the live integrati
 
 Every line in [docs/INTEGRATION.md](docs/INTEGRATION.md) is just one of these five, done right.
 
+## 2026-06-23 (session 2) — deploy-readiness: lossless sampling, faster TTFT, mid-request fault tolerance
+Three engine-side gaps from [docs/DEPLOY_READINESS.md](docs/DEPLOY_READINESS.md), attacked on a fresh N=4 WAN swarm (WA·MN·NC·NJ, 4 distinct 4090 hosts, even 9-layer split) + an Ohio hot-spare:
+
+- **§2 Lossless speculative SAMPLING (temperature/top-p/top-k) — DONE.** The verify path was greedy-only;
+  now the tail runs deterministic-drafter speculative sampling (accept dⱼ w.p. pⱼ(dⱼ); residual sample on
+  reject; bonus on full-accept) and returns a *doctored* result vector so the coordinator's existing
+  equality accept-loop reproduces spec-sampling **unchanged** and the WAN payload is unchanged. temp≤0 stays
+  **bit-identical** to the greedy path. Proven lossless three ways: the acceptance MATH
+  (`research/specsample_proof.py` drives the real `Sampler` code, worst TV **0.0053** across temp/top-p/top-k ×
+  draft positions); the WIRED path on the real model (`specpipe --sample-test`: mean TV(spec,plain)=**0.1905**
+  == plain-vs-plain noise floor **0.1881** at high-entropy positions — statistically identical); and real
+  generation (3 distinct coherent stories greedy/seed7/seed99 at ~4.5 tok/s — sampling is free vs greedy).
+  `shard/specsample.py`. [receipt](docs/receipts/sampling-lossless-20260623.json).
+
+- **§3 Mid-request fault tolerance — DEMONSTRATED.** Killed a middle node (MN) mid-generation under load:
+  detected in **~4s**, the committed **189 tokens preserved**, a pre-warmed Ohio **spare** spliced into the
+  victim's slot (only the spare + the victim's predecessor relaunch; the other survivors auto-re-handshake
+  their dropped links), re-prefilled prompt+committed, continued to **256 tokens** — same request, continuation
+  **byte-preserved**, coherent output. Failover ~131s (cold-spare reload dominated; a hot standby cuts it to the
+  re-prefill). Engine primitive: `coordinate_pipe(resume_ids, resumable)`; control-plane healer: `phase0/heal.py`.
+  [receipt](docs/receipts/fault-tolerance-20260623.json). (Roadmap step 7.)
+
+- **§1 Faster TTFT (pipelined prefill) — PARTIAL.** Prefill was sequential (one chunk per *full ring traversal*
+  = zero overlap). Now `prefill_depth` chunks stay in flight so stages overlap: **30k TTFT 105.6→55.0s (1.9×)**,
+  **110k 226.8→193.3s (1.17×)**. The 100k case is handoff-bound — the 24MB/chunk inter-stage activation send is
+  synchronous, so at long context (large per-chunk attention) a stage stalls on the send and the overlap
+  collapses; **async inter-stage send + more stages** are the path to <60s. Even-split N=4 + pipelining take 110k
+  TTFT from ~556s (old 18/9/9) to 193s, but the **<60s/100k bar is NOT met on 4×4090**.
+  [receipt](docs/receipts/prefill-ttft-20260623.json).
+
+**Honest scope:** the "≥20 tok/s NOVEL-gen at 100k" bar is **not reachable** on this WAN ring with any drop-in
+draft (the g×RTT wall caps it; EAGLE/Medusa need the tail's hidden state a round-trip away) — a researched
+finding (DEPLOY_READINESS §1). The reachable, shipped wins this session are **lossless sampling** + **fault
+tolerance**; TTFT is a measured ~2× partial with a precise diagnosis of the remaining limiter.
+
 ## ≥20 tok/s at >100k context — DONE (2026-06-23): 28.2 tok/s, n-gram spec-decode
 The "fast generation at long context is the open piece" is now closed. On a **3-node WAN swarm
 (WA·WA·TX, all distinct hosts/GPUs)** a ~107k-token prompt decoded at **28.18 tok/s** — past the
@@ -86,7 +121,7 @@ A reported "output breaks past ~20k context / spec-decode degrades quality" sent
 | 4 | Scheduler + assignment protocol | FORM | ✅ **engine done** (`shard/scheduler.py` VRAM-fit + RTT order; live bring-up integration next) |
 | 5 | Job routing + signed receipts + per-node pay | PROVE/PAY | ◑ **receipts done + live** (`shard/receipt.py`); per-node pay = c0mpute rails |
 | 6 | Reputation upgrade + layer-block spot-check | PROVE | ◑ **challenge primitive done** (`shard/challenge.py`); reputation = c0mpute |
-| 7 | Heal + mid-request fault tolerance | FORM | todo *(research)* |
+| 7 | Heal + mid-request fault tolerance | FORM | ◑ **demonstrated** (`coordinate_pipe` resume + `phase0/heal.py` spare-splice; kill mid-gen → request completes, 2026-06-23) |
 | 8 | P2P propagation takes over from mirror | JOIN | todo *(additive)* |
 
 ## Now

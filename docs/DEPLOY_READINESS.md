@@ -8,24 +8,38 @@ Tags: 🔴 blocking for any honest deploy · 🟡 needed to escape the niche · 
 **E**ngineering (shard repo) · **R**esearch · **I**ntegration (c0mpute repo / not this engine).
 
 ## 1. Latency (what users feel)
-- 🔴 **E — Time-to-first-token at long ctx.** 100k prefill is ~10 min (~180 tok/s, sequential through
-  the ring). *Done when:* TTFT(100k) < ~60s. Levers: overlap/parallelize prefill across stages, fp8/int8
-  KV (bandwidth), prefill-specialized path. Until then it's batch-only, never interactive.
-- 🟡 **E — Decode on NOVEL generation.** 28 tok/s is on copy/retrieval; novel prose at 100k is ~2–3
-  tok/s (n-gram has nothing to copy). *Done when:* ≥20 tok/s at 100k on open-ended generation. Needs a
-  **real long-context draft** — small (1–3B) draft with fp8 windowed KV that doesn't OOM, or an
-  EAGLE-style trained head matched to gpt-oss. **Biggest single "make it general" unlock.**
+- ◑ **E — Time-to-first-token at long ctx. PARTIAL (2026-06-23).** Pipelined prefill (`prefill_depth` chunks
+  in flight, stages overlap) landed: **30k TTFT 105.6→55.0s (1.9×)**, **110k 226.8→193.3s (1.17×)**; even-split
+  N=4 + pipelining take 110k from ~556s (old 18/9/9) to 193s. **The <60s bar is NOT met on 4×4090** — the 100k
+  case is handoff-bound (the 24MB/chunk inter-stage activation send is *synchronous*, stalling overlap at long
+  ctx). Next: **async inter-stage send** + more stages (the speedup scales with stage count). fp8/int8 KV is a
+  decode/memory win, not a prefill-compute one. [receipt](receipts/prefill-ttft-20260623.json).
+- 🟡 **E — Decode on NOVEL generation. NOT REACHABLE on this WAN topology (researched 2026-06-23).** 28 tok/s is
+  copy/retrieval; novel prose at 100k is ~2–4 tok/s and **≥20 tok/s on novel gen at 100k is not achievable with
+  any drop-in draft over this ring** — the wall is g×RTT and novel text caps g low; EAGLE/EAGLE-3/Medusa/MTP are
+  structurally defeated (they consume the target's hidden state, which is born on the tail node a full WAN
+  round-trip from the head drafter). Best *lossless* lever (modest, single-digit tok/s): a windowed/fp8-KV small
+  draft (Qwen 0.5–1.5B, 50–120 MB windowed) + n-gram hybrid. Real upside only via PPSD-style early-exit
+  self-speculation (one-time adapter train; LAN-proven only). **Pitch novel-long-ctx as batch/latency-tolerant,
+  never interactive.** This reframes the old "biggest unlock" line: it's a topology wall, not an engine TODO.
 - 🟢 **E — fp8/int8 KV + weights** to cut the per-stage 100k-attention bottleneck (the fat node is the floor).
 
 ## 2. Generality (does what people pay for)
-- 🔴 **E — Sampling, not just greedy.** Need lossless speculative *sampling* (temperature/top-p) at parity.
+- ✅ **E — Sampling, not just greedy. DONE (2026-06-23).** Lossless speculative *sampling* (temperature/top-p/top-k)
+  at parity: deterministic-drafter rejection sampling at the tail (`shard/specsample.py`), output distribution ==
+  the target's temp/top-p distribution (math TV 0.0053; on-swarm TV(spec,plain)==noise floor; 3 coherent sampled
+  generations). temp≤0 stays bit-identical to greedy. [receipt](receipts/sampling-lossless-20260623.json).
 - 🔴 **E — Concurrent request batching.** One stream at a time today; throughput economics need continuous batching.
 - 🟡 **I — >1 model in the catalog** (incl. an uncensored one — the actual differentiator). Manifest/fetch supports it.
 
 ## 3. Reliability (survives a real consumer-GPU swarm)
-- 🔴 **R — Mid-request fault tolerance.** A node dropping mid-gen fails the request today. *Done when:* kill a
-  node mid-stream and the request still completes (KV migration or fast re-prefill of just the dropped block).
-  The hardest non-crypto item; churn is constant on volunteer GPUs.
+- ◑ **R — Mid-request fault tolerance. DEMONSTRATED (2026-06-23).** Killed a middle node mid-generation under
+  load → detected in ~4s, committed 189 tokens preserved, pre-warmed spare spliced in (only spare + the victim's
+  predecessor relaunch; other survivors auto-re-handshake), re-prefilled prompt+committed, continued to 256
+  tokens — same request, continuation byte-preserved. Engine: `coordinate_pipe(resume_ids, resumable)`; healer:
+  `phase0/heal.py`. Failover ~131s (cold-spare reload dominated). [receipt](receipts/fault-tolerance-20260623.json).
+  *Remaining for "fast":* a HOT pre-warmed standby (removes the reload → failover = just the re-prefill) and
+  "re-prefill of JUST the dropped block" via upstream activation checkpointing (vs the full prompt+committed).
 - 🔴 **E/I — Live heal + hot spares** (pre-warmed) so a drop is a <few-sec blip, not a cold relaunch.
 - 🟡 **E — SLA behavior.** Graceful degradation + health so the orchestrator routes around flaky nodes.
 
@@ -64,8 +78,12 @@ idle-compute cost, and trustless verification — never raw speed** (WAN latency
 than OpenAI"; the truthful pitch is "frontier models on terms they won't give you, provably honest."
 
 ## Highest-leverage ENGINE-side (shard repo) next steps
-1. Real long-context draft model → novel-gen ≥20 tok/s (turns a niche tool into a general one).
-2. Mid-request fault tolerance → survives a real swarm.
-3. Faster prefill / TTFT → interactive, not batch-only.
-4. Lossless speculative sampling → real workloads, not just greedy.
+1. ✅ **Lossless speculative sampling** → real workloads, not just greedy. **DONE 2026-06-23.**
+2. ◑ **Mid-request fault tolerance** → survives a real swarm. **DEMONSTRATED 2026-06-23** (cold spare; next:
+   hot standby + block-only re-prefill to make the failover a <few-sec blip).
+3. ◑ **Faster prefill / TTFT** → **PARTIAL 2026-06-23** (pipelined, ~2× at 30k, handoff-bound at 100k); next:
+   async inter-stage send + more stages for <60s/100k.
+4. ✗ **Real long-context draft for novel gen** → researched as **NOT reachable** on this WAN ring (g×RTT wall);
+   reframe as batch/latency-tolerant. Modest lossless lift via windowed small-draft + n-gram hybrid; real upside
+   only via PPSD early-exit self-spec (research bet).
 (PAY / live scheduler / challenge-enforcement / pricing are c0mpute-repo integration, a separate effort.)

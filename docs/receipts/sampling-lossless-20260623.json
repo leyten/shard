@@ -1,0 +1,46 @@
+{
+  "run_id": "sampling-lossless-20260623",
+  "utc": "2026-06-23",
+  "shard_commit": "f3fba2d05b88e965ccb0a01c46df136300375873",
+  "claim": "Lossless speculative SAMPLING (temperature/top-p/top-k) on the distributed verify path: the committed-token distribution is exactly the target's temp/top-p sampling distribution, not just greedy. temp<=0 stays bit-identical to the legacy greedy path.",
+  "model": "gpt-oss-120b",
+  "quant": "mxfp4",
+  "method": "Deterministic-drafter speculative sampling at the tail: accept drafted token d_j w.p. p_j(d_j); on first rejection sample the residual norm(p_m with d_m removed); on full accept sample one bonus from p_K. The tail returns a doctored result vector so the coordinator's existing equality accept-loop reproduces spec-sampling unchanged; WAN payload is unchanged. Implementation: phase0/specsample.py (Sampler.accept), wired into serve_tail_fast / serve_spec_fast; coordinator sends temp/top_p/top_k/seed in the reset.",
+  "proof_1_local_math": {
+    "what": "Drives the REAL Sampler class (phase0/specsample.py) on synthetic logits; compares the committed-token distribution to the target distribution p over many draws. Proves the acceptance math independent of the model. research/specsample_proof.py.",
+    "draws_per_case": 120000,
+    "vocab": 32,
+    "configs_tested": "temp {0.7,0.8,1.0,1.3} x top_p {0.8,0.9,0.95,1.0} x top_k {0,10,20}, each with draft token = argmax / median / outside-top_p",
+    "worst_tv_committed_vs_target": 0.0053,
+    "gate": 0.02,
+    "greedy_temp0_bit_identical_to_argmax": true,
+    "verdict": "LOSSLESS — committed distribution == target distribution within Monte-Carlo noise"
+  },
+  "proof_2_on_swarm": {
+    "what": "On the live 4-node WAN gpt-oss-120B ring: at 12 content positions (past the deterministic harmony preamble), draw 140 iid next-tokens via PLAIN sampling (q=0, pure target sample) and via SPECULATIVE sampling (n-gram draft + accept), and compare. PLAIN-vs-PLAIN calibrates the Monte-Carlo noise floor. specpipe --sample-test.",
+    "temp": 1.0,
+    "top_p": 1.0,
+    "draws_per_mode_per_stop": 140,
+    "stops": 12,
+    "high_entropy_stops_ge_1bit": 6,
+    "max_entropy_bits": 3.99,
+    "mean_tv_spec_vs_plain": 0.1905,
+    "mean_tv_noise_floor_plain_vs_plain": 0.1881,
+    "interpretation": "TV(spec,plain) == TV(plain,plain) noise floor to within 0.0024 — the spec-sampling output is statistically indistinguishable from plain target sampling. A lossy (e.g. greedy-biased) implementation would show TV(spec,plain) far above the floor; it does not.",
+    "verdict": "LOSSLESS on the real gpt-oss-120B distribution end-to-end through the WAN ring"
+  },
+  "proof_3_generation": {
+    "what": "Real multi-token generation on the live ring, same creative prompt, greedy vs two sampled seeds. Shows spec-sampling produces coherent, VARIED prose and adds NO speed penalty vs greedy on novel gen.",
+    "greedy_temp0": {"title": "The Light Between the Tides", "tok_s": 4.60},
+    "sampled_temp0.7_topp0.95_seed7": {"title": "The Fog-Keeper's Gift", "tok_s": 4.61},
+    "sampled_temp0.7_topp0.95_seed99": {"title": "The Light Between the Waves", "tok_s": 4.20},
+    "note": "Three distinct coherent stories (greedy deterministic; sampling varies by seed) at the same ~4.5 tok/s — sampling is free vs greedy here (novel gen is g~1 for both: the n-gram drafter has nothing to copy, the WAN g x RTT wall, not the sampler, is the speed limit)."
+  },
+  "nodes": [
+    {"role": "stage0 (head) + coordinator", "layer_range": [0, 9], "public_ip": "76.121.3.151", "geo": "Washington, US", "gpu_uuid": "GPU-f9b78874-79df-a74f-3574-b4af1740a69a", "gpu_name": "NVIDIA GeForce RTX 4090"},
+    {"role": "stage1", "layer_range": [9, 18], "public_ip": "159.48.242.15", "geo": "Minnesota, US", "gpu_uuid": "GPU-05e6d137-05ac-3366-b5a5-0693759aa011", "gpu_name": "NVIDIA GeForce RTX 4090"},
+    {"role": "stage2", "layer_range": [18, 27], "public_ip": "136.61.20.181", "geo": "North Carolina, US", "gpu_uuid": "GPU-3f6c65d0-6d2e-cc06-4d65-56c36a4bf30c", "gpu_name": "NVIDIA GeForce RTX 4090"},
+    {"role": "tail (stage3)", "layer_range": [27, 36], "public_ip": "71.104.167.38", "geo": "New Jersey, US", "gpu_uuid": "GPU-057e5b8c-4006-e925-4ba5-5fbe145eafeb", "gpu_name": "NVIDIA GeForce RTX 4090"}
+  ],
+  "topology": "N=4 even split (9 layers/box) across 4 distinct hosts/states (WA, MN, NC, NJ), longitude-ordered ring WA->MN->NC->NJ->return, all RTX 4090 24GB over WAN."
+}

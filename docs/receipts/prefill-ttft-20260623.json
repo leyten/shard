@@ -1,0 +1,24 @@
+{
+  "run_id": "prefill-ttft-20260623",
+  "utc": "2026-06-23",
+  "shard_commit": "f3fba2d05b88e965ccb0a01c46df136300375873",
+  "claim": "Pipelined prefill: keep prefill_depth chunks in flight so the N pipeline stages OVERLAP (stage 0 prefills chunk c+1 while stage 1 prefills chunk c). Each stage's chunk c+1 only needs that stage's own chunk-c KV (already local), so prefill is embarrassingly pipelineable. Cuts time-to-first-token vs the old one-chunk-at-a-time path (which waited a full ring traversal per chunk = zero overlap).",
+  "model": "gpt-oss-120b",
+  "quant": "mxfp4",
+  "topology": "N=4 even split (9 layers/box), 4 distinct hosts/states WA->MN->NC->NJ over WAN, all RTX 4090 24GB. Coordinator on the head (WA). prefill-chunk=4096.",
+  "measurements": {
+    "prompt_30k_tokens": {
+      "sequential_prefill_s": 105.6,
+      "pipelined_prefill_s": 55.0,
+      "speedup": 1.92
+    },
+    "prompt_110k_tokens": {
+      "sequential_prefill_s": 226.8,
+      "pipelined_prefill_s": 193.3,
+      "speedup": 1.17
+    }
+  },
+  "honesty": "Pipelining gives a real ~1.9x at 30k but only ~1.17x at 110k. Diagnosis: the inter-stage activation handoff (~24MB/chunk, h.cpu()->send->recv->to(dev)) is SYNCHRONOUS — a stage blocks on its forward send until the next stage drains the 24MB (larger than the socket buffer). At long context the per-chunk attention compute is large and the blocked send re-serializes the stages, collapsing the overlap. At 30k the per-chunk compute is small enough that overlap still shows. The fix is an ASYNC inter-stage sender (a per-stage send queue + background thread, so a stage computes chunk c+1 while chunk c ships) — identified, not yet built (it touches the production serve loop, deferred to avoid risking the verified greedy path). The <60s TTFT-at-100k bar (DEPLOY_READINESS §1) is NOT met on 4x4090 over WAN (193s). Reaching it needs async send + more stages (smaller per-stage compute/handoff) or Hopper FA3 cards; the speedup scales with stage count, which is the c0mpute scattered-GPU model.",
+  "also_note": "The even N=4 split (9 layers/box) is itself faster than the prior heterogeneous 18/9/9 split (where the 18-layer head was the bottleneck): 110k sequential here is 226.8s vs the prior ~556s (~180 tok/s, 18/9/9). Even split + pipelining together take 110k TTFT from ~556s to 193s (~2.9x), 30k to 55s.",
+  "verdict": "PARTIAL: ~1.9x at 30k (zero-overlap bug removed), ~1.17x at 110k (handoff-bound), <60s/100k bar NOT met on this hardware. Honest engine improvement + a precise diagnosis of the remaining limiter (async inter-stage send)."
+}
