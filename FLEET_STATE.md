@@ -42,7 +42,19 @@ than 60.8 — more stages doesn't beat the compute wall). #3 hot-standby — kil
 re-prefill 8.9s, failover blip ~32.6s (vs 131s cold; ~90s reload eliminated), request completed. libp2p —
 transport + engine-swap PROVEN (2MB round-trip 192ms; engines warm over libp2p), fresh full-ring gen blocked
 by vast SSH/daemon-launch flakiness (fleet-ops, not engine). One box (FL 42259376) leaked 19GB VRAM (unclean
-CUDA kill) — needs reset; destroyed with the rest. FLEET TORN DOWN after the commit (no idle spend).
+CUDA kill) — needs reset; destroyed with the rest. FLEET TORN DOWN.
+
+## Session 3c (libp2p re-validation, 3rd fleet) — TORN DOWN
+After 3b's libp2p gen was blocked, rented 4 fresh high-rel US boxes (CA·NV·IL·UT) to nail it. ROOT CAUSE
+was a self-inflicted `launch_libp2p.py` bug, NOT libp2p: `launch_sidecar` ran `pkill -f /tmp/sidecar` but the
+launch command string contains "/tmp/sidecar" → pkill self-matched + killed its own shell before the daemon
+started (the documented specpipe self-match footgun); + the health-check grepped "listening" when tunnel-mode
+sidecars log "tunnel up". Fixed both (fuser -k port instead of pkill; grep 'tunnel up|listening'; ssh-retry
+hardening; --model flag). RESULT: a fresh 3-stage 120B ring (IL·UT·CA) ran a full distributed gen over the
+libp2p sidecar (no PSK, per-node keys, async-send engine) — prefill 87.9s, 48 tok, coherent output, sha
+d74c32c4. (NV was the slow-download laggard, never joined; 3-stage sufficed.) HF anon-pull throttling made
+downloads crawl — wire HF_TOKEN into the bootstrap next time (token in session history, repo is public so
+keep it in a gitignored secret). All 4 destroyed. FLEET TORN DOWN (no idle spend).
 
 ## Session 2 (deploy-readiness: sampling / TTFT / fault tolerance) — TORN DOWN
 Rented 5 distinct-host scattered US 4090s (cuda-13.2.1-auto, `-p 29600:29600`): WA·MN·NC·NJ ring (even

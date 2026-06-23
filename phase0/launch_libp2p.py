@@ -49,29 +49,36 @@ def launch_sidecar(inst, announce, inbound, forwards):
     inb = f"-inbound {inbound}" if inbound else ""
     # proper detach (setsid bash -c '...' </dev/null >/dev/null 2>&1 &) — a bare setsid keeps the ssh
     # channel's fds and the daemon dies when ssh closes (the round-trip self-test only stayed up this way).
-    cmd = (f"pkill -f /tmp/sidecar 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
+    # NB: do NOT `pkill -f /tmp/sidecar` here — this command STRING contains "/tmp/sidecar", so pkill -f
+    # self-matches and kills the launching shell before the daemon starts (the documented specpipe footgun).
+    # Free the libp2p port instead (kills any old sidecar bound there; never matches the launch shell).
+    cmd = (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
            f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
            f"-announce {announce} {inb} {fw} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
-    for attempt in range(4):
+    for attempt in range(6):
         fire(inst, cmd)
-        time.sleep(3)
-        try:
-            r = rssh(inst, "grep -c listening /root/sidecar.log 2>/dev/null || echo 0", 20)
-            if r.returncode == 0 and r.stdout.strip().splitlines()[-1].strip() not in ("", "0"):
-                return True
-        except Exception:
-            pass
+        for _ in range(4):                              # tolerant verify: vast ssh rc=255 can flake the CHECK too
+            time.sleep(3)
+            try:
+                r = rssh(inst, "grep -cE 'tunnel up|listening' /root/sidecar.log 2>/dev/null || echo 0", 20)
+                if r.returncode == 0:
+                    last = r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else "0"
+                    if last not in ("", "0"):
+                        return True
+            except Exception:
+                pass
+        print(f"  sidecar {inst['id']} attempt {attempt+1} not up; relaunching", flush=True)
     print(f"  sidecar {inst['id']} FAILED to come up after retries", flush=True)
     return False
 
 
-def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send):
+def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send, model):
     head = " --served-head" if served_head else ""
     nxt = f" --next 127.0.0.1:{FWD_RING}" if stage < nstages - 1 else ""
     env = f"SHARD_TRANSPORT=libp2p" + (" SHARD_SYNC_SEND=1" if sync_send else "")
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 6; rm -f /root/stage.log /root/.shard_next_*; cd /root && "
-           f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} --model {M120} "
+           f"{env} setsid bash -c 'python3 specpipe.py --stage {stage} --nstages {nstages} --model {model} "
            f"--listen-port {ENG_IN}{nxt}{head} --fast --direct-return --max-ctx {max_ctx} "
            f"--timeout {timeout} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     fire(inst, cmd)
@@ -80,6 +87,7 @@ def launch_engine(inst, stage, nstages, served_head, max_ctx, timeout, sync_send
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--stages", required=True, help="comma ids, head first")
+    ap.add_argument("--model", default=M120, help="model path on the boxes (default the 120B; M20 for the 20B)")
     ap.add_argument("--max-ctx", type=int, default=16384)
     ap.add_argument("--prompt-file", default="/root/ft_prompt.txt")
     ap.add_argument("--prefill-chunk", type=int, default=4096)
@@ -119,7 +127,7 @@ def main():
             ok = False
             for attempt in range(2):
                 launch_engine(stages[k], k, nstages, served_head=(k == 0), max_ctx=a.max_ctx,
-                              timeout=a.edge_timeout, sync_send=a.sync_send)
+                              timeout=a.edge_timeout, sync_send=a.sync_send, model=a.model)
                 _, ok = warm_stage(stages[k], f"stage{k} {stages[k]['id']}")
                 if ok:
                     break
@@ -134,7 +142,7 @@ def main():
     print("[libp2p] running n-gram coordinator on head ...", flush=True)
     sync = " SHARD_SYNC_SEND=1" if a.sync_send else ""
     cmd = (f"cd /root && SHARD_TRANSPORT=libp2p{sync} python3 specpipe.py --coordinator --nstages {nstages} "
-           f"--model {M120} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
+           f"--model {a.model} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
            f"--next 127.0.0.1:{ENG_IN} --direct-return --tail 127.0.0.1:{FWD_RET} --prompt-file {a.prompt_file} "
            f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new} "
            f"--reasoning {a.reasoning} --timeout {a.edge_timeout} --dump /root/run.json 2>&1 | grep -viE 'INFO|WARNING|warn'")

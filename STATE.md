@@ -46,13 +46,14 @@ Fresh N=4 scattered US ring (IL·NV·CA·NJ, 4 distinct 4090 hosts). Two engine 
   request completed, continuation byte-preserved. `phase0/heal_hot.py`. (The ~20s of the 32.6 beyond detect+reprefill
   is the demo re-launching the coordinator — a harness artifact.) [receipt](docs/receipts/hot-standby-failover-20260623.json).
 
-- **libp2p re-validation — transport + engine-swap PROVEN; fresh gen blocked by fleet flakiness.** All the perf
-  runs above use raw-TCP+wire/PSK, not the libp2p sidecar. This session re-confirmed: cross-box libp2p works
-  (2 MiB round-trip NV→CA, 192ms, no PSK) and the engine runs over libp2p via `SHARD_TRANSPORT=libp2p` (swaps
-  `wire.py`→`shard/transport.py`; engines warmed over the sidecar tunnels). A fresh full-ring async-send gen
-  did NOT complete — blocked by vast SSH/daemon-launch flakiness on the multi-sidecar bring-up (orthogonal to
-  engine/transport). The June-19 receipt already proved the full ring over libp2p BIT-IDENTICAL at 44.79 tok/s,
-  and async-send is transport-agnostic (above `send_msg`). New: `phase0/launch_libp2p.py`.
+- **libp2p re-validation — DONE, fresh end-to-end gen over the real transport.** All the perf runs above use
+  raw-TCP+wire/PSK; this re-confirmed the engine on the *permissionless* transport. A fresh 3-stage 120B ring
+  (IL·UT·CA, scattered US) ran a full distributed generation over the **libp2p sidecar** (`SHARD_TRANSPORT=libp2p`,
+  per-node keys, **NO PSK**, async-send + pipelined coordinator): prefill 87.9s, 48 tok, **coherent output**
+  (sha d74c32c4…). 2.86 tok/s is a cold 3-stage / n-gram-no-accept floor — speed wasn't the question (the
+  optimized libp2p speed is June-19's 44.79 tok/s bit-identical); transport CORRECTNESS with the current engine
+  was, and it's confirmed. Earlier "blocked" attempts were a self-inflicted launcher bug (a `pkill -f` that
+  self-matched its own command + a health-check grepping the wrong string), now fixed. `phase0/launch_libp2p.py`.
   [receipt](docs/receipts/libp2p-revalidation-20260623.json).
 
 ## 2026-06-23 (session 2) — deploy-readiness: lossless sampling, faster TTFT, mid-request fault tolerance
