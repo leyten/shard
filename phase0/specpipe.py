@@ -1172,7 +1172,7 @@ def main():
                 import json, hashlib
                 ids = r["output_ids"]
                 rec = {"prompt": args.prompt, "model": args.model, "K": ks[-1], "depth": args.depth,
-                       "tok_s_warm": round(r["tok_s"], 2), "n_tokens": r["n_tokens"],
+                       "tok_s_warm": round(r["tok_s"], 2), "n_tokens": r["n_tokens"], "rounds": r.get("rounds"),
                        "prompt_tokens": r.get("prompt_tokens"), "prefill_s": round(r.get("prefill_s", 0.0), 2),
                        "prefill_depth": args.prefill_depth, "prefill_chunk": args.prefill_chunk,
                        "temp": args.temp, "top_p": args.top_p, "top_k": args.top_k, "seed": args.seed,

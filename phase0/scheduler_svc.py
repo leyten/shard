@@ -48,6 +48,98 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 # import the real solver — service lives in phase0/, scheduler in shard/
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from shard.scheduler import Scheduler, JoinedNode
+from shard.perf_store import PerfStore, DEFAULT_K
+from shard.throughput import best_ring
+
+# Module-level perf store: learns ms/layer, rtt, accept_rate from completed runs (POST
+# /telemetry) and feeds throughput-aware planning (POST /plan ... "objective":"tok_s").
+# Path set in main(); None -> in-memory only (tests inject their own).
+PERF = PerfStore()
+
+
+def plan_tok_s(req: dict) -> dict:
+    """throughput-aware plan: choose the SUBSET + ORDER of nodes maximizing predicted tok/s.
+
+    Same request shape as plan(), plus optional "K" and "accept_rate" overrides. Uses the
+    module PERF store for ms/layer + accept_rate (GPU-class priors when cold); the rtt mesh
+    still comes from the caller's measured node rtt_ms (the orchestrator's probe phase). Falls
+    back to the latency-only plan() when the pool has <=1 feasible node (nothing to choose).
+    """
+    model = req["model"]
+    total_layers = int(req["total_layers"])
+    gb_per_layer = float(req["gb_per_layer"])
+    kv_gb = float(req.get("kv_gb_per_layer", 0.0))
+    headroom = float(req.get("headroom_gb", 2.0))
+    boundary = float(req.get("boundary_gb", 1.0))
+    nodes = req["nodes"]
+    if not nodes:
+        raise ValueError("no nodes")
+    K = int(req.get("K", DEFAULT_K))
+    accept_rate = float(req.get("accept_rate", PERF.accept_for(model)))
+
+    node_ids = [n["node_id"] for n in nodes]
+    vram = {n["node_id"]: float(n["vram_gb"]) for n in nodes}
+    # latency mesh in index space (caller-measured rtt; cold edges via PERF fallback)
+    rtt_of = {n["node_id"]: {k: float(v) for k, v in (n.get("rtt_ms") or {}).items()}
+              for n in nodes}
+
+    def L_at(a_id, b_id):
+        r = rtt_of.get(a_id, {})
+        return r.get(b_id, PERF.rtt_for(a_id, b_id))
+
+    L = [[0.0 if a == b else L_at(node_ids[a], node_ids[b]) for b in range(len(node_ids))]
+         for a in range(len(node_ids))]
+    # coordinator entry/return hops: with the coordinator co-located on the head stage, the
+    # entry/return hops are intra-box (~0). best_ring picks the head; keep these ~0 so the
+    # score reflects the inter-stage WAN + compute, which is what actually gates tok/s.
+    c_out = [0.0] * len(node_ids)
+    c_in = [0.0] * len(node_ids)
+
+    def allocate_fn(subset_ids):
+        """fit the model across exactly subset_ids; None if it can't hold it."""
+        sub = Scheduler(model, total_layers)
+        for nid in subset_ids:
+            sub.register(JoinedNode(node_id=nid, vram_gb=vram[nid], rtt_ms={}))
+        try:
+            alloc = sub.allocate(gb_per_layer, kv_gb, headroom, boundary)
+        except Exception:
+            return None
+        return {nid: (lr.end - lr.start) for nid, lr in alloc.items()}
+
+    best = best_ring(
+        node_ids, vram, L, c_out, c_in,
+        allocate_fn=allocate_fn,
+        ms_per_layer=PERF.ms_map(node_ids),
+        draft_ms_by_node={nid: 0.0 for nid in node_ids},   # draft cost folded into accept model
+        accept_rate=accept_rate, K=K, total_layers=total_layers,
+        max_stages=req.get("max_stages"),
+    )
+    if not best:
+        raise ValueError(f"insufficient VRAM: no subset of {len(node_ids)} nodes holds {model}")
+
+    ring = best["ring_order"]
+    layers = best["layers"]
+    stages, cur = [], 0
+    for nid in ring:
+        c = layers.get(nid, 0)
+        if c == 0:
+            continue
+        stages.append({"stage": len(stages), "node_id": nid, "lo": cur, "hi": cur + c,
+                       "n_layers": c})
+        cur += c
+    if cur != total_layers:
+        raise ValueError(f"coverage gap: tiled {cur} layers != model {total_layers}")
+
+    return {
+        "ok": True,
+        "model": model,
+        "objective": "tok_s",
+        "coordinator": best["coordinator"],
+        "ring_order": [s["node_id"] for s in stages],
+        "stages": stages,
+        "est_tok_s": round(best["tok_s"], 2),
+        "est_round_ms": round(best["round_ms"], 2),
+    }
 
 
 def plan(req: dict) -> dict:
@@ -123,8 +215,21 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(b)
 
     def do_POST(self):
+        if self.path == "/telemetry":
+            try:
+                n = int(self.headers.get("Content-Length", 0))
+                rec = json.loads(self.rfile.read(n) or b"{}")
+            except Exception as e:
+                self._send(400, {"ok": False, "error": f"bad json: {e}"})
+                return
+            try:
+                PERF.observe_run(rec)
+                self._send(200, {"ok": True})
+            except Exception as e:
+                self._send(400, {"ok": False, "error": f"bad telemetry: {e}"})
+            return
         if self.path != "/plan":
-            self._send(404, {"ok": False, "error": "POST /plan"})
+            self._send(404, {"ok": False, "error": "POST /plan or /telemetry"})
             return
         try:
             n = int(self.headers.get("Content-Length", 0))
@@ -133,7 +238,12 @@ class Handler(BaseHTTPRequestHandler):
             self._send(400, {"ok": False, "error": f"bad json: {e}"})
             return
         try:
-            self._send(200, plan(req))
+            # objective=tok_s -> throughput-aware selection; default stays latency-only plan()
+            # so existing callers are byte-identical. tok_s falls back to plan() on a 1-node pool.
+            if req.get("objective") == "tok_s" and len(req.get("nodes") or []) > 1:
+                self._send(200, plan_tok_s(req))
+            else:
+                self._send(200, plan(req))
         except ValueError as e:
             self._send(400, {"ok": False, "error": str(e)})
         except KeyError as e:
@@ -155,9 +265,17 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=8088)
     ap.add_argument("--host", default="127.0.0.1")
+    ap.add_argument("--perf-store", default=os.environ.get("SHARD_PERF_STORE", ""),
+                    help="JSON file to persist learned ms/layer + rtt + accept across restarts")
     a = ap.parse_args()
+    if a.perf_store:
+        global PERF
+        PERF = PerfStore(a.perf_store)
+        print(f"perf store: {a.perf_store} "
+              f"({len(PERF.ms_per_layer)} nodes, {len(PERF.rtt)} edges learned)", flush=True)
     srv = ThreadingHTTPServer((a.host, a.port), Handler)
-    print(f"scheduler_svc on {a.host}:{a.port} (POST /plan, GET /health)", flush=True)
+    print(f"scheduler_svc on {a.host}:{a.port} (POST /plan, POST /telemetry, GET /health)",
+          flush=True)
     srv.serve_forever()
 
 
