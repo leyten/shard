@@ -61,10 +61,11 @@ M25_KV_FP8 = os.environ.get("M25_KV_FP8", "0") != "0"
 # torch has no index_copy_/scatter_ kernel for Float8_e4m3fn on CUDA, so STORE the fp8 cache as raw uint8 bytes
 # (which DO support the scatter/index ops) and bit-reinterpret to fp8 only for the dequant-on-read.
 _KVDT = torch.uint8 if M25_KV_FP8 else torch.bfloat16
-def _kv_enc(t):   # bf16 activation -> storage dtype (fp8 bytes as uint8, or bf16 passthrough)
-    return t.to(torch.float8_e4m3fn).view(torch.uint8) if M25_KV_FP8 else t
-def _kv_dec(t):   # storage slice -> bf16 for SDPA/matmul
-    return t.view(torch.float8_e4m3fn).to(torch.bfloat16) if M25_KV_FP8 else t.to(torch.bfloat16)
+_F8MAX = 448.0                                       # float8_e4m3fn max finite; clamp to avoid NaN (V is unnormed)
+def _kv_enc(t):   # bf16 activation -> storage dtype (clamped fp8 bytes as uint8, or bf16 passthrough)
+    return t.clamp(-_F8MAX, _F8MAX).to(torch.float8_e4m3fn).view(torch.uint8) if M25_KV_FP8 else t
+def _kv_view(buf):   # reinterpret the FULL contiguous buffer as fp8 for read-slicing (slice.view() on a
+    return buf.view(torch.float8_e4m3fn) if M25_KV_FP8 else buf   # non-contiguous slice gives bad strides -> CUDA assert
 
 
 def _bucket(need):                                  # smallest decode bucket >= need, clamped to MAXLEN
@@ -293,7 +294,7 @@ class Layer:
         self.bkc[b:b + 1].index_copy_(2, cp, _kv_enc(k)); self.bvc[b:b + 1].index_copy_(2, cp, _kv_enc(v))   # b:b+1 view → row b (fp8 bytes if M25_KV_FP8)
         with sdpa_kernel(_SDPA_BACKENDS):
             o = torch.nn.functional.scaled_dot_product_attention(
-                q, _kv_dec(self.bkc[b:b + 1, :, :total]), _kv_dec(self.bvc[b:b + 1, :, :total]),
+                q, _kv_view(self.bkc)[b:b + 1, :, :total].to(torch.bfloat16), _kv_view(self.bvc)[b:b + 1, :, :total].to(torch.bfloat16),
                 attn_mask=causal_lower_right(s, total), scale=SCALING, enable_gqa=True)
         return lin(o.transpose(1, 2).reshape(1, s, NH * HD), self.o_proj)
 
@@ -316,7 +317,7 @@ class Layer:
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
         self.bkc[:B].scatter_(2, idx, _kv_enc(k)); self.bvc[:B].scatter_(2, idx, _kv_enc(v))   # per-stream scatter into rows [0,B) (fp8 bytes if M25_KV_FP8)
         alen = _bucket(int(starts.max().item()) + s)
-        kk = _kv_dec(self.bkc[:B, :, :alen]).repeat_interleave(GRP, 1); vv = _kv_dec(self.bvc[:B, :, :alen]).repeat_interleave(GRP, 1)   # dequant on read
+        kk = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1); vv = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)   # dequant on read
         cols = torch.arange(alen, device=dev).view(1, 1, alen)
         amask = torch.where(cols <= cp[:, :, None], 0.0, float("-inf")).to(torch.bfloat16)[:, None]  # [B,1,s,alen]
         a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + amask
