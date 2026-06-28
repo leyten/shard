@@ -1,5 +1,24 @@
 # Deploy-readiness — what's left to make the engine usable & deployable
 
+> ## ⓘ CURRENT MODEL = MiniMax-M2.5 (the body below is gpt-oss-120B-era history, kept for reference)
+> Served model pivoted to **MiniMax-M2.5-NVFP4** (229B-A10B, 62L GQA) on 2026-06-25. M2.5 deploy status:
+>
+> | Capability | Status (warm, 5×5090 EU libp2p ring) |
+> |---|---|
+> | Tool calling | ✅ PASS |
+> | Multi-turn (9-turn recall) | ✅ PASS |
+> | **Long-context (the niche product)** | ✅ **OOM FIXED 2026-06-28** — 28.7k-token prefill no-OOM (SDPA, flash+cudnn on sm_120), needle retrieved at ~14k depth |
+> | Signed per-stage receipts | ✅ PASS (coverage [0:62], all sigs valid) |
+> | Lossless spec sampling | ✅ (from gpt-oss work, transport-agnostic) |
+> | Warm throughput | 20.63 tok/s short-ctx (session 6); 6.36 tok/s long-ctx decode |
+>
+> **Remaining M2.5 engine work (approved plan):** Phase 3 throughput (StaticKV + CUDA-graph — long-ctx
+> decode is WAN-bound at 6.36 tok/s), Phase 4 fault-tolerance port to m25_pipe, Phase 5 multi-request
+> concurrency. Network/PAY/challenge = c0mpute-side. Receipts: `docs/receipts/m25-usability-20260628.json`.
+> Runbook: `phase0/DEPLOY_M25.md`.
+
+---
+
 Status after 2026-06-23: the concrete bar is met (28.2 tok/s decode at >100k on a copy/retrieval
 task, 3-node WA/WA/TX WAN swarm, greedy-exact, signed per-stage receipts live — see STATE.md). This
 is the honest gap list between "works in a niche" and "deployable general engine."
