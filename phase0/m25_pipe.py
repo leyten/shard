@@ -336,6 +336,15 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
                             send_msg(ret, msg.get("receipts", [])); continue
+                        if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
+                            for L in layers: L.reset()
+                            send_msg(ret, "ok"); continue
+                        if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
+                            h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), msg["h"].to(dev), vcfg)
+                            send_msg(ret, _tail_logits(h, parts).argmax(-1).tolist()); continue
+                        if msg.get("prefill"):              # prefill one stream into its row b -> per-pos argmax [L]
+                            h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], msg["h"].to(dev), vcfg)
+                            send_msg(ret, _tail_logits(h, parts).argmax(-1)[0].tolist()); continue
                         x = msg["h"].to(dev)
                         h = _block(graph_runners, layers, msg["start"], x, vcfg)
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
@@ -371,6 +380,23 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                         send_msg(nxt_sock, msg); continue
+                    if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
+                        for L in layers: L.reset()
+                        send_msg(nxt_sock, msg); continue
+                    if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
+                        if parts["head"]:
+                            h = torch.nn.functional.embedding(torch.tensor(msg["token_ids_b"], device=dev), parts["embed_w"])
+                        else:
+                            h = msg["h"].to(dev)
+                        h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
+                        send_msg(nxt_sock, {"op": "verify_batch", "h": h.cpu(), "start_b": msg["start_b"]}); continue
+                    if msg.get("prefill"):                      # prefill one stream into its row b (head embeds)
+                        if parts["head"]:
+                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                        else:
+                            h = msg["h"].to(dev)
+                        h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
+                        send_msg(nxt_sock, {"op": "verify", "stream": msg["stream"], "h": h.cpu(), "start": msg["start"], "prefill": True}); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
@@ -541,6 +567,9 @@ if __name__ == "__main__":
     a = ap.parse_args()
 
     def _ilist(s): return [int(x) for x in s.split(",") if x.strip()] if s else None
+
+    if os.environ.get("SHARD_TRANSPORT") != "libp2p":   # raw-wire mode: load the PSK before any send/recv (libp2p sidecar self-seals)
+        import wire; wire.key_from_env()
 
     if a.role == "stage":
         serve(a.stage, a.nstages, a.lo, a.hi, a.port, a.next, a.timeout)
