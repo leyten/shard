@@ -9,7 +9,7 @@ via the 29612 return tunnel.
   python m25_scatter_pipe.py --order CA:42545183:0:10 WA:..:10:23 MN:..:23:36 NJ:..:36:49 NC:..:49:62 \
       --K 6 --depth 4 --max-new 256 --prompt-file /root/copy_prompt.txt
 """
-import sys, json, time, subprocess, argparse
+import os, sys, json, time, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
@@ -66,7 +66,7 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, ba
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} M25_KV_FP8={os.environ.get('M25_KV_FP8','0')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
