@@ -1033,6 +1033,8 @@ def main():
     ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
     ap.add_argument("--tree-fast", default="", help="coordinator: FAST graphed tree spec 'w,d' (cold+warm)")
     ap.add_argument("--dump", default="", help="--pipe: write {prompt, output_ids, tok_s} JSON here (for the receipt)")
+    ap.add_argument("--receipts-out", default="", help="--pipe + --receipts: write the verified per-stage receipts "
+                    "as {ok, receipts:[...]} JSON here (the c0mpute worker forwards this to the orchestrator)")
     ap.add_argument("--prompt", default="Explain decentralized computing in two sentences.")
     ap.add_argument("--max-new", type=int, default=128)
     ap.add_argument("--timeout", type=float, default=120.0)
@@ -1202,6 +1204,11 @@ def main():
                 except Exception as e:
                     ok = False; print(f"  coverage FAILED: {e}", flush=True)
                 print(f"[coord] PROVE verdict: {'ALL receipts valid + full layer coverage — coordinator cannot fabricate, no node paid without proving its block' if ok else 'FAILED'}", flush=True)
+                if args.receipts_out:                      # c0mpute bridge: emit the verified receipts as JSON
+                    import json as _rjson                    # the worker forwards this to the orchestrator on job:complete
+                    bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in recs]
+                    _rjson.dump({"ok": ok, "receipts": bodies}, open(args.receipts_out, "w"))
+                    print(f"[coord] wrote {len(bodies)} receipts -> {args.receipts_out}", flush=True)
             print(f"\n[coord] === OUTPUT ===\n{r['text']}\n", flush=True)
             return
         ks = [int(x) for x in args.sweep.split(",")] if args.sweep else [args.K]
