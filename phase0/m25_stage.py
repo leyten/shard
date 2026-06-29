@@ -53,6 +53,19 @@ M25_KV_MAXLEN = int(os.environ.get("M25_KV_MAXLEN", "40960"))
 # pattern, proven bit-exact), the MoE runs PER STREAM (NVFP4 MoE is token-count non-invariant), prefill
 # writes one row. Each stream's output is byte-identical to solo. Default 1 (single-stream path untouched).
 M25_BATCH = int(os.environ.get("M25_BATCH", "1"))
+# Batched MoE (opt-in M25_BATCH_MOE=1, default OFF): in batched decode run ONE grouped-GEMM over ALL
+# B*(K+1) tokens instead of the per-stream loop (B separate calls over K+1 tokens each). Decode is
+# weight-read-bound, so the per-stream loop re-reads the 256 NVFP4 expert weights B times per layer AND
+# runs the heavy grouped-GEMM machinery on a wasteful ~9-token batch B*nlayers times per traversal — the
+# GPU-bound cliff that collapses batched serving at context (per-stream MoE GPU grows ~linearly with B).
+# Batched: the expert weights are read ONCE and reused across all B streams' tokens (~B x fewer reads),
+# and one well-utilized grouped GEMM replaces B tiny ones. The MoE is mathematically per-token (no
+# cross-token reduction) so every token's OUTPUT is a valid MoE output either way; the cost is that the
+# NVFP4 cutlass kernel SCHEDULE (tile/Split-K, picked by per-expert token count) varies with batch
+# composition -> a stream's bytes are no longer reproducible-in-isolation (challenger needs the batch),
+# so this trades the per-stream bit-exact RECEIPT for throughput. Restoring both = a batch-INVARIANT
+# grouped GEMM (moe_align_block_size + SPLIT_K=1), the follow-up. Default OFF keeps the verifiable path.
+M25_BATCH_MOE = os.environ.get("M25_BATCH_MOE", "0") != "0"
 # Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
 # context/streams that fit) and dequant to bf16 just before SDPA/matmul (no fp8-attention kernel needed — we
 # own the read). fp8 is float (relative precision ~6%), and K/V are post-RMSNorm O(1) so no scale is needed;
@@ -116,8 +129,8 @@ def vllm_ctx():
     torch.cuda.set_device(0)
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="nccl")
     vcfg = VllmConfig()
-    try:
-        vcfg.kernel_config.moe_backend = "cutlass"
+    try:                                              # cutlass (native FP4, fast, NON-invariant) | emulation (Triton in-kernel dequant: amortizing + batch-INVARIANT under VLLM_BATCH_INVARIANT=1, sm_120, NVFP4 footprint) | marlin
+        vcfg.kernel_config.moe_backend = os.environ.get("M25_MOE_BACKEND", "cutlass")
     except Exception as e:
         print("warn moe_backend:", e, flush=True)
     ctx = set_current_vllm_config(vcfg); ctx.__enter__()
@@ -341,8 +354,13 @@ class Layer:
             o = torch.cat(outs, 0)
         return lin(o.transpose(1, 2).reshape(B, s, NH * HD), self.o_proj)
 
-    def mlp_b(self, x):                                                            # per-stream MoE (token-count invariance)
-        return torch.cat([self.mlp(x[b:b + 1]) for b in range(x.shape[0])], 0)
+    def mlp_b(self, x):                                                            # [B,s,H] -> [B,s,H]
+        if M25_BATCH_MOE:                                                          # ONE grouped GEMM over all B*s tokens (amortizes expert-weight reads ~B x; trades per-stream bit-exactness)
+            B, s, _ = x.shape
+            h = x.reshape(B * s, H)
+            rl = torch.nn.functional.linear(h, self.gate)
+            return self.moe(h, rl).view(B, s, H)
+        return torch.cat([self.mlp(x[b:b + 1]) for b in range(x.shape[0])], 0)     # per-stream MoE (token-count invariant -> verifiable, but B x the weight reads)
 
     def forward_prefill_b(self, x, b, start, pe):
         cos, sin = pe

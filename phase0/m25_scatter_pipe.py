@@ -66,7 +66,7 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, ba
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} M25_KV_FP8={os.environ.get('M25_KV_FP8','0')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} M25_BATCH_MOE={os.environ.get('M25_BATCH_MOE','0')} M25_KV_FP8={os.environ.get('M25_KV_FP8','0')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
@@ -99,6 +99,7 @@ def main():
     ap.add_argument("--prefill-chunk", type=int, default=512)
     ap.add_argument("--validate", action="store_true"); ap.add_argument("--receipts", action="store_true")
     ap.add_argument("--serve", action="store_true", help="deploy mode: after warm, start the OpenAI /v1 gateway on the head (persistent) instead of a one-shot coord job")
+    ap.add_argument("--warm-only", action="store_true", help="warm stages+sidecars then STOP (no coord/gateway) so a measurement tool can run as the SOLE first coordinator on the head box")
     ap.add_argument("--batch", type=int, default=1, help="continuous batching: stages allocate [B,...] KV (M25_BATCH); warm the ring with --serve then drive coordinate_pipe_batch")
     ap.add_argument("--kv-maxlen", type=int, default=0, help="cap M25_KV_MAXLEN (batched KV is B*MAXLEN per layer; 40960 default OOMs the tail at B>=4)")
     a = ap.parse_args()
@@ -143,6 +144,12 @@ def main():
             return
 
     head = nodes[0]
+    if a.warm_only:                               # warm + STOP: run the measurement as the sole coordinator on the head (nxt_sock breaks if anything connects first)
+        print(f"[pipe] WARM-ONLY — ring up. Drive it as the SOLE coordinator ON the head box:", flush=True)
+        print(f"  ssh -i {KEY} -p {head['port']} root@{head['host']}", flush=True)
+        print(f"  SHARD_TRANSPORT=libp2p HEAD_PORT={ENG_IN} TAIL_PORT={FWD_RET} M25_DIR=/root/m25 /root/venv/bin/python -u /root/m25_ctx_table.py", flush=True)
+        print(f"HEAD_SSH {head['host']}:{head['port']}", flush=True)
+        return
     if a.serve:                                   # DEPLOY: start the OpenAI /v1 gateway on the head over the warm ring
         GW = 18000
         rc = "SHARD_RECEIPTS=1 " if a.receipts else ""

@@ -194,7 +194,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     prompts = [render_ids(tok, m, tools=tools) for m in messages_list]
     mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
-    t_recv = 0.0; t0 = time.time()
+    t_recv = 0.0; t_pf = time.time()
     send_msg(pipe_sock, {"op": "reset_batch", "B": B}); recv_msg(rx)
     for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
         gen = prompts[b]
@@ -209,6 +209,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         pos[b] = len(gen); out[b] = [cur[b]]
         if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
         drafters[b].request(prompts[b] + [cur[b]], K)
+    prefill_s = time.time() - t_pf; t0 = time.time()        # start the DECODE-rate timer after prefill (matches coordinate_pipe; agg_tok_s is steady-state decode, not TTFT-polluted)
     # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
     # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
     # Each round speculatively advances ALL B streams; on a stream's divergence we drop that stream's stale
@@ -260,7 +261,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
                     "text": tok.decode(o, skip_special_tokens=True)})
     return {"streams": res, "B": B, "rounds": rounds, "depth": depth, "wasted": wasted, "dt": dt,
-            "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
+            "prefill_s": prefill_s, "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
 def _load(stage, nstages, lo, hi):
