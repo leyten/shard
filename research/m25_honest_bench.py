@@ -7,13 +7,14 @@ reasoning-vs-content token split — so the cost of the <think> block is explici
 Categories span the real workload mix: novel reasoning/math (n-gram-dead), open chat, draftable code-edit &
 RAG-quote (n-gram-friendly), and an agentic tool-call. Run on the head box as the SOLE coordinator:
   SHARD_TRANSPORT=libp2p HEAD_PORT=29610 TAIL_PORT=29612 M25_DIR=/root/m25 python -u m25_honest_bench.py
+Add M25_EAGLE=1 M25_EAGLE_DIR=/root/m25-eagle to swap the n-gram drafter for the n-gram+EAGLE-3 hybrid
+(needs the coordinator process to see a GPU — CUDA_VISIBLE_DEVICES — for the head + M2.5 embed).
 """
 import socket, os, time
 import m25_stage as S
 import m25_pipe as P
 from m25_tools import parse_completion, THINK_END
 from transformers import AutoTokenizer
-from ngram_draft import NgramDrafter
 
 tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 HEAD = ("127.0.0.1", int(os.environ.get("HEAD_PORT", "29610")))
@@ -46,7 +47,7 @@ K = 8; MAXNEW = 256
 
 
 def run(messages, tools):
-    dr = NgramDrafter(ng=3)
+    dr = P.make_drafter(3)                                      # n-gram, or HybridDrafter when M25_EAGLE=1
     st = {"ttft": None, "visible": None}
     t0 = time.time()
     def on_commit(out, dt):
@@ -59,7 +60,8 @@ def run(messages, tools):
     return r, st
 
 
-print(f"=== HONEST single-stream, REASONING ON, K={K} depth=4 (n-gram baseline) ===", flush=True)
+DRAFTER = "n-gram+EAGLE hybrid" if S.M25_EAGLE else "n-gram baseline"
+print(f"=== HONEST single-stream, REASONING ON, K={K} depth=4 ({DRAFTER}) ===", flush=True)
 print(f"{'category':>13} {'p_tok':>6} {'tok/s':>6} {'accept':>7} {'g':>5} {'prefill':>8} {'ttft':>6} {'visible':>8} {'think':>6} {'answer':>7}", flush=True)
 agg_tok = 0; agg_t = 0.0
 for name, m, tools in TASKS:
@@ -71,5 +73,5 @@ for name, m, tools in TASKS:
     agg_tok += r["n_tokens"]; agg_t += r["n_tokens"] / max(r["tok_s"], 1e-9)
     print(f"{name:>13} {r['prompt_tokens']:>6} {r['tok_s']:>6.1f} {r['mean_accept']/K*100:>6.0f}% {r['toks_per_traversal']:>5.1f} "
           f"{r['prefill_s']:>7.1f}s {st['ttft'] or 0:>5.1f}s {vis:>8} {rtok:>6} {atok:>7}", flush=True)
-print(f"\n[honest] decode-weighted mean tok/s = {agg_tok/max(agg_t,1e-9):.1f}  (reasoning-ON, n-gram only)", flush=True)
+print(f"\n[honest] decode-weighted mean tok/s = {agg_tok/max(agg_t,1e-9):.1f}  (reasoning-ON, {DRAFTER})", flush=True)
 print("[honest] done", flush=True)

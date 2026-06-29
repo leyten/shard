@@ -76,6 +76,37 @@ def _eagle_seed(aux, pos):
     return _t.stack([aux[str(li)][pos] for li in S.EAGLE_AUX_LAYER_IDS], 0)
 
 
+_EAGLE = None
+
+
+def _eagle_singleton():
+    """Build the EagleDrafter ONCE (load the EAGLE-3 head + M2.5 embed_tokens onto the coordinator GPU)
+    and reuse it across jobs — its only per-job state (_aux/_pending) is overwritten by set_hidden()/
+    request() each prefill, so back-to-back jobs stay clean. The embed (200064x3072 bf16 ~1.2GB) + the
+    0.2B head fit alongside whatever else shares the coordinator GPU. M25_EAGLE_DIR = the head checkpoint."""
+    global _EAGLE
+    if _EAGLE is None:
+        from eagle_draft import EagleDrafter
+        eagle_dir = os.environ.get("M25_EAGLE_DIR", "/root/m25-eagle")
+        embed = S.raw("model.embed_tokens.weight").to(torch.bfloat16).to(dev)
+        _EAGLE = EagleDrafter(eagle_dir, embed, device=dev)
+        print(f"[eagle] head loaded from {eagle_dir} + M2.5 embed on {dev}", flush=True)
+    return _EAGLE
+
+
+def make_drafter(ngram_n=3):
+    """Coordinator-side drafter factory — ONE place so coord/_validate/sweep, the gateway, and the honest
+    benchmark all build the same thing from the same env. Plain NgramDrafter by default; when M25_EAGLE=1,
+    a HybridDrafter (n-gram-first on draftable text -> EAGLE-3 on novel/reasoning misses). The EagleDrafter
+    is the shared singleton; the n-gram half is fresh per job (clean index)."""
+    from ngram_draft import NgramDrafter
+    ng = NgramDrafter(ng=ngram_n)
+    if not S.M25_EAGLE:
+        return ng
+    from eagle_draft import HybridDrafter
+    return HybridDrafter(ng, _eagle_singleton())
+
+
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
@@ -487,9 +518,9 @@ def _sweep_summary(rows):
 def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk, tools=None):
     """One coordinate_pipe job with a FRESH drafter (clean n-gram state per config). Sockets are
     reused across jobs — coordinate_pipe drains in-flight + opens each job with `reset`, which clears
-    every stage's KV, so back-to-back jobs on the same ring are clean."""
-    from ngram_draft import NgramDrafter
-    drafter = NgramDrafter(ng=ngram_n)
+    every stage's KV, so back-to-back jobs on the same ring are clean. make_drafter adds the EAGLE
+    hybrid when M25_EAGLE=1."""
+    drafter = make_drafter(ngram_n)
     return coordinate_pipe(pipe, tok, messages, k, max_new, timeout, d, ret_sock=ret,
                            local_draft=drafter, tools=tools, prefill_chunk=prefill_chunk, max_ctx=131072)
 

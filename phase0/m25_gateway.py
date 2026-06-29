@@ -32,18 +32,17 @@ RING_LOCK = threading.Lock()   # the ring is single-stream: one generation at a 
 A = None
 tok = None
 coordinate_pipe = None
-NgramDrafter = None
+make_drafter = None
 SOCKS = {}
 
 
 def _engine_init():
     """Import the M2.5 engine + tokenizer and resolve head/tail endpoints (real mode only)."""
-    global tok, coordinate_pipe, NgramDrafter
+    global tok, coordinate_pipe, make_drafter
     import m25_stage as S
-    from m25_pipe import coordinate_pipe as cp
-    from ngram_draft import NgramDrafter as ND
+    from m25_pipe import coordinate_pipe as cp, make_drafter as md
     from transformers import AutoTokenizer
-    coordinate_pipe = cp; NgramDrafter = ND
+    coordinate_pipe = cp; make_drafter = md
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 
 
@@ -69,7 +68,7 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
         try:
             if "pipe" not in SOCKS or attempt == 2:
                 _connect(timeout)
-            drafter = NgramDrafter(ng=A.ngram_n)
+            drafter = make_drafter(A.ngram_n)
             return coordinate_pipe(SOCKS["pipe"], tok, messages, A.K, max_new, timeout, A.depth,
                                    ret_sock=SOCKS["ret"], local_draft=drafter, tools=tools,
                                    prefill_chunk=4096, max_ctx=A.max_ctx, on_commit=on_commit, reasoning=reasoning)
