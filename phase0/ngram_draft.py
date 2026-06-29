@@ -47,6 +47,7 @@ class NgramDrafter:
         self.indexed = 0             # committed positions < this are in `table`
         self.table = {}              # ng-token anchor -> LIST of continuation-start positions (chronological)
         self._pending = None         # snapshotted (ids, k) between request() and fetch()
+        self.matched = False         # did the LAST propose() find a real longest-match? (HybridDrafter routing)
 
     # ---- async-draft-socket shim ------------------------------------------------
     def request(self, ids, k):
@@ -73,6 +74,7 @@ class NgramDrafter:
     def propose(self, seq, k):
         self._sync(seq)
         n = len(seq)
+        self.matched = False                     # default: no real match (HybridDrafter -> EAGLE on a miss)
         if n < self.ng:                          # not enough context yet -> plain decode
             return [seq[-1] if seq else 0] * k
         cands = self.table.get(tuple(seq[n - self.ng:n]))
@@ -95,6 +97,7 @@ class NgramDrafter:
                     break
         if best_p is None:
             return [seq[-1]] * k
+        self.matched = True                      # real longest-match -> draftable, keep depth-pipelining
         cont = seq[best_p:best_p + k]
         if len(cont) < k:                        # ran off the end -> pad (pads get rejected, harmless)
             cont = cont + [cont[-1] if cont else seq[-1]] * (k - len(cont))
