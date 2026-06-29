@@ -66,15 +66,23 @@ M25_BATCH = int(os.environ.get("M25_BATCH", "1"))
 # so this trades the per-stream bit-exact RECEIPT for throughput. Restoring both = a batch-INVARIANT
 # grouped GEMM (moe_align_block_size + SPLIT_K=1), the follow-up. Default OFF keeps the verifiable path.
 M25_BATCH_MOE = os.environ.get("M25_BATCH_MOE", "0") != "0"
-# EAGLE hybrid drafter (opt-in M25_EAGLE=1): capture the target's auxiliary hidden states at layers
-# [1,30,58] (what the EAGLE-3 draft head consumes) during each ring traversal so the coordinator's
-# EagleDrafter can predict the next tokens on NOVEL/reasoning text (where the n-gram drafter is blind).
-# The captured states ride the existing forward->return path to the coordinator (NO extra round-trip).
-# A stage records ONLY the aux layers in its own [lo,hi) range; serve() threads them forward; the tail
-# returns them with the verify result. Default OFF (the n-gram-only path is untouched).
+# EAGLE hybrid drafter (opt-in M25_EAGLE=1): capture the target's auxiliary hidden states (what the
+# EAGLE-3 draft head consumes) during each ring traversal so the coordinator's EagleDrafter can predict
+# the next tokens on NOVEL/reasoning text (where the n-gram drafter is blind). The captured states ride
+# the existing forward->return path to the coordinator (NO extra round-trip). A stage records ONLY the
+# aux layers in its own [lo,hi) range; serve() threads them forward; the tail returns them with the
+# verify result. Default OFF (the n-gram-only path is untouched).
+#
+# INDEX CONVENTION (was an off-by-one bug — fixed 2026-06-29 after the on-engine accept~0 result): the
+# head config's `eagle_aux_hidden_state_layer_ids` = [1,30,58] are vLLM AUX-LIST indices, where index 0
+# is the EMBEDDING output and index K+1 is the OUTPUT of decoder layer K (vLLM's target forward appends
+# the embed at index 0, then idx+1 after each layer — see vllm/model_executor/models/llama.py). So
+# [1,30,58] means post-layer-{0,29,57}, NOT post-layer-{1,30,58}. We capture layer L's output and key it
+# by its vLLM index (L.li+1), so _AUX/_eagle_seed line up with the head's fc. To A/B the OLD (wrong)
+# capture on a live ring, set M25_EAGLE_AUX=2,31,59 (= post-layer-{1,30,58}). KEEP empirically verifying.
 M25_EAGLE = os.environ.get("M25_EAGLE", "0") != "0"
-EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]
-_AUX = {}                                            # li -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
+EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]   # vLLM aux-list indices (embed=0, post-layer-K = K+1)
+_AUX = {}                                            # vLLM-index -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
 # Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
 # context/streams that fit) and dequant to bf16 just before SDPA/matmul (no fp8-attention kernel needed — we
 # own the read). fp8 is float (relative precision ~6%), and K/V are post-RMSNorm O(1) so no scale is needed;
@@ -408,8 +416,8 @@ def run_block(layers, start_pos, h, vcfg):
     with torch.no_grad(), set_forward_context(None, vcfg):
         for L in layers:
             h = L.forward(h, start_pos, pe)
-            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # snapshot this aux layer's output (single-stream [1,s,H]) for the EAGLE drafter
-                _AUX[L.li] = h[0].detach().to(torch.bfloat16)
+            if M25_EAGLE and (L.li + 1) in EAGLE_AUX_LAYER_IDS:   # capture layer L's OUTPUT, keyed by its vLLM aux index (L.li+1)
+                _AUX[L.li + 1] = h[0].detach().to(torch.bfloat16)
     return h
 
 
