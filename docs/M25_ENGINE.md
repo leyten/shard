@@ -21,13 +21,39 @@ return — no extra round-trip). Lossless (ring greedy-verifies).
 HumanEval / 1.78× MT-bench (≈ ~2.5 reasoning accept) — the head's own authors confirmed it works. So **GO** on
 building the integration; the *real* accept number now comes from OUR engine.
 
-**NEXT ACTION:** validate the EAGLE HybridDrafter on **OUR pipeline engine** (NOT vLLM — see DEAD END below).
-Steps: (1) finish the last wiring — construct `HybridDrafter(NgramDrafter, EagleDrafter(eagle_dir, m25_embed))`
-in the coordinator when `M25_EAGLE=1` (in `_run_job`/`coord`/gateway + the benchmarks; load M2.5 `embed_tokens`
-+ the head on the coordinator GPU). (2) Run our engine as a **localhost 8-GPU pipeline** (no WAN, no P2P) on
-one multi-5090 box: 8 stage procs (`CUDA_VISIBLE_DEVICES=i`, raw-wire), coordinator runs `m25_honest_bench.py`
-with `M25_EAGLE=1`. (3) GATE: does reasoning n-gram-accept 0 → EAGLE-accept ~2.5? If yes → build tree-verify
-(roadmap #2). Localhost pipeline gives the ACCEPT (workload-dependent) cleanly; WAN tok/s is a separate ring run.
+**RESULT (this session): on-engine GATE = NO as-is.** Wiring DONE (`make_drafter()` in `m25_pipe.py` is the
+single drafter source for coord/_validate/sweep + gateway + `m25_honest_bench.py`; plain `NgramDrafter`, or
+`HybridDrafter(NgramDrafter, EagleDrafter)` when `M25_EAGLE=1`, EagleDrafter a lazy singleton loading head +
+M2.5 embed on the coordinator GPU; `M25_EAGLE_DIR`=head; CPU-smoke validated) — and the hybrid RAN on a real
+all-EU scattered ring (6×5090). **But reasoning accept = ~0–3%, not ~2.5** (receipt
+`docs/receipts/m25-eagle-onengine-20260629.md`). n-gram path healthy (rag-quote 22%/g2.8) → fault isolated to
+EAGLE. RULED OUT the wire codec (`transport._pack/_unpack` recurse through tensor-dicts → aux DOES serialize).
+Capture (`run_block` `_AUX[L.li]`=layer output for [1,30,58]) + threading (`_merge_aux`) + seed order look
+correct on paper. Could NOT get the live aux-value probe: `scratchpad/diag_eagle.py` hung in head-box import,
+and the ring WEDGES after each coordinator disconnects (tail re-`accept()`s 2 conns but the predecessor stays)
+→ every new coordinator needs a re-warm. Torn down (0 instances).
+
+**ROOT CAUSE FOUND OFFLINE (no GPU) + FIXED — aux LAYER off-by-one.** Diffed our port vs the vLLM eagle3
+reference + the head's actual tensors and verified the plumbing: RULED OUT (offline) the codec,
+aux-survives-wire (`scratchpad/aux_plumbing_test.py`, bit-identical), `propose` STRUCTURE (matches vLLM
+`llama_eagle3.py`), and fc-norm (head ships none → raw-aux→fc is correct). **THE BUG:** the head config's
+`eagle_aux_hidden_state_layer_ids=[1,30,58]` are vLLM aux-LIST indices (index 0 = embedding output, index K+1
+= OUTPUT of layer K — `vllm/.../llama.py` forward). So `[1,30,58]` = post-layer-{0,29,57}; we captured by RAW
+layer index → post-layer-{1,30,58}, feeding the trained fc features shifted one layer → ~0 accept. **Fixed**
+in `m25_stage` (capture keyed by `L.li+1`); env-tunable (`M25_EAGLE_AUX=2,31,59` reproduces the old capture).
+
+**NEXT ACTION = CONFIRM the fix on a scattered ring (one cheap run).** Re-provision EU ring (`swarm_up` now
+EU-filtered), warm `M25_EAGLE=1`, run `m25_honest_bench.py`. GATE: reason-math/-logic accept should jump from
+~1–3%. A/B default `[1,30,58]` (fixed) vs `M25_EAGLE_AUX=2,31,59` (old) to prove it. If better-but-not-~2.5 →
+chase secondary knobs (seed position `h_n`; `next_hidden=final|prenorm`). If still ~0 → single-box vLLM-eagle3
+reference compare (needs an H200: single-GPU M2.5, no TP-P2P). Then real-regime tok/s → tree-verify (roadmap #2).
+⚠️ Before warm: verify every box's `/tmp/sidecar` size == local ref (a truncated one crashed the launcher).
+
+**MEASURE on a scattered ring, DEBUG on a single box (don't conflate):** EAGLE's payoff is that its draft
+COMPUTE is FREE — hidden by the WAN round-trip idle (KEY DECISIONS). A colocated box has no WAN idle, so EAGLE
+adds SERIAL per-token latency → tok/s reads flat/worse even at good accept = the WRONG regime to *measure* the
+product (also the datacenter pattern the north star rejects, `c0mpute-scattered-not-colocated`). BUT accept
+LENGTH and any integration bug are network-independent, so DEBUGGING is correctly + cheaply done on one box.
 
 **DEAD END found (don't repeat): vLLM M2.5 under TP requires GPU P2P** — `MiniMaxText01RMSNormTP` uses a
 Lamport/IPC all-reduce → `cudaErrorPeerAccessUnsupported (217)` on consumer-5090 hosts w/o NVLink + ACS-blocked
@@ -35,9 +61,15 @@ PCIe (most vast boxes). `NCCL_P2P_DISABLE`/`VLLM_DISABLE_CUSTOM_ALL_REDUCE` DON'
 can't GO/NO-GO via vLLM TP on typical vast hosts. Our PIPELINE engine avoids it (point-to-point sockets). If
 vLLM-on-M2.5 is ever needed, the host must support P2P (NVLink box, or ACS-disabled — unverifiable pre-rent).
 
-**OPS this session:** vast handed ~5 dud boxes (broken DNS, hf_transfer stall, sshd-won't-load-key, stuck
-"loading", P2P-less). The verify-gate (`scratchpad/verify_box.sh`: wait-running → SSH-retry → HF-speed → destroy
-on dud) made duds CHEAP (~$0.30 each). Parallel hf_transfer hit ~120 MB/s (130 GB in ~18 min) once on a good box.
+**OPS this session (EAGLE on-engine run):** (1) **`swarm_up` had no continent filter** — only excluded Asia +
+deduped region → grabbed 2 cheap Canada boxes into a 4-EU ring (transatlantic, ~80-100ms hops). FIXED: added a
+`EUROPE` allowlist (`scratchpad/swarm_up.py`); for the live ring, `scratchpad/swarm_add.py` surgically swapped
+the 2 NA boxes for EU (rent+verify replacements BEFORE destroying). Always verify `instances-v1` count after.
+(2) **Zombie box:** `swarm_add`'s `create()` returned None on a transient timeout but vast HAD made the box →
+untracked, billing. Caught by the post-swap instance-count check. Always count instances after any rent.
+(3) **Truncated sidecar:** one box's `/tmp/sidecar` was 7.8MB not 29MB (bootstrap scp left a wrong/partial
+binary) → `peerid()` got no PEERID, launcher crashed. Verify `stat -c%s /tmp/sidecar` == local ref on all boxes
+before warm. (4) **Ring wedges after each coordinator** → re-warm before every new coordinator process.
 
 ---
 
@@ -58,7 +90,7 @@ on dud) made duds CHEAP (~$0.30 each). Parallel hf_transfer hit ~120 MB/s (130 G
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
-| EAGLE hybrid drafter | **chain ported + CPU-mechanically-validated + committed**; tree + on-engine accept = TODO | commit 11dc4ee |
+| EAGLE hybrid drafter | RAN on a real ring → accept ~0–3%; **root cause FOUND offline = aux LAYER off-by-one** (config ids are vLLM aux-list indices, embed=0 → [1,30,58]=post-layer-{0,29,57}, we captured {1,30,58}). **FIXED** (`L.li+1`); codec/structure/fc-norm ruled out. Re-confirm on ring | receipt m25-eagle-onengine-20260629 |
 
 **Root cause of slow reasoning (structural, not a bug):** tok/s = g(committed/traversal) × traversal_rate(≈1/round-trip).
 n-gram gives g≈9 on verbatim-reuse but **g≈1 on novel reasoning** (nothing to copy) → bare WAN floor. Fix = a
@@ -70,7 +102,11 @@ ring, ~3 on global scatter (NO project — Petals/Parallax/etc — does usable s
   a LlamaForCausalLMEagle3: fc fuses aux layers [1,30,58] → 1 Llama layer → 32k draft-vocab → d2t→target).
   `HybridDrafter` = n-gram-first → EAGLE-on-miss. CHAIN version built + CPU-smoke-validated + committed (11dc4ee).
   Ring plumbing wired (opt-in `M25_EAGLE`): aux capture in `m25_stage.run_block`, threaded forward + returned by
-  the tail (`_merge_aux`), coordinator seeds via `_eagle_seed` + runs depth=1. **NOT yet validated on a live ring.**
+  the tail (`_merge_aux`), coordinator seeds via `_eagle_seed` + runs depth=1. Coordinator construction wired via
+  `make_drafter()` (one source for coord/gateway/bench). Ran on a real all-EU ring 2026-06-29 → accept ~0–3%;
+  **root cause found OFFLINE = aux LAYER off-by-one** (the head's `[1,30,58]` are vLLM aux-list indices, embed=0,
+  so = post-layer-{0,29,57}; we captured by raw layer index = post-layer-{1,30,58}). **FIXED** in `m25_stage`
+  (capture keyed `L.li+1`); codec/wire/structure/fc-norm ruled out offline. **Re-confirm accept on a ring next.**
 
 ## ROADMAP / ranked levers (do in this order)
 1. **vLLM tree GO/NO-GO** (NEXT) — measure EAGLE-3 reasoning accept on M2.5 (tree number). Justifies #2.
@@ -120,7 +156,8 @@ ring, ~3 on global scatter (NO project — Petals/Parallax/etc — does usable s
   `M25_MOE_BACKEND`(cutlass|emulation|marlin), `M25_KV_FP8`, `M25_KV_MAXLEN`, `M25_SDPA`, `M25_EAGLE`(aux capture),
   `M25_EAGLE_AUX`(=1,30,58). `_AUX` holds captured aux hidden states.
 - `phase0/m25_pipe.py` — `coordinate_pipe`(single, +`reasoning`, +`_unpack`/`_eagle_seed` EAGLE seeding),
-  `coordinate_pipe_batch`(batched, decode-rate timer fix), `serve`(+`_merge_aux` aux threading).
+  `coordinate_pipe_batch`(batched, decode-rate timer fix), `serve`(+`_merge_aux` aux threading),
+  `make_drafter`(THE drafter factory: n-gram, or n-gram+EAGLE hybrid when `M25_EAGLE=1`; `M25_EAGLE_DIR`=head).
 - `phase0/eagle_draft.py` — `EagleDrafter` + `HybridDrafter` (the split). `phase0/ngram_draft.py` — `+matched` flag.
 - `phase0/m25_tools.py` — `render_ids(reasoning=)`. `phase0/m25_gateway.py` — OpenAI /v1, `reasoning`/`reasoning_effort`.
 - Benchmarks: `research/m25_honest_bench.py` (THE honest measure), `m25_eagle_gonogo.py` (vLLM accept),
