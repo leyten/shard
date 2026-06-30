@@ -73,16 +73,14 @@ M25_BATCH_MOE = os.environ.get("M25_BATCH_MOE", "0") != "0"
 # aux layers in its own [lo,hi) range; serve() threads them forward; the tail returns them with the
 # verify result. Default OFF (the n-gram-only path is untouched).
 #
-# INDEX CONVENTION (was an off-by-one bug — fixed 2026-06-29 after the on-engine accept~0 result): the
-# head config's `eagle_aux_hidden_state_layer_ids` = [1,30,58] are vLLM AUX-LIST indices, where index 0
-# is the EMBEDDING output and index K+1 is the OUTPUT of decoder layer K (vLLM's target forward appends
-# the embed at index 0, then idx+1 after each layer — see vllm/model_executor/models/llama.py). So
-# [1,30,58] means post-layer-{0,29,57}, NOT post-layer-{1,30,58}. We capture layer L's output and key it
-# by its vLLM index (L.li+1), so _AUX/_eagle_seed line up with the head's fc. To A/B the OLD (wrong)
-# capture on a live ring, set M25_EAGLE_AUX=2,31,59 (= post-layer-{1,30,58}). KEEP empirically verifying.
+# INDEX CONVENTION: `eagle_aux_hidden_state_layer_ids` = [1,30,58] are RAW decoder-layer indices — SpecForge
+# (the head's training framework) hooks `layers[idx]` for idx in [1,30,58] and stores `output[0]`, i.e. the
+# OUTPUT residual stream of decoder layers 1/30/58. So capture layer L's output when L.li is in the list.
+# (A brief 2026-06-29 "fix" mis-read vLLM's internal idx+1 and captured {0,29,57}; the 2026-06-30 on-engine
+# A/B confirmed {1,30,58} wins: reason-math 34% vs 30%, open-chat 13% vs 11% — reverted to this.)
 M25_EAGLE = os.environ.get("M25_EAGLE", "0") != "0"
-EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]   # vLLM aux-list indices (embed=0, post-layer-K = K+1)
-_AUX = {}                                            # vLLM-index -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
+EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]   # decoder-layer indices (SpecForge convention)
+_AUX = {}                                            # layer-id -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
 # Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
 # context/streams that fit) and dequant to bf16 just before SDPA/matmul (no fp8-attention kernel needed — we
 # own the read). fp8 is float (relative precision ~6%), and K/V are post-RMSNorm O(1) so no scale is needed;
@@ -190,7 +188,8 @@ def _build_moe(li):
                 pname = f"{grp}_{suf}"
                 if name in _idx and pname in params:
                     moe.weight_loader(params[pname], raw(name).to(dev), name, shard, e)
-    moe.quant_method.process_weights_after_loading(moe)
+    qm = getattr(moe, "quant_method", None) or getattr(moe, "_quant_method", None)   # vLLM renamed quant_method -> _quant_method in newer builds
+    qm.process_weights_after_loading(moe)
     gate = raw(Pmoe + "gate.weight").to(torch.bfloat16).to(dev)
     return moe, gate
 
@@ -416,8 +415,8 @@ def run_block(layers, start_pos, h, vcfg):
     with torch.no_grad(), set_forward_context(None, vcfg):
         for L in layers:
             h = L.forward(h, start_pos, pe)
-            if M25_EAGLE and (L.li + 1) in EAGLE_AUX_LAYER_IDS:   # capture layer L's OUTPUT, keyed by its vLLM aux index (L.li+1)
-                _AUX[L.li + 1] = h[0].detach().to(torch.bfloat16)
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # snapshot the OUTPUT residual stream of decoder layers [1,30,58] for the EAGLE head
+                _AUX[L.li] = h[0].detach().to(torch.bfloat16)
     return h
 
 
