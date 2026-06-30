@@ -392,6 +392,46 @@ def _merge_aux(upstream):
     return acc
 
 
+def _tail_accept(srv):
+    """Tail bring-up handshake. TWO connections land on the tail: the coordinator-RETURN channel (greets
+    with {op:'hello_return'} the instant it connects, because the coordinator sends data immediately) and
+    the PREDECESSOR ring stream (silent until the first job byte flows). With the libp2p sidecars the
+    predecessor's downstream connect to our ENG_IN is established LAZILY — only when the upstream stage
+    first forwards data — and that only happens after the coordinator gets `ret_ok`. So requiring BOTH
+    connections before acking the return channel (the old `c1=accept(); c2=accept()`) is a circular
+    deadlock: no `ret_ok` until the predecessor connects, no predecessor data until `ret_ok`. The tail
+    then wedges on the 2nd accept and the coordinator hangs forever on recv(ret_ok) with EMPTY output.
+
+    Fix: accept connections one at a time and ack the return channel the INSTANT we identify it — do not
+    wait for the predecessor. Whichever connection greets with hello_return is the return channel (the
+    predecessor never speaks first); the remaining silent connection is the predecessor, which connects
+    once data starts flowing post-ack. Returns (ret, pred). Blocks (like the old accept) until both
+    exist — there is no work to do without a coordinator AND a predecessor."""
+    ret, pending = None, []                                # pending = accepted-but-unidentified (the silent predecessor waits here)
+    while ret is None or not pending:
+        ready, _, _ = select.select([srv] + pending, [], [])   # wake on a new conn OR a pending conn finally speaking
+        for s in ready:
+            if s is srv:
+                c, _ = srv.accept(); c.setsockopt(*NODELAY); pending.append(c); continue
+            pending.remove(s)                              # it spoke -> it's the return channel (predecessor stays silent)
+            try:
+                hello = recv_msg(s)
+            except EDGE_ERRORS:
+                try: s.close()
+                except OSError: pass
+                continue
+            if ret is None and isinstance(hello, dict) and hello.get("op") == "hello_return":
+                ret = s; send_msg(ret, "ret_ok")           # ACK NOW so the coordinator proceeds — pred can connect after
+            else:
+                try: s.close()                             # unexpected greeter (or a 2nd hello) -> drop, keep waiting
+                except OSError: pass
+    pred = pending.pop()
+    for extra in pending:                                  # 2-conn ring never leaves extras, but stay clean if it ever does
+        try: extra.close()
+        except OSError: pass
+    return ret, pred
+
+
 def serve(stage, nstages, lo, hi, port, nxt, timeout):
     parts = _load(stage, nstages, lo, hi)
     layers = parts["layers"]
@@ -409,22 +449,11 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
 
     if parts["tail"]:
         node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
-        # serve_tail_direct: predecessor (ring) + coordinator-return (hello_return) connections
+        # serve_tail_direct: ack the coordinator-return as soon as we identify it, THEN take the (lazily
+        # connecting) predecessor — see _tail_accept for why requiring both up front deadlocks bring-up.
         while True:
-            c1, _ = srv.accept(); c2, _ = srv.accept()
-            ready, _, _ = select.select([c1, c2], [], [], timeout)
-            if not ready:
-                c1.close(); c2.close(); continue
-            ret = ready[0]
-            try:
-                hello = recv_msg(ret)
-            except EDGE_ERRORS:
-                c1.close(); c2.close(); continue
-            if not (isinstance(hello, dict) and hello.get("op") == "hello_return"):
-                c1.close(); c2.close(); continue
-            pred = c2 if ret is c1 else c1
-            pred.settimeout(timeout); ret.setsockopt(*NODELAY); pred.setsockopt(*NODELAY)
-            send_msg(ret, "ret_ok")          # confirm the ret channel BEFORE any reset can race into pred's select
+            ret, pred = _tail_accept(srv)    # sends ret_ok the instant the return channel is identified; both have NODELAY
+            pred.settimeout(timeout)         # bound predecessor reads; ret stays untimed (write-only, coordinator-driven)
             print("[tail] predecessor + coord-return connected", flush=True)
             signer = None
             with torch.no_grad():
