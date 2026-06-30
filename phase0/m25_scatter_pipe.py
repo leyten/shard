@@ -67,7 +67,7 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, ba
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
            f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} M25_BATCH_MOE={os.environ.get('M25_BATCH_MOE','0')} M25_KV_FP8={os.environ.get('M25_KV_FP8','0')} "
-           f"M25_EAGLE={os.environ.get('M25_EAGLE','0')} M25_EAGLE_AUX={os.environ.get('M25_EAGLE_AUX','1,30,58')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"M25_EAGLE={os.environ.get('M25_EAGLE','0')} M25_EAGLE_AUX={os.environ.get('M25_EAGLE_AUX','1,30,58')} M25_FP8_WIRE={os.environ.get('M25_FP8_WIRE','0')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:

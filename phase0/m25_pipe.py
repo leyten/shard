@@ -36,6 +36,37 @@ except Exception:
 RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 
+# opt-in fp8 activations on the wire: the MEASURED per-hop bottleneck is moving the bf16 activation, so
+# transporting it as fp8 (e4m3) halves bytes/hop (~2x tok/s) at a small, MEASURED precision cost. Lossy but
+# still deterministic+verifiable (receipts hash the fp8-engine's activations). bf16 path is unchanged when off.
+M25_FP8_WIRE = bool(int(os.environ.get("M25_FP8_WIRE", "0")))
+
+def _pack_h(h):
+    """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
+    residual-stream OUTLIER channels inside e4m3's ±448 range. Returns (fp8_cpu_tensor, float_scale)."""
+    scale = (h.detach().abs().amax() / 448.0).clamp(min=1e-8)
+    return (h / scale).to(torch.float8_e4m3fn).cpu(), float(scale)
+
+def _unpack_h(q, scale):
+    return q.to(torch.bfloat16) * scale                 # cpu bf16; caller moves .to(dev)
+
+def _hsend(msg):
+    """Outgoing stage message: fp8-pack the activation 'h' when M25_FP8_WIRE (half the bytes/hop), else just
+    move it to cpu as before. Only touches 'h'/'h8' — aux/other fields are untouched (aux stays bf16)."""
+    h = msg.get("h")
+    if torch.is_tensor(h):
+        if M25_FP8_WIRE and h.dtype != torch.float8_e4m3fn:
+            msg["h"], msg["h8"] = _pack_h(h)
+        else:
+            msg["h"] = h.cpu()
+    return msg
+
+def _hrecv(msg):
+    """Dequantize an fp8-packed activation back to bf16 in place (no-op on a bf16 message)."""
+    if isinstance(msg, dict) and "h8" in msg:
+        msg["h"] = _unpack_h(msg["h"], msg.pop("h8"))
+    return msg
+
 
 def _act_digest(t):
     """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
@@ -459,7 +490,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
             with torch.no_grad():
                 try:
                     while True:
-                        msg = recv_msg(pred)
+                        msg = _hrecv(recv_msg(pred))
                         if msg["op"] == "reset":
                             for L in layers:
                                 L.reset()
@@ -503,7 +534,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         with torch.no_grad():
             try:
                 while True:
-                    msg = recv_msg(conn)
+                    msg = _hrecv(recv_msg(conn))
                     if msg["op"] == "reset":
                         for L in layers:
                             L.reset()
@@ -524,14 +555,14 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         else:
                             h = msg["h"].to(dev)
                         h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
-                        send_msg(nxt_sock, {"op": "verify_batch", "h": h.cpu(), "start_b": msg["start_b"]}); continue
+                        send_msg(nxt_sock, _hsend({"op": "verify_batch", "h": h, "start_b": msg["start_b"]})); continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
                         h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
-                        send_msg(nxt_sock, {"op": "verify", "stream": msg["stream"], "h": h.cpu(), "start": msg["start"], "prefill": True}); continue
+                        send_msg(nxt_sock, _hsend({"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True})); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
@@ -540,10 +571,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     h = _block(graph_runners, layers, msg["start"], h, vcfg)
                     if RECEIPTS and signer is not None:         # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
-                    fwd = {"op": "verify", "h": h.cpu(), "start": msg["start"]}
+                    fwd = {"op": "verify", "h": h, "start": msg["start"]}
                     if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
                         fwd["aux"] = _merge_aux(msg.get("aux"))
-                    send_msg(nxt_sock, fwd)
+                    send_msg(nxt_sock, _hsend(fwd))
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset", flush=True)
                 for L in layers:

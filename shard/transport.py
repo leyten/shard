@@ -37,6 +37,7 @@ def _read_exact(sock: socket.socket, n: int) -> bytes:
 # Ported from phase0/wire.py's _pack/_unpack — the *message* format the engine speaks
 # (control fields + tensors). No ChaCha seal: encryption + identity are the sidecar's job.
 _DTYPES = {str(d): d for d in (torch.float32, torch.float16, torch.bfloat16,
+                               torch.float8_e4m3fn, torch.float8_e5m2,   # fp8 activation transport (M25_FP8_WIRE)
                                torch.int64, torch.int32, torch.uint8, torch.bool)}
 
 
