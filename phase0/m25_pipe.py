@@ -76,6 +76,12 @@ def _eagle_seed(aux, pos):
     return _t.stack([aux[str(li)][pos] for li in S.EAGLE_AUX_LAYER_IDS], 0)
 
 
+def _eagle_aux_range(aux, lo, hi):
+    """Stack the 3 aux hidden states for chunk positions [lo,hi) -> [hi-lo,3,H] for EagleDrafter.extend()."""
+    import torch as _t
+    return _t.stack([_eagle_seed(aux, p) for p in range(lo, hi)], 0)
+
+
 _EAGLE = None
 
 
@@ -89,7 +95,11 @@ def _eagle_singleton():
         from eagle_draft import EagleDrafter
         eagle_dir = os.environ.get("M25_EAGLE_DIR", "/root/m25-eagle")
         embed = S.raw("model.embed_tokens.weight").to(torch.bfloat16).to(dev)
-        _EAGLE = EagleDrafter(eagle_dir, embed, device=dev)
+        # next_hidden = which hidden the autoregressive draft chain carries forward. "prenorm" = the residual
+        # stream (correct: the final norm is a readout-only transform for the lm_head); "final" = the
+        # post-final-norm vector (collapses the chain to token-repetition — observed on-engine). Tunable A/B.
+        nh = os.environ.get("M25_EAGLE_NEXT_HIDDEN", "prenorm")
+        _EAGLE = EagleDrafter(eagle_dir, embed, device=dev, next_hidden=nh)
         print(f"[eagle] head loaded from {eagle_dir} + M2.5 embed on {dev}", flush=True)
     return _EAGLE
 
@@ -141,8 +151,12 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             toks, aux = _unpack(rr); cur = toks[-1]
         else:
             send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
-        if S.M25_EAGLE and aux is not None and hasattr(local_draft, "set_hidden"):
-            local_draft.set_hidden(_eagle_seed(aux, len(toks) - 1))   # seed EAGLE from the prompt's last position
+        if S.M25_EAGLE and aux is not None and hasattr(local_draft, "extend"):
+            local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
+            pf_len = len(toks)                                        # aux covers the LAST received prefill chunk's positions
+            pf_base = len(gen_ids) - pf_len                           # that chunk starts here (0 if prefill wasn't chunked)
+            ctx_toks = gen_ids[pf_base + 1:] + [cur]                  # tokens predicted by aux[0..pf_len-1] (EAGLE left-shift), + the 1st gen token
+            local_draft.extend(ctx_toks, _eagle_aux_range(aux, 0, pf_len), base_pos=pf_base)
         prefill_s = time.time() - t_pf
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
@@ -167,14 +181,28 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 if ds[j] == r[j]: n += 1
                 else: break
             valid += 1; accepted += n
+            if os.environ.get("M25_EAGLE_DEBUG") and S.M25_EAGLE and valid <= 3:   # diagnostic: is aux arriving + is EAGLE drafting?
+                _mt = getattr(local_draft, "matched", None)
+                if aux is None:
+                    print(f"[eagle-dbg] r{valid}: aux=None (ring returned plain toks -> EAGLE degrades to repeat) matched={_mt} ds={ds[:5]} r={r[:5]} acc={n}", flush=True)
+                else:
+                    _ok = all(str(li) in aux for li in S.EAGLE_AUX_LAYER_IDS)
+                    _sd = _eagle_seed(aux, n) if _ok else None
+                    _nm = float(_sd.float().norm()) if _ok else -1.0
+                    _eg = getattr(local_draft, "eagle", local_draft)            # decisive probe: does fc(aux) VARY across prompts?
+                    _fcs = "n/a"
+                    if _ok and hasattr(_eg, "fc"):
+                        _fc = torch.nn.functional.linear(_sd.reshape(-1).to(_eg.fc.dtype).to(_eg.fc.device).unsqueeze(0), _eg.fc)
+                        _fcs = f"norm={float(_fc.norm()):.2f} v3={[round(x,3) for x in _fc[0,:3].float().tolist()]}"
+                    print(f"[eagle-dbg] r{valid}: seednorm={_nm:.1f} fc(aux):{_fcs} matched={_mt} ds={ds[:5]} r={r[:5]} acc={n}", flush=True)
             if conf: conf.observe(n, K)                                     # acceptance EMA (free, from the verify result)
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]; committed = ds
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_fetch(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
-            if S.M25_EAGLE and aux is not None and hasattr(local_draft, "set_hidden"):
-                local_draft.set_hidden(_eagle_seed(aux, n))   # the target hidden that predicted the last committed token -> seed next EAGLE draft
+            if S.M25_EAGLE and aux is not None and hasattr(local_draft, "extend"):   # grow the EAGLE context with the newly committed positions
+                local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         d_fetch()
