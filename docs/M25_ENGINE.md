@@ -21,33 +21,31 @@ return — no extra round-trip). Lossless (ring greedy-verifies).
 HumanEval / 1.78× MT-bench (≈ ~2.5 reasoning accept) — the head's own authors confirmed it works. So **GO** on
 building the integration; the *real* accept number now comes from OUR engine.
 
-**RESULT (this session): on-engine GATE = NO as-is.** Wiring DONE (`make_drafter()` in `m25_pipe.py` is the
-single drafter source for coord/_validate/sweep + gateway + `m25_honest_bench.py`; plain `NgramDrafter`, or
-`HybridDrafter(NgramDrafter, EagleDrafter)` when `M25_EAGLE=1`, EagleDrafter a lazy singleton loading head +
-M2.5 embed on the coordinator GPU; `M25_EAGLE_DIR`=head; CPU-smoke validated) — and the hybrid RAN on a real
-all-EU scattered ring (6×5090). **But reasoning accept = ~0–3%, not ~2.5** (receipt
-`docs/receipts/m25-eagle-onengine-20260629.md`). n-gram path healthy (rag-quote 22%/g2.8) → fault isolated to
-EAGLE. RULED OUT the wire codec (`transport._pack/_unpack` recurse through tensor-dicts → aux DOES serialize).
-Capture (`run_block` `_AUX[L.li]`=layer output for [1,30,58]) + threading (`_merge_aux`) + seed order look
-correct on paper. Could NOT get the live aux-value probe: `scratchpad/diag_eagle.py` hung in head-box import,
-and the ring WEDGES after each coordinator disconnects (tail re-`accept()`s 2 conns but the predecessor stays)
-→ every new coordinator needs a re-warm. Torn down (0 instances).
+**RESULT (2026-06-30): EAGLE-3 WORKS — reasoning lifted off the ~1% floor.** The real bug (a 4-agent panel
+found it; the off-by-one layer hypothesis earlier this session was a red herring): the EAGLE-3 draft head is a
+TRANSFORMER that attends causally over the WHOLE committed sequence (each position carries the target aux
+feature), but our port ran `propose()` from an EMPTY KV cache every call → no context → it ignored the aux and
+degenerated to token-repetition (~1% accept). **FIXED:** `EagleDrafter` keeps a persistent committed-context KV
+cache (`reset`/`extend`/`propose`); `coordinate_pipe` feeds per-position committed aux via `extend()` each
+commit (the ring already returned aux for every chunk position — we were keeping only the last). Validated on a
+5-EU scattered ring (branch `eagle/chain-diagnostics`, commits 0dc939a + 76ab7e2):
+reason-math **8.0 tok/s / 30% / g3.4**, reason-logic 6.4/14%, open-chat 5.9/11%, code-edit 6.9/11%,
+rag-quote 7.6/15%, agentic-tool **15.2/50%/g5.0**; **decode-weighted mean 7.0 tok/s** (was 0.9 broken / ~3
+n-gram baseline). The panel: reference-diff caught the missing context attention; SpecForge killed the
+"standardize aux" idea + confirmed raw-aux→fc and layers {1,30,58}; code-audit forced the decisive
+`fc(aux)`-varies test; out-of-box mapped the space. Receipt `docs/receipts/m25-eagle-onengine-20260629.md`.
 
-**ROOT CAUSE FOUND OFFLINE (no GPU) + FIXED — aux LAYER off-by-one.** Diffed our port vs the vLLM eagle3
-reference + the head's actual tensors and verified the plumbing: RULED OUT (offline) the codec,
-aux-survives-wire (`scratchpad/aux_plumbing_test.py`, bit-identical), `propose` STRUCTURE (matches vLLM
-`llama_eagle3.py`), and fc-norm (head ships none → raw-aux→fc is correct). **THE BUG:** the head config's
-`eagle_aux_hidden_state_layer_ids=[1,30,58]` are vLLM aux-LIST indices (index 0 = embedding output, index K+1
-= OUTPUT of layer K — `vllm/.../llama.py` forward). So `[1,30,58]` = post-layer-{0,29,57}; we captured by RAW
-layer index → post-layer-{1,30,58}, feeding the trained fc features shifted one layer → ~0 accept. **Fixed**
-in `m25_stage` (capture keyed by `L.li+1`); env-tunable (`M25_EAGLE_AUX=2,31,59` reproduces the old capture).
+**vLLM PIN:** newer vLLM (0.24.0) broke the NVFP4 MoE load (`quant_method`→`_quant_method`, then
+`w13_weight_scale_2`). `swarm_up` bootstrap now pins `vllm==0.23.0` (m25_stage also getattr-shims the rename).
 
-**NEXT ACTION = CONFIRM the fix on a scattered ring (one cheap run).** Re-provision EU ring (`swarm_up` now
-EU-filtered), warm `M25_EAGLE=1`, run `m25_honest_bench.py`. GATE: reason-math/-logic accept should jump from
-~1–3%. A/B default `[1,30,58]` (fixed) vs `M25_EAGLE_AUX=2,31,59` (old) to prove it. If better-but-not-~2.5 →
-chase secondary knobs (seed position `h_n`; `next_hidden=final|prenorm`). If still ~0 → single-box vLLM-eagle3
-reference compare (needs an H200: single-GPU M2.5, no TP-P2P). Then real-regime tok/s → tree-verify (roadmap #2).
-⚠️ Before warm: verify every box's `/tmp/sidecar` size == local ref (a truncated one crashed the launcher).
+**NEXT ACTION = chase the remaining accept upside (the ring is WARM — KEEP it, see memory keep-rings-warm):**
+1. **Layer A/B:** the win used `M25_EAGLE_AUX=1,30,58` (captures layers {0,29,57} via `L.li+1`). SpecForge's
+   training hook grabs OUTPUTS of layers {1,30,58} directly → try `M25_EAGLE_AUX=2,31,59` (re-warm) and compare.
+2. **Full-accept bonus token:** `coordinate_pipe` n==K branch drops `r[K]` + mis-seeds the next draft — commit
+   it (free token + correct EAGLE pairing).
+3. **Tree-verify (roadmap #2):** GPU idle during the WAN round-trip → verify a TREE per traversal → ~2× accept.
+Then land the branch (PR → squash-merge), update PROVEN. ⚠️ Before any warm: verify every box's `/tmp/sidecar`
+size == local ref (a truncated one crashed the launcher once).
 
 **MEASURE on a scattered ring, DEBUG on a single box (don't conflate):** EAGLE's payoff is that its draft
 COMPUTE is FREE — hidden by the WAN round-trip idle (KEY DECISIONS). A colocated box has no WAN idle, so EAGLE
@@ -90,7 +88,7 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
-| EAGLE hybrid drafter | RAN on a real ring → accept ~0–3%; **root cause FOUND offline = aux LAYER off-by-one** (config ids are vLLM aux-list indices, embed=0 → [1,30,58]=post-layer-{0,29,57}, we captured {1,30,58}). **FIXED** (`L.li+1`); codec/structure/fc-norm ruled out. Re-confirm on ring | receipt m25-eagle-onengine-20260629 |
+| **EAGLE hybrid drafter (reasoning)** | **WORKS: decode-weighted 7.0 tok/s, reason-math 30%/g3.4/8tok/s, agentic 50%/g5.0** (was 0.9 broken). Bug was missing context attention; fixed w/ persistent context KV | branch eagle/chain-diagnostics, receipt m25-eagle-onengine-20260629 |
 
 **Root cause of slow reasoning (structural, not a bug):** tok/s = g(committed/traversal) × traversal_rate(≈1/round-trip).
 n-gram gives g≈9 on verbatim-reuse but **g≈1 on novel reasoning** (nothing to copy) → bare WAN floor. Fix = a
