@@ -39,11 +39,14 @@ n-gram baseline). The panel: reference-diff caught the missing context attention
 `w13_weight_scale_2`). `swarm_up` bootstrap now pins `vllm==0.23.0` (m25_stage also getattr-shims the rename).
 
 **NEXT ACTION = chase the remaining accept upside (the ring is WARM — KEEP it, see memory keep-rings-warm):**
-1. **Layer A/B:** the win used `M25_EAGLE_AUX=1,30,58` (captures layers {0,29,57} via `L.li+1`). SpecForge's
-   training hook grabs OUTPUTS of layers {1,30,58} directly → try `M25_EAGLE_AUX=2,31,59` (re-warm) and compare.
-2. **Full-accept bonus token:** `coordinate_pipe` n==K branch drops `r[K]` + mis-seeds the next draft — commit
-   it (free token + correct EAGLE pairing).
-3. **Tree-verify (roadmap #2):** GPU idle during the WAN round-trip → verify a TREE per traversal → ~2× accept.
+1. **Layer A/B: DONE** — {1,30,58} (SpecForge) beats {0,29,57} (reason-math 34% vs 30%); reverted to capture
+   `L.li` so the default `M25_EAGLE_AUX=1,30,58` maps to those layers (commit 1289088).
+2. **Full-accept bonus token (minor):** `coordinate_pipe` n==K branch drops the verified `r[K]` — committing it
+   is a free token (the EAGLE pairing is now correct via `extend()`, so this is efficiency, not correctness).
+   Small on reasoning (few full-accept rounds); more on agentic. Low priority.
+3. **Tree-verify (roadmap #2 — the BIG lever):** GPU idle during the WAN round-trip → verify a TREE of
+   candidates per traversal → ~2× accept (2.5→4–5). Needs a tree-attention mask threaded through every stage +
+   coordinator best-path selection. The natural next build now that single-chain EAGLE works.
 Then land the branch (PR → squash-merge), update PROVEN. ⚠️ Before any warm: verify every box's `/tmp/sidecar`
 size == local ref (a truncated one crashed the launcher once).
 
@@ -88,7 +91,7 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
-| **EAGLE hybrid drafter (reasoning)** | **WORKS: decode-weighted 7.0 tok/s, reason-math 30%/g3.4/8tok/s, agentic 50%/g5.0** (was 0.9 broken). Bug was missing context attention; fixed w/ persistent context KV | branch eagle/chain-diagnostics, receipt m25-eagle-onengine-20260629 |
+| **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} A/B-confirmed > {0,29,57} | branch eagle/chain-diagnostics |
 
 **Root cause of slow reasoning (structural, not a bug):** tok/s = g(committed/traversal) × traversal_rate(≈1/round-trip).
 n-gram gives g≈9 on verbatim-reuse but **g≈1 on novel reasoning** (nothing to copy) → bare WAN floor. Fix = a
