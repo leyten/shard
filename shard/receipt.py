@@ -123,7 +123,15 @@ def verify_coverage(receipts: list[dict], layer_count: int,
     by exactly one node), and (3) chain — each stage's in_root continuity is the coordinator's to
     assert across the ring; here we enforce the coverage tiling, which is what stops a node from
     being paid for a block it didn't hold. expected_by_signer maps pubkey -> the block c0mpute
-    assigned it (optional pinning)."""
+    assigned it (optional pinning).
+
+    FIXME (flagged by onlyzhynx code review S2): the `if want is not None` check below has the
+    same unknown-signer hole as the TS side had before C2. An unknown signer (one not in
+    expected_by_signer at all) is silently allowed through. This is the coordinator's self-check
+    (not the payment trust boundary — the TS verifyCoverage in c0mpute/lib/receipt.ts gates money
+    and has been fixed). For defense in depth, this should also reject unknown signers. Open as
+    issue/PR against leyten's base.
+    """
     spans = []
     for r in receipts:
         verify_receipt(r, None)
