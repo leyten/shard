@@ -12,6 +12,31 @@
 ---
 
 ## RESUME HERE  (the one next action)
+
+**LATEST (2026-06-30 late) — NEXT ACTION = validate the self-optimizer on a real ring.**
+- **Handshake bring-up deadlock FIXED** (branch `ops/tail-handshake`): the tail required BOTH the coord-return
+  AND the (lazily-connecting) predecessor before acking `ret_ok` → circular deadlock. `_tail_accept` now acks
+  the return channel the instant it's identified. Validated on a real decoded row. Covers coord + gateway.
+- **Usability table ran but on a JUNK ring (2.6 tok/s).** Root cause: the M2.5 launcher NEVER selected nodes —
+  it took the rental lottery's boot order (spread boxes incl. Spain/Norway + a 400W-capped GPU). The drafter
+  reproduced EXACTLY (reason-math 34%/g3.7) → the engine is fine; the gap was 100% bad hardware + no selection.
+  **Reframe (real comparables, don't despair):** Petals ≈ 5-6 tok/s for a 70B model; we do ~12 for 230B on a
+  GOOD ring → we're AHEAD. The ~2× WAN penalty we measured matches Petals' own geo-distributed number.
+- **FIX BUILT: `shard/topology.select_ring`** (branch `feat/topology-select-ring`) — the self-optimizer's pure
+  core: from a measured pool pick the subset+order+layer-split minimizing predicted decode step-time (WAN +
+  summed compute = physical, no hand-weights); drop throttled/far/co-located nodes; fewest-fattest stages; pin
+  the coord via `require`. Adversarially reviewed (2 critical false-"infeasible" bugs fixed), regression-tested,
+  calibrated (predicts the measured tok/s). `scratchpad/plan_ring.py` = vast glue (measure → select → --order).
+- **NEXT:** over-rent ~8 (swarm_up now has a free-VRAM gate + /24-subnet dedup, NOT geolocation), `plan_ring`
+  selects the ring, warm it, benchmark → compare predicted vs actual tok/s (validates the whole loop with a
+  number). THEN the self-optimizer graduates to c0mpute (shard stays the engine; c0mpute→shard dep only).
+- **PRs to land:** `ops/tail-handshake`, `feat/topology-select-ring`, + `eagle/chain-diagnostics`,
+  `eagle/tree-verify`. **Roadmap (prior-art):** Vivaldi network-coordinates = O(N) all-pairs latency (no N²
+  pings) is the node-selection scaling unlock; tree-verify (built, `eagle/tree-verify`) is the ENGINE lever for
+  high-RTT global scatter. The `select_ring` test surfaced COORD PLACEMENT (separate-coord case) as a lever too.
+
+---
+*(historical — the EAGLE hybrid work that reached ~12 tok/s on a good ring:)*
 **Goal:** make M2.5 usable on NORMAL reasoning-ON usage (currently ~3 tok/s single-stream — see PROVEN).
 **Approach (approved plan `.claude/plans/graceful-greeting-seahorse.md`):** a HybridDrafter = n-gram for
 draftable output ⊕ **EAGLE-3** for novel reasoning, run coordinator-side (aux hidden states ride the verify
