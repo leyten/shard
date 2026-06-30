@@ -190,7 +190,8 @@ def _build_moe(li):
                 pname = f"{grp}_{suf}"
                 if name in _idx and pname in params:
                     moe.weight_loader(params[pname], raw(name).to(dev), name, shard, e)
-    moe.quant_method.process_weights_after_loading(moe)
+    qm = getattr(moe, "quant_method", None) or getattr(moe, "_quant_method", None)   # vLLM renamed quant_method -> _quant_method in newer builds
+    qm.process_weights_after_loading(moe)
     gate = raw(Pmoe + "gate.weight").to(torch.bfloat16).to(dev)
     return moe, gate
 
