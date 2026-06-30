@@ -13,27 +13,52 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-06-30 late) — NEXT ACTION = validate the self-optimizer on a real ring.**
-- **Handshake bring-up deadlock FIXED** (branch `ops/tail-handshake`): the tail required BOTH the coord-return
-  AND the (lazily-connecting) predecessor before acking `ret_ok` → circular deadlock. `_tail_accept` now acks
-  the return channel the instant it's identified. Validated on a real decoded row. Covers coord + gateway.
-- **Usability table ran but on a JUNK ring (2.6 tok/s).** Root cause: the M2.5 launcher NEVER selected nodes —
-  it took the rental lottery's boot order (spread boxes incl. Spain/Norway + a 400W-capped GPU). The drafter
-  reproduced EXACTLY (reason-math 34%/g3.7) → the engine is fine; the gap was 100% bad hardware + no selection.
-  **Reframe (real comparables, don't despair):** Petals ≈ 5-6 tok/s for a 70B model; we do ~12 for 230B on a
-  GOOD ring → we're AHEAD. The ~2× WAN penalty we measured matches Petals' own geo-distributed number.
-- **FIX BUILT: `shard/topology.select_ring`** (branch `feat/topology-select-ring`) — the self-optimizer's pure
-  core: from a measured pool pick the subset+order+layer-split minimizing predicted decode step-time (WAN +
-  summed compute = physical, no hand-weights); drop throttled/far/co-located nodes; fewest-fattest stages; pin
-  the coord via `require`. Adversarially reviewed (2 critical false-"infeasible" bugs fixed), regression-tested,
-  calibrated (predicts the measured tok/s). `scratchpad/plan_ring.py` = vast glue (measure → select → --order).
-- **NEXT:** over-rent ~8 (swarm_up now has a free-VRAM gate + /24-subnet dedup, NOT geolocation), `plan_ring`
-  selects the ring, warm it, benchmark → compare predicted vs actual tok/s (validates the whole loop with a
-  number). THEN the self-optimizer graduates to c0mpute (shard stays the engine; c0mpute→shard dep only).
-- **PRs to land:** `ops/tail-handshake`, `feat/topology-select-ring`, + `eagle/chain-diagnostics`,
-  `eagle/tree-verify`. **Roadmap (prior-art):** Vivaldi network-coordinates = O(N) all-pairs latency (no N²
-  pings) is the node-selection scaling unlock; tree-verify (built, `eagle/tree-verify`) is the ENGINE lever for
-  high-RTT global scatter. The `select_ring` test surfaced COORD PLACEMENT (separate-coord case) as a lever too.
+**LATEST (2026-07-01) — all on `master`; NEXT = make `select_ring` upload-aware, then validate.**
+Tonight landed on master: handshake fix + `select_ring` + EAGLE-chain (PRs #7/#8/#9) + **fp8 wire** (cherry-pick
+c4588bf). Branches deleted; only `eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine
+integrated INTO c0mpute, permissionless) — NOT a standalone fast ring (don't relabel it as just "usable speed").
+
+- **Handshake deadlock FIXED** (`_tail_accept`): acks the coord-return the instant it's identified instead of
+  waiting for the lazily-connecting predecessor. Validated on a real decoded row. Covers coord + gateway.
+- **The "junk ring 2.6 tok/s" was NO node selection** (rental-lottery boot order: Spain/Norway + a 400W box).
+  Drafter reproduced exactly (reason-math 34%/g3.7) → engine fine. We're AHEAD of Petals (≈5-6 tok/s @70B; us
+  ~12 @230B on a good ring; their geo-distributed ~2× WAN penalty matches ours).
+- **`shard/topology.select_ring`** = the self-optimizer's pure core (subset+order+layer-split minimizing predicted
+  decode step-time; drops weak/co-located; fewest-fattest; `require` pins the coord/head). Reviewed (2 critical
+  false-infeasible bugs fixed), regression-tested, calibrated. `scratchpad/plan_ring.py` = vast glue (measure→
+  select→--order); `scratchpad/sim_network.py` = offline simulator ($0 dev loop, reproduces tonight's rings).
+- **fp8 activations on the wire (`M25_FP8_WIRE`)** — halves bytes/hop. MEASURED A/B (5-EU ring): bf16 4.87 → fp8
+  5.30 = **+9% on vast** (high-bw → per-hop is RTT-windowing-bound, not bytes; fp8's ~2× is the RESIDENTIAL/
+  bytes-bound regime). QUALITY: fp8 keeps M2.5 correct+coherent (same primes, sound reasoning) but NOT bit-exact
+  (flips a token → greedy diverges). So fp8 = usable-M2.5 quality, NOT lossless. Per-channel scale = the
+  tightening lever if a precision-sweep shows loss.
+
+- **⚠ RESIDENTIAL BOTTLENECK (3-agent research) — the bind is the SENDER's UPLOAD.** Asymmetric residential (fast
+  down, slow up) strands the downlink; the ring runs at its slowest uplink. DECODE survives (~3-5 tok/s @20Mbps,
+  →8-12 w/ fp8+fiber); **long-context PREFILL is the wall** (100MB+/hop → ~3-6min TTFT @16k, ~20min @100k on
+  20Mbps cable). NOT monolithic: FIBER (sym 100M-1G, ~40% US homes) → bottleneck VANISHES; the killer is the slow
+  CABLE/DSL UPSTREAM specifically. You CANNOT conjure upload on a too-small pipe (QoS/FEC/transport-multipath all
+  spend upload or need a 2nd physical link — can't beat line rate). The torrent move that WORKS = use the DOWNLOAD
+  direction: fan-in (split the activation across W senders, receiver aggregates W uplinks → ~W× eff up) + a
+  relay/supernode tier for heavy prefill.
+  RANKED LEVERS: (1) **upload as a first-class (prefill-DOMINANT) cost in `select_ring`** + relegate low-uplink
+  nodes to off-critical roles (spot-check verifier / hot-standby / weight-seeder / decode-only replica) — biggest,
+  free, scatter-pure; (2) fewer/fatter hops (−40-60% prefill upload); (3) fp8 done → int4+compression next (drafts
+  free under lossless verify, prefill measured-lossy, codec-in-manifest for receipts); (4) BBR + persistent
+  connections (CUBIC collapses ~70% @1% loss; BBR shrugs it); (5) chunked-prefill overlap + route long-ctx to the
+  fiber subset; (6) relay/supernode tier = the ONE THESIS-RISK lever (curated-transport crutch unless
+  permissionless+staked).
+- **ADMISSION vs PLACEMENT (decided framing):** do NOT gate joins with a single hard threshold — it discards nodes
+  useful in off-critical roles and shrinks the permissionless pool. **Admission** = a coarse PROVEN floor (real
+  GPU, reachable, can carry *some* role) in c0mpute; **Placement** = capability-matched roles in the self-optimizer
+  (the "threshold" is PER-ROLE inside `select_ring`, not a velvet rope at the door). Both on MEASURED/VERIFIED
+  capability, never self-reported (lying-uplink attack → caught by probing + the receipt hash-chain).
+
+- **NEXT ACTIONS (ranked):** (a) extend `select_ring` to take per-node upload bw + make it the dominant prefill
+  cost + role relegation; (b) validation run (over-rent ~8, plan_ring selects, warm, benchmark predicted-vs-
+  actual); (c) residential-bw A/B (tc-throttle a ring to 20Mbps, measure decode+prefill bf16-vs-fp8 — boxes torn
+  down, re-provision); (d) self-optimizer graduates to c0mpute (shard=engine, c0mpute→shard only). Roadmap:
+  Vivaldi coords = O(N) all-pairs latency at scale; tree-verify (`eagle/tree-verify`) = engine lever for high-RTT.
 
 ---
 *(historical — the EAGLE hybrid work that reached ~12 tok/s on a good ring:)*
