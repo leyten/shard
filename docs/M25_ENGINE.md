@@ -31,7 +31,7 @@ c4588bf) + **upload-bandwidth-aware `select_ring` + role relegation** (this sess
   request-time speedup 1.01×@2k → 1.09×@16k → 1.32×@64k; **TTFT (first-token) speedup 2.5–5× (p95 up to 19×)**;
   the rental/fat-uplink pool shows a smaller gap (sanity). Adversarial review (2 attackers found nothing; 1 found
   + I reproduced/fixed a pre-existing funnel false-infeasible: subnet-blind `must`-set). Tests: `tests/
-  test_topology.py` (10, all pass). Commit <pending>. c0mpute self-optimizer feeds it measured up_mbps; it stays pure.
+  test_topology.py` (10, all pass). Commit c2e226e. c0mpute self-optimizer feeds it measured up_mbps; it stays pure.
 
 - **Handshake deadlock FIXED** (`_tail_accept`): acks the coord-return the instant it's identified instead of
   waiting for the lazily-connecting predecessor. Validated on a real decoded row. Covers coord + gateway.
