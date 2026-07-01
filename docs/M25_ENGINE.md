@@ -13,10 +13,25 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-07-01) — all on `master`; NEXT = make `select_ring` upload-aware, then validate.**
+**LATEST (2026-07-01) — all on `master`; `select_ring` is now UPLOAD-AWARE. NEXT = the selection-driven warm run.**
 Tonight landed on master: handshake fix + `select_ring` + EAGLE-chain (PRs #7/#8/#9) + **fp8 wire** (cherry-pick
-c4588bf). Branches deleted; only `eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine
-integrated INTO c0mpute, permissionless) — NOT a standalone fast ring (don't relabel it as just "usable speed").
+c4588bf) + **upload-bandwidth-aware `select_ring` + role relegation** (this session). Branches deleted; only
+`eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine integrated INTO c0mpute, permissionless)
+— NOT a standalone fast ring (don't relabel it as just "usable speed").
+
+- **`select_ring` UPLOAD-AWARE (this session, on master).** The #1 residential lever landed. Objective is now
+  TOTAL REQUEST TIME `T = prefill_ms + D*decode_step_ms` with per-node UPLOAD a first-class cost (sender-uplink
+  bound; the residential bind). Prefill's [S,H] activation (~100MB/hop @16k) is the wall; the selector tails the
+  lowest-upload node (the tail forwards nothing), drops nodes whose uplink would dominate prefill, and RELEGATES
+  them to off-critical roles (weight-seeder / aggregator-relay / hot-standby / decode-only-replica / spot-check-
+  verifier) instead of discarding capacity. Prefill transport modeled as the engine's chunked+pipelined makespan
+  `(sum_fwd(u)+(C-1)*max_fwd(u))/C` (C=1 SUM ↔ C large MAX). PURE, and BYTE-IDENTICAL to the old decode-only path
+  when `up_mbps` is omitted (golden-snapshot regression-tested). VALIDATED offline (`scratchpad/sim_network.py`,
+  volunteer/residential pool): aware/oracle ~0.98 across ctx while blind/oracle collapses 0.98→0.80 as ctx grows;
+  request-time speedup 1.01×@2k → 1.09×@16k → 1.32×@64k; **TTFT (first-token) speedup 2.5–5× (p95 up to 19×)**;
+  the rental/fat-uplink pool shows a smaller gap (sanity). Adversarial review (2 attackers found nothing; 1 found
+  + I reproduced/fixed a pre-existing funnel false-infeasible: subnet-blind `must`-set). Tests: `tests/
+  test_topology.py` (10, all pass). Commit <pending>. c0mpute self-optimizer feeds it measured up_mbps; it stays pure.
 
 - **Handshake deadlock FIXED** (`_tail_accept`): acks the coord-return the instant it's identified instead of
   waiting for the lazily-connecting predecessor. Validated on a real decoded row. Covers coord + gateway.
@@ -54,10 +69,12 @@ integrated INTO c0mpute, permissionless) — NOT a standalone fast ring (don't r
   (the "threshold" is PER-ROLE inside `select_ring`, not a velvet rope at the door). Both on MEASURED/VERIFIED
   capability, never self-reported (lying-uplink attack → caught by probing + the receipt hash-chain).
 
-- **NEXT ACTIONS (ranked):** (a) extend `select_ring` to take per-node upload bw + make it the dominant prefill
-  cost + role relegation; (b) validation run (over-rent ~8, plan_ring selects, warm, benchmark predicted-vs-
-  actual); (c) residential-bw A/B (tc-throttle a ring to 20Mbps, measure decode+prefill bf16-vs-fp8 — boxes torn
-  down, re-provision); (d) self-optimizer graduates to c0mpute (shard=engine, c0mpute→shard only). Roadmap:
+- **NEXT ACTIONS (ranked):** (a) ~~upload-aware `select_ring` + relegation~~ **DONE** (this session; offline-validated,
+  tested, on master). (b) **selection-driven warm run** (over-rent ~8, `plan_ring` measures→selects→`--order`, warm,
+  benchmark predicted-vs-actual request_ms; also wire per-node upload into `plan_ring` — it currently measures RTT/
+  VRAM/power but NOT uplink, so add an upload probe before this run); (c) residential-bw A/B (tc-throttle a ring to
+  20Mbps, measure decode+prefill bf16-vs-fp8 — boxes torn down, re-provision); (d) self-optimizer graduates to
+  c0mpute (shard=engine, c0mpute→shard only; roles become placement hints the network layer acts on). Roadmap:
   Vivaldi coords = O(N) all-pairs latency at scale; tree-verify (`eagle/tree-verify`) = engine lever for high-RTT.
 
 ---
@@ -142,7 +159,8 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
 | **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
-| **Self-optimizer core (`select_ring`)** | built, adversarially reviewed (2 critical bugs fixed), regression-tested, calibrated (predicts measured tok/s); picks subset+order+layer-split by predicted step-time, drops weak/co-located | **master** (`shard/topology.py`) |
+| **Self-optimizer core (`select_ring`)** | UPLOAD-AWARE: minimizes total request time (prefill+D·decode) with per-node uplink first-class; tails/drops slow-upload nodes + relegates them to off-critical roles; picks subset+order+layer-split; adversarially reviewed (3 false-infeasible bugs fixed total), 10 regression tests, byte-identical legacy path | **master** (`shard/topology.py`, `tests/test_topology.py`) |
+| **Upload-aware selection (offline validation)** | aware/oracle ~0.98 vs blind 0.98→0.80 as ctx grows; **TTFT speedup 2.5–5× (p95 19×)** on the residential pool; request 1.0→1.32× (2k→64k); rental gap smaller (sanity) | `scratchpad/sim_network.py`, this doc RESUME HERE |
 | **fp8 activations on the wire** | **+9% on high-bw vast** (bf16 4.87→fp8 5.30; ~2× is the residential bytes-bound regime); quality preserved (correct+coherent) but NOT bit-exact | **master** (`M25_FP8_WIRE`, commit c4588bf) |
 | **Residential bottleneck (3-agent research)** | bind = sender UPLOAD; decode survives, long-ctx PREFILL is the wall on cable/DSL (fine on fiber); fix = upload-aware selection + use download direction, NOT QoS | RESUME HERE, this doc |
 
