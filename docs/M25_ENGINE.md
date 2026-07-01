@@ -141,7 +141,10 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
-| **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} A/B-confirmed > {0,29,57} | branch eagle/chain-diagnostics |
+| **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
+| **Self-optimizer core (`select_ring`)** | built, adversarially reviewed (2 critical bugs fixed), regression-tested, calibrated (predicts measured tok/s); picks subset+order+layer-split by predicted step-time, drops weak/co-located | **master** (`shard/topology.py`) |
+| **fp8 activations on the wire** | **+9% on high-bw vast** (bf16 4.87→fp8 5.30; ~2× is the residential bytes-bound regime); quality preserved (correct+coherent) but NOT bit-exact | **master** (`M25_FP8_WIRE`, commit c4588bf) |
+| **Residential bottleneck (3-agent research)** | bind = sender UPLOAD; decode survives, long-ctx PREFILL is the wall on cable/DSL (fine on fiber); fix = upload-aware selection + use download direction, NOT QoS | RESUME HERE, this doc |
 
 **Root cause of slow reasoning (structural, not a bug):** tok/s = g(committed/traversal) × traversal_rate(≈1/round-trip).
 n-gram gives g≈9 on verbatim-reuse but **g≈1 on novel reasoning** (nothing to copy) → bare WAN floor. Fix = a
@@ -157,10 +160,15 @@ ring, ~3 on global scatter (NO project — Petals/Parallax/etc — does usable s
   `make_drafter()` (one source for coord/gateway/bench). Ran on a real all-EU ring 2026-06-29 → accept ~0–3%;
   **root cause found OFFLINE = aux LAYER off-by-one** (the head's `[1,30,58]` are vLLM aux-list indices, embed=0,
   so = post-layer-{0,29,57}; we captured by raw layer index = post-layer-{1,30,58}). **FIXED** in `m25_stage`
-  (capture keyed `L.li+1`); codec/wire/structure/fc-norm ruled out offline. **Re-confirm accept on a ring next.**
+  (capture keyed `L.li+1`); codec/wire/structure/fc-norm ruled out offline. **✓ CONFIRMED + MERGED to master** —
+  the real fix was context attention (persistent KV), reason-math 34%/g3.7/11.8 tok/s. No longer in-flight.
 
 ## ROADMAP / ranked levers (do in this order)
-1. **vLLM tree GO/NO-GO** (NEXT) — measure EAGLE-3 reasoning accept on M2.5 (tree number). Justifies #2.
+> ⚠ **The current ranked NEXT ACTIONS live in RESUME HERE (2026-07-01), not here.** Top of the list:
+> (1) make `select_ring` UPLOAD-aware (dominant prefill cost + off-critical-path role relegation);
+> (2) the selection-driven validation run; (3) residential-bandwidth throttle A/B; (4) self-optimizer → c0mpute.
+> The items below are the older EAGLE-era levers, kept for context (tree-verify is still a real engine lever).
+1. ~~vLLM tree GO/NO-GO~~ — SUPERSEDED (EAGLE confirmed working + merged to master; no vLLM re-measure needed).
 2. **EAGLE TREE-verify in the ring** — the GPU is IDLE during the WAN round-trip, so verifying a candidate
    TREE per traversal is ~free → ~2× accept (2.5→4–5). Needs a tree-attention mask threaded through every stage
    + coordinator best-path selection. (Tree "regresses" only in the batched compute-bound regime; single-stream
