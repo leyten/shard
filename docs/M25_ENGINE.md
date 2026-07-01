@@ -32,6 +32,18 @@ c4588bf) + **upload-bandwidth-aware `select_ring` + role relegation** (this sess
   the rental/fat-uplink pool shows a smaller gap (sanity). Adversarial review (2 attackers found nothing; 1 found
   + I reproduced/fixed a pre-existing funnel false-infeasible: subnet-blind `must`-set). Tests: `tests/
   test_topology.py` (10, all pass). Commit c2e226e. c0mpute self-optimizer feeds it measured up_mbps; it stays pure.
+- **WARM A/B (2026-07-01): attempted on 8 real scattered EU boxes; premise CONFIRMED, full automation infra-blocked.**
+  Rented 8 subnet-distinct EU boxes (CZ/HR/PL/NO×2/BG/CZ/HU, echo-only, no model — the [S,H] TRANSPORT is the term
+  under test). MEASURED real bandwidth heterogeneity across ring hops from one box: **8, 16, 39, 40, 50, 61, 127 Mbps**
+  — i.e. real scattered rings DO have residential-tier slow hops (8–16 Mbps) that wall prefill (a 100MB @16k activation
+  over an 8 Mbps hop ≈ 100s vs ~6s over 127). That confirms the premise. BUT the fully-automated per-node-UPLOAD
+  aware-vs-blind A/B did not complete, blocked by vast-container infra: (1) **no NET_ADMIN** → `tc` egress-shaping
+  unavailable (switched to app-layer send-pacing); (2) **NAT hairpin** (a box can't reach its own public IP → self must
+  be excluded from probes); (3) an 8s socket timeout killed >8s uploads (fixed → settimeout 300); (4) detached echo
+  servers didn't persist + (5) **vast ssh-proxy RATE-LIMITED** my repeated debug runs → all probes failed. Tore down
+  cleanly (0 live, ~$4). PATH TO A CLEAN NUMBER (cheap, no throttle needed — natural EU uplinks are already 8–127 Mbps):
+  ONE GENTLE run — sequential per-box, verified servers, spaced SSH, no retries-in-a-burst — after the proxy cools;
+  tools staged in `scratchpad/measure_uplinks.py`. The engine change itself is offline-validated + reviewed + landed.
 
 - **Handshake deadlock FIXED** (`_tail_accept`): acks the coord-return the instant it's identified instead of
   waiting for the lazily-connecting predecessor. Validated on a real decoded row. Covers coord + gateway.
