@@ -1,0 +1,16 @@
+{
+  "code_1024": {
+    "p_accept": 0.84897,
+    "accept_len": 6.6214,
+    "matches": 6948,
+    "n": 8184,
+    "n_seqs": 8
+  },
+  "code_8192": {
+    "p_accept": 0.87901,
+    "accept_len": 8.2654,
+    "matches": 57600,
+    "n": 65528,
+    "n_seqs": 8
+  }
+}
