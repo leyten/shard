@@ -146,6 +146,31 @@ def test_no_false_infeasible_funnel_subnet_blind():
     print("ok  no false-infeasible (funnel `must` keeps a distinct-subnet cover)")
 
 
+def test_no_false_infeasible_funnel_require_blind():
+    """Bug class 1c (fleet review 2026-07-02): the >_TRIM funnel's `must` cover is REQUIRE-blind. When
+    `require` is a THIN node whose subnet also holds the pool's fattest card, the blind cover spends
+    that subnet's slot on the fat card — which can never ring with `require` (same subnet) — and stops
+    before keeping the OTHER-subnet fat nodes a require-ring actually needs. Here node 3 (fat,
+    distinct-subnet, high-RTT) is that needed node: outside `keep` (RTT) and outside the blind `must`
+    (walk already stopped) -> old code trims it and returns None though ring {0,2,3} holds the model."""
+    n = 13
+    L = [[0.0 if i == j else 15.0 for j in range(n)] for i in range(n)]
+    c_out = [10.0] * n; c_in = [10.0] * n
+    c_out[3] = c_in[3] = 300.0                                 # 3: high RTT -> not in `keep`
+    free = {0: 2000, 1: 80000, 2: 61500, 3: 61500}             # caps: 0->1, 1->43, 2->33, 3->33
+    free.update({i: 2000 for i in range(4, n)})                # 4..12: cap-1 fillers (push pool past _TRIM)
+    lms = {i: 10.0 for i in range(n)}
+    sub = {0: "X", 1: "X", 2: "Y", 3: "Z"}                     # require 0 shares subnet X with fat node 1
+    sub.update({i: "F" for i in range(4, n)})                  # fillers co-located -> cheap subset pruning
+    r = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                    slack=0, require=0, **MODEL)
+    assert r is not None, "false infeasible: require-blind funnel `must` trimmed the require-cover"
+    assert 0 in r["order"] and sum(r["layers"].values()) == MODEL["n_layers"]
+    subs = [sub[x] for x in r["order"]]
+    assert len(subs) == len(set(subs)), "co-located stages in the ring"
+    print("ok  no false-infeasible (funnel `must` keeps a require-compatible cover)")
+
+
 def _upool():
     """6 fat single-stage-capable cards; node 5 fiber, nodes 3,4 slow cable, 4 is a subnet-twin of 0."""
     n = 6
@@ -280,7 +305,8 @@ def test_edge_cases():
 
 
 TESTS = [test_legacy_byte_identical, test_no_false_infeasible_rtt_trim, test_no_false_infeasible_subnet_kmin,
-         test_no_false_infeasible_funnel_subnet_blind, test_upload_aware_tails_and_drops,
+         test_no_false_infeasible_funnel_subnet_blind, test_no_false_infeasible_funnel_require_blind,
+         test_upload_aware_tails_and_drops,
          test_prefill_sum_vs_max_regime, test_roles_total_coverage_and_kinds,
          test_never_high_latency_hot_standby, test_purity_deterministic_and_no_mutation, test_edge_cases]
 
