@@ -40,6 +40,12 @@ NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 # transporting it as fp8 (e4m3) halves bytes/hop (~2x tok/s) at a small, MEASURED precision cost. Lossy but
 # still deterministic+verifiable (receipts hash the fp8-engine's activations). bf16 path is unchanged when off.
 M25_FP8_WIRE = bool(int(os.environ.get("M25_FP8_WIRE", "0")))
+# fp8 EAGLE-aux on the wire: with M25_EAGLE the aux hidden states (3 layers x [K+1,H] bf16 ~ 166KB/hop)
+# are ~3x the activation payload itself and ride EVERY hop + the return. They only feed the DRAFTER
+# (losslessness untouched — the ring still greedy-verifies), so fp8 is safe by construction; only accept
+# could move, and per-tensor-scale e4m3 on O(1) hidden states is well inside the head's tolerance.
+# Defaults to the M25_FP8_WIRE setting (one "fp8 on the wire" concept); override with M25_FP8_AUX=0/1.
+M25_FP8_AUX = bool(int(os.environ.get("M25_FP8_AUX", "1" if M25_FP8_WIRE else "0")))
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -95,9 +101,16 @@ def _verify_receipts(receipts):
 
 
 def _unpack(resp):
-    """EAGLE verify return is {"toks":[ids], "aux":{li:[s,H]}}; the plain path returns just [ids]."""
+    """EAGLE verify return is {"toks":[ids], "aux":{li:[s,H]}}; the plain path returns just [ids].
+    fp8-packed aux entries ([fp8_tensor, scale] pairs, M25_FP8_AUX) are dequantized here once, so every
+    downstream consumer (_eagle_seed/_eagle_aux_range/debug) sees plain bf16 [s,H] tensors."""
     if isinstance(resp, dict):
-        return resp.get("toks"), resp.get("aux")
+        aux = resp.get("aux")
+        if aux:
+            for k, v in aux.items():
+                if isinstance(v, list):                 # [fp8_cpu_tensor, float_scale] from _merge_aux
+                    aux[k] = _unpack_h(v[0], v[1])
+        return resp.get("toks"), aux
     return resp, None
 
 
@@ -108,9 +121,10 @@ def _eagle_seed(aux, pos):
 
 
 def _eagle_aux_range(aux, lo, hi):
-    """Stack the 3 aux hidden states for chunk positions [lo,hi) -> [hi-lo,3,H] for EagleDrafter.extend()."""
+    """Stack the 3 aux hidden states for chunk positions [lo,hi) -> [hi-lo,3,H] for EagleDrafter.extend()
+    (one slice+stack per layer — not a per-position Python loop, which cost seconds on long prefills)."""
     import torch as _t
-    return _t.stack([_eagle_seed(aux, p) for p in range(lo, hi)], 0)
+    return _t.stack([aux[str(li)][lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
 
 
 _EAGLE = None
@@ -171,23 +185,30 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
                              "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
         t_pf = time.time()
+        eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
+        if eagle_on:
+            from eagle_draft import prefill_pair_tokens
+            local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
+        def _pf_extend(start_i, toks_i, aux_i):
+            """Feed ONE prefill chunk's aux into the EAGLE context as it arrives, so the drafter sees the
+            WHOLE prompt (the old code kept only the LAST chunk -> the drafter attended ~prefill_chunk
+            tokens of context on long prompts) and the extend compute hides in the next chunk's WAN wait."""
+            if eagle_on and aux_i is not None:
+                local_draft.extend(prefill_pair_tokens(gen_ids, start_i, toks_i),
+                                   _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
         if prefill_chunk and len(gen_ids) > prefill_chunk:
             starts = list(range(0, len(gen_ids), prefill_chunk))
             def _send_pf(i): send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
-            d = min(max(prefill_depth, 1), len(starts)); sent = 0; rr = None
+            d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
-            for _ in range(len(starts)):
-                rr = recv_msg(rx)
+            for j in range(len(starts)):
+                toks, aux = _unpack(recv_msg(rx))
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
-            toks, aux = _unpack(rr); cur = toks[-1]
+                _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
+            cur = toks[-1]
         else:
             send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
-        if S.M25_EAGLE and aux is not None and hasattr(local_draft, "extend"):
-            local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
-            pf_len = len(toks)                                        # aux covers the LAST received prefill chunk's positions
-            pf_base = len(gen_ids) - pf_len                           # that chunk starts here (0 if prefill wasn't chunked)
-            ctx_toks = gen_ids[pf_base + 1:] + [cur]                  # tokens predicted by aux[0..pf_len-1] (EAGLE left-shift), + the 1st gen token
-            local_draft.extend(ctx_toks, _eagle_aux_range(aux, 0, pf_len), base_pos=pf_base)
+            _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
@@ -232,7 +253,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_fetch(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
-            if S.M25_EAGLE and aux is not None and hasattr(local_draft, "extend"):   # grow the EAGLE context with the newly committed positions
+            if eagle_on and aux is not None:                 # grow the EAGLE context with the newly committed positions
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
@@ -256,6 +277,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
+            # decode-loop breakdown: draft_s = serial drafter compute, ring_wait_s = blocked on the ring's
+            # return channel, decode_s = the whole decode wall. What's NOT wait or draft is coordinator-side
+            # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
+            "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             "final_confidence": conf.confidence() if conf else None}
 
 
@@ -415,11 +440,17 @@ def _block(grs, layers, start, x, vcfg):
 def _merge_aux(upstream):
     """EAGLE: accumulate this stage's captured aux hidden states (S._AUX, only the aux layers in [lo,hi))
     onto whatever upstream stages already collected, so the tail returns all of [1,30,58] to the coordinator.
-    Keys are str(layer_id); values are [s,H] bf16 cpu tensors. No-op unless M25_EAGLE."""
+    Keys are str(layer_id); values are [s,H] bf16 cpu tensors — or [fp8_tensor, scale] pairs under
+    M25_FP8_AUX (halves the dominant EAGLE decode payload; upstream entries are already packed and pass
+    through untouched; the coordinator dequantizes once in _unpack). No-op unless M25_EAGLE."""
     acc = dict(upstream or {})
     if S.M25_EAGLE:
         for li, h in S._AUX.items():
-            acc[str(li)] = h.cpu()
+            if M25_FP8_AUX:
+                q, sc = _pack_h(h)
+                acc[str(li)] = [q, sc]
+            else:
+                acc[str(li)] = h.cpu()
     return acc
 
 
@@ -703,6 +734,10 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
         parsed = parse_completion(r["text"])
         print(f"\n[coord] {r['n_tokens']}tok  {r['tok_s']:.2f} tok/s  g={r['toks_per_traversal']:.2f}  "
               f"mean_accept={r['mean_accept']:.2f}/{K}  prefill={r['prefill_s']:.2f}s  depth={depth}", flush=True)
+        if r.get("decode_s"):                                # where the decode wall went (serial-path profile)
+            other = r["decode_s"] - r.get("draft_s", 0) - r.get("ring_wait_s", 0)
+            print(f"[coord] decode {r['decode_s']:.1f}s = ring-wait {r.get('ring_wait_s', 0):.1f}s "
+                  f"+ draft {r.get('draft_s', 0):.1f}s + coord-other {other:.1f}s", flush=True)
         if parsed["reasoning_content"]:
             print("[coord] THINK:\n" + parsed["reasoning_content"][:600], flush=True)
         print("[coord] OUTPUT:\n" + (parsed["content"] or "")[:1200], flush=True)
