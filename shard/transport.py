@@ -100,9 +100,17 @@ def send_msg(sock: socket.socket, obj) -> int:
 
 
 def recv_msg(sock: socket.socket):
-    """receive + unpack one message. drop-in for phase0/wire.recv_msg."""
+    """receive + unpack one message. drop-in for phase0/wire.recv_msg.
+    A frame we can't parse into a message is a DEAD EDGE, not a process death: re-raise as
+    ConnectionError so `except EDGE_ERRORS` supervision resets the connection (wire.py has carried
+    this guard since the pickle removal; this production path lost it — one malformed frame, e.g. a
+    PSK-mode peer dialing a libp2p-mode ring, crashed the stage and its warm weights)."""
     (n,) = struct.unpack("!Q", _read_exact(sock, 8))
-    return _unpack(_read_exact(sock, n))
+    frame = _read_exact(sock, n)
+    try:
+        return _unpack(frame)
+    except (ValueError, KeyError, IndexError, TypeError, RuntimeError, struct.error, json.JSONDecodeError) as e:
+        raise ConnectionError(f"malformed frame ({type(e).__name__}: {str(e)[:80]})") from e
 
 
 # No-ops so `import shard.transport as wire` is a perfect drop-in: the libp2p sidecar
