@@ -335,8 +335,15 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
             seen.add(subnet[m]); must.add(m)                     # node per NEW subnet, mirroring the k_min walk
             if len(must) >= k_min + slack:
                 break
-        if require is not None:
-            must.add(require)
+        if require is not None:                                  # ...and a REQUIRE-compatible cover: `require`
+            must.add(require)                                    # sits in every ring, so its subnet's slot is
+            seen, acc = {subnet[require]}, caps[require]         # spent on IT (a same-subnet fat card can never
+            for m in by_cap:                                     # join it) -> keep OTHER-subnet fat nodes until
+                if subnet[m] in seen:                            # they cover the model, else a require-blind
+                    continue                                     # `must` starves the pool the same way (that
+                seen.add(subnet[m]); must.add(m); acc += caps[m] # was false-"infeasible" bug #3)
+                if acc >= n_layers:
+                    break
         usable = keep + [n for n in must if n not in keep]
 
     aware = up_mbps is not None
