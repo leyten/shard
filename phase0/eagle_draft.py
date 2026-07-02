@@ -95,18 +95,32 @@ class EagleDrafter:
     # ---- persistent committed-context cache -------------------------------------
     def reset(self):
         """Clear the committed context (start of a new generation)."""
-        self.kc = []                                    # per committed slot: RoPE'd key [1, NKV, HD]
-        self.vc = []                                    # per committed slot: value    [1, NKV, HD]
+        self.kbuf = None                                # [CAP, NKV, HD] RoPE'd keys: committed [:ctx_len] + chain scratch tail
+        self.vbuf = None                                # [CAP, NKV, HD] values (same layout)
         self.ctx_len = 0
         self._last_h = None                             # fc_out [1,H] of the last committed slot (propose's step-0 residual)
         self._last_tok = None                           # token id of the last committed slot
         self._last_pos = -1                             # RoPE position of the last committed slot
 
+    def _ensure_cap(self, need):
+        """Grow the KV buffers to >= `need` slots (amortized doubling). extend() and the draft chain write
+        IN PLACE, so propose() never re-concatenates the context — the old per-slot list + torch.cat-per-call
+        was O(ctx) on the serial draft path (depth=1: draft time adds straight to per-traversal latency)."""
+        cap = 0 if self.kbuf is None else self.kbuf.shape[0]
+        if need <= cap:
+            return
+        n = max(1024, 2 * need)
+        kb = torch.zeros(n, self.NKV, self.HD, dtype=self.fc.dtype, device=self.dev)
+        vb = torch.zeros(n, self.NKV, self.HD, dtype=self.fc.dtype, device=self.dev)
+        if self.ctx_len:
+            kb[:self.ctx_len] = self.kbuf[:self.ctx_len]; vb[:self.ctx_len] = self.vbuf[:self.ctx_len]
+        self.kbuf, self.vbuf = kb, vb
+
     def _aux_to_mat(self, auxes, n):
         """Normalize auxes (tensor [n,3,H] / [n,3H], or a list of per-position [3,H]/[3H]) -> [n, 3H] bf16."""
         if not torch.is_tensor(auxes):
             auxes = torch.stack([torch.as_tensor(a) for a in auxes], 0)
-        A = auxes.to(torch.bfloat16).to(self.dev).reshape(n, -1)
+        A = auxes.to(self.fc.dtype).to(self.dev).reshape(n, -1)
         assert A.shape[1] == self.fc.shape[1], f"aux feature {A.shape[1]} != fc in-dim {self.fc.shape[1]}"
         return A
 
@@ -114,7 +128,9 @@ class EagleDrafter:
     def extend(self, tokens, auxes, base_pos):
         """Append committed positions to the context cache. tokens[i] pairs with auxes[i] at RoPE base_pos+i
         (the caller supplies the EAGLE shift: auxes[i] = the target hidden that predicted tokens[i]). Only the
-        k/v are stored; the slot's query is re-formed in propose() (the last slot) / the chain (drafted slots)."""
+        k/v are stored; the slot's query is re-formed in propose() (the last slot) / the chain (drafted slots).
+        BATCHED: all n positions project + RoPE in one shot, written in place (the old loop ran ~8 tiny
+        kernels per position — seconds of serial coordinator time on a long prefill)."""
         if tokens is None:
             return
         tokens = tokens.tolist() if torch.is_tensor(tokens) else list(tokens)
@@ -123,20 +139,22 @@ class EagleDrafter:
             return
         lin = torch.nn.functional.linear
         fc_out = lin(self._aux_to_mat(auxes, n), self.fc)      # [n,H] fused target feature per position
-        for i in range(n):
-            tok = int(tokens[i])
-            h = fc_out[i:i + 1]                                 # [1,H]
-            en = _rms(self.embed[tok].unsqueeze(0), self.in_ln, self.eps)
-            hn = _rms(h, self.h_ln, self.eps)
-            x = torch.cat([en, hn], -1)                         # [1,2H] (layer_idx 0: embed ⊕ hidden)
-            kk = lin(x, self.kp).view(1, self.NKV, self.HD)
-            vv = lin(x, self.vp).view(1, self.NKV, self.HD)
-            p = min(base_pos + i, self.cos.shape[0] - 1)
-            cos = self.cos[p].view(1, 1, self.HD); sin = self.sin[p].view(1, 1, self.HD)
-            kk = kk * cos + _rotate_half(kk) * sin
-            self.kc.append(kk); self.vc.append(vv)
-            self._last_h = h; self._last_tok = tok; self._last_pos = p
+        tt = torch.as_tensor([int(t) for t in tokens], dtype=torch.long, device=self.dev)
+        en = _rms(self.embed[tt], self.in_ln, self.eps)        # [n,H]
+        hn = _rms(fc_out, self.h_ln, self.eps)                 # [n,H]
+        x = torch.cat([en, hn], -1)                            # [n,2H] (layer_idx 0: embed ⊕ hidden)
+        kk = lin(x, self.kp).view(n, self.NKV, self.HD)
+        vv = lin(x, self.vp).view(n, self.NKV, self.HD)
+        p = torch.clamp(torch.arange(base_pos, base_pos + n, device=self.dev), max=self.cos.shape[0] - 1)
+        cos = self.cos[p].unsqueeze(1); sin = self.sin[p].unsqueeze(1)   # [n,1,HD] broadcasts over NKV
+        kk = kk * cos + _rotate_half(kk) * sin
+        self._ensure_cap(self.ctx_len + n)
+        self.kbuf[self.ctx_len:self.ctx_len + n] = kk
+        self.vbuf[self.ctx_len:self.ctx_len + n] = vv
         self.ctx_len += n
+        self._last_h = fc_out[n - 1:n]
+        self._last_tok = int(tokens[-1])
+        self._last_pos = int(p[-1])
 
     # ---- the drafter ------------------------------------------------------------
     @torch.no_grad()
@@ -147,9 +165,8 @@ class EagleDrafter:
         if self.ctx_len == 0 or self._last_h is None:
             return [int(self._last_tok) if self._last_tok is not None else 0] * k
         lin = torch.nn.functional.linear
-        Kp = torch.cat(self.kc, 0).repeat_interleave(self.GRP, 1)   # [L,NH,HD] committed keys (GQA-expanded)
-        Vp = torch.cat(self.vc, 0).repeat_interleave(self.GRP, 1)
-        ck = []; cv = []                                            # temporary draft-chain k/v (discarded after the call)
+        self._ensure_cap(self.ctx_len + k)                         # chain scratch tail: slots [ctx_len, ctx_len+k) are
+        T = self.ctx_len                                           # overwritten by the next extend(), never committed
         out = []
         h = self._last_h; tok = self._last_tok; base = self._last_pos
         for i in range(k):
@@ -157,21 +174,22 @@ class EagleDrafter:
             hn = _rms(h, self.h_ln, self.eps)
             x = torch.cat([en, hn], -1)                            # [1,2H]
             res = h                                                # residual = fc_out (step 0) / prev hidden (chain)
-            q = lin(x, self.qp).view(1, self.NH, self.HD)
+            q = lin(x, self.qp).view(self.NH, self.HD)
             p = min(base + i, self.cos.shape[0] - 1)
-            cos = self.cos[p].view(1, 1, self.HD); sin = self.sin[p].view(1, 1, self.HD)
+            cos = self.cos[p].view(1, self.HD); sin = self.sin[p].view(1, self.HD)
             q = q * cos + _rotate_half(q) * sin
-            if i == 0:                                             # query = last committed slot (already cached)
-                K, V = Kp, Vp
-            else:                                                  # new chain slot: cache its k/v, then attend
-                kk = lin(x, self.kp).view(1, self.NKV, self.HD)
-                vv = lin(x, self.vp).view(1, self.NKV, self.HD)
-                kk = kk * cos + _rotate_half(kk) * sin
-                ck.append(kk.repeat_interleave(self.GRP, 1)); cv.append(vv.repeat_interleave(self.GRP, 1))
-                K = torch.cat([Kp] + ck, 0); V = torch.cat([Vp] + cv, 0)
-            qh = q.transpose(0, 1)                                 # [NH,1,HD]
-            att = torch.softmax((qh @ K.permute(1, 0, 2).transpose(-1, -2)).float() / (self.HD ** 0.5), -1).to(qh.dtype)
-            o = (att @ V.permute(1, 0, 2)).transpose(0, 1).reshape(1, self.NH * self.HD)
+            if i > 0:                                              # new chain slot: write its k/v at the scratch tail
+                kk = lin(x, self.kp).view(self.NKV, self.HD)
+                vv = lin(x, self.vp).view(self.NKV, self.HD)
+                self.kbuf[T] = kk * cos + _rotate_half(kk) * sin
+                self.vbuf[T] = vv; T += 1
+            # GQA attention over the buffer: K/V stay at NKV heads, the GRP query groups broadcast against
+            # them (dim-1 of Kt/Vt) — no repeat_interleave copy of the whole context per step.
+            qg = q.view(self.NKV, self.GRP, 1, self.HD)
+            Kt = self.kbuf[:T].permute(1, 2, 0).unsqueeze(1)       # [NKV,1,HD,T]
+            att = torch.softmax((qg @ Kt).float() / (self.HD ** 0.5), -1).to(q.dtype)   # [NKV,GRP,1,T]
+            Vt = self.vbuf[:T].permute(1, 0, 2).unsqueeze(1)       # [NKV,1,T,HD]
+            o = (att @ Vt).reshape(1, self.NH * self.HD)           # heads NKV-major == repeat_interleave order
             res = lin(o, self.op) + res
             hn2 = _rms(res, self.post_ln, self.eps)
             res = lin(torch.nn.functional.silu(lin(hn2, self.gp)) * lin(hn2, self.upp), self.dp) + res
@@ -202,7 +220,7 @@ class EagleDrafter:
     def set_hidden(self, aux):
         """aux: the 3 target aux hidden states for the LAST verified position, shape [3,H] or [3H]
         (order = eagle_aux_hidden_state_layer_ids = layers [1,30,58]). Stashed for the legacy propose(ids,k)."""
-        self._aux = None if aux is None else aux.reshape(-1).to(torch.bfloat16).to(self.dev)
+        self._aux = None if aux is None else aux.reshape(-1).to(self.fc.dtype).to(self.dev)
 
     def request(self, ids, k):
         self._pending = (list(ids), k)
@@ -210,6 +228,17 @@ class EagleDrafter:
     def fetch(self):
         ids, k = self._pending
         return self.propose(ids, k)
+
+
+def prefill_pair_tokens(gen_ids, start, toks):
+    """The extend() pairing for ONE prefill chunk (pure; the EAGLE left-shift): the chunk's aux positions
+    [start, start+len(toks)) each predicted the NEXT prompt token, so tokens[i] = gen_ids[start+1+i]; the
+    final position of the LAST chunk predicted the first generated token instead (= toks[-1], the tail's
+    argmax). Feeding every chunk through this (not just the last) gives the drafter the WHOLE prompt as
+    context. Invariant: concatenated over all chunks == gen_ids[1:] + [first_gen_token]."""
+    n = len(toks)
+    nxt = list(gen_ids[start + 1: start + n + 1])
+    return nxt if len(nxt) == n else nxt + [toks[-1]]
 
 
 class HybridDrafter:
