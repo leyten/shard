@@ -120,6 +120,11 @@ def _bucket(need):                                  # smallest decode bucket >= 
 M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
 if M25_CUDA_GRAPH:
     M25_STATIC_KV = True
+if M25_CUDA_GRAPH and M25_EAGLE:
+    # fail LOUD: GraphRunner replays a captured graph and never re-runs run_block's aux capture, so the
+    # EAGLE drafter would silently feed on STALE prefill aux — accept craters and the measurement lies.
+    raise SystemExit("M25_CUDA_GRAPH is incompatible with M25_EAGLE (graph replay bypasses aux capture "
+                     "-> stale aux poisons the drafter); unset one of them")
 DECODE_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
 _GR = None        # active _GraphState during capture (None = eager); attn reads its static buffers
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
