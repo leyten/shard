@@ -1,0 +1,16 @@
+{
+  "what": "Warm smoke-test of the ring-wedge fix (branch fix/ring-wedge-receipt-truth): coordinator churn must not wedge the warm ring — no re-warm between coordinator processes",
+  "date": "2026-07-02",
+  "ring": "6x RTX5090 scattered EU (HU,HU,DK,CZ,BG,CZ), one stage per /24 subnet + machine, libp2p sidecars, layers [0:10][10:20][20:30][30:40][40:51][51:62]",
+  "code": "eagle/tree-verify-v2 @ a7742f0 (contains the wedge fix commits 46c93bd + 3a5241d verbatim; tree handlers dormant without M25_TREE)",
+  "env": "SHARD_TRANSPORT=libp2p M25_EAGLE=1 M25_EAGLE_DIR=/root/m25-eagle, K=8 depth=4",
+  "procedure_and_results": [
+    {"job": 1, "desc": "first coordinator on the fresh warm ring", "result": "PASS — 50 tok, 6.70 tok/s, g=5.00, prefill 1.95s"},
+    {"job": 2, "desc": "coordinator kill -9 at t=14s, mid-decode, depth=4 chunks in flight", "result": "killed as planned"},
+    {"job": 3, "desc": "NEW coordinator process on the SAME ring, NO re-warm (the old code wedged exactly here — tail closed pred on ret death, EOF cascaded, nobody re-dialed)", "result": "PASS — 49 tok, 6.60 tok/s, g=5.56, prefill 1.93s"},
+    {"job": 4, "desc": "coordinator with SHARD_RECEIPTS=1 (stages not signing this launch — coverage logic is CPU-test-pinned in tests/test_receipt_coverage.py)", "result": "PASS — 38 tok, 7.18 tok/s, no crash on empty receipt sweep"}
+  ],
+  "stage_log_evidence": "every head/middle stage logged 'edge closed (ConnectionError); reset + drop forward link' -> 'forward link rebuilt -> 127.0.0.1:29611' per churn; tail logged 'predecessor edge closed; re-accepting both channels' — the ported specpipe choreography executing as designed, weights never reloaded",
+  "verdict": "WEDGE FIXED: the re-warm-before-every-coordinator tax is gone; a warm ring survives coordinator kill/restart mid-job (stale in-flight replies dropped until the next reset)",
+  "caveats": "clean-exit churn also cascades a ring re-handshake by design (~1s, no weight reload); receipts-signing arm not exercised on-ring this run"
+}
