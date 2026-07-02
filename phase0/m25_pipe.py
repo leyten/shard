@@ -29,6 +29,21 @@ except Exception:
 dev = "cuda"
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 
+
+def _keepalive(s):
+    """Bound silent-peer death (no FIN: box power-loss, NAT idle expiry) to ~2min instead of NEVER: the
+    churn-resilient tail waits in select(), which cannot see a half-open predecessor, and the old 600s
+    recv-timeout teardown is gone (that timeout WAS the idle-wedge). Keepalive makes the kernel probe the
+    peer and error the socket, which wakes select and routes through the normal death paths. Matters on
+    direct-TCP rings; libp2p conns are loopback-to-sidecar (never half-open)."""
+    try:
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_KEEPALIVE, 1)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPIDLE, 60)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPINTVL, 20)
+        s.setsockopt(socket.IPPROTO_TCP, socket.TCP_KEEPCNT, 3)
+    except (OSError, AttributeError):                    # non-Linux: at least the plain keepalive attempt
+        pass
+
 try:                                                    # PROVE: opt-in signed per-stage receipts (trustless verify)
     from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
 except Exception:
@@ -462,7 +477,7 @@ def _merge_aux(upstream):
     return acc
 
 
-def _tail_accept(srv, pending=None):
+def _tail_accept(srv, pending=None, ret=None, timeout=None):
     """Tail bring-up handshake. TWO connections land on the tail: the coordinator-RETURN channel (greets
     with {op:'hello_return'} the instant it connects, because the coordinator sends data immediately) and
     the PREDECESSOR ring stream (silent until the first job byte flows). With the libp2p sidecars the
@@ -473,37 +488,60 @@ def _tail_accept(srv, pending=None):
     then wedges on the 2nd accept and the coordinator hangs forever on recv(ret_ok) with EMPTY output.
 
     Fix: accept connections one at a time and ack the return channel the INSTANT we identify it — do not
-    wait for the predecessor. Whichever connection greets with hello_return is the return channel (the
-    predecessor never speaks first); the remaining silent connection is the predecessor, which connects
-    once data starts flowing post-ack. Returns (ret, pred). Blocks (like the old accept) until both
-    exist — there is no work to do without a coordinator AND a predecessor.
+    wait for the predecessor. Whichever connection greets with hello_return is the return channel; a
+    connection that speaks a JOB frame first is a (re-dialing direct-TCP) predecessor and its frame is
+    handed back as `first_msg` (specpipe fill()'s semantic — closing it kill-looped stage replacement);
+    a SILENT connection is adopted as the predecessor once the return channel exists (the libp2p
+    predecessor connects lazily and never speaks first). Returns (ret, pred, first_msg); first_msg is
+    None on the silent-predecessor path. Blocks until both channels exist.
 
     `pending` seeds the accepted-but-unidentified pool with leftovers from a torn-down session (a new
     coordinator's hello_return may already have been accepted when the old predecessor died) — closing
-    them instead would EOF the reconnecting peer and re-wedge."""
-    ret, pending = None, list(pending or [])               # pending = accepted-but-unidentified (the silent predecessor waits here)
-    while ret is None or not pending:
-        ready, _, _ = select.select([srv] + pending, [], [])   # wake on a new conn OR a pending conn finally speaking
+    them instead would EOF the reconnecting peer and re-wedge. `ret` seeds an already-live return
+    channel (kept across a pred-death that raced a fresh coordinator) — then only the predecessor is
+    awaited. `timeout` bounds the greeting read so a half-sent frame can't hang bring-up."""
+    pred, first, pending = None, None, list(pending or [])
+    while ret is None or pred is None:
+        if ret is not None and pred is None and pending:   # silent conn + live ret -> it's the predecessor
+            pred = pending.pop()
+            for extra in pending:                          # 2-conn ring never leaves extras, but stay clean
+                try: extra.close()
+                except OSError: pass
+            pending = []
+            break
+        ready, _, _ = select.select([srv] + pending, [], [])   # wake on a new conn OR a pending conn speaking
         for s in ready:
             if s is srv:
-                c, _ = srv.accept(); c.setsockopt(*NODELAY); pending.append(c); continue
-            pending.remove(s)                              # it spoke -> it's the return channel (predecessor stays silent)
+                c, _ = srv.accept(); c.setsockopt(*NODELAY); _keepalive(c); pending.append(c); continue
+            pending.remove(s)                              # it spoke -> classify by content
+            if timeout:
+                s.settimeout(timeout)
             try:
                 hello = recv_msg(s)
             except EDGE_ERRORS:
                 try: s.close()
                 except OSError: pass
                 continue
-            if ret is None and isinstance(hello, dict) and hello.get("op") == "hello_return":
-                ret = s; send_msg(ret, "ret_ok")           # ACK NOW so the coordinator proceeds — pred can connect after
+            if isinstance(hello, dict) and hello.get("op") == "hello_return":
+                if ret is not None:                        # newer coordinator wins (the old one is dead/stale)
+                    try: ret.close()
+                    except OSError: pass
+                ret = s
+                try:
+                    send_msg(ret, "ret_ok")                # ACK NOW so the coordinator proceeds — pred can connect after
+                except EDGE_ERRORS:                        # greeter died between hello and ack: not a session event
+                    try: ret.close()
+                    except OSError: pass
+                    ret = None
+            elif isinstance(hello, dict) and "op" in hello:
+                if pred is not None:                       # a speaking predecessor replaces a stale one
+                    try: pred.close()
+                    except OSError: pass
+                pred = s; first = hello                    # its first frame is real job data — hand it back
             else:
-                try: s.close()                             # unexpected greeter (or a 2nd hello) -> drop, keep waiting
+                try: s.close()                             # unexpected greeter (junk/probe) -> drop, keep waiting
                 except OSError: pass
-    pred = pending.pop()
-    for extra in pending:                                  # 2-conn ring never leaves extras, but stay clean if it ever does
-        try: extra.close()
-        except OSError: pass
-    return ret, pred
+    return ret, pred, first
 
 
 def serve(stage, nstages, lo, hi, port, nxt, timeout):
@@ -514,6 +552,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     def _dial_fwd():
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
+        _keepalive(s)
         return s
     nxt_sock = None
     if not parts["tail"]:
@@ -552,10 +591,11 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
 
         while True:
             if pred is None:
-                ret, pred = _tail_accept(srv, pending)   # acks ret_ok the instant the return channel is identified
+                # re-accept the predecessor (and the return channel unless a live one was carried over)
+                ret, pred, queued = _tail_accept(srv, pending, ret=ret, timeout=timeout)
                 pending = []                     # consumed (became ret/pred or were closed) — don't double-select
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
-                stale = False
+                stale = False                    # any stale in-flight died with the old predecessor
                 print("[tail] predecessor + coord-return connected", flush=True)
             signer = None
             with torch.no_grad():
@@ -564,39 +604,62 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         # Multiplex: pred carries job data; srv carries a reconnecting coordinator's
                         # hello_return, which MUST be accepted mid-session or coordinator churn wedges the
                         # warm ring; pending holds accepted-but-silent conns (never block-recv a silent
-                        # conn — the _tail_accept bring-up deadlock, same reasoning).
-                        ready, _, _ = select.select([srv, pred] + pending, [], [])
-                        if srv in ready:
-                            c, _ = srv.accept(); c.setsockopt(*NODELAY); pending.append(c)
-                            continue
-                        spoke = next((s for s in pending if s in ready), None)
-                        if spoke is not None:
-                            pending.remove(spoke)
-                            spoke.settimeout(timeout)      # a half-sent greeting must not hang the live session
-                            try:
-                                hello = recv_msg(spoke)
-                            except EDGE_ERRORS:
-                                try: spoke.close()
-                                except OSError: pass
-                                continue
-                            if isinstance(hello, dict) and hello.get("op") == "hello_return":
-                                if ret is not None:        # coordinator churn: the old return channel is dead
-                                    try: ret.close()       # even if this write-only socket never told us
+                        # conn — the _tail_accept bring-up deadlock, same reasoning). `queued` is a job
+                        # frame already read off a newly-adopted predecessor — process it before selecting.
+                        if queued is not None:
+                            msg, queued = _hrecv(queued), None
+                        else:
+                            ready, _, _ = select.select([srv, pred] + pending, [], [])
+                            if srv in ready:
+                                c, _ = srv.accept(); c.setsockopt(*NODELAY); _keepalive(c); pending.append(c)
+                                if len(pending) > 8:       # reap silent junk before it grows the select set
+                                    old = pending.pop(0)
+                                    try: old.close()
                                     except OSError: pass
-                                    stale = True           # in-flight traffic belongs to the dead job
-                                ret = spoke; send_msg(ret, "ret_ok")
-                                print("[tail] coord-return (re)connected mid-session", flush=True)
-                            else:
-                                try: spoke.close()         # unexpected greeter (junk/probe) -> drop
-                                except OSError: pass
-                            continue
-                        if pred not in ready:
-                            continue
-                        msg = _hrecv(recv_msg(pred))
-                        if stale:
+                                continue
+                            spoke = next((s for s in pending if s in ready), None)
+                            if spoke is not None:
+                                pending.remove(spoke)
+                                spoke.settimeout(timeout)  # a half-sent greeting must not hang the live session
+                                try:
+                                    hello = recv_msg(spoke)
+                                except EDGE_ERRORS:
+                                    try: spoke.close()
+                                    except OSError: pass
+                                    continue
+                                if isinstance(hello, dict) and hello.get("op") == "hello_return":
+                                    if ret is not None:    # coordinator churn: the old return channel is dead
+                                        try: ret.close()   # even if this write-only socket never told us
+                                        except OSError: pass
+                                        stale = True       # in-flight traffic belongs to the dead job
+                                    ret = spoke
+                                    try:
+                                        send_msg(ret, "ret_ok"); ret.settimeout(None)   # ret is untimed, like bring-up
+                                        print("[tail] coord-return (re)connected mid-session", flush=True)
+                                    except EDGE_ERRORS:    # reconnector died between hello and ack: not a pred event
+                                        try: ret.close()
+                                        except OSError: pass
+                                        ret = None
+                                elif isinstance(hello, dict) and "op" in hello:
+                                    # a NEW predecessor speaking its first job frame (direct-TCP stage
+                                    # replacement after a silent pred death) — adopt it, keep the frame
+                                    try: pred.close()
+                                    except OSError: pass
+                                    pred = spoke; queued = hello; stale = False
+                                    print("[tail] predecessor REPLACED mid-session", flush=True)
+                                else:
+                                    try: spoke.close()     # unexpected greeter (junk/probe) -> drop
+                                    except OSError: pass
+                                continue
+                            if pred not in ready:
+                                continue
+                            msg = _hrecv(recv_msg(pred))
+                        if stale or ret is None:
                             # These messages belong to a job whose coordinator died: don't compute them,
-                            # never answer them. The next job boundary (reset) re-arms the session.
-                            if msg.get("op") not in ("reset", "reset_batch"):
+                            # never answer them. The next job boundary (reset) re-arms the session — but
+                            # only once a live return channel exists to ack it (a reset with ret=None is
+                            # the dead coordinator's own; its successor always hellos before sending).
+                            if ret is None or msg.get("op") not in ("reset", "reset_batch"):
                                 continue
                             stale = False
                         if msg["op"] == "reset":
@@ -627,15 +690,21 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
                 except EDGE_ERRORS as e:
                     # PREDECESSOR death (ret failures are absorbed in _ret_send and never land here):
-                    # tear the session down, ret included, and re-accept both channels fresh.
-                    print(f"[tail] predecessor edge closed ({type(e).__name__}); re-accepting both channels", flush=True)
+                    # tear the session down and re-accept. The ret goes too — a reset-ok must never reach
+                    # a dead coordinator's channel — UNLESS it was JUST replaced by a reconnecting
+                    # coordinator (stale set, no reset consumed yet): then this EOF is the OLD session's
+                    # cascade arriving late, and killing the fresh ret would fail the very retry that
+                    # churn recovery exists for.
+                    keep = ret if (stale and ret is not None) else None
+                    print(f"[tail] predecessor edge closed ({type(e).__name__}); re-accepting "
+                          f"{'predecessor (fresh coord-return kept)' if keep else 'both channels'}", flush=True)
                     for L in layers:
                         L.reset()
-                    for s in (pred, ret):
+                    for s in (pred, None if keep else ret):
                         if s is not None:
                             try: s.close()
                             except OSError: pass
-                    pred = ret = None
+                    pred, ret = None, keep
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
@@ -651,7 +720,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 if tries % 60 == 0:                   # waiting than dead (downstream may be mid-restart)
                     print(f"[s{stage}] forward re-dial {nxt} still failing ({tries} tries)", flush=True)
                 time.sleep(0.5)
-        conn, _ = srv.accept(); conn.setsockopt(*NODELAY)
+        conn, _ = srv.accept(); conn.setsockopt(*NODELAY); _keepalive(conn)
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None
         with torch.no_grad():
