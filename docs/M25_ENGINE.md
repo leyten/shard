@@ -13,7 +13,40 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-07-01) — all on `master`; `select_ring` is now UPLOAD-AWARE. NEXT = the selection-driven warm run.**
+**LATEST (2026-07-02) — ENGINE-PERF session (Fable-5 full-repo review + fixes). Branch `perf/eagle-serial-path`
+(worktree `/root/.openclaw/workspace/shard-perf`) holds 7 commits, tested (18 CPU tests pass), UNMERGED — land it
+(PR → squash) then NEXT = one warm EAGLE run that reads the new `draft_s`/`ring_wait_s` breakdown + A/Bs the branch.**
+- What the branch fixes (all found by reading + a 12-reviewer adversarial fleet; leyten directed: ENGINE PERF focus):
+  (1) `EagleDrafter` was O(ctx) per draft round (list-KV re-cat + GQA repeat_interleave every propose; ~8 tiny
+  kernels/token in extend) → preallocated in-place KV + batched extend + broadcast-GQA; CPU bench 156×
+  prefill-extend / 3.8× decode round; proposals regression-locked to the old impl (`tests/test_eagle_draft.py`).
+  (2) EAGLE aux payload (3×[K+1,H] bf16 ≈ 166KB/hop ≈ 3× the h payload) now fp8-packs (`M25_FP8_AUX`, defaults to
+  M25_FP8_WIRE; drafter-only → losslessness untouched). (3) The drafter saw only the LAST prefill chunk (512-token
+  context window!) → every chunk now extends the EAGLE context as it arrives (accept ↑ on long prompts, unmeasured).
+  (4) Divergences no longer compute-then-discard a full stale draft (`cancel()`). (5) n-gram `matched` needed zero
+  context agreement → coincidence anchors starved EAGLE on novel text; now `best_len>=1` routes (M25_NGRAM_MINMATCH).
+  (6) K=8 defaults landed (coord+gateway were still 6). (7) fp8 dtypes added to `wire.py` (raw-TCP path rejected
+  every M25_FP8_WIRE frame — codec drift vs transport.py). (8) M25_CUDA_GRAPH+M25_EAGLE now fails loud (stale-aux
+  poison). (9) `coordinate_pipe` returns `decode_s/draft_s/ring_wait_s` — the warm run finally attributes the
+  ~180ms/traversal that isn't RTT.
+- **Review fleet (12 reviewers + adversarial verifiers, run wf_6818d2f6-5cf) — verification still completing;**
+  headline verified-or-strong findings BEYOND this branch, ranked for perf: (a) tree-verify's measured tok/s loss is
+  largely SELF-INFLICTED (~6-7× wire bytes/traversal: trunk re-feed + un-fp8'd aux + dense-mask-off-flash attn +
+  worst-case 2^d fan-out shape) → fix payload+shape+mask-split BEFORE the high-RTT measure, it may flip the tight-ring
+  verdict too; (b) ring-wedge root cause CONFIRMED in code (stages dial `nxt_sock` once, tail closes pred on coord
+  death → cascade, nobody re-dials) — the re-warm tax is a fixable bug; (c) batched-decode KV write has NO MAXLEN
+  guard (OOB scatter CUDA-assert kills the stage); (d) receipt coverage check is self-referential (layer_count from
+  the receipts themselves — pass n_layers explicitly), receipts have no freshness/chain-link binding, and
+  `transport.py` (production path!) lost wire.py's malformed-frame hardening (one bad frame kills a stage — betanet
+  blocker, not perf); (e) `m25_scatter_pipe` forwards M25_* env to stages but NOT coord/gateway (measurement-poison
+  trap); (f) STATE.md/FLEET_STATE.md/RESUME_B.md are dead-stale (history agent) — cull or supersede.
+- Next actions (ranked): (1) land `perf/eagle-serial-path`; (2) warm EAGLE run: read the breakdown, A/B branch vs
+  master, A/B M25_FP8_AUX + MINMATCH (accept must not regress); (3) tree-verify payload/shape/mask fixes on a rebased
+  branch, THEN the high-RTT measure; (4) wedge fix (nxt_sock re-dial + tail keeps pred on ret death); (5) batched
+  MAXLEN guard + scatter-launcher env forwarding; (6) the (d) soundness cluster when back on trust work.
+
+*(previous session, kept for context:)*
+**2026-07-01 — all on `master`; `select_ring` is now UPLOAD-AWARE. NEXT = the selection-driven warm run.**
 Tonight landed on master: handshake fix + `select_ring` + EAGLE-chain (PRs #7/#8/#9) + **fp8 wire** (cherry-pick
 c4588bf) + **upload-bandwidth-aware `select_ring` + role relegation** (this session). Branches deleted; only
 `eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine integrated INTO c0mpute, permissionless)
