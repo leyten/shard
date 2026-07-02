@@ -1,0 +1,26 @@
+{
+  "receipt": "m25-eagle-serial-path-ab",
+  "date": "2026-07-02",
+  "what": "Warm A/B of branch perf/eagle-serial-path vs master on a scattered 6x RTX-5090 EU ring, EAGLE reasoning-hybrid, honest_bench (reasoning ON, K=8 depth=4)",
+  "ring": {
+    "order": "Czechia(head,L0-10) -> UnitedKingdom(10-20) -> Czechia(20-30) -> Hungary(30-40) -> Germany(40-51) -> Denmark(51-62)",
+    "note": "rental-lottery order (NOT topology-optimized); all arms on the SAME ring so the comparison is internal; ring showed large per-warm WAN jitter (code-edit prefill swung 8.8s..66s across cycles)",
+    "iids": "43611563,43611571,43611574,43611599,43611608,43611553"
+  },
+  "arms": {
+    "M_master_forward":  {"decode_wtd_tok_s": 4.0, "reason_math": 3.2, "reason_logic": 4.0, "open_chat": 4.6, "code_edit": 3.9, "rag_quote": 4.1, "agentic": 8.9, "rag_quote_accept_pct": 13},
+    "B0_branch_forward": {"decode_wtd_tok_s": 5.9, "reason_math": 4.9, "reason_logic": 4.9, "open_chat": 4.9, "code_edit": 6.2, "rag_quote": 10.3, "agentic": 8.8, "rag_quote_accept_pct": 44, "env": "M25_FP8_AUX=0 M25_NGRAM_MINMATCH=0"},
+    "B1_branch_minmatch":{"decode_wtd_tok_s": 4.8, "note": "M25_NGRAM_MINMATCH=1; within the master-branch noise band on a single pass -> UNPROVEN either way"},
+    "B2_branch_fp8aux":  {"decode_wtd_tok_s": 3.6, "note": "M25_FP8_AUX=1; low tok/s is a BAD-JITTER warm cycle (code-edit prefill 47.8s), NOT fp8-aux; accept identical to B0 (14/13/24/43/44) => fp8-aux is QUALITY-SAFE"},
+    "B0r_branch_reverse":{"decode_wtd_tok_s": 5.5, "reason_math": 7.8, "rag_quote": 10.5, "agentic": 11.2, "rag_quote_accept_pct": 44, "env": "M25_FP8_AUX=0 M25_NGRAM_MINMATCH=0"},
+    "Mr_master_reverse": {"decode_wtd_tok_s": 4.6, "reason_math": 5.8, "code_edit": 5.8, "rag_quote": 4.8, "agentic": 9.8, "rag_quote_accept_pct": 13}
+  },
+  "verdict": {
+    "serial_path_win": "JITTER-ROBUST +33% decode-weighted (master mean 4.3 -> branch mean 5.7); both orderings agree branch>master (fwd 4.0->5.9, rev 4.6->5.5). Accept identical M-vs-branch on all cells except rag-quote => pure per-traversal latency recovery (drafter O(ctx)->O(1) + cancel), as the CPU bench predicted.",
+    "accept_win": "REPRODUCIBLE accept lift on long-context-QUOTE (rag-quote 13% -> 44%, g 2.0 -> 4.5, tok/s ~4 -> ~10.5) across BOTH branch passes; the whole-prompt EAGLE-context fix landing on exactly the category it targets (old code fed the drafter only the last 512-tok prefill chunk).",
+    "fp8_aux": "QUALITY-SAFE (accept unchanged vs B0); tok/s effect unmeasurable tonight due to jitter. Keep as default under M25_FP8_WIRE.",
+    "min_match": "UNPROVEN on one pass (lost in jitter); needs a within-run A/B before trusting the default. Keeping default on but flagged.",
+    "merge": "MERGE-WORTHY on the serial-path + rag-quote wins. Push pending leyten go (condition 'concrete swarm-ring results' now met)."
+  },
+  "method": "phase0/m25_scatter_pipe.py --warm-only (worktree-safe REPO pushes branch vs master code per arm) then research/m25_honest_bench.py as the sole coordinator on the head; re-warm between every arm."
+}

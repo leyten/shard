@@ -13,10 +13,85 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-07-01) — all on `master`; NEXT = make `select_ring` upload-aware, then validate.**
+**LATEST (2026-07-02) — ENGINE-PERF session. Branch `perf/eagle-serial-path` (worktree `shard-perf`, 9 commits,
+18 CPU tests pass) is WARM-A/B-VALIDATED on a scattered 6×5090 EU ring: +33% decode-weighted vs master
+(jitter-robust, both orderings) + a reproducible rag-quote accept lift 13→44%. MERGE-WORTHY. UNMERGED + UNPUSHED
+(awaiting leyten's push go; the "concrete swarm-ring results" push-gate is now met). Ring torn down (0 live).**
+- **A/B RESULT (receipt `docs/receipts/m25-eagle-serial-path-ab-20260702.json`):** 6 arms, same rental-lottery
+  ring all arms. Master mean 4.3 → branch mean 5.7 = **+33% decode-weighted**, BOTH warm orderings agree
+  branch>master (fwd 4.0→5.9, rev 4.6→5.5) so it survives the ring's large per-warm WAN jitter. Accept is
+  IDENTICAL master-vs-branch on every cell EXCEPT rag-quote, where the whole-prompt drafter-context fix lifts
+  accept **13→44%** (g 2.0→4.5, ~4→10.5 tok/s) reproducibly across both branch passes — so the branch delivers
+  TWO wins: serial-path latency recovery everywhere + a real accept/g gain on long-context-quote. fp8-aux
+  QUALITY-SAFE (accept unchanged). min-match (B1) UNPROVEN on one pass (lost in jitter) — needs a within-run A/B.
+- **NEXT:** (1) leyten's push go → PR → squash-merge; (2) a within-run min-match A/B + a topology-optimized run
+  (the mesh probe confirmed the 2 CZ boxes are ~5ms apart but the lottery split them with GB — `plan_ring`
+  sidecar-RTT measure, not ICMP which vast blocks); (3) the ring-wedge fix (nxt_sock re-dial) as its own branch;
+  (4) the receipt-soundness cluster. Full 79-finding fleet backlog: `.claude/plans/fleet-findings-20260702.md`.
+
+*(pre-A/B, kept for context — the branch build:)*
+**Branch `perf/eagle-serial-path` (worktree `/root/.openclaw/workspace/shard-perf`), tested (18 CPU tests pass).**
+- What the branch fixes (all found by reading + a 12-reviewer adversarial fleet; leyten directed: ENGINE PERF focus):
+  (1) `EagleDrafter` was O(ctx) per draft round (list-KV re-cat + GQA repeat_interleave every propose; ~8 tiny
+  kernels/token in extend) → preallocated in-place KV + batched extend + broadcast-GQA; CPU bench 156×
+  prefill-extend / 3.8× decode round; proposals regression-locked to the old impl (`tests/test_eagle_draft.py`).
+  (2) EAGLE aux payload (3×[K+1,H] bf16 ≈ 166KB/hop ≈ 3× the h payload) now fp8-packs (`M25_FP8_AUX`, defaults to
+  M25_FP8_WIRE; drafter-only → losslessness untouched). (3) The drafter saw only the LAST prefill chunk (512-token
+  context window!) → every chunk now extends the EAGLE context as it arrives (accept ↑ on long prompts, unmeasured).
+  (4) Divergences no longer compute-then-discard a full stale draft (`cancel()`). (5) n-gram `matched` needed zero
+  context agreement → coincidence anchors starved EAGLE on novel text; now `best_len>=1` routes (M25_NGRAM_MINMATCH).
+  (6) K=8 defaults landed (coord+gateway were still 6). (7) fp8 dtypes added to `wire.py` (raw-TCP path rejected
+  every M25_FP8_WIRE frame — codec drift vs transport.py). (8) M25_CUDA_GRAPH+M25_EAGLE now fails loud (stale-aux
+  poison). (9) `coordinate_pipe` returns `decode_s/draft_s/ring_wait_s` — the warm run finally attributes the
+  ~180ms/traversal that isn't RTT.
+- **Review fleet (12 reviewers + adversarial verifiers, run wf_6818d2f6-5cf) — verification still completing;**
+  headline verified-or-strong findings BEYOND this branch, ranked for perf: (a) tree-verify's measured tok/s loss is
+  largely SELF-INFLICTED (~6-7× wire bytes/traversal: trunk re-feed + un-fp8'd aux + dense-mask-off-flash attn +
+  worst-case 2^d fan-out shape) → fix payload+shape+mask-split BEFORE the high-RTT measure, it may flip the tight-ring
+  verdict too; (b) ring-wedge root cause CONFIRMED in code (stages dial `nxt_sock` once, tail closes pred on coord
+  death → cascade, nobody re-dials) — the re-warm tax is a fixable bug; (c) batched-decode KV write has NO MAXLEN
+  guard (OOB scatter CUDA-assert kills the stage); (d) receipt coverage check is self-referential (layer_count from
+  the receipts themselves — pass n_layers explicitly), receipts have no freshness/chain-link binding, and
+  `transport.py` (production path!) lost wire.py's malformed-frame hardening (one bad frame kills a stage — betanet
+  blocker, not perf); (e) `m25_scatter_pipe` forwards M25_* env to stages but NOT coord/gateway (measurement-poison
+  trap); (f) STATE.md/FLEET_STATE.md/RESUME_B.md are dead-stale (history agent) — cull or supersede.
+- Next actions (ranked): (1) land `perf/eagle-serial-path`; (2) warm EAGLE run: read the breakdown, A/B branch vs
+  master, A/B M25_FP8_AUX + MINMATCH (accept must not regress); (3) tree-verify payload/shape/mask fixes on a rebased
+  branch, THEN the high-RTT measure; (4) wedge fix (nxt_sock re-dial + tail keeps pred on ret death); (5) batched
+  MAXLEN guard + scatter-launcher env forwarding; (6) the (d) soundness cluster when back on trust work.
+
+*(previous session, kept for context:)*
+**2026-07-01 — all on `master`; `select_ring` is now UPLOAD-AWARE. NEXT = the selection-driven warm run.**
 Tonight landed on master: handshake fix + `select_ring` + EAGLE-chain (PRs #7/#8/#9) + **fp8 wire** (cherry-pick
-c4588bf). Branches deleted; only `eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine
-integrated INTO c0mpute, permissionless) — NOT a standalone fast ring (don't relabel it as just "usable speed").
+c4588bf) + **upload-bandwidth-aware `select_ring` + role relegation** (this session). Branches deleted; only
+`eagle/tree-verify` remains unmerged. PoC = **the BETANET** (M2.5 engine integrated INTO c0mpute, permissionless)
+— NOT a standalone fast ring (don't relabel it as just "usable speed").
+
+- **`select_ring` UPLOAD-AWARE (this session, on master).** The #1 residential lever landed. Objective is now
+  TOTAL REQUEST TIME `T = prefill_ms + D*decode_step_ms` with per-node UPLOAD a first-class cost (sender-uplink
+  bound; the residential bind). Prefill's [S,H] activation (~100MB/hop @16k) is the wall; the selector tails the
+  lowest-upload node (the tail forwards nothing), drops nodes whose uplink would dominate prefill, and RELEGATES
+  them to off-critical roles (weight-seeder / aggregator-relay / hot-standby / decode-only-replica / spot-check-
+  verifier) instead of discarding capacity. Prefill transport modeled as the engine's chunked+pipelined makespan
+  `(sum_fwd(u)+(C-1)*max_fwd(u))/C` (C=1 SUM ↔ C large MAX). PURE, and BYTE-IDENTICAL to the old decode-only path
+  when `up_mbps` is omitted (golden-snapshot regression-tested). VALIDATED offline (`scratchpad/sim_network.py`,
+  volunteer/residential pool): aware/oracle ~0.98 across ctx while blind/oracle collapses 0.98→0.80 as ctx grows;
+  request-time speedup 1.01×@2k → 1.09×@16k → 1.32×@64k; **TTFT (first-token) speedup 2.5–5× (p95 up to 19×)**;
+  the rental/fat-uplink pool shows a smaller gap (sanity). Adversarial review (2 attackers found nothing; 1 found
+  + I reproduced/fixed a pre-existing funnel false-infeasible: subnet-blind `must`-set). Tests: `tests/
+  test_topology.py` (10, all pass). Commit c2e226e. c0mpute self-optimizer feeds it measured up_mbps; it stays pure.
+- **WARM A/B (2026-07-01): attempted on 8 real scattered EU boxes; premise CONFIRMED, full automation infra-blocked.**
+  Rented 8 subnet-distinct EU boxes (CZ/HR/PL/NO×2/BG/CZ/HU, echo-only, no model — the [S,H] TRANSPORT is the term
+  under test). MEASURED real bandwidth heterogeneity across ring hops from one box: **8, 16, 39, 40, 50, 61, 127 Mbps**
+  — i.e. real scattered rings DO have residential-tier slow hops (8–16 Mbps) that wall prefill (a 100MB @16k activation
+  over an 8 Mbps hop ≈ 100s vs ~6s over 127). That confirms the premise. BUT the fully-automated per-node-UPLOAD
+  aware-vs-blind A/B did not complete, blocked by vast-container infra: (1) **no NET_ADMIN** → `tc` egress-shaping
+  unavailable (switched to app-layer send-pacing); (2) **NAT hairpin** (a box can't reach its own public IP → self must
+  be excluded from probes); (3) an 8s socket timeout killed >8s uploads (fixed → settimeout 300); (4) detached echo
+  servers didn't persist + (5) **vast ssh-proxy RATE-LIMITED** my repeated debug runs → all probes failed. Tore down
+  cleanly (0 live, ~$4). PATH TO A CLEAN NUMBER (cheap, no throttle needed — natural EU uplinks are already 8–127 Mbps):
+  ONE GENTLE run — sequential per-box, verified servers, spaced SSH, no retries-in-a-burst — after the proxy cools;
+  tools staged in `scratchpad/measure_uplinks.py`. The engine change itself is offline-validated + reviewed + landed.
 
 - **Handshake deadlock FIXED** (`_tail_accept`): acks the coord-return the instant it's identified instead of
   waiting for the lazily-connecting predecessor. Validated on a real decoded row. Covers coord + gateway.
@@ -54,10 +129,12 @@ integrated INTO c0mpute, permissionless) — NOT a standalone fast ring (don't r
   (the "threshold" is PER-ROLE inside `select_ring`, not a velvet rope at the door). Both on MEASURED/VERIFIED
   capability, never self-reported (lying-uplink attack → caught by probing + the receipt hash-chain).
 
-- **NEXT ACTIONS (ranked):** (a) extend `select_ring` to take per-node upload bw + make it the dominant prefill
-  cost + role relegation; (b) validation run (over-rent ~8, plan_ring selects, warm, benchmark predicted-vs-
-  actual); (c) residential-bw A/B (tc-throttle a ring to 20Mbps, measure decode+prefill bf16-vs-fp8 — boxes torn
-  down, re-provision); (d) self-optimizer graduates to c0mpute (shard=engine, c0mpute→shard only). Roadmap:
+- **NEXT ACTIONS (ranked):** (a) ~~upload-aware `select_ring` + relegation~~ **DONE** (this session; offline-validated,
+  tested, on master). (b) **selection-driven warm run** (over-rent ~8, `plan_ring` measures→selects→`--order`, warm,
+  benchmark predicted-vs-actual request_ms; also wire per-node upload into `plan_ring` — it currently measures RTT/
+  VRAM/power but NOT uplink, so add an upload probe before this run); (c) residential-bw A/B (tc-throttle a ring to
+  20Mbps, measure decode+prefill bf16-vs-fp8 — boxes torn down, re-provision); (d) self-optimizer graduates to
+  c0mpute (shard=engine, c0mpute→shard only; roles become placement hints the network layer acts on). Roadmap:
   Vivaldi coords = O(N) all-pairs latency at scale; tree-verify (`eagle/tree-verify`) = engine lever for high-RTT.
 
 ---
@@ -142,7 +219,8 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
 | **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
-| **Self-optimizer core (`select_ring`)** | built, adversarially reviewed (2 critical bugs fixed), regression-tested, calibrated (predicts measured tok/s); picks subset+order+layer-split by predicted step-time, drops weak/co-located | **master** (`shard/topology.py`) |
+| **Self-optimizer core (`select_ring`)** | UPLOAD-AWARE: minimizes total request time (prefill+D·decode) with per-node uplink first-class; tails/drops slow-upload nodes + relegates them to off-critical roles; picks subset+order+layer-split; adversarially reviewed (3 false-infeasible bugs fixed total), 10 regression tests, byte-identical legacy path | **master** (`shard/topology.py`, `tests/test_topology.py`) |
+| **Upload-aware selection (offline validation)** | aware/oracle ~0.98 vs blind 0.98→0.80 as ctx grows; **TTFT speedup 2.5–5× (p95 19×)** on the residential pool; request 1.0→1.32× (2k→64k); rental gap smaller (sanity) | `scratchpad/sim_network.py`, this doc RESUME HERE |
 | **fp8 activations on the wire** | **+9% on high-bw vast** (bf16 4.87→fp8 5.30; ~2× is the residential bytes-bound regime); quality preserved (correct+coherent) but NOT bit-exact | **master** (`M25_FP8_WIRE`, commit c4588bf) |
 | **Residential bottleneck (3-agent research)** | bind = sender UPLOAD; decode survives, long-ctx PREFILL is the wall on cable/DSL (fine on fiber); fix = upload-aware selection + use download direction, NOT QoS | RESUME HERE, this doc |
 

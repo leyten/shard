@@ -34,10 +34,16 @@ class NgramDrafter:
     dict lookup, so it stays ~O(1) per round even at 100k context, fully hidden behind the
     WAN verify."""
 
-    def __init__(self, ng=3, max_ext=64, max_cand=48, margin=256):
+    def __init__(self, ng=3, max_ext=64, max_cand=48, margin=256, min_match=1):
         self.ng = ng                 # anchor suffix length to index on (the lookup key)
         self.max_ext = max_ext       # cap how far back we extend a match (bounds per-round cost)
         self.max_cand = max_cand     # only weigh the most-recent N occurrences of an anchor
+        # `matched` (the HybridDrafter n-gram-vs-EAGLE router) requires best_len >= min_match: a bare
+        # ng-token anchor recurrence with ZERO preceding-context agreement is a coincidence on novel/
+        # reasoning text, and claiming it starved EAGLE of exactly the rounds it exists for (garbage
+        # n-gram draft -> accept 0 -> wasted traversal). min_match=0 restores the old any-anchor routing.
+        # The n-gram PROPOSAL itself is unchanged either way — only the routing signal moves.
+        self.min_match = min_match
         # only index positions older than `margin` from the end: the recent tail is the pipeline's
         # SPECULATIVE region (in-flight drafts, rewritten on a divergence), so indexing it would
         # create stale entries and force rebuilds. Everything older is committed + immutable, so the
@@ -56,6 +62,9 @@ class NgramDrafter:
     def fetch(self):
         ids, k = self._pending
         return self.propose(ids, k)
+
+    def cancel(self):
+        self._pending = None                    # drop a stale request without computing the proposal
 
     # ---- the drafter ------------------------------------------------------------
     def _sync(self, seq):
@@ -97,7 +106,7 @@ class NgramDrafter:
                     break
         if best_p is None:
             return [seq[-1]] * k
-        self.matched = True                      # real longest-match -> draftable, keep depth-pipelining
+        self.matched = best_len >= self.min_match   # real longest-match -> draftable (see min_match)
         cont = seq[best_p:best_p + k]
         if len(cont) < k:                        # ran off the end -> pad (pads get rejected, harmless)
             cont = cont + [cont[-1] if cont else seq[-1]] * (k - len(cont))
