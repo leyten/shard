@@ -1011,6 +1011,9 @@ def main():
     ap.add_argument("--top-p", type=float, default=1.0, help="nucleus sampling cutoff (with --temp>0)")
     ap.add_argument("--top-k", type=int, default=0, help="top-k sampling cutoff (0=off; with --temp>0)")
     ap.add_argument("--seed", type=int, default=0, help="tail sampler seed (reproducible sampled runs / receipts)")
+    ap.add_argument("--n-layers", type=int, default=0, help="coordinator: the model's TRUE layer count for the "
+                    "receipt coverage check (e.g. 36 for gpt-oss-120b); 0 derives it from the receipts "
+                    "themselves, which a layer-omitting ring can game (warned loudly)")
     ap.add_argument("--sample-test", type=int, default=0, help="coordinator: draw N iid next-tokens via PLAIN vs "
                     "SPECULATIVE sampling and report TV distance (on-swarm losslessness proof); needs --ngram-draft")
     ap.add_argument("--resume-file", default="", help="coordinator: JSON {output_ids:[...]} of already-committed "
@@ -1185,7 +1188,10 @@ def main():
                     except Exception as e:
                         ok = False; print(f"  stage {rr['stage']}: sig FAILED ({e})", flush=True)
                 try:
-                    total = max(rr["layer_end"] for rr in recs)
+                    total = args.n_layers or max(rr["layer_end"] for rr in recs)
+                    if not args.n_layers:                  # derived from the receipts under test = self-referential:
+                        print("  ⚠ coverage target derived from the receipts themselves (pass --n-layers to pin "
+                              "the model's true depth — a layer-omitting ring passes without it)", flush=True)
                     verify_coverage([{k: v for k, v in rr.items() if k != "stage"} for rr in recs], total)
                     print(f"  coverage: blocks tile [0:{total}] no gap/overlap — every layer attested by a distinct signed node", flush=True)
                 except Exception as e:
