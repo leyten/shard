@@ -13,9 +13,24 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-07-02) — ENGINE-PERF session (Fable-5 full-repo review + fixes). Branch `perf/eagle-serial-path`
-(worktree `/root/.openclaw/workspace/shard-perf`) holds 7 commits, tested (18 CPU tests pass), UNMERGED — land it
-(PR → squash) then NEXT = one warm EAGLE run that reads the new `draft_s`/`ring_wait_s` breakdown + A/Bs the branch.**
+**LATEST (2026-07-02) — ENGINE-PERF session. Branch `perf/eagle-serial-path` (worktree `shard-perf`, 9 commits,
+18 CPU tests pass) is WARM-A/B-VALIDATED on a scattered 6×5090 EU ring: +33% decode-weighted vs master
+(jitter-robust, both orderings) + a reproducible rag-quote accept lift 13→44%. MERGE-WORTHY. UNMERGED + UNPUSHED
+(awaiting leyten's push go; the "concrete swarm-ring results" push-gate is now met). Ring torn down (0 live).**
+- **A/B RESULT (receipt `docs/receipts/m25-eagle-serial-path-ab-20260702.json`):** 6 arms, same rental-lottery
+  ring all arms. Master mean 4.3 → branch mean 5.7 = **+33% decode-weighted**, BOTH warm orderings agree
+  branch>master (fwd 4.0→5.9, rev 4.6→5.5) so it survives the ring's large per-warm WAN jitter. Accept is
+  IDENTICAL master-vs-branch on every cell EXCEPT rag-quote, where the whole-prompt drafter-context fix lifts
+  accept **13→44%** (g 2.0→4.5, ~4→10.5 tok/s) reproducibly across both branch passes — so the branch delivers
+  TWO wins: serial-path latency recovery everywhere + a real accept/g gain on long-context-quote. fp8-aux
+  QUALITY-SAFE (accept unchanged). min-match (B1) UNPROVEN on one pass (lost in jitter) — needs a within-run A/B.
+- **NEXT:** (1) leyten's push go → PR → squash-merge; (2) a within-run min-match A/B + a topology-optimized run
+  (the mesh probe confirmed the 2 CZ boxes are ~5ms apart but the lottery split them with GB — `plan_ring`
+  sidecar-RTT measure, not ICMP which vast blocks); (3) the ring-wedge fix (nxt_sock re-dial) as its own branch;
+  (4) the receipt-soundness cluster. Full 79-finding fleet backlog: `.claude/plans/fleet-findings-20260702.md`.
+
+*(pre-A/B, kept for context — the branch build:)*
+**Branch `perf/eagle-serial-path` (worktree `/root/.openclaw/workspace/shard-perf`), tested (18 CPU tests pass).**
 - What the branch fixes (all found by reading + a 12-reviewer adversarial fleet; leyten directed: ENGINE PERF focus):
   (1) `EagleDrafter` was O(ctx) per draft round (list-KV re-cat + GQA repeat_interleave every propose; ~8 tiny
   kernels/token in extend) → preallocated in-place KV + batched extend + broadcast-GQA; CPU bench 156×
