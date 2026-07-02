@@ -400,9 +400,19 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
         rounds = 0; total_committed = 0; t0 = time.time(); done = False
+        ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
         while not done:
             L = len(pending_path)
-            td = time.time(); tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
+            td = time.time()
+            tree = None
+            if ng is not None:                              # HYBRID routing, same split as the chain path: n-gram
+                ng.request(prompt_ids + out, tree_depth)    # FIRST (nails verbatim-reuse; the EAGLE-only tree lost
+                ds = ng.fetch()                             # rag-quote 5.6->3.0 tok/s in the 2026-07-02 A/B) ->
+                if ds and getattr(ng, "matched", False):    # EAGLE tree on a miss (novel/reasoning text)
+                    tree = {"tokens": list(ds), "parents": [-1] + list(range(len(ds) - 1)),
+                            "depths": list(range(1, len(ds) + 1))}   # a matched n-gram chain IS a 1-wide tree
+            if tree is None:
+                tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
             t_draft += time.time() - td
             token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
             send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
