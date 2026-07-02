@@ -761,7 +761,7 @@ if __name__ == "__main__":
     pc = sub.add_parser("coord")
     pc.add_argument("--head", required=True); pc.add_argument("--tail", required=True)
     pc.add_argument("--prompt", default="Explain a decentralized inference swarm in 3 sentences.")
-    pc.add_argument("--prompt-file", default=None); pc.add_argument("--K", type=int, default=6)
+    pc.add_argument("--prompt-file", default=None); pc.add_argument("--K", type=int, default=8)   # K=8 = the measured sweet spot (2026-06-27 sweep; K=6 left ~2x on the table)
     pc.add_argument("--depth", type=int, default=4); pc.add_argument("--max-new", type=int, default=256)
     pc.add_argument("--ngram-n", type=int, default=3); pc.add_argument("--timeout", type=int, default=600)
     pc.add_argument("--sweep", default=None, help="comma K list, e.g. 4,6,8,12,16 (drafter margin is safe to K<=16)")
