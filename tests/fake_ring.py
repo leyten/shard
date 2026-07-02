@@ -1,0 +1,235 @@
+"""CPU FAKE-RING harness for the m25_pipe coordinators — no GPU, no model, no network ring.
+
+Runs coordinate_pipe / coordinate_pipe_tree against a TEACHER-FORCED ORACLE ring played by a
+background thread over two real sockets (socketpair), speaking the exact head+tail wire protocol
+serve() speaks (reset -> "ok", receipt -> [], verify -> per-position argmax [+ EAGLE aux]) through
+the same send_msg/recv_msg codec the coordinator uses (SHARD_TRANSPORT=libp2p -> shard/transport.py's
+JSON+tensor frames, no PSK).
+
+THE ORACLE: a fixed target token sequence T indexed by ABSOLUTE position. For any verify slot at
+absolute position p (plain chunk: start+i; tree node: pos_ids[i]) the reply token is T[p+1] — the
+model's greedy argmax depends only on the position, never on the (possibly wrong) draft token in
+that slot. This preserves speculative-accept accounting exactly: a draft token is accepted iff it
+equals the true continuation, and every committed stream must therefore be a prefix of T after the
+prompt. Losslessness == `output_ids == T[P:P+n]`, assertable to the token.
+
+EAGLE aux convention (mirrors serve()'s tail return {"toks":..., "aux":{str(li): [s,H]}}):
+aux[li][i] is filled with the ABSOLUTE POSITION of slot i, as float32 (the real tail sends bf16,
+but bf16 only holds integers exactly up to 256; fp32 keeps the position encoding assertable at any
+test length — the coordinator and codec are dtype-agnostic). This makes the EAGLE extend-pairing
+contract (auxes[i] = hidden at base_pos+i, tokens[i] = T[base_pos+i+1]) directly checkable via
+RecordingDrafter.
+
+Import bootstrap (must run BEFORE m25_pipe): a minimal fake M25_DIR (real M2.5 dims) satisfies
+m25_stage's module-level AutoConfig.from_pretrained + safetensors index read; SHARD_TRANSPORT=libp2p
+selects the PSK-free codec; phase0/ and shard/ go on sys.path (node_kv does a flat
+`import transport`).
+"""
+import json
+import os
+import socket
+import sys
+import tempfile
+import threading
+
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+for _p in (os.path.join(_REPO, "phase0"), os.path.join(_REPO, "shard"), os.path.dirname(os.path.abspath(__file__))):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+os.environ["SHARD_TRANSPORT"] = "libp2p"          # JSON+tensor codec, no PSK (set before node_kv import)
+
+
+def _fake_model_dir():
+    """Minimal M25_DIR that satisfies m25_stage's module-level reads: a minimax_m2 config.json with
+    the real M2.5 dims + an empty safetensors weight index (weights are only read lazily via raw())."""
+    d = tempfile.mkdtemp(prefix="m25_fake_")
+    json.dump({
+        "model_type": "minimax_m2", "hidden_size": 3072, "num_attention_heads": 48,
+        "num_key_value_heads": 8, "head_dim": 128, "num_hidden_layers": 62,
+        "rms_norm_eps": 1e-6, "num_local_experts": 256, "num_experts_per_tok": 8,
+        "intermediate_size": 1536, "moe_intermediate_size": 1536, "rope_theta": 5000000,
+        "vocab_size": 200064, "max_position_embeddings": 196608,
+    }, open(os.path.join(d, "config.json"), "w"))
+    json.dump({"weight_map": {}}, open(os.path.join(d, "model.safetensors.index.json"), "w"))
+    return d
+
+
+if not os.path.exists(os.path.join(os.environ.get("M25_DIR", "/nonexistent"), "config.json")):
+    os.environ["M25_DIR"] = _fake_model_dir()
+
+import torch                                       # noqa: E402
+import m25_pipe as MP                              # noqa: E402  (imports m25_stage on CPU)
+from node_kv import send_msg, recv_msg             # noqa: E402  (libp2p codec — same one the coordinator uses)
+
+S = MP.S
+
+
+class FakeTok:
+    """The minimal tokenizer surface coordinate_pipe touches: eos (an id NOT in T so generation never
+    stops early), decode() for the result text, and apply_chat_template() so render_ids() yields
+    exactly the chosen prompt prefix of T."""
+
+    def __init__(self, prompt_ids, eos_id=10 ** 6):
+        self._ids = [int(t) for t in prompt_ids]
+        self.eos_token_id = eos_id
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, return_dict=True, **kw):
+        return {"input_ids": list(self._ids)}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(str(int(i)) for i in ids)
+
+    def __call__(self, text, add_special_tokens=False):   # render_ids' reasoning=False path (unused but cheap)
+        return {"input_ids": []}
+
+
+class RecordingDrafter:
+    """Transparent wrapper over a drafter (EagleDrafter, typically) that records every
+    extend(tokens, auxes, base_pos) call before delegating — the probe for the EAGLE left-shift
+    pairing contract. Everything else (propose/propose_tree/reset/cancel/request/fetch/matched)
+    forwards to the wrapped drafter untouched."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.extends = []                          # [(tokens list, aux [n,3,H] fp32 clone, base_pos int)]
+
+    def extend(self, tokens, auxes, base_pos):
+        toks = tokens.tolist() if torch.is_tensor(tokens) else list(tokens)
+        aux = auxes if torch.is_tensor(auxes) else torch.stack([torch.as_tensor(a) for a in auxes], 0)
+        self.extends.append(([int(t) for t in toks], aux.detach().clone().float(), int(base_pos)))
+        return self.inner.extend(tokens, auxes, base_pos)
+
+    def __getattr__(self, name):                   # only called for attributes NOT defined above
+        return getattr(self.inner, name)
+
+
+class FakeRing(threading.Thread):
+    """Head+tail combined, one thread: recv each coordinator message off the pipe socket, reply the
+    oracle answer on the return socket — exactly one reply per message, FIFO, mirroring serve()'s
+    per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
+
+    def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None):
+        super().__init__(daemon=True)
+        self.pipe = pipe_sock
+        self.ret = ret_sock
+        self.T = [int(t) for t in T]
+        self.eagle = eagle                          # reply {"toks","aux"} like an M25_EAGLE tail, else plain list
+        self.aux_h = aux_h                          # aux hidden width (32 = the synthetic EAGLE head's H)
+        self.aux_ids = list(aux_layer_ids if aux_layer_ids is not None else S.EAGLE_AUX_LAYER_IDS)
+        self.log = []                               # every message, in arrival order (accounting ground truth)
+        self.error = None
+
+    # oracle: the target's greedy argmax AT absolute position p is T[p+1] (clamped past the end so
+    # deep in-flight speculation never crashes the ring — those replies get discarded anyway)
+    def _tok_at(self, p):
+        return self.T[p + 1] if p + 1 < len(self.T) else self.T[-1]
+
+    def _aux(self, positions):
+        n = len(positions)
+        col = torch.tensor([float(p) for p in positions], dtype=torch.float32).unsqueeze(1)
+        a = col.expand(n, self.aux_h).contiguous()
+        return {str(li): a.clone() for li in self.aux_ids}
+
+    def run(self):
+        try:
+            while True:
+                msg = recv_msg(self.pipe)
+                op = msg.get("op")
+                if op == "reset":
+                    self.log.append({"op": "reset"})
+                    send_msg(self.ret, "ok")
+                elif op == "receipt":
+                    self.log.append({"op": "receipt"})
+                    send_msg(self.ret, msg.get("receipts", []))
+                elif op == "verify":
+                    if msg.get("tree"):
+                        pos = [int(p) for p in msg["pos_ids"]]
+                    else:
+                        s = int(msg["start"])
+                        pos = [s + i for i in range(len(msg["token_ids"]))]
+                    self.log.append({"op": "verify", "start": int(msg["start"]),
+                                     "n": len(msg["token_ids"]), "tree": bool(msg.get("tree")),
+                                     "prefill": bool(msg.get("prefill")),
+                                     "token_ids": [int(t) for t in msg["token_ids"]], "pos": pos})
+                    toks = [self._tok_at(p) for p in pos]
+                    send_msg(self.ret, {"toks": toks, "aux": self._aux(pos)} if self.eagle else toks)
+                else:
+                    raise ValueError(f"fake ring got unexpected op {op!r}")
+        except (OSError, EOFError):                 # coordinator closed its ends — normal shutdown
+            return
+        except Exception as e:                      # anything else is a harness bug — surface it
+            self.error = e
+
+
+# ---- target-sequence builders ------------------------------------------------------------------
+# Token ids stay < 100 (the synthetic EAGLE head's target vocab) so the real EagleDrafter's embed
+# lookups are always in range on every path.
+
+def novel_T(n, seed=1234):
+    """Pseudo-random tokens — no n-gram structure, the drafter is blind."""
+    import random
+    rng = random.Random(seed)
+    return [rng.randrange(2, 100) for _ in range(n)]
+
+
+def repetitive_T(n, seed=99, phrase_len=30):
+    """A ~30-token phrase repeated verbatim — the n-gram drafter matches long runs (rag-quote-like)."""
+    import random
+    rng = random.Random(seed)
+    phrase = [rng.randrange(2, 100) for _ in range(phrase_len)]
+    out = []
+    while len(out) < n:
+        out.extend(phrase)
+    return out[:n]
+
+
+def trap_T(n, seed=7, break_at=168, novel_len=30):
+    """Repetition that BREAKS once: phrase A repeats through `break_at`, then a novel run, then a
+    different phrase B repeats. The n-gram drafter confidently speculates A's continuation across the
+    break -> a mid-stream divergence with chunks in flight (the discard-bookkeeping trap)."""
+    import random
+    rng = random.Random(seed)
+    a = [rng.randrange(2, 100) for _ in range(26)]
+    b = [rng.randrange(2, 100) for _ in range(26)]
+    out = []
+    while len(out) < break_at:
+        out.extend(a)
+    out = out[:break_at]
+    out += [rng.randrange(2, 100) for _ in range(novel_len)]
+    while len(out) < n:
+        out.extend(b)
+    return out[:n]
+
+
+# ---- runner --------------------------------------------------------------------------------------
+
+def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefill_chunk=4096,
+                    eagle_ring=False, timeout=30, on_commit=None):
+    """One coordinate_pipe job against a fresh FakeRing. S.M25_TREE (monkeypatched by the caller)
+    routes to coordinate_pipe_tree inside coordinate_pipe, same as production. Returns (result, ring);
+    ring.log is the wire-level ground truth."""
+    c_pipe, r_pipe = socket.socketpair()
+    c_ret, r_ret = socket.socketpair()
+    c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
+    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring)
+    ring.start()
+    tok = FakeTok(T[:prompt_len])
+    try:
+        res = MP.coordinate_pipe(c_pipe, tok, [{"role": "user", "content": "fake"}], K, max_new,
+                                 timeout, depth, c_ret, drafter,
+                                 prefill_chunk=prefill_chunk, on_commit=on_commit)
+    finally:
+        for s_ in (c_pipe, c_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+        ring.join(10)
+        for s_ in (r_pipe, r_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+    if ring.error is not None:
+        raise AssertionError(f"fake ring crashed: {type(ring.error).__name__}: {ring.error}")
+    return res, ring
