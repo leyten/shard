@@ -13,21 +13,37 @@
 
 ## RESUME HERE  (the one next action)
 
-**LATEST (2026-07-02) — ENGINE-PERF session. Branch `perf/eagle-serial-path` (worktree `shard-perf`, 9 commits,
-18 CPU tests pass) is WARM-A/B-VALIDATED on a scattered 6×5090 EU ring: +33% decode-weighted vs master
-(jitter-robust, both orderings) + a reproducible rag-quote accept lift 13→44%. MERGE-WORTHY. UNMERGED + UNPUSHED
-(awaiting leyten's push go; the "concrete swarm-ring results" push-gate is now met). Ring torn down (0 live).**
-- **A/B RESULT (receipt `docs/receipts/m25-eagle-serial-path-ab-20260702.json`):** 6 arms, same rental-lottery
-  ring all arms. Master mean 4.3 → branch mean 5.7 = **+33% decode-weighted**, BOTH warm orderings agree
-  branch>master (fwd 4.0→5.9, rev 4.6→5.5) so it survives the ring's large per-warm WAN jitter. Accept is
-  IDENTICAL master-vs-branch on every cell EXCEPT rag-quote, where the whole-prompt drafter-context fix lifts
-  accept **13→44%** (g 2.0→4.5, ~4→10.5 tok/s) reproducibly across both branch passes — so the branch delivers
-  TWO wins: serial-path latency recovery everywhere + a real accept/g gain on long-context-quote. fp8-aux
-  QUALITY-SAFE (accept unchanged). min-match (B1) UNPROVEN on one pass (lost in jitter) — needs a within-run A/B.
-- **NEXT:** (1) leyten's push go → PR → squash-merge; (2) a within-run min-match A/B + a topology-optimized run
-  (the mesh probe confirmed the 2 CZ boxes are ~5ms apart but the lottery split them with GB — `plan_ring`
-  sidecar-RTT measure, not ICMP which vast blocks); (3) the ring-wedge fix (nxt_sock re-dial) as its own branch;
-  (4) the receipt-soundness cluster. Full 79-finding fleet backlog: `.claude/plans/fleet-findings-20260702.md`.
+**LATEST (2026-07-02 evening) — TIER-1 session: wedge fix + CRITICAL trust fix + tree-verify v2, ALL
+warm-validated on a fresh 6×5090 EU ring (HU/HU/DK/CZ/BG/CZ). Two branches ready to land, in order:**
+1. **`fix/ring-wedge-receipt-truth` (4 commits)** — (a) RING WEDGE FIXED: specpipe's churn recovery ported
+   into m25_pipe (forward-link rebuild, independent tail pred/ret lifecycles, stale-job drop) + hardened
+   after 2 adversarial review passes (speaking-pred adoption, TCP keepalive 60/20/3, guarded ret_ok,
+   fresh-ret keep on the gateway-retry race, transport.py malformed-frame guard). WARM-PROVEN: coord
+   kill -9 mid-decode (depth=4 in flight) → NEW coordinator on the same ring, NO re-warm (receipt
+   `m25-ring-wedge-smoke-20260702.json`). The re-warm-per-coordinator tax is gone. (b) CRITICAL receipt
+   fix: coverage verified against the model's TRUE depth (62), fail-closed on empty receipts — the
+   skip-layers-and-still-get-paid hole is shut (`tests/test_receipt_coverage.py`; specpipe: `--n-layers`).
+2. **`eagle/tree-verify-v2` (4 commits, stacked on 1)** — tree-verify REBUILT on the merged base with the
+   fleet's payload fixes: top-M best-first tree (M25_TREE_M=12/TOPB=3/DEPTH=8 — kills the 62-node 2^d
+   shape), fp8 tree traffic (_hsend + fp8 aux), manual broadcast-GQA tree kernel (dense mask is off-flash
+   on sm_120), receipts attested through the tree path, hybrid n-gram routing kept (matched rounds verify
+   as a 1-wide tree + bank the bonus token). **WARM A/B (receipt `m25-tree-verify-v2-ab-20260702.json`):
+   tree WINS the tight EU ring +18% decode-weighted (3.9→4.6); reason-math 4.8→6.0, reason-logic 3.0→4.7,
+   code-edit 4.5→6.1 — v1's tok/s loss WAS wire payload, as the fleet concluded.** Losslessness gate: 76
+   identical tokens then one near-tie kernel flip (manual-vs-SDPA numerics; documented class, same as fp8
+   wire). Known gap: rag-quote 5.6→4.2 (depth-4 pipelined n-gram beats the sync depth-1 tree round on
+   verbatim) → depth-aware hybrid = the measured next lever. 33 CPU tests (8 new tree tests incl.
+   `propose_tree(topb=1) == propose()` exactly).
+- **NEXT:** (1) push go → PR both branches in order → squash-merge (`docs/roadmap-fleet-findings` is
+  superseded — its commit is cherry-picked here; delete that branch). (2) The **high-RTT global-scatter
+  cell** — tree's natural regime, quantify the upside; M/topb sweep rides along. (3) Depth-aware hybrid
+  (pipeline n-gram rounds, sync tree rounds — recovers rag-quote). (4) Topology-optimized order (TIER 1.3)
+  + min-match within-run A/B. (5) TIER-2 receipt freshness/binding, TIER-3 gateway/wire cluster. Full
+  79-finding backlog: `.claude/plans/fleet-findings-20260702.md`.
+
+*(2026-07-02 morning — serial-path A/B, MERGED as PR #10:)* master 4.3 → branch 5.7 = **+33%
+decode-weighted** (jitter-robust, both orderings) + rag-quote accept **13→44%** (whole-prompt drafter
+context). Receipt `docs/receipts/m25-eagle-serial-path-ab-20260702.json`. min-match still unproven.
 
 *(pre-A/B, kept for context — the branch build:)*
 **Branch `perf/eagle-serial-path` (worktree `/root/.openclaw/workspace/shard-perf`), tested (18 CPU tests pass).**
@@ -221,8 +237,10 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Batched throughput | **155 tok/s agg @16k (2.60× single), coherent** (B=4, batched-MoE, fp8 KV) | commit f3894d6, m25-batched-serving-fixed |
 | Single-stream DRAFTABLE (copy/RAG/verbatim) | 50–81 tok/s (n-gram, accept high) | m25_ctx_table |
 | **Single-stream NORMAL reasoning-ON (EAGLE hybrid)** | **~5.7 tok/s decode-wtd on a jittery lottery ring / ~7 on a good tight EU ring** (2026-07-02 warm A/B, merged serial-path; was ~3 n-gram-only, ~1.8 raw) | receipt m25-eagle-serial-path-ab-20260702 |
+| **TREE-verify v2 (hybrid, tight EU ring)** | **+18% decode-wtd over chain on the SAME warm ring (3.9→4.6); reason-math 4.8→6.0, reason-logic 3.0→4.7, code-edit 4.5→6.1; g novel 3.7→4.5 at M=12** — flips v1's 'tree loses tok/s on tight rings' (payload, not physics). rag-quote gap = sync tree vs pipelined n-gram | receipt m25-tree-verify-v2-ab-20260702, branch eagle/tree-verify-v2 |
+| **Ring churn survival (wedge fix)** | coord kill -9 mid-decode → new coordinator, same ring, NO re-warm (6.7→6.6 tok/s); forward links rebuild, tail keeps warm KV | receipt m25-ring-wedge-smoke-20260702, branch fix/ring-wedge-receipt-truth |
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
-| Trustless verification | signed per-stage receipts, lossless — ⚠ coverage check is SELF-REFERENTIAL (TIER 2 CRITICAL, fleet 2026-07-02) | shard/receipt.py, PROOF.md |
+| Trustless verification | signed per-stage receipts, lossless — coverage now vs TRUE model depth, fail-closed on empty (fix on branch fix/ring-wedge-receipt-truth; freshness/replay binding still open, TIER 2.2) | shard/receipt.py, tests/test_receipt_coverage.py |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
 | **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
 | **Self-optimizer core (`select_ring`)** | UPLOAD-AWARE: minimizes total request time (prefill+D·decode) with per-node uplink first-class; tails/drops slow-upload nodes + relegates them to off-critical roles; picks subset+order+layer-split; adversarially reviewed (3 false-infeasible bugs fixed total), 10 regression tests, byte-identical legacy path | **master** (`shard/topology.py`, `tests/test_topology.py`) |
@@ -261,11 +279,11 @@ cancel(), n-gram min-match routing, K=8 defaults, wire fp8 dtype, CUDA_GRAPH+EAG
 Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25-eagle-serial-path-ab-20260702).
 
 **TIER 1 — PERF / tok/s (the only remaining speed levers; everything else is correctness):**
-1. **Ring-wedge fix** (`pipe`/`launcher`/`critpath`, 3 reviewers). `nxt_sock` dialed once, never re-dialed; tail
+1. **✅ DONE (branch fix/ring-wedge-receipt-truth, warm-proven 2026-07-02) — Ring-wedge fix** (`pipe`/`launcher`/`critpath`, 3 reviewers). `nxt_sock` dialed once, never re-dialed; tail
    closes `pred` on coord death → cascade → the re-warm tax. Fix = re-dial `nxt_sock` on send fail + tail keeps
    draining `pred` when only `ret` dies. NOT tok/s but the iteration-velocity multiplier + churn-survival. Own
    branch, own warm smoke-test. **Do first** (makes every later measure cheaper).
-2. **EAGLE TREE-verify** — the ~2× accept lever (g 2.5→4–5, reasoning ~7→~10–12). Rebase `eagle/tree-verify`
+2. **✅ BUILT + EU-MEASURED (branch eagle/tree-verify-v2, +18% decode-wtd 2026-07-02; high-RTT cell still open) — EAGLE TREE-verify** — the accept lever. Rebase `eagle/tree-verify`
    (worktree `shard-treemeasure`) on merged master (inherits fp8-aux + O(1) drafter → shrinks its payload wall),
    then the 3 fleet fixes: **fp8 the tree aux; split prefix-attn from the N×N tree block to stay on flash (not the
    dense-mask fallback); right-size the fan-out vs the fixed 2^d**. Fleet verdict: the measured tok/s LOSS was
@@ -278,7 +296,7 @@ Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25
    drops verified r[K] on n==K — free token, small on reasoning); stream `<think>` live (UX, not tok/s).
 
 **TIER 2 — TRUST / the moat (correctness debt; 1 CRITICAL + 4 high, flagged by 3 reviewers):**
-1. **CRITICAL — receipt coverage is self-referential** (`receipt.verify_coverage`, `pipe._verify_receipts`).
+1. **✅ DONE (branch fix/ring-wedge-receipt-truth) — CRITICAL — receipt coverage is self-referential** (`receipt.verify_coverage`, `pipe._verify_receipts`).
    `layer_count` is derived FROM the receipts being checked, so a ring that OMITS layers still "tiles fully" and
    passes → a node can skip its block and still be paid. ~10-line fix (pass the model's true `n_layers`
    explicitly). **Do alongside the wedge branch — a skip-compute-and-get-paid hole shouldn't sit open even in a
