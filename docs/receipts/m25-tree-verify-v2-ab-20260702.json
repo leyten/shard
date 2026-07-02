@@ -1,0 +1,21 @@
+{
+  "what": "Tree-verify v2 (top-M best-first + fp8 payload + manual GQA kernel + hybrid n-gram routing) vs chain-EAGLE, same warm ring, honest bench (reasoning ON, 6 cells)",
+  "date": "2026-07-02",
+  "ring": "6x RTX5090 scattered EU (HU,HU,DK,CZ,BG,CZ), one stage per /24 subnet + machine, libp2p sidecars, ~4-6 tok/s-class ring (slower than the 2026-07-01 lottery ring; all comparisons same-warm back-to-back)",
+  "code": "eagle/tree-verify-v2 @ 766afc7 (stacked on fix/ring-wedge-receipt-truth); stages message-driven, one launch served all arms",
+  "env": "M25_EAGLE=1 M25_FP8_WIRE=1 (fp8 aux implied), K=8 depth=4 chain vs M25_TREE=1 M25_TREE_M=12 M25_TREE_TOPB=3 M25_TREE_DEPTH=8",
+  "losslessness_gate": "chain vs tree(topb=1), bf16 wire: 76 identical tokens through prefill + multiple tree rounds, then ONE near-tie argmax flip (manual tree kernel vs SDPA chain kernel — same class as fp8-wire 'quality-safe, not bit-exact'); both continuations coherent. Tree logic (mask/RoPE/walk/extend/trunk) correct; offline half: propose_tree(topb=1) == propose() exactly (tests/test_tree_spec.py)",
+  "results_tok_s_and_g": {
+    "reason-math":  {"chain": [4.8, 3.7], "tree_eagle_only": [4.9, 4.5], "tree_hybrid": [6.0, 4.5]},
+    "reason-logic": {"chain": [3.0, 2.2], "tree_eagle_only": [4.4, 3.5], "tree_hybrid": [4.7, 3.5]},
+    "open-chat":    {"chain": [2.9, 2.0], "tree_eagle_only": [3.5, 2.5], "tree_hybrid": [3.1, 2.5]},
+    "code-edit":    {"chain": [4.5, 2.8], "tree_eagle_only": [4.9, 3.9], "tree_hybrid": [6.1, 4.2]},
+    "rag-quote":    {"chain": [5.6, 5.4], "tree_eagle_only": [3.0, 2.8], "tree_hybrid": [4.2, 3.8]},
+    "agentic-tool": {"chain": [5.8, 4.5], "tree_eagle_only": [5.8, 4.8], "tree_hybrid": [6.2, 4.8]},
+    "decode_weighted_mean": {"chain": 3.9, "tree_eagle_only": 4.1, "tree_hybrid": 4.6}
+  },
+  "verdict": "TREE WINS ON THE TIGHT EU RING: +18% decode-weighted (3.9 -> 4.6), every novel cell up big (reason-math +25%, reason-logic +57%, code-edit +36%) — the 2026-07-01 v1 tok/s LOSS was self-inflicted payload (fleet verdict confirmed), not physics. g on novel reasoning 3.7 -> 4.5 at M=12 nodes (vs v1's 62-node 2^d for less gain).",
+  "known_gap": "rag-quote stays chain's win (5.6 vs 4.2): depth-4 pipelined n-gram beats the synchronous depth-1 tree round on pure verbatim reuse. The EAGLE-only tree arm measured this hole at full depth (5.6 -> 3.0) before the hybrid routing fix (766afc7) recovered most of it. Next lever = depth-aware hybrid (pipeline matched n-gram rounds, sync tree rounds) — LATER roadmap item, now measured-justified.",
+  "next": "high-RTT global-scatter cell (tree's natural regime — WAN idle hides the M-node verify) to quantify the upside; M/topb sweep can ride that run",
+  "cost_note": "ring ~$3.4/hr, all arms + gate + wedge smoke on one provisioning"
+}
