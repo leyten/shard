@@ -238,6 +238,40 @@ def test_prefill_pair_tokens_invariant():
         assert paired == gen_ids[1:] + [first_gen], f"chunk={chunk}"
 
 
+def test_hybrid_routing_min_match():
+    """A bare 3-gram anchor recurrence with ZERO preceding-context agreement is a coincidence on novel
+    text: with min_match=1 (default) it must route to EAGLE (matched=False); a match with real context
+    agreement stays on the n-gram path; min_match=0 restores the old any-anchor routing. The n-gram
+    PROPOSAL itself is identical either way."""
+    from ngram_draft import NgramDrafter
+    # anchor [1,2,3] recurs, but the tokens BEFORE its two homes disagree (9 vs 8) -> best_len == 0
+    seq_anchor_only = [9, 1, 2, 3, 40, 41, 42, 43, 8, 1, 2, 3]
+    # the whole prefix before the anchor agrees (…,7,1,2,3 twice) -> best_len >= 1
+    seq_real_match = [7, 1, 2, 3, 50, 51, 52, 53, 7, 1, 2, 3]
+    d1 = NgramDrafter(ng=3, margin=0)                       # default min_match=1
+    p1 = d1.propose(seq_anchor_only, 4)
+    assert d1.matched is False and p1[:4] == [40, 41, 42, 43], (d1.matched, p1)
+    p2 = d1.propose(seq_real_match, 4)
+    assert d1.matched is True and p2[:4] == [50, 51, 52, 53], (d1.matched, p2)
+    d0 = NgramDrafter(ng=3, margin=0, min_match=0)          # legacy routing
+    p0 = d0.propose(seq_anchor_only, 4)
+    assert d0.matched is True and p0 == p1, "min_match must only move the routing signal, not the proposal"
+
+
+def test_cancel_drops_pending_without_compute():
+    """cancel() discards a stale request; a fresh request/fetch afterwards behaves normally."""
+    new, ref = _pair(17)
+    g = torch.Generator().manual_seed(17)
+    toks = torch.randint(0, TV, (10,), generator=torch.Generator().manual_seed(18)).tolist()
+    aux = _aux(g, 10)
+    new.extend(toks, aux, base_pos=0)
+    ref.extend(toks, aux.clone(), base_pos=0)
+    new.request([1, 2, 3], K); new.cancel()
+    assert new._pending is None
+    new.request([1, 2, 3], K)
+    assert new.fetch() == ref.propose(K)
+
+
 def test_wire_codec_roundtrips_fp8():
     """M25_FP8_WIRE tensors must survive the raw-TCP codec (they already survive shard/transport.py —
     the two tables must stay in lockstep)."""

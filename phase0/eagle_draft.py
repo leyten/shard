@@ -229,6 +229,9 @@ class EagleDrafter:
         ids, k = self._pending
         return self.propose(ids, k)
 
+    def cancel(self):
+        self._pending = None                    # drop a stale request without running the K-step chain
+
 
 def prefill_pair_tokens(gen_ids, start, toks):
     """The extend() pairing for ONE prefill chunk (pure; the EAGLE left-shift): the chunk's aux positions
@@ -262,6 +265,9 @@ class HybridDrafter:
 
     def request(self, ids, k):
         self.ngram.request(ids, k); self._pending = (list(ids), k)
+
+    def cancel(self):
+        self.ngram.cancel(); self._pending = None
 
     def fetch(self):
         ids, k = self._pending
