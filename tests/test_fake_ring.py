@@ -197,16 +197,19 @@ def test_accounting_chain_vs_tree_repetitive(monkeypatch, capsys):
     assert t8["real_g"] >= ch["real_g"] - 0.25, (
         f"tree_d8 real g {t8['real_g']:.2f} mechanically below chain {ch['real_g']:.2f} — "
         f"a bookkeeping cause for the warm rag gap DOES exist; inspect per-round commits above")
-    # the one mechanical knob that DOES reproduce the warm gap's direction: TREE_DEPTH < K caps the
-    # n-gram draft length on the tree path (coordinate_pipe_tree reuses tree_depth as the n-gram k)
-    assert t4["real_g"] < ch["real_g"], "expected the depth-coupling cell to show a mechanical g loss"
-    # chain's REPORTED g counts the free verify token it does NOT commit on full-accept rounds;
-    # the tree's reported g is exact — quantify the reporting skew for the record
+    # DEPTH/K coupling is now FIXED: the tree hybrid requests K n-gram draft tokens regardless of
+    # TREE_DEPTH, so a shallow tree no longer caps verbatim g. tree_d4 must now match chain on
+    # repetitive text (the n-gram path is identical; only novel rounds differ by tree depth).
+    assert t4["real_g"] >= ch["real_g"] - 0.25, (
+        f"tree_d4 real g {t4['real_g']:.2f} still capped below chain {ch['real_g']:.2f} — "
+        f"the n-gram draft is being limited by TREE_DEPTH again")
+    # both paths' reported g is now exact (committed frontier / rounds) — the full-accept bonus is
+    # committed under depth-1 and counted, so there is no chain/tree reporting asymmetry left.
     skew_chain = ch["res"]["toks_per_traversal"] - ch["real_g"]
     skew_tree = t8["res"]["toks_per_traversal"] - t8["real_g"]
-    print(f"reported-g minus real-g: chain {skew_chain:+.2f} (full-accept rounds count an uncommitted "
-          f"free token), tree {skew_tree:+.2f}")
+    print(f"reported-g minus real-g: chain {skew_chain:+.2f}, tree {skew_tree:+.2f} (both ~0 = honest)")
     assert abs(skew_tree) < 0.05, "tree reported g should equal committed/rounds exactly"
+    assert abs(skew_chain) < 0.05, "chain reported g should now equal committed/rounds (bonus committed + honest metric)"
 
 
 def test_accounting_same_drafter_novel(monkeypatch, capsys):

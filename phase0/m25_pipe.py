@@ -298,6 +298,16 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             if conf: conf.observe(n, K)                                     # acceptance EMA (free, from the verify result)
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]; committed = ds
+                # FULL-ACCEPT BONUS: r[K] is the target's greedy token at the position just past the last
+                # accepted draft (lossless — the whole draft matched, so the prefix IS the greedy sequence).
+                # When nothing is in flight (depth-1: EAGLE/tree) that position is NOT covered by a queued
+                # chunk, so committing it now advances the frontier K+1 not K -> ~1/K fewer WAN round-trips on
+                # draftable text, and makes toks_per_traversal honest. Under pipelining (depth>1) the next
+                # in-flight chunk already re-derives it at no extra RTT, so we leave it (committing would
+                # collide with that chunk's start).
+                if not inflight and len(r) > K:
+                    out.append(r[K]); committed = ds + [r[K]]; cur = r[K]
+                    pos += 1; send_pos += 1; dprefix = dprefix + [r[K]]
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
@@ -324,7 +334,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
                    else (False if RECEIPTS else None))
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
-            "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
+            # HONEST g: committed tokens per verify round = frontier advance (pos) / rounds. NOT the old
+            # (accepted+valid)/valid, which counted a bonus token on EVERY full-accept round even when the
+            # pipelined path dropped it -> up to +1 inflation, not comparable to the tree arm's exact g.
+            "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (pos - len(gen_ids)) / max(valid, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
@@ -406,9 +419,9 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             td = time.time()
             tree = None
             if ng is not None:                              # HYBRID routing, same split as the chain path: n-gram
-                ng.request(prompt_ids + out, tree_depth)    # FIRST (nails verbatim-reuse; the EAGLE-only tree lost
-                ds = ng.fetch()                             # rag-quote 5.6->3.0 tok/s in the 2026-07-02 A/B) ->
-                if ds and getattr(ng, "matched", False):    # EAGLE tree on a miss (novel/reasoning text)
+                ng.request(prompt_ids + out, K)             # FIRST, K draft tokens (verbatim runs are long — do
+                ds = ng.fetch()                             # NOT cap at tree_depth; the fake-ring harness showed
+                if ds and getattr(ng, "matched", False):    # tree_depth<K silently halves the n-gram g). Miss -> EAGLE tree.
                     tree = {"tokens": list(ds), "parents": [-1] + list(range(len(ds) - 1)),
                             "depths": list(range(1, len(ds) + 1))}   # a matched n-gram chain IS a 1-wide tree
             if tree is None:
