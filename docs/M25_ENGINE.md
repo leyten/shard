@@ -34,12 +34,16 @@ warm-validated on a fresh 6×5090 EU ring (HU/HU/DK/CZ/BG/CZ). Two branches read
    wire). Known gap: rag-quote 5.6→4.2 (depth-4 pipelined n-gram beats the sync depth-1 tree round on
    verbatim) → depth-aware hybrid = the measured next lever. 33 CPU tests (8 new tree tests incl.
    `propose_tree(topb=1) == propose()` exactly).
-- **NEXT:** (1) push go → PR both branches in order → squash-merge (`docs/roadmap-fleet-findings` is
-  superseded — its commit is cherry-picked here; delete that branch). (2) The **high-RTT global-scatter
-  cell** — tree's natural regime, quantify the upside; M/topb sweep rides along. (3) Depth-aware hybrid
-  (pipeline n-gram rounds, sync tree rounds — recovers rag-quote). (4) Topology-optimized order (TIER 1.3)
-  + min-match within-run A/B. (5) TIER-2 receipt freshness/binding, TIER-3 gateway/wire cluster. Full
-  79-finding backlog: `.claude/plans/fleet-findings-20260702.md`.
+- **NEXT:** (1) leyten merges the two PRs in order (`docs/roadmap-fleet-findings` is superseded — its
+  commit is cherry-picked here; delete that branch). (2) **Depth-aware hybrid** (pipeline n-gram rounds at
+  depth, keep tree rounds sync — recovers rag-quote 5.6→4.2, the one cell tree loses; code change, CPU-
+  testable). (3) **Topology-ordered launch** (wire `plan_ring` sidecar-RTT into provisioning so ring order
+  stops being a lottery draw; fix the select_ring false-infeasible first, TIER 3) → then ONE over-rented
+  RTT-ordered warm run = the ABSOLUTE 10–12 check (tonight's ring was ~2.4× slower per traversal than the
+  2026-06-30 good ring at identical g — the relative +18% is banked, the absolute target needs a good
+  ring); min-match within-run A/B rides along. (4) TIER-2 receipt freshness/binding, TIER-3 gateway/wire.
+  Backlog: `.claude/plans/fleet-findings-20260702.md`. NOTE: the high-RTT global-scatter cell is DROPPED
+  (decision below) — do not resurrect it.
 
 *(2026-07-02 morning — serial-path A/B, MERGED as PR #10:)* master 4.3 → branch 5.7 = **+33%
 decode-weighted** (jitter-robust, both orderings) + rag-quote accept **13→44%** (whole-prompt drafter
@@ -327,6 +331,12 @@ depth=4 / EAGLE depth=1); batch-invariant emulation MoE (verifiable batched, OOM
 EAGLE-3 only if the stock head underperforms (~$400–2000, SpecForge).
 
 ## KEY DECISIONS (don't relitigate)
+- **REGIONAL-FIRST; the high-RTT global cell is DROPPED (2026-07-02, leyten).** Steady-state, rings are
+  REGIONAL by construction — `select_ring`'s whole job is picking close subsets; a global ring is a
+  placement failure, not a target regime. The global measure was only ever go/no-go for tree-verify when
+  tree LOST on tight rings; v2 WINS on the tight EU ring (+18%), so no decision hangs on a global number
+  (directionally free: more WAN idle → tree wins by more; betanet thin-supply cross-region rings are a
+  transient we tolerate, not optimize). Design + marketing numbers are regional numbers.
 - **Drafter = EAGLE-3, NOT MTP/DeepSeek.** Vocab-lock: a drafter must emit M2.5's 200064 vocab → DeepSeek heads
   don't transfer; M2.5 MTP weights were never released. EAGLE-3 > MTP in accept anyway. (DeepSeek-q answered.)
 - **Tree is the target; chain-validate first** — don't build intricate tree-verify on an unvalidated EAGLE base.
