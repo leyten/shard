@@ -24,6 +24,20 @@ INF = float("inf")
 _TRIM = 12          # max candidates fed to exhaustive Held-Karp; the network layer funnels bigger pools first
 
 
+def _up(up_mbps, n):
+    """Upload Mbps for node n, floored to avoid div-by-zero. An unmeasured/zero node reads as very
+    slow (0.5 Mbps) -> costed OFF the critical path, then relegated. Unmeasured == assume bad uplink
+    is the safe default (a lying/absent uplink can't sneak onto a load-bearing hop)."""
+    v = up_mbps.get(n, 0.0) if hasattr(up_mbps, "get") else up_mbps[n]
+    return max(float(v), 0.5)
+
+
+def _xfer_ms(nbytes, up_mbps, n):
+    """ms to upload `nbytes` from node n over its uplink (bits / bandwidth). Residential is asymmetric
+    (fast down, slow up), so a hop a->b is bound by the SENDER a's UPLOAD, never the receiver's."""
+    return nbytes * 8.0 / (_up(up_mbps, n) * 1000.0)
+
+
 def loop_cost(order, L, c_out, c_in):
     """total per-traversal latency for a given node ordering (entry + hops + return)."""
     if not order:
@@ -138,13 +152,84 @@ def select_and_order(nodes, L, c_out, c_in, k):
 # PURE: measured stats in, a RingSpec out — no probing/IO here (that's the network layer's job).
 
 
-def predict_step_ms(order, layers, L, c_out, c_in, layer_ms):
+def predict_step_ms(order, layers, L, c_out, c_in, layer_ms, up_mbps=None, decode_bytes=0.0):
     """Predicted per-traversal time of one decode step (ms): WAN round-trip (depends on ORDER) +
-    sum of per-stage compute (depends on the layer ASSIGNMENT). The activation-transfer term is
-    ~0 for single-token decode (one hidden state per hop) so it's omitted — it dominates PREFILL/
-    TTFT, not tok/s. `layers[n]` = #layers node n holds; `layer_ms[n]` = MEASURED ms to run one
-    layer for a decode step on n (a throttled GPU measures higher — don't infer it from watts)."""
-    return loop_cost(order, L, c_out, c_in) + sum(layers[n] * layer_ms[n] for n in order)
+    sum of per-stage compute (depends on the layer ASSIGNMENT) + the per-step activation UPLOAD when
+    `up_mbps` is given. `layers[n]` = #layers node n holds; `layer_ms[n]` = MEASURED ms to run one
+    layer for a decode step on n (a throttled GPU measures higher — don't infer it from watts).
+    Decode's activation is small (a few draft tokens' hidden state) but NOT free below ~fiber: at
+    20 Mbps a ~50KB bundle costs ~20ms/hop, so on residential links decode transport is real and
+    each stage uploads its per-step output once around the loop. On fiber `decode_bytes/up -> ~0` and
+    this reduces to the pure round-trip+compute model (transport was rightly omitted there)."""
+    ms = loop_cost(order, L, c_out, c_in) + sum(layers[n] * layer_ms[n] for n in order)
+    if up_mbps is not None and decode_bytes:
+        ms += sum(_xfer_ms(decode_bytes, up_mbps, n) for n in order)   # every stage uploads once/step
+    return ms
+
+
+def predict_prefill_ms(order, layers, L, c_out, c_in, up_mbps, prefill_bytes, prefill_chunks=1,
+                       prefill_layer_ms=None):
+    """Predicted TTFT (ms) — the RESIDENTIAL WALL. One forward traversal of the prompt + the [S,H]
+    activation UPLOAD (upload-bound, dominant) + optional prefill compute. The prompt's [S,H]
+    activation (`prefill_bytes` per hop, e.g. 16k*3072*2 ~= 100MB) is pipelined across the ring as
+    `prefill_chunks` (C) chunks, so each FORWARDING (non-tail) stage uploads its whole [S,H] split
+    into C pieces. The pipeline makespan interpolates the two physical regimes:
+        transport = ( sum_fwd(u) + (C-1)*max_fwd(u) ) / C ,   u_s = _xfer_ms(prefill_bytes, up, s)
+    C=1 (a single blob per hop) -> SUM (serial: each stage waits for the whole activation);
+    C large (fine chunking) -> MAX (steady-state pipeline, bounded by the slowest uplink). The engine
+    runs chunked+pipelined prefill (prefill_chunk, prefill_depth), so C = ceil(S/prefill_chunk).
+    The TAIL forwards nothing onward (it returns only the first token's logits, tiny) -> EXEMPT, so a
+    low-upload node belongs at the TAIL. Compute optional: residential prefill is transport-dominated
+    (~100MB@20Mbps = ~40s/hop vs seconds of compute); pass `prefill_layer_ms` for fiber-accurate TTFT."""
+    lat = loop_cost(order, L, c_out, c_in)                       # one traversal; return = first-token logits (small)
+    fwd = order[:-1]                                             # non-tail stages upload [S,H] onward
+    C = max(1, int(prefill_chunks))
+    if fwd:
+        us = [_xfer_ms(prefill_bytes, up_mbps, n) for n in fwd]
+        transport = (sum(us) + (C - 1) * max(us)) / C
+    else:
+        transport = 0.0
+    compute = sum(layers[n] * prefill_layer_ms[n] for n in order) if prefill_layer_ms else 0.0
+    return lat + transport + compute
+
+
+def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms):
+    """Advisory off-critical-path role for every DROPPED node, derived from WHY the objective dropped
+    it — NOT a fresh absolute threshold. This is the PLACEMENT half of the decided admission/placement
+    framing: the "threshold" is per-role capability against the CHOSEN ring, never a velvet rope at the
+    door. c0mpute makes the final placement; these are hints. Coverage is TOTAL (every dropped node
+    gets a role). The only capacity split is physical: cap==0 (can't be a stage) vs cap>=1.
+      weight-seeder      : cap==0 — serves weight shards from disk (the torrent fetch path); no VRAM/
+                           compute/latency needs. The universal floor.
+      aggregator/relay   : upload >= the ring's BEST uplink AND subnet-distinct — a fiber-class node
+                           wasted as a mere stage; spend its scarce UPLOAD as a prefill fan-in / relay
+                           supernode (the research's top off-ring lever). Mechanism lives in c0mpute.
+      hot-standby        : subnet-twin of a chosen stage — warm PASSIVE failover for that block (co-
+                           location is fine for a spare; a twin is latency-close, so failover keeps the
+                           ring's step_ms — we never route a high-latency node here).
+      decode-only-replica: compute ring-competitive but dropped for its slow UPLOAD — decode's tiny
+                           activation survives its uplink; candidate member of a decode-only ring (ring
+                           formation, which needs >=k subnet-distinct peers, lives in c0mpute).
+      spot-check-verifier: any other block-capable node — samples & recomputes a stage to catch
+                           cheaters (latency/upload tolerant, async, bounded demand)."""
+    if not order:
+        return {}
+    ring_subnets = {subnet[n] for n in order}
+    ring_best_up = max(_up(up_mbps, n) for n in order)          # the ring's fastest uplink
+    ring_worst_compute = max(layer_ms[n] for n in order)        # slowest per-layer compute the ring admitted
+    roles = {}
+    for n in dropped:
+        if caps.get(n, 0) == 0:
+            roles[n] = "weight-seeder"                          # can't hold a stage -> seed weights
+        elif _up(up_mbps, n) >= ring_best_up and subnet[n] not in ring_subnets:
+            roles[n] = "aggregator"                             # better-connected than the whole ring
+        elif subnet[n] in ring_subnets:
+            roles[n] = "hot-standby"                            # subnet-twin of a stage -> warm failover
+        elif layer_ms[n] <= ring_worst_compute:
+            roles[n] = "decode-only-replica"                    # compute-fine, dropped for upload -> decode is ok
+        else:
+            roles[n] = "spot-check-verifier"                    # slow compute/high latency -> sampled recompute
+    return roles
 
 
 def node_capacity(free_vram_mb, layer_vram_mb, kv_mb_per_layer=0):
@@ -179,17 +264,36 @@ def assign_layers(order, n_layers, caps, layer_ms):
 
 
 def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
-                n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None):
+                n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None,
+                up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
+                prefill_chunks=1, prefill_layer_ms=None, relegate=True):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
-    per-node layer split that MINIMIZES predicted decode step-time (=> maximizes tok/s), subject to:
+    per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
       * NEVER co-locate — no two stages share a `subnet` key (datacenter/network),
       * health — a power-capped/slow node has a high `layer_ms`, so it's dropped or given fewer
         layers automatically; no hand-tuned weights, just physical milliseconds.
     Prefers the FEWEST nodes that fit (each extra node is another full WAN round-trip — fewer,
     fatter stages win over scatter), trying sizes k_min..k_min+slack so a faster larger set can
-    still win. Returns a RingSpec dict, or None if the pool can't hold the model:
-      {order, blocks:{n:(lo,hi)}, layers:{n:cnt}, step_ms, tok_s_per_g, dropped, k}.
+    still win.
+
+    UPLOAD-AWARE (opt-in via `up_mbps={node: Mbps}`): the objective becomes TOTAL REQUEST TIME
+    T = prefill_ms + decode_steps * decode_step_ms, with per-node UPLOAD a first-class cost. This is
+    the residential lever: a home link is asymmetric (fast down, SLOW up) and the per-hop bottleneck
+    is MOVING THE ACTIVATION on the sender's uplink. Decode's activation is tiny (survives), but
+    long-context PREFILL ([S,H] ~= 100MB/hop @16k) is the WALL — minutes of TTFT on a 20 Mbps cable
+    uplink. So the selector (a) tails the lowest-upload node (the tail forwards nothing — see
+    predict_prefill_ms), (b) drops nodes whose upload would dominate prefill, and (c) RELEGATES those
+    dropped nodes to off-critical-path roles (see _relegate) instead of discarding useful capacity.
+    Bytes are PRE-MULTIPLIED by the caller (workload- and dtype-agnostic core): `prefill_bytes`=S*H*
+    dtype, `decode_bytes`=draft_tokens*H*dtype (fp8 wire => halve them), `prefill_chunks`=ceil(S/
+    prefill_chunk) sets the SUM<->MAX pipeline regime, `prefill_layer_ms` (optional) adds prefill
+    compute for fiber-accurate TTFT. Missing/absent `up_mbps` == today's pure decode-step objective
+    (BYTE-IDENTICAL legacy path); when set, the spec also carries prefill_ms/request_ms/roles.
+
+    Returns a RingSpec dict, or None if the pool can't hold the model:
+      {order, blocks:{n:(lo,hi)}, layers:{n:cnt}, step_ms, tok_s_per_g, dropped, k}
+      (+ prefill_ms, request_ms, roles:{dropped_node: role}  when up_mbps is given).
     `require` pins a node that MUST be in the ring (our coordinator runs on the head box, so for
     that deployment pass the head node and set c_out/c_in relative to it -> the loop becomes the
     correct head->...->tail->head cycle). `exclude` drops nodes outright. NOTE: `slack` is the pool
@@ -224,8 +328,47 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
 
     if len(usable) > _TRIM:                                      # latency funnel, but never trim out nodes feasibility
         keep = sorted(usable, key=lambda n: c_out[n] + c_in[n])[:_TRIM]   # or `require` need
-        must = set(by_cap[:k_min + slack]) | ({require} if require is not None else set())
+        must, seen = set(), set()                                # a DISTINCT-subnet cover (+slack) must survive: a
+        for m in by_cap:                                         # subnet-BLIND top-cap `must` starves the pool of
+            if subnet[m] in seen:                                # feasible cover when the fattest cards are co-located
+                continue                                         # (that was a false-"infeasible" bug) -> pick fattest
+            seen.add(subnet[m]); must.add(m)                     # node per NEW subnet, mirroring the k_min walk
+            if len(must) >= k_min + slack:
+                break
+        if require is not None:
+            must.add(require)
         usable = keep + [n for n in must if n not in keep]
+
+    aware = up_mbps is not None
+    D = max(0, int(decode_steps))
+    if aware:
+        # Effective ORDERING matrices: fold the frequency-weighted latency (each traversal happens
+        # once for prefill + D times for decode) with a per-edge upload cost, so the SAME optimal_loop
+        # returns a request-time-optimal order. The big [S,H] prefill term rides ONLY forward edges
+        # (sender a uploads to its successor); the return hop (Ein) carries just the first token's
+        # logits, so the tail's expensive forward upload vanishes -> optimal_loop naturally TAILS the
+        # lowest-upload node. Compute is order-independent (summed per node), so it's added at scoring,
+        # not here; hence minimizing this fold == minimizing request_ms over orders (exact for C=1,
+        # a tight tail-exempting heuristic for C>1 where prefill is a MAX the loop-sum can't express).
+        EL = {a: {} for a in usable}
+        Eout, Ein = {}, {}
+        for a in usable:
+            pf_a = _xfer_ms(prefill_bytes, up_mbps, a)
+            dc_a = _xfer_ms(decode_bytes, up_mbps, a)
+            Eout[a] = (1 + D) * c_out[a]                         # entry: coord uploads tiny token-ids -> latency only
+            Ein[a] = (1 + D) * c_in[a] + D * dc_a               # return: tail uploads decode output D times, no [S,H]
+            for b in usable:
+                if a != b:
+                    EL[a][b] = (1 + D) * L[a][b] + pf_a + D * dc_a
+
+    def _score(order, alloc):
+        step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms,
+                               up_mbps if aware else None, decode_bytes)
+        if not aware:
+            return step, step, 0.0                              # legacy: rank == decode step; no prefill
+        pf = predict_prefill_ms(order, alloc, L, c_out, c_in, up_mbps, prefill_bytes,
+                                prefill_chunks, prefill_layer_ms)
+        return pf + D * step, step, pf                          # rank by total request time
 
     def _search(k_lo, k_hi):
         found = None
@@ -235,13 +378,13 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     continue
                 if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
                     continue
-                order, _ = optimal_loop(subset, L, c_out, c_in)
+                order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
                 alloc = assign_layers(order, n_layers, {n: caps[n] for n in subset}, layer_ms)
                 if alloc is None:
                     continue
-                step = predict_step_ms(order, alloc, L, c_out, c_in, layer_ms)
-                if found is None or step < found[0]:                     # ties: smaller k wins (k ascending, strict <)
-                    found = (step, order, alloc, k)
+                rank, step, pf = _score(order, alloc)
+                if found is None or rank < found[0]:                     # ties: smaller k wins (k ascending, strict <)
+                    found = (rank, order, alloc, k, step, pf)
         return found
 
     kmax = k_min + slack
@@ -250,12 +393,19 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         best = _search(kmax + 1, len(usable))                    # -> widen rather than falsely report infeasible
     if best is None:
         return None
-    step, order, alloc, k = best
+    rank, order, alloc, k, step, pf = best
     blocks, lo = {}, 0
     for n in order:
         blocks[n] = (lo, lo + alloc[n]); lo += alloc[n]
-    return {"order": order, "blocks": blocks, "layers": alloc, "step_ms": round(step, 1),
-            "tok_s_per_g": round(1000.0 / step, 2), "dropped": [n for n in nodes if n not in order], "k": k}
+    dropped = [n for n in nodes if n not in order]
+    spec = {"order": order, "blocks": blocks, "layers": alloc, "step_ms": round(step, 1),
+            "tok_s_per_g": round(1000.0 / step, 2) if step > 0 else INF, "dropped": dropped, "k": k}
+    if aware:
+        spec["prefill_ms"] = round(pf, 1)
+        spec["request_ms"] = round(rank, 1)
+        if relegate:
+            spec["roles"] = _relegate(order, dropped, caps, subnet, up_mbps, layer_ms)
+    return spec
 
 
 # ---- demo: a scattered-US mesh, optimal loop vs naive ordering ----

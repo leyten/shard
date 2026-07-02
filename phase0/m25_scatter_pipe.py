@@ -13,8 +13,23 @@ import os, sys, json, time, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
-REPO = "/root/.openclaw/workspace/shard"
+REPO = os.environ.get("SHARD_REPO", os.path.dirname(os.path.dirname(os.path.abspath(__file__))))   # the checkout THIS launcher runs from (worktree-safe); override via SHARD_REPO
 LIBP2P, ENG_IN, FWD_RING, FWD_RET = 29600, 29610, 29611, 29612
+
+# Every engine flag the operator sets locally must reach ALL ring processes — the stages AND the
+# coordinator/gateway. These are read per-process (S.M25_EAGLE etc.), so forwarding them only to the
+# stages (the old behavior) silently disabled the feature on the coordinator side and poisoned the
+# measurement (e.g. M25_EAGLE=1 warmed aux-capturing stages while the coordinator drafted n-gram-only).
+ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAGLE_DIR",
+           "M25_EAGLE_NEXT_HIDDEN", "M25_FP8_WIRE", "M25_FP8_AUX", "M25_NGRAM_MINMATCH",
+           "M25_CONF_SCHED", "M25_SDPA", "M25_STATIC_KV", "M25_CUDA_GRAPH", "M25_MOE_BACKEND",
+           "M25_DEFAULT_REASONING", "M25_MAX_POS"]
+
+
+def eng_env():
+    """The operator's engine flags as a shell env prefix (only the ones actually set — unset ones fall
+    through to each process's own default, which is identical code on both sides)."""
+    return "".join(f"{k}={os.environ[k]} " for k in ENG_ENV if k in os.environ)
 
 
 def vinst(iid):
@@ -30,7 +45,12 @@ def push_code(host, port):
               "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
               "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
-        subprocess.run(["scp", *SSHO, "-P", str(port), f"{REPO}/{f}", f"root@{host}:{dst}"], capture_output=True, text=True)
+        for attempt in (1, 2):                       # fail LOUD: a silently-dropped scp launches a stale/mixed-version ring
+            r = subprocess.run(["scp", *SSHO, "-P", str(port), f"{REPO}/{f}", f"root@{host}:{dst}"], capture_output=True, text=True)
+            if r.returncode == 0:
+                break
+            if attempt == 2:
+                raise RuntimeError(f"push_code {host}:{port} failed on {f}: {r.stderr.strip()[-200:]}")
 
 
 def peerid(host, port):
@@ -66,8 +86,8 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, ba
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} M25_BATCH_MOE={os.environ.get('M25_BATCH_MOE','0')} M25_KV_FP8={os.environ.get('M25_KV_FP8','0')} "
-           f"M25_EAGLE={os.environ.get('M25_EAGLE','0')} M25_EAGLE_AUX={os.environ.get('M25_EAGLE_AUX','1,30,58')} M25_FP8_WIRE={os.environ.get('M25_FP8_WIRE','0')} {kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} {eng_env()}"
+           f"{kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
     try:
@@ -92,7 +112,7 @@ def warm(host, port, label, tries=80):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--order", nargs="+", required=True)
-    ap.add_argument("--K", type=int, default=6); ap.add_argument("--depth", type=int, default=4)
+    ap.add_argument("--K", type=int, default=8); ap.add_argument("--depth", type=int, default=4)   # K=8 = the measured sweet spot (2026-06-27 sweep)
     ap.add_argument("--max-new", type=int, default=256); ap.add_argument("--ngram-n", type=int, default=3)
     ap.add_argument("--prompt", default="Explain a decentralized inference swarm in 3 sentences.")
     ap.add_argument("--prompt-file", default=None)
@@ -154,7 +174,7 @@ def main():
     if a.serve:                                   # DEPLOY: start the OpenAI /v1 gateway on the head over the warm ring
         GW = 18000
         rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
-        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 "
+        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
               f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
         sh(head["host"], head["port"], gw, 30); time.sleep(4)
@@ -169,7 +189,7 @@ def main():
     sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
     rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
-    cmd = (f"cd /root && {rc}SHARD_TRANSPORT=libp2p CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
+    cmd = (f"cd /root && {rc}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
            f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
     r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth or a.validate) else 1200)
