@@ -155,7 +155,7 @@ def make_drafter(ngram_n=3):
     a HybridDrafter (n-gram-first on draftable text -> EAGLE-3 on novel/reasoning misses). The EagleDrafter
     is the shared singleton; the n-gram half is fresh per job (clean index)."""
     from ngram_draft import NgramDrafter
-    ng = NgramDrafter(ng=ngram_n)
+    ng = NgramDrafter(ng=ngram_n, min_match=int(os.environ.get("M25_NGRAM_MINMATCH", "1")))
     if not S.M25_EAGLE:
         return ng
     from eagle_draft import HybridDrafter
@@ -173,6 +173,9 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     rx = ret_sock if ret_sock is not None else pipe_sock
     def d_request(ids, k): local_draft.request(ids, k)
     def d_fetch(): return local_draft.fetch()
+    # discard a stale pending request WITHOUT computing it — fetch() runs the whole proposal (on the
+    # EAGLE path a K-step serial chain) just to throw it away on every divergence + at drain.
+    d_cancel = getattr(local_draft, "cancel", d_fetch)
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompt_ids = render_ids(tok, messages, tools=tools, reasoning=reasoning)   # chat-template + tools; reasoning=False closes <think> -> direct answer (fast)
@@ -252,12 +255,12 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 out.extend(ds); pos += K; cur = ds[-1]; committed = ds
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
-                discard = len(inflight); d_fetch(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+                discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
             if eagle_on and aux is not None:                 # grow the EAGLE context with the newly committed positions
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
-        d_fetch()
+        d_cancel()
         while inflight: recv_msg(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
