@@ -23,7 +23,8 @@ LIBP2P, ENG_IN, FWD_RING, FWD_RET = 29600, 29610, 29611, 29612
 ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAGLE_DIR",
            "M25_EAGLE_NEXT_HIDDEN", "M25_FP8_WIRE", "M25_FP8_AUX", "M25_NGRAM_MINMATCH",
            "M25_CONF_SCHED", "M25_SDPA", "M25_STATIC_KV", "M25_CUDA_GRAPH", "M25_MOE_BACKEND",
-           "M25_DEFAULT_REASONING", "M25_MAX_POS"]
+           "M25_DEFAULT_REASONING", "M25_MAX_POS",
+           "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH"]   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four
 
 
 def eng_env():
@@ -42,7 +43,7 @@ def sh(host, port, cmd, timeout=120):
 
 def push_code(host, port):
     for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/ngram_draft.py", "phase0/eagle_draft.py",
-              "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
+              "phase0/tree_spec.py", "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
               "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
         for attempt in (1, 2):                       # fail LOUD: a silently-dropped scp launches a stale/mixed-version ring

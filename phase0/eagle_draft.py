@@ -46,6 +46,7 @@ is that last slot, attending over the whole cache, predicting t_{m+1}; the chain
 Compat shims (deprecated single-aux path): set_hidden(aux) -> request(ids,k) -> fetch() == k target ids;
 propose(ids, k) still works (uses the persistent context if present, else seeds a 1-slot context).
 """
+import heapq
 import json
 import torch
 from safetensors.torch import load_file
@@ -199,6 +200,86 @@ class EagleDrafter:
             out.append(tok)
             h = hf if self.next_hidden == "final" else res        # carry: prenorm (res) = vLLM reference
         return out
+
+    @torch.no_grad()
+    def propose_tree(self, m, topb=3, max_depth=8):
+        """Expand a speculative TREE over the persistent committed context: BEST-FIRST top-M selection
+        (EAGLE-2 style) instead of fixed per-depth fan-out — the fleet-measured waste of a full 2^d tree
+        (62 nodes for +0.7 g) is exactly what this kills. Each expansion drafts the top-`topb` children of
+        the current best unexpanded candidate (by CUMULATIVE draft log-prob); candidates are popped
+        best-first into the tree until it holds `m` nodes. Ancestors always outrank descendants (logp <= 0),
+        so every popped node's parent is already in the tree and parents precede children in the output.
+
+        Returns {"tokens": [M], "parents": [M], "depths": [M]} — parents index the drafted set (-1 = the
+        anchor = the last committed slot), depths >= 1. Attention per expansion reuses _draft's scratch-tail
+        pattern: the node's ancestor chain (root->parent, <= max_depth slots, a few KB) is copied into the
+        buffer tail right after the committed context, so the attention is one contiguous GQA-broadcast over
+        buf[:ctx_len+d] — committed prefix + ancestors + own slot, never siblings, and never an O(ctx) re-cat.
+        Only extend() mutates the committed cache. topb=1 degenerates to the _draft chain exactly (the
+        losslessness gate: tree output must byte-match chain-EAGLE greedy)."""
+        if self.ctx_len == 0 or self._last_h is None or m <= 0:
+            return {"tokens": [], "parents": [], "depths": []}
+        lin = torch.nn.functional.linear
+        self._ensure_cap(self.ctx_len + max_depth + 1)             # scratch tail: ancestors + own slot
+        kside = torch.zeros(m, self.NKV, self.HD, dtype=self.fc.dtype, device=self.dev)
+        vside = torch.zeros(m, self.NKV, self.HD, dtype=self.fc.dtype, device=self.dev)
+
+        def expand(tok, h, depth, anc, own_idx):
+            """One node forward (mirrors one _draft step). tok/h = the node's token + carried hidden;
+            depth = its tree depth (anchor 0); anc = ancestor tree indices root->parent; own_idx = tree
+            index to store this node's k/v under (None for the anchor, whose k/v already sit in the
+            committed cache). Returns (out_hidden, [(token, logp)] top-topb children)."""
+            en = _rms(self.embed[tok].unsqueeze(0), self.in_ln, self.eps)
+            hn = _rms(h, self.h_ln, self.eps)
+            x = torch.cat([en, hn], -1)                            # [1,2H]
+            res = h
+            p = min(self._last_pos + depth, self.cos.shape[0] - 1)
+            cos = self.cos[p].view(1, self.HD); sin = self.sin[p].view(1, self.HD)
+            q = lin(x, self.qp).view(self.NH, self.HD)
+            q = q * cos + _rotate_half(q) * sin
+            T = self.ctx_len
+            for a in anc:                                          # ancestors into the scratch tail (contiguous)
+                self.kbuf[T] = kside[a]; self.vbuf[T] = vside[a]; T += 1
+            if own_idx is not None:                                # drafted node: its k/v feed itself + descendants
+                kk = lin(x, self.kp).view(self.NKV, self.HD)
+                vv = lin(x, self.vp).view(self.NKV, self.HD)
+                kside[own_idx] = kk * cos + _rotate_half(kk) * sin; vside[own_idx] = vv
+                self.kbuf[T] = kside[own_idx]; self.vbuf[T] = vside[own_idx]; T += 1
+            qg = q.view(self.NKV, self.GRP, 1, self.HD)            # GQA broadcast, same as _draft
+            Kt = self.kbuf[:T].permute(1, 2, 0).unsqueeze(1)       # [NKV,1,HD,T]
+            att = torch.softmax((qg @ Kt).float() / (self.HD ** 0.5), -1).to(q.dtype)
+            Vt = self.vbuf[:T].permute(1, 0, 2).unsqueeze(1)       # [NKV,1,T,HD]
+            o = (att @ Vt).reshape(1, self.NH * self.HD)
+            res = lin(o, self.op) + res
+            hn2 = _rms(res, self.post_ln, self.eps)
+            res = lin(torch.nn.functional.silu(lin(hn2, self.gp)) * lin(hn2, self.upp), self.dp) + res
+            hf = _rms(res, self.norm, self.eps)
+            lp, did = torch.log_softmax(lin(hf, self.lm).float(), -1)[0].topk(topb)
+            kids = [(int(d) + int(self.d2t[d]), float(l)) for d, l in zip(did, lp)]
+            return (hf if self.next_hidden == "final" else res), kids
+
+        tokens = []; parents = []; depths = []
+        seq = 0                                                    # heap tiebreaker: never compare the tensor field
+        root_h, kids = expand(self._last_tok, self._last_h, 0, [], None)
+        cand = [(-l, si, t, -1, 1, root_h) for si, (t, l) in enumerate(kids)]  # (-cum_logp, seq, token, parent, depth, carried_h)
+        seq = len(cand)
+        heapq.heapify(cand)
+        anc_of = {}                                                # tree index -> drafted-ancestor chain root->self
+        while cand and len(tokens) < m:
+            nc, _, t, par, d, h = heapq.heappop(cand)              # best unexpanded candidate joins the tree
+            i = len(tokens)
+            tokens.append(t); parents.append(par); depths.append(d)
+            anc_of[i] = (anc_of[par] + [par] if par >= 0 else [])  # drafted ancestors only (anchor is committed)
+            if d < max_depth and len(tokens) < m:                  # expand it -> its children become candidates
+                out_h, kids = expand(t, h, d, anc_of[i], i)
+                for tt, l in kids:
+                    heapq.heappush(cand, (nc - l, seq, tt, i, d + 1, out_h)); seq += 1
+        return {"tokens": tokens, "parents": parents, "depths": depths}
+
+    def fetch_tree(self, m, topb=3, max_depth=8):
+        """Thin shim for the ring tree branch: expand the top-M tree over the persistent context (built
+        via extend())."""
+        return self.propose_tree(m, topb=topb, max_depth=max_depth)
 
     @torch.no_grad()
     def propose(self, a, b=None):

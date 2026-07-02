@@ -144,6 +144,29 @@ def _eagle_aux_range(aux, lo, hi):
     return _t.stack([aux[str(li)][lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
 
 
+def _eagle_aux_nodes(aux, node_indices):
+    """Gather the 3 aux hidden states at arbitrary FLAT verify-node indices -> [len,3,H]. The tree walk
+    indexes the verify's nodes (anchor + accepted path), not contiguous chunk positions, so EagleDrafter.extend()
+    needs the predicting-aux gathered by node index, not by range."""
+    import torch as _t
+    return _t.stack([_eagle_seed(aux, i) for i in node_indices], 0)
+
+
+def _build_tree_msg(trunk, tree, vbase):
+    """Tree-verify wire payload: a causal TRUNK (the last committed path, re-fed at absolute positions vbase+i)
+    followed by the M draft-tree nodes off its last slot (the anchor). Returns (token_ids, parents, pos_ids) for
+    {op:verify,tree:True,start:vbase}: the ring writes KV cropped-to-start=vbase, and build_tree_mask makes every
+    node attend the committed prefix [0:vbase] + the trunk + its root->node ancestors (siblings never see each
+    other). parents index the flat node set (-1 = attend committed prefix only); siblings share a depth-RoPE pos."""
+    L = len(trunk); M = len(tree["tokens"]); token_ids = list(trunk) + list(tree["tokens"])
+    parents = [i - 1 for i in range(L)]; pos_ids = [vbase + i for i in range(L)]      # trunk = causal chain
+    for j in range(M):
+        pj = tree["parents"][j]
+        parents.append(L - 1 if pj == -1 else L + pj)                                 # anchor(-1)->trunk's last node
+        pos_ids.append(vbase + (L - 1) + tree["depths"][j])                           # depth-based RoPE pos
+    return token_ids, parents, pos_ids
+
+
 _EAGLE = None
 
 
@@ -186,6 +209,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
     + the drafter + tokenizer. eos handled as int-or-list for M2.5."""
+    if S.M25_TREE:                                          # EAGLE tree-verify (M25_TREE): one draft TREE per traversal
+        return coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
+                                    tools=tools, prefill_chunk=prefill_chunk, max_ctx=max_ctx, prefill_depth=prefill_depth,
+                                    on_commit=on_commit, swarm_id=swarm_id, job_id=job_id, resume_ids=resume_ids,
+                                    resumable=resumable, reasoning=reasoning)
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
     def d_request(ids, k): local_draft.request(ids, k)
@@ -305,6 +333,112 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             "final_confidence": conf.confidence() if conf else None}
+
+
+def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
+                         tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
+                         swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
+    """EAGLE TREE-VERIFY coordinator (M25_TREE=1): one draft TREE per ring traversal instead of one linear
+    chain. Each round re-feeds the last committed path as a causal trunk + grows a top-M EAGLE tree off its
+    last node (the anchor); the ring verifies the whole thing in ONE forward under an ancestor-only mask
+    (run_block_tree) and tree_greedy_walk commits the longest accepted path + 1 correction/bonus. depth=1
+    structurally — one tree in flight per traversal — so K/depth are unused; the speculation budget is
+    M25_TREE_M nodes (best-first by cumulative draft log-prob, M25_TREE_TOPB children per expansion, depth
+    cap M25_TREE_DEPTH — the fleet-confirmed fix for the fixed-2^d waste, 62 nodes for +0.7 g).
+
+    GREEDY / LOSSLESS by construction (the ring greedy-verifies every node; the tree only changes WHICH
+    tokens are proposed). CORRECTNESS GATE: with M25_TREE_TOPB=1 the tree degenerates to a single chain and
+    the committed output must byte-match chain-EAGLE greedy (same-kernel caveat: attn_tree is the manual
+    reference kernel, so gate against M25_SDPA=0 stages or accept rare near-tie argmax flips). Prefill, the
+    receipts sweep and the return-dict shape are identical to coordinate_pipe (honest_bench parses it the
+    same; receipts stay ON so the tree A/B carries the same attestation cost as the chain)."""
+    from tree_spec import tree_greedy_walk
+    pipe_sock.settimeout(timeout)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    _eos = tok.eos_token_id
+    eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
+    prompt_ids = render_ids(tok, messages, tools=tools, reasoning=reasoning)
+    resume_ids = list(resume_ids or [])
+    gen_ids = list(prompt_ids) + resume_ids
+    if max_ctx:
+        max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
+    out = []; prefill_s = 0.0; t_draft = t_recv = 0.0; receipts = []
+    tree_m = int(os.environ.get("M25_TREE_M", "12"))
+    tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
+    tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
+    eg = getattr(local_draft, "eagle", local_draft)         # the EagleDrafter (HybridDrafter.eagle, or itself)
+    if not hasattr(eg, "propose_tree"):
+        raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
+    try:
+        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        t_pf = time.time()                                  # ---- prefill: IDENTICAL to coordinate_pipe ----
+        eg.reset()                                          # fresh EAGLE context per job (drafter is a shared singleton)
+        from eagle_draft import prefill_pair_tokens
+        def _pf_extend(start_i, toks_i, aux_i):
+            """Feed ONE prefill chunk's aux into the EAGLE context as it arrives (whole-prompt drafter
+            context — the accept lever the serial-path A/B proved on rag-quote, 13->44%)."""
+            if aux_i is not None:
+                eg.extend(prefill_pair_tokens(gen_ids, start_i, toks_i),
+                          _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
+        if prefill_chunk and len(gen_ids) > prefill_chunk:
+            starts = list(range(0, len(gen_ids), prefill_chunk))
+            def _send_pf(i): send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
+            d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
+            while sent < d: _send_pf(starts[sent]); sent += 1
+            for j in range(len(starts)):
+                toks, aux = _unpack(recv_msg(rx))
+                if sent < len(starts): _send_pf(starts[sent]); sent += 1
+                _pf_extend(starts[j], toks, aux)            # after the refill send: extend overlaps the ring
+            cur = toks[-1]
+        else:
+            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
+            _pf_extend(0, toks, aux)
+        if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
+            raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
+        prefill_s = time.time() - t_pf
+        out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
+        if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
+        rounds = 0; total_committed = 0; t0 = time.time(); done = False
+        while not done:
+            L = len(pending_path)
+            td = time.time(); tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
+            t_draft += time.time() - td
+            token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
+            send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
+                                 "parents": parents, "pos_ids": pos_ids, "start": vbase})
+            tr = time.time(); r, aux = _unpack(recv_msg(rx)); t_recv += time.time() - tr
+            path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
+            out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
+            # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
+            # accepted path node (flat node L+path_idx[k-1]). Slice to len(committed) (== 1+len(path_idx)).
+            pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
+            eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos (predicting hidden), per the extend contract & the chain path
+            rounds += 1; total_committed += len(committed)
+            if on_commit: on_commit(out, time.time() - t0)           # stream: this round's running output
+            if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+        if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
+            send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+    except EDGE_ERRORS as e:
+        if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes
+            committed = out if out else list(resume_ids)
+            return {"ok": False, "error": f"{type(e).__name__}: {str(e)[:120]}", "resumable": True,
+                    "output_ids": committed, "n_tokens": len(committed),
+                    "text": tok.decode(committed, skip_special_tokens=True)}
+        raise TransportError(f"tree pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    dt = time.time() - t0
+    for ee in eos_set:
+        if ee in out: out = out[:out.index(ee)]; break
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
+                   else (False if RECEIPTS else None))
+    accepted = total_committed - rounds                     # accept per round = len(committed)-1 (the +1 is the correction/bonus)
+    return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
+            "mean_accept": accepted / max(rounds, 1), "toks_per_traversal": total_committed / max(rounds, 1),
+            "tok_s": len(out) / max(dt, 1e-9), "wasted": 0, "prefill_s": prefill_s, "output_ids": out,
+            "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
+            "receipts": receipts, "receipts_ok": receipts_ok,
+            "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
+            "final_confidence": None}
 
 
 def _sdpa_backend_probe(stage):
@@ -682,6 +816,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                             h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], msg["h"].to(dev), vcfg)
                             _ret_send(_tail_logits(h, parts).argmax(-1)[0].tolist()); continue
+                        if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
+                            x = msg["h"].to(dev)
+                            h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
+                            if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
                         x = msg["h"].to(dev)
                         h = _block(graph_runners, layers, msg["start"], x, vcfg)
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
@@ -755,6 +896,20 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             h = msg["h"].to(dev)
                         h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
                         send_msg(nxt_sock, _hsend({"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True})); continue
+                    if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
+                        if parts["head"]:
+                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                        else:
+                            h = msg["h"].to(dev)
+                        x = h
+                        h = S.run_block_tree(layers, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                        if RECEIPTS and signer is not None:     # attest tree blocks too — verification must not silently turn off under M25_TREE
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
+                               "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
+                        if S.M25_EAGLE:
+                            fwd["aux"] = _merge_aux(msg.get("aux"))
+                        send_msg(nxt_sock, _hsend(fwd)); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
