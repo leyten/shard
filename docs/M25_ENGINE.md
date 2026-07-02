@@ -204,6 +204,12 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 ## North star → current goal
 - **North star:** torrent-for-compute — permissionless scattered GPUs serving big models, trustless. M2.5 = PoC.
 - **Current goal:** a sharded M2.5 engine that is *usable + viable*. NOT one metric — the whole product.
+- **tok/s TARGET (normal reasoning-ON, single-stream, scattered ring — the honest projection):** today **~5.7–7**
+  (merged serial-path). After TIER-1 perf (tree-verify fixed + topology order + small levers): **~10–12 on a good
+  tight EU ring**, **~5–6 on high-RTT global scatter** — approaching the ~12–20 physics cap (a perfect drafter can't
+  accept every novel reasoning token; the reason-math cell is the hard floor, ~7–9 even post-tree). NOTE: most of
+  the 79 fleet findings are NOT tok/s (trust/gateway/wire); tree-verify + topology are the only real speed levers
+  left on this path. This number is ON the scattered ring — NOT via co-location ([[never-colocate-usable-speed-on-scattered]]).
 - **TWO-TIER framing (decided):** **scattered ring = cheap/permissionless/THROUGHPUT** (latency-tolerant); a
   **co-located/regional node or mini-cluster = fast/INTERACTIVE** (M2.5-NVFP4 ~115 GB fits on 1× H200 / 2× H200 /
   4× RTX6000-Blackwell → no WAN → 30–50 tok/s, physics-guaranteed). WAN-sharded single-stream is the *hardest*
@@ -214,9 +220,9 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 |---|---|---|
 | Batched throughput | **155 tok/s agg @16k (2.60× single), coherent** (B=4, batched-MoE, fp8 KV) | commit f3894d6, m25-batched-serving-fixed |
 | Single-stream DRAFTABLE (copy/RAG/verbatim) | 50–81 tok/s (n-gram, accept high) | m25_ctx_table |
-| **Single-stream NORMAL reasoning-ON** | **~3 tok/s (HONEST baseline; reason-math=1.8, 68s to first visible answer; n-gram only drafts verbatim-reuse)** | receipt m25-honest-reasoning-baseline-20260629, commit da9f11d |
+| **Single-stream NORMAL reasoning-ON (EAGLE hybrid)** | **~5.7 tok/s decode-wtd on a jittery lottery ring / ~7 on a good tight EU ring** (2026-07-02 warm A/B, merged serial-path; was ~3 n-gram-only, ~1.8 raw) | receipt m25-eagle-serial-path-ab-20260702 |
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
-| Trustless verification | signed per-stage receipts, lossless, coverage-checked | shard/receipt.py, PROOF.md |
+| Trustless verification | signed per-stage receipts, lossless — ⚠ coverage check is SELF-REFERENTIAL (TIER 2 CRITICAL, fleet 2026-07-02) | shard/receipt.py, PROOF.md |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
 | **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
 | **Self-optimizer core (`select_ring`)** | UPLOAD-AWARE: minimizes total request time (prefill+D·decode) with per-node uplink first-class; tails/drops slow-upload nodes + relegates them to off-critical roles; picks subset+order+layer-split; adversarially reviewed (3 false-infeasible bugs fixed total), 10 regression tests, byte-identical legacy path | **master** (`shard/topology.py`, `tests/test_topology.py`) |
@@ -241,22 +247,66 @@ ring, ~3 on global scatter (NO project — Petals/Parallax/etc — does usable s
   (capture keyed `L.li+1`); codec/wire/structure/fc-norm ruled out offline. **✓ CONFIRMED + MERGED to master** —
   the real fix was context attention (persistent KV), reason-math 34%/g3.7/11.8 tok/s. No longer in-flight.
 
-## ROADMAP / ranked levers (do in this order)
-> ⚠ **The current ranked NEXT ACTIONS live in RESUME HERE (2026-07-01), not here.** Top of the list:
-> (1) make `select_ring` UPLOAD-aware (dominant prefill cost + off-critical-path role relegation);
-> (2) the selection-driven validation run; (3) residential-bandwidth throttle A/B; (4) self-optimizer → c0mpute.
-> The items below are the older EAGLE-era levers, kept for context (tree-verify is still a real engine lever).
-1. ~~vLLM tree GO/NO-GO~~ — SUPERSEDED (EAGLE confirmed working + merged to master; no vLLM re-measure needed).
-2. **EAGLE TREE-verify in the ring** — the GPU is IDLE during the WAN round-trip, so verifying a candidate
-   TREE per traversal is ~free → ~2× accept (2.5→4–5). Needs a tree-attention mask threaded through every stage
-   + coordinator best-path selection. (Tree "regresses" only in the batched compute-bound regime; single-stream
-   idle-GPU inverts that — it's the natural fit. **The queued big lever — keep in mind.**)
-3. **Two-tier deploy** — stand up a co-located fast tier (M2.5 on 1–2 H200 / 4× RTX6000-Blackwell, no WAN) for
-   interactive; keep the scattered ring for cheap/throughput. Physics-guaranteed fast single-stream.
-4. **Depth-aware hybrid** — n-gram path keeps depth=4 (pipelined), EAGLE path depth=1 (v1 forces depth=1 globally).
-5. **Stream the `<think>` live** (UX) — turns the 68 s reason-math wait into R1/o1-style visible thinking; free.
-6. Later: batch-invariant emulation MoE (verifiable batched, OOMs in vLLM 0.23 today); train-our-own EAGLE-3 on
-   our reasoning/agentic distribution ONLY if the stock head underperforms (~$400–2000, SpecForge).
+## ROADMAP (findings-backed, 2026-07-02) — do in tier order
+
+> Grounded in the **2026-07-02 review fleet** (12 subsystem reviewers + adversarial verify → **79 CONFIRMED /
+> 5 refuted**; full per-finding detail incl. evidence + fix in `.claude/plans/fleet-findings-20260702.md`
+> [+ `-full.json`]). The merged serial-path PR (#10) already closed ~10 of them (the EAGLE/aux/fp8/env/K8/
+> cuda-graph cluster). What remains is tiered below. KEY SIGNAL: after the merge, **only 1 of the remaining
+> HIGHs is perf** — the high-severity risk has moved OFF the single-stream perf hot path and onto TRUST (the
+> moat) and GATEWAY/WIRE robustness. We are near the single-stream perf ceiling (tree-verify aside).
+
+**TIER 0 — DONE (PR #10, merged):** serial-path recovery — drafter O(ctx)→O(1), aux fp8+whole-prompt context,
+cancel(), n-gram min-match routing, K=8 defaults, wire fp8 dtype, CUDA_GRAPH+EAGLE guard, launcher env/scp/REPO.
+Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25-eagle-serial-path-ab-20260702).
+
+**TIER 1 — PERF / tok/s (the only remaining speed levers; everything else is correctness):**
+1. **Ring-wedge fix** (`pipe`/`launcher`/`critpath`, 3 reviewers). `nxt_sock` dialed once, never re-dialed; tail
+   closes `pred` on coord death → cascade → the re-warm tax. Fix = re-dial `nxt_sock` on send fail + tail keeps
+   draining `pred` when only `ret` dies. NOT tok/s but the iteration-velocity multiplier + churn-survival. Own
+   branch, own warm smoke-test. **Do first** (makes every later measure cheaper).
+2. **EAGLE TREE-verify** — the ~2× accept lever (g 2.5→4–5, reasoning ~7→~10–12). Rebase `eagle/tree-verify`
+   (worktree `shard-treemeasure`) on merged master (inherits fp8-aux + O(1) drafter → shrinks its payload wall),
+   then the 3 fleet fixes: **fp8 the tree aux; split prefix-attn from the N×N tree block to stay on flash (not the
+   dense-mask fallback); right-size the fan-out vs the fixed 2^d**. Fleet verdict: the measured tok/s LOSS was
+   ~6–7× SELF-INFLICTED wire payload, NOT physics, and the tree math is correct. Measure tight-EU (does payload
+   fix flip it?) then high-RTT scatter (its natural regime). See [[m25-tree-verify-measured-state]].
+3. **Topology-optimized ring order** — `plan_ring` sidecar-RTT measure → `select_ring` → `--order` BEFORE the pull
+   (order is baked at pull time). This session's rental-lottery order split the 2 co-located CZ boxes with GB
+   between them; a measured order recovers that. (⚠ fix the `select_ring` false-infeasible bug first, TIER 3.)
+4. **Cheap:** min-match within-run A/B (still unproven, one jittery pass); full-accept bonus token (coordinate_pipe
+   drops verified r[K] on n==K — free token, small on reasoning); stream `<think>` live (UX, not tok/s).
+
+**TIER 2 — TRUST / the moat (correctness debt; 1 CRITICAL + 4 high, flagged by 3 reviewers):**
+1. **CRITICAL — receipt coverage is self-referential** (`receipt.verify_coverage`, `pipe._verify_receipts`).
+   `layer_count` is derived FROM the receipts being checked, so a ring that OMITS layers still "tiles fully" and
+   passes → a node can skip its block and still be paid. ~10-line fix (pass the model's true `n_layers`
+   explicitly). **Do alongside the wedge branch — a skip-compute-and-get-paid hole shouldn't sit open even in a
+   perf sprint.**
+2. Receipts have no freshness/content binding (old receipts replay); bind to the job's actual tokens/activations.
+3. Tree-verify path emits NO receipts (verification silently off under M25_TREE) — wire the hash-chain through it.
+4. Verified-fetch trust root (`shard/fetch.py`) is bypassed by the real M2.5 deploy path (HF pull, unverified) —
+   route the betanet weight pull through the content-addressed manifest check.
+
+**TIER 3 — ROBUSTNESS (gateway + wire + contained bugs; a batch-into-one-session hardening pass):**
+- **Gateway** (`m25_gateway`, 4 high): reconnect wedges the warm ring; client-disconnect mid-stream silently
+  re-runs the ENTIRE generation; `reasoning=False` streaming duplicates the whole answer as reasoning+content; a
+  slow/stalled streaming client blocks the single-stream ring up to 30 min (add a write timeout / decouple).
+- **Wire/transport** (2 high, security): unauthenticated 64-bit length prefix → any peer forces unbounded alloc
+  (cap it pre-alloc); the libp2p PRODUCTION transport LOST wire.py's malformed-frame hardening (one bad frame
+  kills a stage — port the try/except).
+- **Contained bugs:** batched-decode KV write has no `M25_KV_MAXLEN` guard (OOB scatter kills the stage — copy
+  the prefill guard); `select_ring` false-infeasible (require-blind `>_TRIM` funnel returns None when a feasible
+  ring exists — TIER 1.3 depends on this).
+
+**TIER 4 — cleanup (38 medium + 19 low):** batched-path perf (per-layer host syncs, redundant full-cache copy,
+synchronous batched prefill), test-gaps on load-bearing logic (EAGLE bookkeeping, tree primitives, fetch trust
+root — several now covered by `tests/test_eagle_draft.py`), dead code (`shard/specdec.py` stub, scheduler), and
+doc/state staleness (STATE.md/FLEET_STATE.md/RESUME_B.md dead — cull or supersede). Detail in the findings file.
+
+**LATER (unchanged, not fleet items):** two-tier co-located fast interactive deploy; depth-aware hybrid (n-gram
+depth=4 / EAGLE depth=1); batch-invariant emulation MoE (verifiable batched, OOMs vLLM 0.23); train-our-own
+EAGLE-3 only if the stock head underperforms (~$400–2000, SpecForge).
 
 ## KEY DECISIONS (don't relitigate)
 - **Drafter = EAGLE-3, NOT MTP/DeepSeek.** Vocab-lock: a drafter must emit M2.5's 200064 vocab → DeepSeek heads
