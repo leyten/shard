@@ -41,6 +41,7 @@ _KEY = None                                  # 32-byte AEAD key, set once per pr
 _NONCE = 12                                  # ChaCha20-Poly1305 nonce length
 # torch dtype <-> stable JSON-clean name, so the header serializes without pickle
 _DTYPES = {str(d): d for d in (torch.float32, torch.float16, torch.bfloat16,
+                               torch.float8_e4m3fn, torch.float8_e5m2,   # fp8 activation transport (M25_FP8_WIRE) — keep in lockstep with shard/transport.py
                                torch.int64, torch.int32, torch.uint8, torch.bool)}
 
 
