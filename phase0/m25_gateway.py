@@ -231,7 +231,7 @@ if __name__ == "__main__":
     ap = argparse.ArgumentParser()
     ap.add_argument("--head", required=True); ap.add_argument("--tail", required=True)
     ap.add_argument("--port", type=int, default=29600)
-    ap.add_argument("--K", type=int, default=6); ap.add_argument("--depth", type=int, default=4)
+    ap.add_argument("--K", type=int, default=8); ap.add_argument("--depth", type=int, default=4)   # K=8 = the measured sweet spot (2026-06-27 sweep)
     ap.add_argument("--ngram-n", type=int, default=3, dest="ngram_n")
     ap.add_argument("--max-ctx", type=int, default=131072, dest="max_ctx")
     A = ap.parse_args()
