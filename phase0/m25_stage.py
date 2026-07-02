@@ -79,6 +79,15 @@ M25_BATCH_MOE = os.environ.get("M25_BATCH_MOE", "0") != "0"
 # (A brief 2026-06-29 "fix" mis-read vLLM's internal idx+1 and captured {0,29,57}; the 2026-06-30 on-engine
 # A/B confirmed {1,30,58} wins: reason-math 34% vs 30%, open-chat 13% vs 11% — reverted to this.)
 M25_EAGLE = os.environ.get("M25_EAGLE", "0") != "0"
+# EAGLE tree-verify (opt-in M25_TREE=1, implies M25_EAGLE): instead of verifying ONE linear draft per ring
+# traversal, verify a whole draft TREE (N nodes, each with its own parent + RoPE position) in a SINGLE forward
+# under an ancestor-only attention mask, then commit the longest accepted root->leaf path (tree_spec). A tree
+# packs more candidate continuations per (expensive WAN) round-trip than a chain -> more tokens/traversal at the
+# same depth. Only the attention mask + per-node RoPE differ from a normal decode (the MoE/MLP stay per-token).
+# The coordinator sets BOTH flags; default OFF (the linear-EAGLE / n-gram path is untouched).
+M25_TREE = os.environ.get("M25_TREE", "0") != "0"
+if M25_TREE:
+    M25_EAGLE = True                                 # tree-verify consumes the EAGLE aux + drafter; M25_TREE implies M25_EAGLE
 EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]   # decoder-layer indices (SpecForge convention)
 _AUX = {}                                            # layer-id -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
 # Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
@@ -309,6 +318,46 @@ class Layer:
         x = x + self.mlp(self._rms(x, self.post_ln))
         return x
 
+    # ---- EAGLE tree-verify (M25_TREE): one forward over a draft tree, ancestor-only attention mask ----
+    def attn_tree(self, x, start, pos_ids, mask):
+        """TREE-VERIFY attention (single-stream EAGLE). x=[1,N,H] the N drafted tree nodes; pos_ids=[N] long =
+        each node's ABSOLUTE RoPE position (siblings share one, so positions are NOT contiguous); mask=
+        [1,1,N,start+N] additive bias from tree_spec.build_tree_mask (0 = attend, -inf = block), already on
+        device in x's dtype (run_block_tree builds it ONCE and every layer reuses it). Per-node partial RoPE
+        via gather (like attn_decode_b), q_norm/k_norm, KV written CROPPED-to-start at slots [start,start+N)
+        (a tree node's k/v at start+i overwrites any prior speculative slot there — same crop-to-start as
+        attn()), read over [0,start+N). The mask makes every node attend the WHOLE committed prefix [0:start]
+        plus its root->node ancestors inside the tree block, never its siblings. Attention is ALWAYS the
+        manual broadcast-GQA kernel (_gqa_masked_attend): a dense float mask knocks SDPA off flash on sm_120
+        and N is tiny, so manual is both the fast and the bit-reproducible choice (no SDPA backend variance).
+        MoE/MLP stay per-token (run_block_tree)."""
+        from tree_spec import _gqa_masked_attend, _rope_gather       # tree-path-only dep (pure torch; pushed flat next to this file)
+        _, N, _ = x.shape
+        lin = torch.nn.functional.linear
+        cos, sin = get_pe(); rd = cos.shape[-1]                       # same rotary table attn()/run_block use
+        q = self._rms(lin(x, self.q_proj), self.q_norm).view(1, N, NH, HD).transpose(1, 2)
+        k = self._rms(lin(x, self.k_proj), self.k_norm).view(1, N, NKV, HD).transpose(1, 2)
+        v = lin(x, self.v_proj).view(1, N, NKV, HD).transpose(1, 2)
+        q = _rope_gather(q, cos, sin, pos_ids, rd); k = _rope_gather(k, cos, sin, pos_ids, rd)
+        total = start + N
+        if M25_STATIC_KV:                                             # fixed-address write at [start,total); read :total
+            if total > M25_KV_MAXLEN:
+                raise RuntimeError(f"tree context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise it or unset M25_STATIC_KV)")
+            cp = torch.arange(start, total, device=dev)
+            self.kc.index_copy_(2, cp, k); self.vc.index_copy_(2, cp, v)
+            kcur, vcur = self.kc[:, :, :total, :], self.vc[:, :, :total, :]
+        else:                                                        # cat path: crop any prior speculative tail to start, then append the N nodes
+            if self.kc is not None and self.kc.shape[2] > start:
+                self.kc = self.kc[:, :, :start, :].contiguous(); self.vc = self.vc[:, :, :start, :].contiguous()
+            if self.kc is None:
+                self.kc, self.vc = k, v
+            else:
+                self.kc = torch.cat([self.kc, k], 2); self.vc = torch.cat([self.vc, v], 2)
+            kcur, vcur = self.kc, self.vc
+        o = _gqa_masked_attend(q, kcur, vcur, mask, GRP)
+        o = o.transpose(1, 2).reshape(1, N, NH * HD)
+        return lin(o, self.o_proj)
+
     # ---- continuous batching (M25_BATCH>1): prefill writes one row; decode batches all rows ----
     def attn_prefill_b(self, x, b, start, cos, sin):
         """PER-STREAM prefill into batch-row b (x: [1, L, H]); SDPA-flash over :total (same as single-stream)."""
@@ -421,6 +470,30 @@ def run_block(layers, start_pos, h, vcfg):
         for L in layers:
             h = L.forward(h, start_pos, pe)
             if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # snapshot the OUTPUT residual stream of decoder layers [1,30,58] for the EAGLE head
+                _AUX[L.li] = h[0].detach().to(torch.bfloat16)
+    return h
+
+
+def run_block_tree(layers, start, h, vcfg, parents, pos_ids):   # EAGLE tree-verify: one forward over the draft tree
+    """Run the N drafted tree nodes (h: [1,N,H]) through this stage's layers in ONE forward under an
+    ancestor-only attention mask, so each node attends the committed prefix [0:start] + its root->node chain
+    (never its siblings). `parents` [N] (-1 = the committed anchor) and `pos_ids` [N] (per-node ABSOLUTE RoPE
+    position, siblings shared) describe the tree. The additive mask is built ONCE per stage-call, on device in
+    h's dtype, and reused across every layer (the old branch built fp32-on-CPU and re-cast per layer);
+    attn_tree does attention, the MoE/MLP stay per-token (the tree only changes attention). Same residual
+    structure as Layer.forward; captures EAGLE aux exactly like run_block."""
+    from vllm.forward_context import set_forward_context
+    from tree_spec import build_tree_mask
+    N = h.shape[1]
+    pos_ids = torch.as_tensor(pos_ids, dtype=torch.long, device=dev)
+    depths = (pos_ids - (start - 1)).tolist()                  # build_tree_mask wants depths; pos_ids == (start-1)+depth (we keep pos_ids for RoPE)
+    mask, _ = build_tree_mask(parents, depths, start, N)       # [1,1,N,start+N] additive bias; returned positions ignored (pos_ids drive RoPE)
+    mask = mask.to(h.dtype).to(dev)
+    with torch.no_grad(), set_forward_context(None, vcfg):
+        for L in layers:
+            h = h + L.attn_tree(L._rms(h, L.in_ln), start, pos_ids, mask)
+            h = h + L.mlp(L._rms(h, L.post_ln))
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:       # snapshot the OUTPUT residual stream for the EAGLE head (same as run_block)
                 _AUX[L.li] = h[0].detach().to(torch.bfloat16)
     return h
 
