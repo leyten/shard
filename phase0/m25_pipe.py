@@ -79,10 +79,12 @@ def _act_digest(t):
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
 
 
-def _verify_receipts(receipts):
+def _verify_receipts(receipts, layer_count):
     """Coordinator-side PROVE: every per-stage receipt's signature must verify AND the blocks must
     tile [0:layer_count] with no gap/overlap — so no node is paid without proving its own block and
-    the coordinator cannot fabricate one. Returns True/False (fails closed). Prints a per-stage line."""
+    the coordinator cannot fabricate one. layer_count is the model's TRUE depth (config), never
+    derived from the receipts under test: a ring that omits layers must FAIL coverage, not shrink
+    the target to whatever it did attest. Returns True/False (fails closed). Prints a per-stage line."""
     bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in receipts]
     ok = True
     for rr, body in zip(receipts, bodies):
@@ -94,7 +96,7 @@ def _verify_receipts(receipts):
         except Exception as e:
             ok = False; print(f"  stage {rr.get('stage')}: sig FAILED ({e})", flush=True)
     try:
-        verify_coverage(bodies, max(b["layer_end"] for b in bodies))
+        verify_coverage(bodies, layer_count)
     except Exception as e:
         ok = False; print(f"  coverage FAILED: {e}", flush=True)
     return ok
@@ -274,7 +276,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     dt = time.time() - t0
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
-    receipts_ok = _verify_receipts(receipts) if receipts else None
+    # True depth from the model config — never from the receipts themselves (self-referential coverage
+    # let a layer-omitting ring pass). Fail CLOSED when receipts were requested but none came back.
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
+                   else (False if RECEIPTS else None))
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
             "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
@@ -457,7 +462,7 @@ def _merge_aux(upstream):
     return acc
 
 
-def _tail_accept(srv):
+def _tail_accept(srv, pending=None):
     """Tail bring-up handshake. TWO connections land on the tail: the coordinator-RETURN channel (greets
     with {op:'hello_return'} the instant it connects, because the coordinator sends data immediately) and
     the PREDECESSOR ring stream (silent until the first job byte flows). With the libp2p sidecars the
@@ -471,8 +476,12 @@ def _tail_accept(srv):
     wait for the predecessor. Whichever connection greets with hello_return is the return channel (the
     predecessor never speaks first); the remaining silent connection is the predecessor, which connects
     once data starts flowing post-ack. Returns (ret, pred). Blocks (like the old accept) until both
-    exist — there is no work to do without a coordinator AND a predecessor."""
-    ret, pending = None, []                                # pending = accepted-but-unidentified (the silent predecessor waits here)
+    exist — there is no work to do without a coordinator AND a predecessor.
+
+    `pending` seeds the accepted-but-unidentified pool with leftovers from a torn-down session (a new
+    coordinator's hello_return may already have been accepted when the old predecessor died) — closing
+    them instead would EOF the reconnecting peer and re-wedge."""
+    ret, pending = None, list(pending or [])               # pending = accepted-but-unidentified (the silent predecessor waits here)
     while ret is None or not pending:
         ready, _, _ = select.select([srv] + pending, [], [])   # wake on a new conn OR a pending conn finally speaking
         for s in ready:
@@ -502,11 +511,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     layers = parts["layers"]
     vcfg = S._CTX[1]
     graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
+    def _dial_fwd():
+        host, p = nxt.rsplit(":", 1)
+        s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
+        return s
     nxt_sock = None
     if not parts["tail"]:
-        host, p = nxt.rsplit(":", 1)
-        nxt_sock = socket.socket(); nxt_sock.settimeout(timeout); nxt_sock.connect((host, int(p)))
-        nxt_sock.setsockopt(*NODELAY)
+        nxt_sock = _dial_fwd()                        # launch-time dial stays strict: a dead --next at boot is a launcher bug
         print(f"[s{stage}] forward connected -> {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port)); srv.listen(2)
@@ -516,52 +527,130 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
         # serve_tail_direct: ack the coordinator-return as soon as we identify it, THEN take the (lazily
         # connecting) predecessor — see _tail_accept for why requiring both up front deadlocks bring-up.
+        # CHURN-RESILIENT (specpipe.serve_tail_fast's model): pred and ret have INDEPENDENT lifecycles.
+        # ret dies alone (coordinator exit/crash, gateway restart) -> keep the predecessor + warm KV,
+        # accept the next hello_return MID-SESSION, and drop the dead job's in-flight replies until the
+        # next reset (a stale reply poisons the new coordinator's handshake). Only a pred death tears the
+        # session down — and takes ret with it, so a reset-ok can never go to a dead coordinator's channel.
+        # This tail was the wedge's first domino: it closed pred whenever ret died, which EOF'd every
+        # upstream stage in turn and left the whole warm ring needing a relaunch per coordinator.
+        ret = pred = None; pending = []; stale = False
+
+        def _ret_send(o):
+            # Deliver a reply to the coordinator-return. On failure the RETURN channel is dead, not the
+            # session: drop only ret (the next coordinator brings a fresh one) and mark the job stale.
+            nonlocal ret, stale
+            if ret is None:
+                return
+            try:
+                send_msg(ret, o)
+            except EDGE_ERRORS as e:
+                print(f"[tail] return edge died on send ({type(e).__name__}); keeping predecessor+KV", flush=True)
+                try: ret.close()
+                except OSError: pass
+                ret = None; stale = True
+
         while True:
-            ret, pred = _tail_accept(srv)    # sends ret_ok the instant the return channel is identified; both have NODELAY
-            pred.settimeout(timeout)         # bound predecessor reads; ret stays untimed (write-only, coordinator-driven)
-            print("[tail] predecessor + coord-return connected", flush=True)
+            if pred is None:
+                ret, pred = _tail_accept(srv, pending)   # acks ret_ok the instant the return channel is identified
+                pending = []                     # consumed (became ret/pred or were closed) — don't double-select
+                pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
+                stale = False
+                print("[tail] predecessor + coord-return connected", flush=True)
             signer = None
             with torch.no_grad():
                 try:
                     while True:
+                        # Multiplex: pred carries job data; srv carries a reconnecting coordinator's
+                        # hello_return, which MUST be accepted mid-session or coordinator churn wedges the
+                        # warm ring; pending holds accepted-but-silent conns (never block-recv a silent
+                        # conn — the _tail_accept bring-up deadlock, same reasoning).
+                        ready, _, _ = select.select([srv, pred] + pending, [], [])
+                        if srv in ready:
+                            c, _ = srv.accept(); c.setsockopt(*NODELAY); pending.append(c)
+                            continue
+                        spoke = next((s for s in pending if s in ready), None)
+                        if spoke is not None:
+                            pending.remove(spoke)
+                            spoke.settimeout(timeout)      # a half-sent greeting must not hang the live session
+                            try:
+                                hello = recv_msg(spoke)
+                            except EDGE_ERRORS:
+                                try: spoke.close()
+                                except OSError: pass
+                                continue
+                            if isinstance(hello, dict) and hello.get("op") == "hello_return":
+                                if ret is not None:        # coordinator churn: the old return channel is dead
+                                    try: ret.close()       # even if this write-only socket never told us
+                                    except OSError: pass
+                                    stale = True           # in-flight traffic belongs to the dead job
+                                ret = spoke; send_msg(ret, "ret_ok")
+                                print("[tail] coord-return (re)connected mid-session", flush=True)
+                            else:
+                                try: spoke.close()         # unexpected greeter (junk/probe) -> drop
+                                except OSError: pass
+                            continue
+                        if pred not in ready:
+                            continue
                         msg = _hrecv(recv_msg(pred))
+                        if stale:
+                            # These messages belong to a job whose coordinator died: don't compute them,
+                            # never answer them. The next job boundary (reset) re-arms the session.
+                            if msg.get("op") not in ("reset", "reset_batch"):
+                                continue
+                            stale = False
                         if msg["op"] == "reset":
                             for L in layers:
                                 L.reset()
                             if RECEIPTS:                    # start this job's per-stage activation hash-chain
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                        msg.get("job_id", "job"), lo, hi)
-                            send_msg(ret, "ok"); continue
+                            _ret_send("ok"); continue
                         if msg["op"] == "receipt":          # job done: sign + return the full ring's receipts
                             if RECEIPTS and signer is not None:
                                 msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
-                            send_msg(ret, msg.get("receipts", [])); continue
+                            _ret_send(msg.get("receipts", [])); continue
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
                             for L in layers: L.reset()
-                            send_msg(ret, "ok"); continue
+                            _ret_send("ok"); continue
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), msg["h"].to(dev), vcfg)
-                            send_msg(ret, _tail_logits(h, parts).argmax(-1).tolist()); continue
+                            _ret_send(_tail_logits(h, parts).argmax(-1).tolist()); continue
                         if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                             h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], msg["h"].to(dev), vcfg)
-                            send_msg(ret, _tail_logits(h, parts).argmax(-1)[0].tolist()); continue
+                            _ret_send(_tail_logits(h, parts).argmax(-1)[0].tolist()); continue
                         x = msg["h"].to(dev)
                         h = _block(graph_runners, layers, msg["start"], x, vcfg)
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                         toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                        send_msg(ret, {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
+                        _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
                 except EDGE_ERRORS as e:
-                    print(f"[tail] edge closed ({type(e).__name__}); reset", flush=True)
+                    # PREDECESSOR death (ret failures are absorbed in _ret_send and never land here):
+                    # tear the session down, ret included, and re-accept both channels fresh.
+                    print(f"[tail] predecessor edge closed ({type(e).__name__}); re-accepting both channels", flush=True)
                     for L in layers:
                         L.reset()
-                    try: pred.close(); ret.close()
-                    except OSError: pass
+                    for s in (pred, ret):
+                        if s is not None:
+                            try: s.close()
+                            except OSError: pass
+                    pred = ret = None
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
     node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
     while True:
+        tries = 0
+        while nxt_sock is None:                       # forward link dropped (churn cascade): rebuild it BEFORE
+            try:                                      # accepting a new predecessor, so the ring re-handshakes
+                nxt_sock = _dial_fwd()                # front-to-back onto WARM stages — no relaunch, no reload
+                print(f"[s{stage}] forward link rebuilt -> {nxt}", flush=True)
+            except OSError:
+                tries += 1                            # dial forever: a stage holding warm weights is worth more
+                if tries % 60 == 0:                   # waiting than dead (downstream may be mid-restart)
+                    print(f"[s{stage}] forward re-dial {nxt} still failing ({tries} tries)", flush=True)
+                time.sleep(0.5)
         conn, _ = srv.accept(); conn.setsockopt(*NODELAY)
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None
@@ -610,11 +699,14 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         fwd["aux"] = _merge_aux(msg.get("aux"))
                     send_msg(nxt_sock, _hsend(fwd))
             except EDGE_ERRORS as e:
-                print(f"[s{stage}] edge closed ({type(e).__name__}); reset", flush=True)
+                print(f"[s{stage}] edge closed ({type(e).__name__}); reset + drop forward link", flush=True)
                 for L in layers:
                     L.reset()
-                try: conn.close()
-                except OSError: pass
+                for s in (conn, nxt_sock):            # deliberately drop the forward link too: the next stage
+                    if s is not None:                 # sees EOF and cascades, so the WHOLE ring re-handshakes
+                        try: s.close()                # fresh (warm weights intact) and a new coordinator can
+                        except OSError: pass          # drive it — specpipe's proven recovery choreography
+                nxt_sock = None
 
 
 def _sweep_summary(rows):
