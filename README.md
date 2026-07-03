@@ -6,7 +6,7 @@ pools them into swarms that run models far larger than any single card holds. Th
 long arc is a worldwide compute fabric: many models, ever bigger, and eventually
 training and general compute. Shard is the protocol that connects it.
 
-[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21178431.svg)](https://doi.org/10.5281/zenodo.21178431)
+[![DOI](https://zenodo.org/badge/DOI/10.5281/zenodo.21178430.svg)](https://doi.org/10.5281/zenodo.21178430)
 
 **Technical report:** [Sharded Inference of a 229B-Parameter MoE over the Public Internet at Interactive Speed](docs/paper/main.pdf) — measured on five countries' consumer GPUs, every number backed by a signed receipt in [`docs/receipts/`](docs/receipts/).
 
