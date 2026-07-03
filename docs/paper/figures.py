@@ -149,14 +149,15 @@ def fig_split(bench="m25-paper-bench-20260703.json"):
         tv = sum(r["traversal_s"] for r in rr); st = sum(r["stage_s"] for r in rr)
         n_tr = sum(r["new_tokens"] / r["g"] for r in rr)
         rows.append((arm, tv / n_tr * 1000, st / n_tr * 1000))
-    fig, ax = plt.subplots(figsize=(4.6, 1.7))
+    fig, ax = plt.subplots(figsize=(6.4, 1.9))
     for i, (arm, tvms, stms) in enumerate(rows):
         ax.barh(i, stms, color=C[arm], zorder=3, height=0.55)
         ax.barh(i, tvms - stms, left=stms + 2, color="#c3c2b7", zorder=3, height=0.55)
         ax.annotate(f"stage compute {stms:.0f} ms", (stms / 2, i), ha="center", va="center",
-                    fontsize=7, color="#ffffff" if arm != "hybrid" else INK)
+                    fontsize=6.8, color="#ffffff" if arm != "hybrid" else INK)
         ax.annotate(f"transport + codec {tvms - stms:.0f} ms ({(tvms - stms) / tvms * 100:.0f}%)",
-                    (stms + (tvms - stms) / 2, i), ha="center", va="center", fontsize=7, color=INK)
+                    (tvms + 10, i), ha="left", va="center", fontsize=7.4, color=INK)
+    ax.set_xlim(0, max(r[1] for r in rows) * 1.62)
     ax.set_yticks(range(len(rows)))
     ax.set_yticklabels([r[0] for r in rows], fontsize=8)
     ax.set_xlabel("mean traversal decomposition (ms)")
