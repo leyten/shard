@@ -131,6 +131,32 @@ def _unpack(resp):
     return resp, None
 
 
+def _acc_stage_dt(resp, per_stage):
+    """Coordinator-side fold of one reply's stage_dt rows ([stage, span_ms, compute_ms], stages launched with
+    M25_STAGE_TIMING=1) into running per-stage sums; returns this traversal's (span_s, compute_s) totals."""
+    sd = resp.get("stage_dt") if isinstance(resp, dict) else None
+    if not sd:
+        return 0.0, 0.0
+    sp = cp = 0.0
+    for row in sd:
+        sp += row[1] / 1e3; cp += row[2] / 1e3
+        a = per_stage.setdefault(str(row[0]), [0.0, 0.0, 0]); a[0] += row[1]; a[1] += row[2]; a[2] += 1
+    return sp, cp
+
+
+def _timing_fields(t_trav, t_stage, t_comp, per_stage):
+    """Traversal/transport split for the coordinator return dict. traversal_s = Σ per-chunk send->recv
+    latency (under pipelining depth>1 chunks overlap, so this can EXCEED wall decode_s — it is per-chunk
+    latency, not wall). transport_s = traversal - Σ stage spans = wire + sidecar hops + codec serialize;
+    None unless stages ran M25_STAGE_TIMING=1. per_stage_ms = {stage: [mean_span_ms, mean_compute_ms]}."""
+    return {"traversal_s": round(t_trav, 3),
+            "stage_s": round(t_stage, 3) if t_stage else None,
+            "stage_compute_s": round(t_comp, 3) if t_stage else None,
+            "transport_s": round(t_trav - t_stage, 3) if t_stage else None,
+            "per_stage_ms": ({k: [round(v[0] / v[2], 2), round(v[1] / v[2], 2)] for k, v in per_stage.items()}
+                             if per_stage else None)}
+
+
 def _eagle_seed(aux, pos):
     """Stack the 3 aux hidden states at chunk position `pos` -> [3,H] for EagleDrafter.set_hidden()."""
     import torch as _t
@@ -229,6 +255,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
+    t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
         send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
                              "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
@@ -269,12 +296,15 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
             while len(inflight) < cur_depth and not done:
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
+                t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
-                inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
+                inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
             tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
             r, aux = _unpack(resp)
-            sp, ds = inflight.pop(0)
+            sp, ds, t_sent = inflight.pop(0)
+            t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
+            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
             if discard > 0: discard -= 1; wasted += 1; continue
             n = 0
             for j in range(K):
@@ -298,6 +328,16 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             if conf: conf.observe(n, K)                                     # acceptance EMA (free, from the verify result)
             if n == K:
                 out.extend(ds); pos += K; cur = ds[-1]; committed = ds
+                # FULL-ACCEPT BONUS: r[K] is the target's greedy token at the position just past the last
+                # accepted draft (lossless — the whole draft matched, so the prefix IS the greedy sequence).
+                # When nothing is in flight (depth-1: EAGLE/tree) that position is NOT covered by a queued
+                # chunk, so committing it now advances the frontier K+1 not K -> ~1/K fewer WAN round-trips on
+                # draftable text, and makes toks_per_traversal honest. Under pipelining (depth>1) the next
+                # in-flight chunk already re-derives it at no extra RTT, so we leave it (committing would
+                # collide with that chunk's start).
+                if not inflight and len(r) > K:
+                    out.append(r[K]); committed = ds + [r[K]]; cur = r[K]
+                    pos += 1; send_pos += 1; dprefix = dprefix + [r[K]]
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
@@ -324,7 +364,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
                    else (False if RECEIPTS else None))
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
-            "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (accepted + valid) / max(valid, 1),
+            # HONEST g: committed tokens per verify round = frontier advance (pos) / rounds. NOT the old
+            # (accepted+valid)/valid, which counted a bonus token on EVERY full-accept round even when the
+            # pipelined path dropped it -> up to +1 inflation, not comparable to the tree arm's exact g.
+            "mean_accept": accepted / max(valid, 1), "toks_per_traversal": (pos - len(gen_ids)) / max(valid, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
@@ -332,26 +375,36 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # return channel, decode_s = the whole decode wall. What's NOT wait or draft is coordinator-side
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
+            **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
             "final_confidence": conf.confidence() if conf else None}
 
 
 def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                          tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                          swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
-    """EAGLE TREE-VERIFY coordinator (M25_TREE=1): one draft TREE per ring traversal instead of one linear
-    chain. Each round re-feeds the last committed path as a causal trunk + grows a top-M EAGLE tree off its
-    last node (the anchor); the ring verifies the whole thing in ONE forward under an ancestor-only mask
-    (run_block_tree) and tree_greedy_walk commits the longest accepted path + 1 correction/bonus. depth=1
-    structurally — one tree in flight per traversal — so K/depth are unused; the speculation budget is
-    M25_TREE_M nodes (best-first by cumulative draft log-prob, M25_TREE_TOPB children per expansion, depth
-    cap M25_TREE_DEPTH — the fleet-confirmed fix for the fixed-2^d waste, 62 nodes for +0.7 g).
+    """DEPTH-AWARE HYBRID coordinator (M25_TREE=1): per round, route by what the text is doing.
+    * n-gram MATCHED (verbatim/draftable) -> a PLAIN pipelined chain frame, up to `depth` in flight —
+      the flash kernel + the small payload + pipelining, exactly the regime that wins those cells.
+      (The 2026-07-03 good-ring split showed routing matched rounds as 1-wide TREES paid the manual
+      off-flash kernel + trunk re-feed + wider aux for zero accept gain: 199-303ms/round vs 139ms,
+      ctx-8k-quote 5.1 vs 11.8 tok/s. And both arms ran depth-1, leaving the α≈0.97 streaks unpipelined.)
+    * n-gram MISS (novel/reasoning) -> ONE synchronous EAGLE tree round: top-M best-first tree
+      (M25_TREE_M nodes, M25_TREE_TOPB children, M25_TREE_DEPTH cap) verified in one forward under an
+      ancestor-only mask (run_block_tree); tree_greedy_walk commits the longest path + 1 correction/bonus.
+      Tree rounds stay depth-1 structurally (EAGLE needs the verified hidden to draft the next round).
 
-    GREEDY / LOSSLESS by construction (the ring greedy-verifies every node; the tree only changes WHICH
-    tokens are proposed). CORRECTNESS GATE: with M25_TREE_TOPB=1 the tree degenerates to a single chain and
-    the committed output must byte-match chain-EAGLE greedy (same-kernel caveat: attn_tree is the manual
-    reference kernel, so gate against M25_SDPA=0 stages or accept rare near-tie argmax flips). Prefill, the
-    receipts sweep and the return-dict shape are identical to coordinate_pipe (honest_bench parses it the
-    same; receipts stay ON so the tree A/B carries the same attestation cost as the chain)."""
+    KV DIRTY-FRONTIER CONTRACT (the cross-mode bookkeeping): a tree round leaves the newly committed
+    path's KV rows dirty (they were tree nodes at scattered slots), tracked as `pending_path` @ vbase.
+    The NEXT frame must re-feed them: a tree round re-feeds them as its causal trunk (as before); the
+    FIRST chain frame of a burst prepends them as a causal prefix (start=vbase, accept offset L-1).
+    After any chain commit the only dirty token is `cur` (a correction/bonus is never an input until
+    re-sent), so pending_path collapses to [cur] — which makes the burst's first frame IDENTICAL to
+    coordinate_pipe's standard [anchor]+draft frame. The fake-ring harness models this frontier and
+    asserts no frame ever writes past a KV gap.
+
+    GREEDY / LOSSLESS by construction on BOTH routes (the ring greedy-verifies every proposed token;
+    routing only changes WHICH tokens are proposed and how many frames are in flight). Prefill, the
+    receipts sweep and the return-dict shape are identical to coordinate_pipe."""
     from tree_spec import tree_greedy_walk
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
@@ -363,6 +416,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []; prefill_s = 0.0; t_draft = t_recv = 0.0; receipts = []
+    t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     tree_m = int(os.environ.get("M25_TREE_M", "12"))
     tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
     tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
@@ -399,34 +453,98 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         prefill_s = time.time() - t_pf
         out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
-        rounds = 0; total_committed = 0; t0 = time.time(); done = False
+        rounds = 0; total_committed = 0; accepted = 0; wasted = 0; t0 = time.time(); done = False
         ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
+        inflight = []                                       # chain-burst frames: (off, start, ds, t_sent)
+        discard = 0                                         # stale in-flight replies after a mid-burst divergence
+        dprefix = None                                      # committed + speculative tokens (slot i == dprefix[i]); None = rebuild
+        send_pos = 0                                        # slot of the NEXT plain frame's anchor (dprefix[-1])
+        refeed = True                                       # pending_path KV is dirty (post-prefill / post-tree round)
         while not done:
-            L = len(pending_path)
-            td = time.time()
-            tree = None
-            if ng is not None:                              # HYBRID routing, same split as the chain path: n-gram
-                ng.request(prompt_ids + out, tree_depth)    # FIRST (nails verbatim-reuse; the EAGLE-only tree lost
-                ds = ng.fetch()                             # rag-quote 5.6->3.0 tok/s in the 2026-07-02 A/B) ->
-                if ds and getattr(ng, "matched", False):    # EAGLE tree on a miss (novel/reasoning text)
-                    tree = {"tokens": list(ds), "parents": [-1] + list(range(len(ds) - 1)),
-                            "depths": list(range(1, len(ds) + 1))}   # a matched n-gram chain IS a 1-wide tree
-            if tree is None:
+            # ---- FILL: keep plain chain frames in flight while the n-gram matches -------------------
+            while len(inflight) < depth and not done:
+                if dprefix is None:
+                    dprefix = list(gen_ids) + out
+                d = None
+                if ng is not None:
+                    td = time.time()
+                    ng.request(dprefix, K)
+                    d0 = ng.fetch()
+                    t_draft += time.time() - td
+                    if d0 and getattr(ng, "matched", False):
+                        d = list(d0)
+                if d is None:
+                    break                                   # novel text -> tree round (or drain what's in flight)
+                if refeed:                                  # first frame after prefill/tree: re-feed the dirty path
+                    ids = list(pending_path) + d; start = vbase; off = len(pending_path) - 1
+                    refeed = False
+                else:
+                    ids = [dprefix[-1]] + d; start = send_pos; off = 0
+                t_sent = time.monotonic()                   # traversal origin: includes the outbound serialize
+                send_msg(pipe_sock, {"op": "verify", "token_ids": ids, "start": start})
+                inflight.append((off, start, d, t_sent))
+                dprefix = dprefix + d; send_pos = start + off + K   # next anchor = dprefix[-1]'s slot
+            if not inflight:
+                # ---- NOVEL: one synchronous EAGLE tree round ---------------------------------------
+                L = len(pending_path)
+                td = time.time()
                 tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
-            t_draft += time.time() - td
-            token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
-            send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
-                                 "parents": parents, "pos_ids": pos_ids, "start": vbase})
-            tr = time.time(); r, aux = _unpack(recv_msg(rx)); t_recv += time.time() - tr
-            path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
-            out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
-            # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
-            # accepted path node (flat node L+path_idx[k-1]). Slice to len(committed) (== 1+len(path_idx)).
-            pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
-            eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos (predicting hidden), per the extend contract & the chain path
-            rounds += 1; total_committed += len(committed)
-            if on_commit: on_commit(out, time.time() - t0)           # stream: this round's running output
+                t_draft += time.time() - td
+                token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
+                t_sent = time.monotonic()
+                send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
+                                     "parents": parents, "pos_ids": pos_ids, "start": vbase})
+                tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+                t_trav += time.monotonic() - t_sent         # depth-1: this IS the clean per-round T_traversal
+                s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+                r, aux = _unpack(resp)
+                path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
+                out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
+                # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
+                # accepted path node (flat node L+path_idx[k-1]). Slice to len(committed) (== 1+len(path_idx)).
+                pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
+                eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos
+                rounds += 1; total_committed += len(committed)
+                accepted += len(committed) - 1              # DRAFT tokens accepted (the +1 is correction/bonus)
+                refeed = True; dprefix = None               # the committed path's KV rows are tree nodes -> dirty
+                if on_commit: on_commit(out, time.time() - t0)
+                if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+                continue
+            # ---- BURST REPLY: same accept/divergence bookkeeping as coordinate_pipe ----------------
+            tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+            r, aux = _unpack(resp)
+            off, start, ds, t_sent = inflight.pop(0)
+            t_trav += time.monotonic() - t_sent             # count discarded chunks too — they traversed
+            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+            if discard > 0:
+                discard -= 1; wasted += 1; continue
+            n = 0
+            for j in range(K):
+                if ds[j] == r[off + j]: n += 1
+                else: break
+            rounds += 1; accepted += n                      # chain semantics: draft tokens accepted, exactly
+                                                            # (a no-bonus full accept is n=K accepted, not K-1)
+            if n == K:
+                committed = list(ds)
+                if not inflight and len(r) > off + K:       # full-accept bonus, same rule as coordinate_pipe:
+                    committed.append(r[off + K])            # only when nothing queued re-derives that position
+                    dprefix = dprefix + [r[off + K]]; send_pos += 1
+            else:
+                committed = ds[:n] + [r[off + n]]
+                discard = len(inflight)                     # everything in flight speculated past the divergence
+            out.extend(committed); cur = committed[-1]
+            total_committed += len(committed)
+            # the only dirty token after a chain commit is cur (a correction/bonus was never an input);
+            # the next plain frame re-sends it as its anchor, so bursts continue with standard framing.
+            vbase = start + off + len(committed); pending_path = [cur]
+            if n < K:
+                dprefix = list(gen_ids) + out; send_pos = vbase   # next anchor = cur @ its own slot
+            if aux is not None:                             # burst frames carry aux rows per frame position:
+                eg.extend(committed, _eagle_aux_range(aux, off, off + len(committed)), base_pos=start + off)
+            if on_commit: on_commit(out, time.time() - t0)
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+        while inflight:                                     # drain replies for frames sent past the finish
+            recv_msg(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
     except EDGE_ERRORS as e:
@@ -441,13 +559,16 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         if ee in out: out = out[:out.index(ee)]; break
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
                    else (False if RECEIPTS else None))
-    accepted = total_committed - rounds                     # accept per round = len(committed)-1 (the +1 is the correction/bonus)
+    # mean_accept counts DRAFT tokens accepted per round, same as coordinate_pipe — NOT committed-1:
+    # a pipelined full-accept round commits K with no bonus, and deriving accept from committed under-
+    # reported it by 1 (a 12.5pp phantom accept deficit vs the chain arm at K=8; found adversarially).
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
             "mean_accept": accepted / max(rounds, 1), "toks_per_traversal": total_committed / max(rounds, 1),
-            "tok_s": len(out) / max(dt, 1e-9), "wasted": 0, "prefill_s": prefill_s, "output_ids": out,
+            "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
+            **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
             "final_confidence": None}
 
 
@@ -619,6 +740,22 @@ def _merge_aux(upstream):
             else:
                 acc[str(li)] = h.cpu()
     return acc
+
+
+def _dt_sync():
+    """Stage-timing compute stamp: force the async block forward to finish so the delta is real GPU time,
+    not launch time (the very next op — fp8 pack / logits .tolist() — syncs anyway, so this costs nothing)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.monotonic()
+
+
+def _dt_row(msg, stage, t_rx, t_comp):
+    """[stage, span_ms, compute_ms] appended to the frame's accumulated stage_dt (the _merge_aux pattern).
+    span = post-dequant recv -> just-before-send (block forward + fp8 pack); compute = recv -> synced block
+    forward. Traversal-minus-span on the coordinator = wire + sidecar + codec — the transport bucket."""
+    return (msg.get("stage_dt") or []) + [[stage, round((time.monotonic() - t_rx) * 1e3, 2),
+                                           round((t_comp - t_rx) * 1e3, 2)]]
 
 
 def _tail_accept(srv, pending=None, ret=None, timeout=None):
@@ -798,6 +935,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if pred not in ready:
                                 continue
                             msg = _hrecv(recv_msg(pred))
+                        t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                         if stale or ret is None:
                             # These messages belong to a job whose coordinator died: don't compute them,
                             # never answer them. The next job boundary (reset) re-arms the session — but
@@ -829,16 +967,26 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
                             x = msg["h"].to(dev)
                             h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                             if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                            if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                                o = o if isinstance(o, dict) else {"toks": o}
+                                o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                            _ret_send(o); continue
                         x = msg["h"].to(dev)
                         h = _block(graph_runners, layers, msg["start"], x, vcfg)
+                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                         toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                        _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
+                        o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                        if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                            o = o if isinstance(o, dict) else {"toks": o}
+                            o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                        _ret_send(o)
                 except EDGE_ERRORS as e:
                     # PREDECESSOR death (ret failures are absorbed in _ret_send and never land here):
                     # tear the session down and re-accept. The ret goes too — a reset-ok must never reach
@@ -878,6 +1026,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
             try:
                 while True:
                     msg = _hrecv(recv_msg(conn))
+                    t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg["op"] == "reset":
                         for L in layers:
                             L.reset()
@@ -913,25 +1062,33 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             h = msg["h"].to(dev)
                         x = h
                         h = S.run_block_tree(layers, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         if RECEIPTS and signer is not None:     # attest tree blocks too — verification must not silently turn off under M25_TREE
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
                                "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
                         if S.M25_EAGLE:
                             fwd["aux"] = _merge_aux(msg.get("aux"))
-                        send_msg(nxt_sock, _hsend(fwd)); continue
+                        fwd = _hsend(fwd)
+                        if S.M25_STAGE_TIMING:
+                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                        send_msg(nxt_sock, fwd); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
                         h = msg["h"].to(dev)
                     x = h
                     h = _block(graph_runners, layers, msg["start"], h, vcfg)
+                    t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                     if RECEIPTS and signer is not None:         # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
                     fwd = {"op": "verify", "h": h, "start": msg["start"]}
                     if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
                         fwd["aux"] = _merge_aux(msg.get("aux"))
-                    send_msg(nxt_sock, _hsend(fwd))
+                    fwd = _hsend(fwd)
+                    if S.M25_STAGE_TIMING:
+                        fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                    send_msg(nxt_sock, fwd)
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset + drop forward link", flush=True)
                 for L in layers:
@@ -1067,6 +1224,12 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
             other = r["decode_s"] - r.get("draft_s", 0) - r.get("ring_wait_s", 0)
             print(f"[coord] decode {r['decode_s']:.1f}s = ring-wait {r.get('ring_wait_s', 0):.1f}s "
                   f"+ draft {r.get('draft_s', 0):.1f}s + coord-other {other:.1f}s", flush=True)
+        if r.get("transport_s") is not None:                 # stage-timing split (stages ran M25_STAGE_TIMING=1)
+            tv = r["traversal_s"]
+            print(f"[coord] traversal {tv:.1f}s = transport {r['transport_s']:.1f}s "
+                  f"({100 * r['transport_s'] / max(tv, 1e-9):.0f}%) + stage-span {r['stage_s']:.1f}s "
+                  f"(compute {r['stage_compute_s']:.1f}s)  per-stage ms[span,comp]: "
+                  + " ".join(f"s{k}={v}" for k, v in sorted(r["per_stage_ms"].items())), flush=True)
         if parsed["reasoning_content"]:
             print("[coord] THINK:\n" + parsed["reasoning_content"][:600], flush=True)
         print("[coord] OUTPUT:\n" + (parsed["content"] or "")[:1200], flush=True)

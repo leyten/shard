@@ -36,13 +36,16 @@ def _scen(seed, n):
     return nodes, L, c_out, c_in, free, lms, sub
 
 
-# ---- golden: the LEGACY (up_mbps=None) output, captured from the pre-upload-aware select_ring ----
+# ---- golden: the LEGACY (up_mbps=None) output. Re-captured 2026-07-03 for the deployable-orientation
+# change: with `require` pinned, order[0] MUST be the require/coord node (the launcher puts the
+# coordinator on order[0]'s box — the old goldens tailed or mid-pathed it, which no launch could
+# realize, so their lower predicted step_ms was fiction). Costs are the honest deployed ones now. ----
 GOLDEN = {
-    "s1": {"order": [3, 5, 0], "step_ms": 725.2, "tok_s_per_g": 1.38, "k": 3,
-           "layers": {3: 29, 5: 25, 0: 8}, "dropped": [1, 2, 4, 6, 7]},
-    "s2": {"order": [2, 7, 0, 3], "step_ms": 694.9, "tok_s_per_g": 1.44, "k": 4,
-           "layers": {2: 43, 7: 17, 0: 1, 3: 1}, "dropped": [1, 4, 5, 6]},
-    "s3": {"order": [1, 0, 7, 9, 4, 2, 8, 5], "step_ms": 772.8, "k": 8, "dropped": [3, 6]},
+    "s1": {"order": [0, 1, 3, 5], "step_ms": 732.6, "tok_s_per_g": 1.36, "k": 4,
+           "layers": {0: 8, 1: 1, 3: 28, 5: 25}, "dropped": [2, 4, 6, 7]},
+    "s2": {"order": [0, 3, 2, 7], "step_ms": 709.6, "tok_s_per_g": 1.41, "k": 4,
+           "layers": {0: 1, 3: 1, 2: 43, 7: 17}, "dropped": [1, 4, 5, 6]},
+    "s3": {"order": [0, 9, 4, 1, 7, 2, 8, 5], "step_ms": 787.9, "k": 8, "dropped": [3, 6]},
     "s4": None,
 }
 
@@ -79,6 +82,39 @@ def test_legacy_byte_identical():
         assert all(v >= 1 for v in r["layers"].values())      # no empty stages
         assert len(set(r["order"])) == len(r["order"])        # no repeats
     print("ok  legacy byte-identical (4 scenarios incl. co-location, widen-k, infeasible)")
+
+
+def test_require_is_always_order_zero():
+    """Deployable orientation: with `require` pinned (coord on the head box), order[0] MUST be the
+    require node in BOTH objectives — the launcher dials stage 0 locally on the coord box, so any
+    other placement can't be launched. Under symmetric matrices entry-at-head and exit-at-head are
+    cost-mirrors, so the pre-fix optimizer legally returned head-LAST rings (seed 7 below did exactly
+    that); the fix must re-orient without breaking the block tiling."""
+    import random
+    for seed in range(1, 12):
+        rng = random.Random(seed)
+        n = 8
+        L = [[0.0] * n for _ in range(n)]
+        for i in range(n):
+            for j in range(i + 1, n):
+                L[i][j] = L[j][i] = round(rng.uniform(14, 38), 1)     # tight-EU-ish symmetric mesh
+        free = {i: 31000.0 for i in range(n)}
+        lms = {i: 11.0 for i in range(n)}
+        sub = {i: f"10.0.{i}.0/24" for i in range(n)}
+        head = 0
+        lms[head] *= 1.3
+        c_out = [L[head][i] if i != head else 1.0 for i in range(n)]
+        c_in = [L[i][head] if i != head else 1.0 for i in range(n)]
+        r = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                        slack=n, require=head, **MODEL)
+        assert r is not None
+        assert r["order"][0] == head, f"seed {seed}: require node at position {r['order'].index(head)}"
+        lo = 0
+        for nd in r["order"]:                                          # blocks tile [0,n_layers) along the order
+            assert r["blocks"][nd][0] == lo, f"seed {seed}: block gap at node {nd}"
+            lo = r["blocks"][nd][1]
+        assert lo == MODEL["n_layers"]
+    print("ok  require node is order[0] across 11 symmetric pools (blocks tile gaplessly)")
 
 
 def test_no_false_infeasible_rtt_trim():
@@ -190,14 +226,17 @@ def _aware(n, L, c_out, c_in, free, lms, sub, up, S=16384, D=256, chunks=4, requ
 
 
 def test_upload_aware_tails_and_drops():
-    """Slow-upload nodes are dropped from the ring; the lowest-upload IN-ring node sits at the tail
-    (which forwards nothing); the aware ring has a lower TRUE prefill cost than the blind one."""
+    """Slow-upload nodes are dropped from the ring; the lowest-upload eligible node sits at the tail
+    (which forwards nothing); the aware ring has a lower TRUE prefill cost than the blind one.
+    The require/coord node is EXEMPT from tail candidacy: it must sit at order[0] to be launchable
+    (the pre-orientation selector happily tailed the coord box — a ring no launch could realize)."""
     n, L, c_out, c_in, free, lms, sub, up = _upool()
     r = _aware(n, L, c_out, c_in, free, lms, sub, up)
     assert 3 not in r["order"] and 4 not in r["order"], "kept a slow-cable node on the critical path"
-    # tail = the min-upload node among those in the ring
+    assert r["order"][0] == 0, "require/coord node not at order[0] — undeployable ring"
+    # tail = the min-upload node among the in-ring nodes that CAN tail (everyone but the head)
     tail = r["order"][-1]
-    assert up[tail] == min(up[x] for x in r["order"]), "did not tail the lowest-upload in-ring node"
+    assert up[tail] == min(up[x] for x in r["order"][1:]), "did not tail the lowest-upload eligible node"
     assert "prefill_ms" in r and "request_ms" in r and "roles" in r
     # request_ms == prefill_ms + D * step_ms (decomposition holds on unrounded values; allow the
     # rounding budget: each of prefill/request rounds to 0.1, and D copies of step's 0.1 rounding).
