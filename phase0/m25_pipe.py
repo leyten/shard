@@ -131,6 +131,32 @@ def _unpack(resp):
     return resp, None
 
 
+def _acc_stage_dt(resp, per_stage):
+    """Coordinator-side fold of one reply's stage_dt rows ([stage, span_ms, compute_ms], stages launched with
+    M25_STAGE_TIMING=1) into running per-stage sums; returns this traversal's (span_s, compute_s) totals."""
+    sd = resp.get("stage_dt") if isinstance(resp, dict) else None
+    if not sd:
+        return 0.0, 0.0
+    sp = cp = 0.0
+    for row in sd:
+        sp += row[1] / 1e3; cp += row[2] / 1e3
+        a = per_stage.setdefault(str(row[0]), [0.0, 0.0, 0]); a[0] += row[1]; a[1] += row[2]; a[2] += 1
+    return sp, cp
+
+
+def _timing_fields(t_trav, t_stage, t_comp, per_stage):
+    """Traversal/transport split for the coordinator return dict. traversal_s = Σ per-chunk send->recv
+    latency (under pipelining depth>1 chunks overlap, so this can EXCEED wall decode_s — it is per-chunk
+    latency, not wall). transport_s = traversal - Σ stage spans = wire + sidecar hops + codec serialize;
+    None unless stages ran M25_STAGE_TIMING=1. per_stage_ms = {stage: [mean_span_ms, mean_compute_ms]}."""
+    return {"traversal_s": round(t_trav, 3),
+            "stage_s": round(t_stage, 3) if t_stage else None,
+            "stage_compute_s": round(t_comp, 3) if t_stage else None,
+            "transport_s": round(t_trav - t_stage, 3) if t_stage else None,
+            "per_stage_ms": ({k: [round(v[0] / v[2], 2), round(v[1] / v[2], 2)] for k, v in per_stage.items()}
+                             if per_stage else None)}
+
+
 def _eagle_seed(aux, pos):
     """Stack the 3 aux hidden states at chunk position `pos` -> [3,H] for EagleDrafter.set_hidden()."""
     import torch as _t
@@ -229,6 +255,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
+    t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
         send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
                              "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
@@ -269,12 +296,15 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
             while len(inflight) < cur_depth and not done:
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
+                t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
                 send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
-                inflight.append((send_pos, ds)); dprefix = dprefix + ds; send_pos += K
+                inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
             tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
             r, aux = _unpack(resp)
-            sp, ds = inflight.pop(0)
+            sp, ds, t_sent = inflight.pop(0)
+            t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
+            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
             if discard > 0: discard -= 1; wasted += 1; continue
             n = 0
             for j in range(K):
@@ -345,6 +375,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # return channel, decode_s = the whole decode wall. What's NOT wait or draft is coordinator-side
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
+            **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
             "final_confidence": conf.confidence() if conf else None}
 
 
@@ -376,6 +407,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
     out = []; prefill_s = 0.0; t_draft = t_recv = 0.0; receipts = []
+    t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     tree_m = int(os.environ.get("M25_TREE_M", "12"))
     tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
     tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
@@ -428,9 +460,13 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
             t_draft += time.time() - td
             token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
+            t_sent = time.monotonic()                           # traversal origin: includes the outbound serialize
             send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
                                  "parents": parents, "pos_ids": pos_ids, "start": vbase})
-            tr = time.time(); r, aux = _unpack(recv_msg(rx)); t_recv += time.time() - tr
+            tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+            t_trav += time.monotonic() - t_sent                 # depth-1: this IS the clean per-round T_traversal
+            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+            r, aux = _unpack(resp)
             path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
             out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
             # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
@@ -461,6 +497,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
+            **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
             "final_confidence": None}
 
 
@@ -632,6 +669,22 @@ def _merge_aux(upstream):
             else:
                 acc[str(li)] = h.cpu()
     return acc
+
+
+def _dt_sync():
+    """Stage-timing compute stamp: force the async block forward to finish so the delta is real GPU time,
+    not launch time (the very next op — fp8 pack / logits .tolist() — syncs anyway, so this costs nothing)."""
+    if torch.cuda.is_available():
+        torch.cuda.synchronize()
+    return time.monotonic()
+
+
+def _dt_row(msg, stage, t_rx, t_comp):
+    """[stage, span_ms, compute_ms] appended to the frame's accumulated stage_dt (the _merge_aux pattern).
+    span = post-dequant recv -> just-before-send (block forward + fp8 pack); compute = recv -> synced block
+    forward. Traversal-minus-span on the coordinator = wire + sidecar + codec — the transport bucket."""
+    return (msg.get("stage_dt") or []) + [[stage, round((time.monotonic() - t_rx) * 1e3, 2),
+                                           round((t_comp - t_rx) * 1e3, 2)]]
 
 
 def _tail_accept(srv, pending=None, ret=None, timeout=None):
@@ -811,6 +864,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if pred not in ready:
                                 continue
                             msg = _hrecv(recv_msg(pred))
+                        t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                         if stale or ret is None:
                             # These messages belong to a job whose coordinator died: don't compute them,
                             # never answer them. The next job boundary (reset) re-arms the session — but
@@ -842,16 +896,26 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
                             x = msg["h"].to(dev)
                             h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                             if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                            if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                                o = o if isinstance(o, dict) else {"toks": o}
+                                o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                            _ret_send(o); continue
                         x = msg["h"].to(dev)
                         h = _block(graph_runners, layers, msg["start"], x, vcfg)
+                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         if RECEIPTS and signer is not None:   # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
                         toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                        _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks)
+                        o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                        if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                            o = o if isinstance(o, dict) else {"toks": o}
+                            o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                        _ret_send(o)
                 except EDGE_ERRORS as e:
                     # PREDECESSOR death (ret failures are absorbed in _ret_send and never land here):
                     # tear the session down and re-accept. The ret goes too — a reset-ok must never reach
@@ -891,6 +955,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
             try:
                 while True:
                     msg = _hrecv(recv_msg(conn))
+                    t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg["op"] == "reset":
                         for L in layers:
                             L.reset()
@@ -926,25 +991,33 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             h = msg["h"].to(dev)
                         x = h
                         h = S.run_block_tree(layers, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         if RECEIPTS and signer is not None:     # attest tree blocks too — verification must not silently turn off under M25_TREE
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
                                "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
                         if S.M25_EAGLE:
                             fwd["aux"] = _merge_aux(msg.get("aux"))
-                        send_msg(nxt_sock, _hsend(fwd)); continue
+                        fwd = _hsend(fwd)
+                        if S.M25_STAGE_TIMING:
+                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                        send_msg(nxt_sock, fwd); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
                         h = msg["h"].to(dev)
                     x = h
                     h = _block(graph_runners, layers, msg["start"], h, vcfg)
+                    t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                     if RECEIPTS and signer is not None:         # attest this block's input->output transform
                         signer.observe(_act_digest(x), _act_digest(h))
                     fwd = {"op": "verify", "h": h, "start": msg["start"]}
                     if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
                         fwd["aux"] = _merge_aux(msg.get("aux"))
-                    send_msg(nxt_sock, _hsend(fwd))
+                    fwd = _hsend(fwd)
+                    if S.M25_STAGE_TIMING:
+                        fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                    send_msg(nxt_sock, fwd)
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset + drop forward link", flush=True)
                 for L in layers:
@@ -1080,6 +1153,12 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
             other = r["decode_s"] - r.get("draft_s", 0) - r.get("ring_wait_s", 0)
             print(f"[coord] decode {r['decode_s']:.1f}s = ring-wait {r.get('ring_wait_s', 0):.1f}s "
                   f"+ draft {r.get('draft_s', 0):.1f}s + coord-other {other:.1f}s", flush=True)
+        if r.get("transport_s") is not None:                 # stage-timing split (stages ran M25_STAGE_TIMING=1)
+            tv = r["traversal_s"]
+            print(f"[coord] traversal {tv:.1f}s = transport {r['transport_s']:.1f}s "
+                  f"({100 * r['transport_s'] / max(tv, 1e-9):.0f}%) + stage-span {r['stage_s']:.1f}s "
+                  f"(compute {r['stage_compute_s']:.1f}s)  per-stage ms[span,comp]: "
+                  + " ".join(f"s{k}={v}" for k, v in sorted(r["per_stage_ms"].items())), flush=True)
         if parsed["reasoning_content"]:
             print("[coord] THINK:\n" + parsed["reasoning_content"][:600], flush=True)
         print("[coord] OUTPUT:\n" + (parsed["content"] or "")[:1200], flush=True)

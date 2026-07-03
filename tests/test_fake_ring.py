@@ -1,7 +1,8 @@
 """Offline integration tests for the m25_pipe coordinators over the CPU fake ring (tests/fake_ring.py):
 losslessness, the EAGLE extend-pairing (left-shift) contract, chain-vs-tree accounting on identical
-synthetic text (the rag-quote g-gap probe), and mid-stream divergence bookkeeping. No GPU, no model,
-no network — the ring is a teacher-forced oracle, so `output == T-prefix` is exact.
+synthetic text (the rag-quote g-gap probe), the stage-timing transport breakdown, and mid-stream
+divergence bookkeeping. No GPU, no model, no network — the ring is a teacher-forced oracle, so
+`output == T-prefix` is exact.
 
 Run: python3 -m pytest tests/test_fake_ring.py -q     (-s to see the accounting-comparison table)
 """
@@ -230,7 +231,50 @@ def test_accounting_same_drafter_novel(monkeypatch, capsys):
               f"reported_g={res['toks_per_traversal']:.2f} real_g={real_g:.2f}")
 
 
-# ---- 4. DIVERGENCE / IN-FLIGHT BOOKKEEPING ---------------------------------------------------------
+# ---- 4. STAGE-TIMING / TRANSPORT BREAKDOWN ---------------------------------------------------------
+
+SPANS = [[0, 5.0, 4.0], [1, 3.25, 2.5], [2, 1.5, 1.0]]     # [stage, span_ms, comp_ms]; binary-exact floats
+
+
+@pytest.mark.parametrize("path", ["ngram-pipelined", "chain-eagle", "tree"])
+def test_transport_breakdown_adds_up(path, monkeypatch):
+    """Stages under M25_STAGE_TIMING return [stage, span_ms, comp_ms] rows on every verify reply; the
+    coordinator's split must tile exactly: every decode reply it folds (rounds + wasted — drained
+    chunks are not folded) contributes one full row set, transport_s == traversal_s - stage_s, and
+    per_stage_ms means reproduce the injected constants. All three decode loops must carry it."""
+    T = fr.repetitive_T(760)
+    if path == "tree":
+        _tree_env(monkeypatch, depth=8)
+        drafter, eagle_ring = _hybrid()[0], True
+    elif path == "chain-eagle":
+        monkeypatch.setattr(S, "M25_EAGLE", True)
+        drafter, eagle_ring = _hybrid()[0], True
+    else:                                                   # plain pipelined n-gram: bare-list reply promoted to dict
+        drafter, eagle_ring = _ngram(), False
+    res, ring = fr.run_coordinator(T, P, drafter, K=8, depth=4, max_new=160,
+                                   prefill_chunk=4096, eagle_ring=eagle_ring, stage_dt=SPANS)
+    _assert_lossless(res, T, P, 160)
+    folded = res["rounds"] + res["wasted"]
+    span_s = sum(r[1] for r in SPANS) / 1e3
+    comp_s = sum(r[2] for r in SPANS) / 1e3
+    assert res["stage_s"] == pytest.approx(folded * span_s, abs=5e-3)
+    assert res["stage_compute_s"] == pytest.approx(folded * comp_s, abs=5e-3)
+    assert res["transport_s"] == pytest.approx(res["traversal_s"] - res["stage_s"], abs=2e-3)
+    assert res["traversal_s"] > 0
+    assert res["per_stage_ms"] == {"0": [5.0, 4.0], "1": [3.25, 2.5], "2": [1.5, 1.0]}
+
+
+def test_no_stage_timing_means_none_fields():
+    """Without M25_STAGE_TIMING rows the split must be absent (None), never a fabricated zero — the
+    coordinator still reports traversal_s (its own clock), which needs no stage cooperation."""
+    T = fr.repetitive_T(560)
+    res, _ = fr.run_coordinator(T, P, _ngram(), K=8, depth=4, max_new=120, eagle_ring=False)
+    assert res["traversal_s"] > 0
+    for k in ("stage_s", "stage_compute_s", "transport_s", "per_stage_ms"):
+        assert res[k] is None
+
+
+# ---- 5. DIVERGENCE / IN-FLIGHT BOOKKEEPING ---------------------------------------------------------
 
 def test_divergence_trap_chain_bookkeeping():
     """An n-gram trap (repetition that breaks once, then a different repetition): the pipelined chain

@@ -57,6 +57,9 @@ def row(name, messages, max_new=256):
                "ttft_s": round(st["ttft"] or 0, 2), "visible_s": round(st["vis"], 2) if st["vis"] else None,
                "think_tokens": rtok, "answer_tokens": max(0, r["n_tokens"] - rtok),
                "draft_s": r.get("draft_s"), "ring_wait_s": r.get("ring_wait_s"),
+               # traversal/transport split (needs stages launched with M25_STAGE_TIMING=1, else None)
+               "traversal_s": r.get("traversal_s"), "transport_s": r.get("transport_s"),
+               "stage_s": r.get("stage_s"), "per_stage_ms": r.get("per_stage_ms"),
                "answer": (p["content"] or "")[:400]}
         print(f"| {name:<22} | {rec['prompt_tokens']:>6} | {rec['tok_s']:>5.1f} | {rec['g']:>4.1f} | "
               f"{rec['prefill_s']:>6.1f}s | {rec['ttft_s']:>5.1f}s | {rec['new_tokens']:>4} |", flush=True)

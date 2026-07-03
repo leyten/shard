@@ -108,7 +108,7 @@ class FakeRing(threading.Thread):
     oracle answer on the return socket — exactly one reply per message, FIFO, mirroring serve()'s
     per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
 
-    def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None):
+    def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
@@ -116,7 +116,8 @@ class FakeRing(threading.Thread):
         self.eagle = eagle                          # reply {"toks","aux"} like an M25_EAGLE tail, else plain list
         self.aux_h = aux_h                          # aux hidden width (32 = the synthetic EAGLE head's H)
         self.aux_ids = list(aux_layer_ids if aux_layer_ids is not None else S.EAGLE_AUX_LAYER_IDS)
-        self.log = []                               # every message, in arrival order (accounting ground truth)
+        self.stage_dt = stage_dt                    # [[stage, span_ms, comp_ms], ...] on every verify reply,
+        self.log = []                               # mirroring stages under M25_STAGE_TIMING (bare list -> dict)
         self.error = None
 
     # oracle: the target's greedy argmax AT absolute position p is T[p+1] (clamped past the end so
@@ -152,7 +153,11 @@ class FakeRing(threading.Thread):
                                      "prefill": bool(msg.get("prefill")),
                                      "token_ids": [int(t) for t in msg["token_ids"]], "pos": pos})
                     toks = [self._tok_at(p) for p in pos]
-                    send_msg(self.ret, {"toks": toks, "aux": self._aux(pos)} if self.eagle else toks)
+                    o = {"toks": toks, "aux": self._aux(pos)} if self.eagle else toks
+                    if self.stage_dt is not None:   # M25_STAGE_TIMING tail: timing rows promote a bare list to a dict
+                        o = o if isinstance(o, dict) else {"toks": o}
+                        o["stage_dt"] = [list(row) for row in self.stage_dt]
+                    send_msg(self.ret, o)
                 else:
                     raise ValueError(f"fake ring got unexpected op {op!r}")
         except (OSError, EOFError):                 # coordinator closed its ends — normal shutdown
@@ -204,14 +209,14 @@ def trap_T(n, seed=7, break_at=168, novel_len=30):
 # ---- runner --------------------------------------------------------------------------------------
 
 def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefill_chunk=4096,
-                    eagle_ring=False, timeout=30, on_commit=None):
+                    eagle_ring=False, timeout=30, on_commit=None, stage_dt=None):
     """One coordinate_pipe job against a fresh FakeRing. S.M25_TREE (monkeypatched by the caller)
     routes to coordinate_pipe_tree inside coordinate_pipe, same as production. Returns (result, ring);
     ring.log is the wire-level ground truth."""
     c_pipe, r_pipe = socket.socketpair()
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
-    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring)
+    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt)
     ring.start()
     tok = FakeTok(T[:prompt_len])
     try:

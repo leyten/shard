@@ -88,6 +88,10 @@ M25_EAGLE = os.environ.get("M25_EAGLE", "0") != "0"
 M25_TREE = os.environ.get("M25_TREE", "0") != "0"
 if M25_TREE:
     M25_EAGLE = True                                 # tree-verify consumes the EAGLE aux + drafter; M25_TREE implies M25_EAGLE
+# Per-stage timing stamps (opt-in M25_STAGE_TIMING=1): each stage appends [stage, span_ms, compute_ms] to the
+# frame's stage_dt list (forward-accumulated like the EAGLE aux, returned by the tail), so the coordinator can
+# split a traversal into stage-local work vs transport+overhead. Deltas are local monotonic — clock-skew-free.
+M25_STAGE_TIMING = os.environ.get("M25_STAGE_TIMING", "0") != "0"
 EAGLE_AUX_LAYER_IDS = [int(x) for x in os.environ.get("M25_EAGLE_AUX", "1,30,58").split(",")]   # decoder-layer indices (SpecForge convention)
 _AUX = {}                                            # layer-id -> last run_block's hidden for that layer, [s, H] (this stage's aux layers only)
 # Opt-in fp8 KV (M25_KV_FP8=1): store the batched KV cache as float8_e4m3 (HALF the bf16 footprint -> 2x the
