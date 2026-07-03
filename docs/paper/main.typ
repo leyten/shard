@@ -47,7 +47,8 @@
 = Introduction
 
 c0mpute's premise is that idle consumer GPUs can form a permissionless fabric for large-model
-compute. The question that decides whether the premise holds is concrete. Can a frontier-scale
+compute. Decentralized inference is the first test of that premise, and the question that decides
+it is concrete. Can a frontier-scale
 model, sharded across GPUs connected only by the public internet, serve a single user at usable
 speed? And can the user verify they got what they paid for?
 
@@ -77,8 +78,8 @@ Four contributions, each backed by receipts in the repository:
 
 = Related work
 
-Petals @borzunov2022petals is the published reference point for frontier-scale inference over
-wide-area volunteer GPUs: roughly 1 token/s single-stream at 176B. Our setting is stricter, since
+Petals @borzunov2022petals is the published reference point for decentralized inference at
+frontier scale: roughly 1 token/s single-stream at 176B over wide-area volunteer GPUs. Our setting is stricter, since
 no stage is trusted, and our single-stream results are an order of magnitude faster at larger
 model scale on cheaper hardware.
 
@@ -285,9 +286,21 @@ receipts-enabled job passes signature and full 62-layer coverage checks on the r
 A 229B mixture-of-experts model serves a single user at interactive speed from five consumer GPUs
 in four countries, and every request arrives with proof that each stage did its share. The design
 came from measurement: a law that says when speculation can hide the network and when it cannot,
-a timing split that says the bottleneck on consumer fleets is the CPU next to the GPU, and a
-benchmark discipline that publishes the receipt behind every number. Not projections. A ring you
-can rent, measure, and verify today.
+a timing split that shows the bottleneck on consumer fleets is the CPU next to the GPU, and a
+benchmark discipline that publishes the receipt behind every number.
+
+The same measurements set the roadmap. Drafter training toward the α ≈ 0.8 crossover is the one
+lever that raises the reasoning ceiling, and crossing it would unlock pipelined speculation as a
+second gain. The verification layer extends next to freshness binding and randomized
+spot-recomputation, closing the replay gaps listed above. CPU-aware node selection and CUDA-graph
+capture recover the stage time that slow hosts currently waste. And because the engine is
+model-agnostic, the fabric that carries a 229B model in five hops carries a 30--70B model in one
+or two, with single-stream speeds to match.
+
+The supply side of decentralized AI already exists: hundreds of millions of consumer GPUs sit
+idle at any hour. What this report shows is that using them honestly, at frontier scale, over the
+network we already have, is a tractable engineering problem. We intend to keep publishing the
+engineering, and the receipts with it.
 
 #v(1em)
 #line(length: 30%)
