@@ -13,6 +13,132 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-03: THE GOOD-RING RECEIPT IS BANKED — 10-11 tok/s interactive reasoning MEASURED; fork resolved: path (a) EXECUTE
+leyten picked **(a)**: execute to the ceiling, declare the honest number, re-point the perf narrative at
+batched 155 agg + draftable/agentic. The receipt run happened same evening (receipt
+`docs/receipts/m25-goodring-receipt-20260703.md` + the two arm JSONs; ~$6 spent, ~$100-mandate has ~$30 used):
+- **RTT-measured, select_ring-planned 5-stage EU ring** (scratchpad/ring_up.py: pool→mesh-RTT→select_ring→
+  ranged pull; head-first orientation FIXED in shard/topology.py — the old order was undeployable).
+  Loop RTT ≈105ms. Both report arms on ONE warm ring, receipts verified per cell.
+- **Numbers: chain 8.3 decode-weighted / tree 7.83 / per-cell-best 9.11; interactive novel cells (tree):
+  reason-math 10.0, reason-logic 10.1, agentic 11.2, conversation 9.28.** The "10-12" projection is now
+  MEASURED. Tree wins every interactive cell; depth-4 pipelined n-gram wins every verbatim/ctx cell (fast
+  ring ⇒ pipelining pays) — chain took the aggregate, so **depth-aware hybrid is the #1 code lever** (~+1 aggregate).
+- **First transport/compute split (M25_STAGE_TIMING, landed on the branch): transport 55-68% of T_traversal
+  (~170-290ms vs ~105ms RTT floor); stage compute ≈138ms NOT ~40ms.** And the compute is
+  **CPU-KERNEL-LAUNCH-BOUND, not GPU-bound**: identical 5090s (1525GB/s, ~220TF all five), but idle
+  Core-Ultra boxes run 13 layers in 11.5ms while loaded/old EPYC slices take 35-50ms (pyloop 0.09s vs
+  0.28-0.47s, one spare at load-average 272). Consequences: (1) box selection must probe single-thread
+  CPU+load (ring_up now does, crude factor); (2) **CUDA-graphs are UN-DEAD for scattered rings** — the
+  ~1.05× dead-end verdict came from a fast-CPU box; on EPYC slices graphs recover ~2-4× of block time, but
+  GraphRunner must learn to emit EAGLE aux (python side-effect — graphs skip it today). Scoped code task.
+- **DEPTH-AWARE HYBRID: DONE + MEASURED (same day, arm 3 on the same ring).** Matched n-gram rounds now
+  ride plain PIPELINED chain frames (up to --depth in flight; the tree's 1-wide-tree framing paid the
+  manual off-flash kernel + trunk re-feed for zero accept gain); novel rounds stay sync tree. Landed as
+  `feat(coord): depth-aware hybrid` + adversarial-review fixes (honest mean_accept on pipelined rounds;
+  fake-ring KV content model + through-divergence pairing tests; 64 CPU tests). **Measured: raw 7.59
+  decode-weighted on a 1.32×-slower ring window (co-tenant jitter, measured at identical g) ≈ 10.0
+  normalized — above the 9.11 per-cell-best bound; g novel == tree exactly, g verbatim strictly up
+  (rag 2.5→2.7, 8k-quote 2.2→2.8; raw tok/s beat the tree arm on those cells DESPITE the slower ring).**
+  Receipt addendum in `docs/receipts/m25-goodring-receipt-20260703.md`.
+- **NEXT SESSION, in order:** (1) **CUDA-graph aux compatibility** (+20-30% on slow-CPU boxes, makes the
+  ring CPU-agnostic; NOTE from review: hybrid refeed frames have variable size L+K ≤ TREE_DEPTH+1+K → up
+  to ~TREE_DEPTH extra graph captures — bound the capture set or bucket sizes). (2) **lean codec /
+  thin-TCP** (transport 55-68% measured — up to +20-30%). (3) a CALM-WINDOW interleaved 3-arm pass to
+  re-pin the hybrid number without time-of-day jitter (cells alternate arms, one warm ring). Stacked
+  honest ceiling on this ring class: **~12-14 interactive**. (4) then TIER-2 trust (receipt
+  freshness/binding) + TIER-3 gateway/wire hardening = the betanet-integration path. Review-logged debt:
+  tree-path resume_ids handling diverges from chain (out excludes resume; pre-existing), 30k tree rounds
+  pay the manual kernel over full ctx (807ms/round — flash tree kernel is the fix).
+- **RING IS WARM (7 boxes, ~$3.6/hr): 5-stage ring CZ900(head)/CZ887/CH/NO/DK + spares IT/HU** (GB spare
+  destroyed, load-272 dud). iids 43696900,43696887,43696869,43696886,43696878 + 43696880,43696881. Head ssh
+  ssh3.vast.ai:16900; drive reports as SOLE coordinator on the head (report_chain/report_tree.log there).
+  Same-ring re-measure after the hybrid lands = clean A/B/C.
+- Branch `perf/tree-depth-hybrid` (9 commits, pushed): fake-ring harness + bonus/honest-g + usability
+  harness + panel docs + **M25_STAGE_TIMING** + **topology head-first fix**. PR NOT yet open (no gh token
+  on this box): leyten one-clicks github.com/leyten/shard/compare/master...perf/tree-depth-hybrid.
+
+*(2026-07-02 night panel verdict — the physics this receipt confirms, kept for the record:)*
+### PRIOR FOCUS: BREAK THE ~5 tok/s REASONING FLOOR — step back, find the lever or the breakthrough
+leyten is not satisfied with ~5 tok/s single-stream reasoning and wants this to be THE focus: take a step
+back, think from first principles, decide whether we're missing something buildable or need a genuine
+breakthrough. **Do NOT resume by grinding TIER-1 cleanup — resume HERE.**
+
+**The physics (verified against the record, not a guess):** tok/s = g / T_traversal.
+- **g ≈ 3.6** committed tokens per ring traversal on novel reasoning, and it is **STABLE across every ring
+  ever run** (11.8 tok/s ring @g3.7, serial-path ring @g3.6, tonight @g3.6). g is the drafter's accept —
+  ring-independent. Tree-verify lifts it to ~4.5 (measured), a marginal move.
+- **T_traversal ≈ 900ms** on tonight's ring = coordinator draft + 6× serial stage MoE-compute + ~12 WAN
+  legs + return. tok/s = 3.6/0.9 ≈ 4. On a good ring T_traversal drops and the SAME g gives ~12 (06-30).
+- **THE STRUCTURAL WALL:** the DRAFTABLE path (n-gram) PIPELINES depth-4 → 50-80 tok/s; the REASONING path
+  (EAGLE) is FORCED SERIAL depth-1 (`m25_pipe.py` `cur_depth = 1 if S.M25_EAGLE`) because EAGLE needs the
+  ring's verified hidden from traversal N to draft N+1. So reasoning pays the full 900ms serially every
+  ~3.6 tokens. **The floor is SERIAL LATENCY on the reasoning path, not accept.** This is the thing to break.
+- **Two levers only:** (1) raise g (tree/better drafter — marginal, we've mostly done it); (2) cut or HIDE
+  T_traversal. The big one is #2 — specifically, can the reasoning path PIPELINE like n-gram does? Prime
+  candidate: a **standalone small draft model** on the coordinator (drafts autoregressively WITHOUT the
+  ring's hidden → pipelinable depth-4; lower accept than EAGLE but pipelined-low may beat serial-high at
+  T=900ms). Plus: fewest-fattest stages (6→4/5 cuts hops), is stage compute launch- or compute-bound,
+  RTT-ordered ring, staleness-tolerant EAGLE. **Measure-first:** the engine already returns
+  decode_s/draft_s/ring_wait_s — a single warm run prints where the 900ms actually goes (transport vs
+  stage-compute vs draft), which decides which lever matters. Don't build before that breakdown is read.
+
+**PANEL VERDICT (3 agents: latency-hiding / traversal-time / ceiling-skeptic, 2026-07-02 night) — NO
+breakthrough exists for novel-reasoning single-stream; it's accept-gated PHYSICS, proven with a calibrated
+sim. The honest ceiling is ~10-12 tok/s on a good tight EU ring, and the path there is EXECUTION, not invention.**
+
+- **The pipelining lever is DEAD (proven, not assumed).** The latency-hiding agent built a Monte-Carlo of
+  `coordinate_pipe`'s real flush-on-divergence pipeline, calibrated at BOTH ends (α=0.74 per-token accept →
+  g3.6/4.0 tok/s = measured reason-math EXACTLY; α=0.97 → 50-75 = the n-gram ceiling). Result: **pipelining
+  depth-D is accept-gated** — a depth-D chunk is only valid if the prior chunk FULLY accepts (α^K); at
+  α=0.74, K=8 that's ~8%, so ~92% of traversals flush the pipe and depth buys ~nothing. **Pipelining only
+  pays above α≈0.80 — the verbatim regime n-gram already exploits.** No novel-reasoning drafter reaches 0.80
+  (EAGLE-3, which PEEKS at the target hidden, tops at 0.74; anything blind is worse). So: standalone draft
+  model (α0.5-0.7 → 2.2-3.7 tok/s, LOSES to serial-tree 4.6), staleness-tolerant EAGLE (depth-2 → 4.07,
+  loses to tree, and staleness drops accept further), Medusa/MTP (=tree, already built), block-parallel/
+  Jacobi (α≈0 on novel text) — ALL dead or dominated by the tree-verify we already run. **Tree-verify
+  (raise g at depth-1, zero flush penalty) beats every pipelining scheme at every T_ring for α=0.74.**
+- **T_traversal is 98% "blocked on the ring"** (the coordinator draft+commit is 2% — every serial-path
+  micro-opt is spent), and ~80-90% of that is TRANSPORT on a good ring. It's **7 legs, not 12** (the tail
+  return is already one direct leg via `serve_tail_direct`). Tonight's 900ms was a slow draw; the good-ring
+  floor is ~400-500ms (06-30 hit it). The scattered-WAN T floor is ~300-340ms (5 legs × ~28ms RTT + ~40ms
+  compute + ~90ms overhead) — uncrossable without co-location (banned).
+- **THE EXECUTION PATH to ~10-12 (all depth-1, all scatter-native, most already built/scoped):**
+  1. **Topology / RTT-ordered ring** (biggest lever — it's the 2.4× between tonight's 900ms and a good
+     ring's ~400ms). `plan_ring`→`select_ring`→`--order`; the false-infeasible fix is already MERGED (PR #13).
+     Value is variance-reduction: it STOPS you paying 900ms. Needs the measure-before-pull launch flow.
+  2. **Fewest-fattest stages: 6→5** (−1 leg −1 sidecar hop ≈ −55ms, +14%, ~free — just the layer split;
+     M2.5's 115GB/32GB fits in 5). 4 is VRAM-infeasible with the EAGLE head on the coord stage.
+  3. **Lean codec / thin-TCP** — kill the ~180ms non-RTT overhead (pickle serialize + libp2p sidecar
+     loopback+Noise) with a fixed binary frame for [ids,h_fp8,aux_fp8]. +18% (~450→380ms). Medium effort.
+  4. **Tree-verify (DONE, g3.7→4.5)** rides on top. Stacked: T~325-400ms × g4.5 → **~11-14 tok/s**.
+  5. **Tail-side drafter** (run the EAGLE head on the tail, draft the instant the hidden exists, inject
+     tail→head) — minor ~5-15% T shave on rings where the coord is remote; bundle with topology.
+- **The ONE receipt that ends the argument (do FIRST next session):** the good-ring tok/s (11.8) and the
+  tree +18% have NEVER been measured on the SAME ring — "10-12" is arithmetic, not evidence. ONE
+  RTT-ordered, 5-stage, good-EU-ring tree-verify run converts it to a real ~11-14 or a real disappointment.
+  Cheap ($5, one warm run). Bundle the T_traversal per-stage-timestamp breakdown (~20 lines) to split
+  transport-vs-compute finally.
+- **The only ceiling-RAISER left is g** (α toward 0.80): train a better EAGLE head on M2.5 reasoning traces
+  (SpecForge, ~$400-2000). Raises g directly AND is the only thing that would ever unlock pipelining as a
+  bonus (α≥0.80 flips the whole table). But EAGLE-3's authors already sit at ~0.74 on hard reasoning — +0.06
+  absolute is a RESEARCH bet, not an engineering certainty. Queue it, don't bank on it.
+- **⇒ STRATEGIC FORK for leyten (genuine, surface it):** single-stream novel-reasoning is PHYSICS-capped at
+  ~10-12 on scatter — that's the honest tolerable-demo number, at/ahead of the field (Petals ~1 tok/s true-
+  global @176B; nobody does usable single-stream 100B+ over WAN). The engine's actual WINS are elsewhere:
+  **batched 155 tok/s aggregate** ($/token, latency-tolerant — under-marketed) and the **draftable/agentic
+  path** (50-80 tok/s). Also note: the 5-hop serial chain is FORCED by M2.5's 115GB not fitting fewer cards
+  — a RIGHT-SIZED reasoning model (~30-70B, 1-2 hops) would be genuinely fast single-stream on the same
+  fabric (the north-star "many models" angle). OPTIONS: (a) execute to ~11-12, declare it the tolerable
+  demo number, re-point the perf narrative at batched+agentic; (b) also serve a smaller model for the
+  interactive/reasoning tier; (c) spend on the EAGLE-head research bet. Full panel outputs archived in
+  `.claude/plans/` if needed.
+_(NOTE: co-location/datacenter/NVLink is BANNED as a "solution" — [[never-colocate-usable-speed-on-scattered]].
+The lever must be scattered-native. Reframe option on the table per the skeptic: is single-stream reasoning
+even the right target vs batched 155 tok/s aggregate — but leyten's call is that usable single-stream matters.)_
+
+---
+*(prior TIER-1 session, banked — still valid, just no longer the focus:)*
 **LATEST (2026-07-02 evening) — TIER-1 session: wedge fix + CRITICAL trust fix + tree-verify v2, ALL
 warm-validated on a fresh 6×5090 EU ring (HU/HU/DK/CZ/BG/CZ). Two branches ready to land, in order:**
 1. **`fix/ring-wedge-receipt-truth` (4 commits)** — (a) RING WEDGE FIXED: specpipe's churn recovery ported

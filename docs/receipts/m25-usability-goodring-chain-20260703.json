@@ -1,0 +1,778 @@
+{
+ "arm": "chain-EAGLE",
+ "K": 8,
+ "depth": 4,
+ "date": "2026-07-03 12:06 UTC",
+ "env": {
+  "M25_EAGLE": "1",
+  "M25_DIR": "/root/m25",
+  "M25_STAGE_TIMING": "1",
+  "M25_EAGLE_DIR": "/root/m25-eagle",
+  "M25_FP8_WIRE": "1"
+ },
+ "workloads": [
+  {
+   "cell": "reason-math",
+   "prompt_tokens": 67,
+   "new_tokens": 262,
+   "tok_s": 9.33,
+   "g": 4.14,
+   "accept": 0.393,
+   "prefill_s": 1.85,
+   "ttft_s": 2.51,
+   "visible_s": 29.01,
+   "think_tokens": 241,
+   "answer_tokens": 21,
+   "draft_s": 0.906,
+   "ring_wait_s": 26.845,
+   "traversal_s": 26.925,
+   "transport_s": 18.256,
+   "stage_s": 8.669,
+   "per_stage_ms": {
+    "0": [
+     29.27,
+     28.45
+    ],
+    "1": [
+     34.85,
+     34.22
+    ],
+    "2": [
+     11.47,
+     11.22
+    ],
+    "3": [
+     12.49,
+     12.27
+    ],
+    "4": [
+     49.54,
+     47.81
+    ]
+   },
+   "answer": "The farmer originally had 17 sheep.  \nThe phrase \u201call but 9 run away\u201d",
+   "prompt": "A farmer has 17 sheep. All but 9 run away. How many sheep are left? Think it through, then give the number."
+  },
+  {
+   "cell": "reason-logic",
+   "prompt_tokens": 88,
+   "new_tokens": 258,
+   "tok_s": 6.81,
+   "g": 2.38,
+   "accept": 0.172,
+   "prefill_s": 1.19,
+   "ttft_s": 1.26,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 258,
+   "draft_s": 1.372,
+   "ring_wait_s": 36.113,
+   "traversal_s": 36.243,
+   "transport_s": 21.098,
+   "stage_s": 15.145,
+   "per_stage_ms": {
+    "0": [
+     29.64,
+     28.84
+    ],
+    "1": [
+     34.64,
+     34.0
+    ],
+    "2": [
+     11.67,
+     11.42
+    ],
+    "3": [
+     12.46,
+     12.26
+    ],
+    "4": [
+     51.83,
+     50.1
+    ]
+   },
+   "answer": "We need to solve classic puzzle: three switches (outside) control three bulbs (inside). You can flip switches any number of times, but you can only enter the room once. Determine which switch corresponds to which bulb.\n\nWe need to reason step by step.\n\nClassic solution: Turn on switch A for some time (say 5 minutes), then turn it off. Turn on switch B immediately before entering. Then go into room",
+   "prompt": "Three light switches outside a windowless room each control one of three bulbs inside. You may flip switches as much as you like, but you can enter the room only once. How do you determine which switch controls which bulb? Reason step by step."
+  },
+  {
+   "cell": "open-chat",
+   "prompt_tokens": 58,
+   "new_tokens": 256,
+   "tok_s": 6.27,
+   "g": 2.02,
+   "accept": 0.128,
+   "prefill_s": 0.77,
+   "ttft_s": 0.84,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 256,
+   "draft_s": 1.593,
+   "ring_wait_s": 38.76,
+   "traversal_s": 38.908,
+   "transport_s": 21.241,
+   "stage_s": 17.667,
+   "per_stage_ms": {
+    "0": [
+     29.82,
+     28.99
+    ],
+    "1": [
+     34.47,
+     33.82
+    ],
+    "2": [
+     11.48,
+     11.25
+    ],
+    "3": [
+     12.45,
+     12.25
+    ],
+    "4": [
+     51.99,
+     50.28
+    ]
+   },
+   "answer": "The user asks: \"Explain the main tradeoffs between mixture-of-experts and dense transformer models, in a few sentences.\"\n\nWe need to answer concisely, describing tradeoffs: computational cost, parameter efficiency, sparsity vs dense, scalability, latency, model capacity, training difficulty, etc.\n\nWe should be mindful of policy: no disallowed content. This is a straightforward question. Provide an",
+   "prompt": "Explain the main tradeoffs between mixture-of-experts and dense transformer models, in a few sentences."
+  },
+  {
+   "cell": "code-edit",
+   "prompt_tokens": 3563,
+   "new_tokens": 257,
+   "tok_s": 9.32,
+   "g": 3.2,
+   "accept": 0.275,
+   "prefill_s": 15.93,
+   "ttft_s": 16.02,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 257,
+   "draft_s": 0.816,
+   "ring_wait_s": 26.443,
+   "traversal_s": 26.549,
+   "transport_s": 14.976,
+   "stage_s": 11.573,
+   "per_stage_ms": {
+    "0": [
+     30.42,
+     29.6
+    ],
+    "1": [
+     37.97,
+     37.3
+    ],
+    "2": [
+     11.42,
+     11.19
+    ],
+    "3": [
+     12.46,
+     12.26
+    ],
+    "4": [
+     52.39,
+     50.54
+    ]
+   },
+   "answer": "The user wants me to add a concise docstring to the `coordinate_pipe` function describing its key arguments and what it returns.\n\nLooking at the code, I need to find the `coordinate_pipe` function. However, looking at the provided code, I don't see a function explicitly named `coordinate_pipe` in this snippet. The code shows:\n\n1. Imports and setup\n2. Various helper functions (_keepalive, _pack_h, ",
+   "prompt": "Here is some code:\n\n\"\"\"MiniMax-M2.5 PIPELINED ring \u2014 direct-return stages + the PROVEN coordinate_pipe coordinator.\n\nThe lean m25_ring driver was synchronous (one ring traversal at a time), so every t ...[12473 chars of real code context]"
+  },
+  {
+   "cell": "rag-quote",
+   "prompt_tokens": 3562,
+   "new_tokens": 256,
+   "tok_s": 5.68,
+   "g": 2.02,
+   "accept": 0.128,
+   "prefill_s": 7.81,
+   "ttft_s": 7.9,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 256,
+   "draft_s": 1.551,
+   "ring_wait_s": 43.064,
+   "traversal_s": 43.239,
+   "transport_s": 25.583,
+   "stage_s": 17.657,
+   "per_stage_ms": {
+    "0": [
+     28.95,
+     28.11
+    ],
+    "1": [
+     36.44,
+     35.74
+    ],
+    "2": [
+     11.45,
+     11.22
+    ],
+    "3": [
+     12.46,
+     12.26
+    ],
+    "4": [
+     50.83,
+     49.12
+    ]
+   },
+   "answer": "The user asks: \"What dictionary does coordinate_pipe return on success? Quote the exact return statement from the code.\"\n\nWe need to find in the code the function coordinate_pipe (presumably in the module coordinate_pipe) that returns a dictionary on success. The code snippet provided is a comment at the top describing the pipeline, but not the actual function. The user likely expects that we have",
+   "prompt": "Here is some code:\n\n\"\"\"MiniMax-M2.5 PIPELINED ring \u2014 direct-return stages + the PROVEN coordinate_pipe coordinator.\n\nThe lean m25_ring driver was synchronous (one ring traversal at a time), so every t ...[12471 chars of real code context]"
+  },
+  {
+   "cell": "agentic-tool",
+   "prompt_tokens": 52,
+   "new_tokens": 163,
+   "tok_s": 6.67,
+   "g": 3.39,
+   "accept": 0.298,
+   "prefill_s": 1.46,
+   "ttft_s": 1.53,
+   "visible_s": 22.89,
+   "think_tokens": 120,
+   "answer_tokens": 43,
+   "draft_s": 0.629,
+   "ring_wait_s": 23.549,
+   "traversal_s": 23.608,
+   "transport_s": 17.275,
+   "stage_s": 6.333,
+   "per_stage_ms": {
+    "0": [
+     29.16,
+     28.38
+    ],
+    "1": [
+     26.31,
+     25.81
+    ],
+    "2": [
+     11.87,
+     11.61
+    ],
+    "3": [
+     12.55,
+     12.35
+    ],
+    "4": [
+     49.36,
+     47.69
+    ]
+   },
+   "answer": "I'll use the get_weather tool to find the current weather in Tokyo for you.",
+   "prompt": "What's the current weather in Tokyo? Use the get_weather tool.",
+   "tools": "get_weather"
+  }
+ ],
+ "context_axis": [
+  {
+   "cell": "ctx-8k-summarize",
+   "prompt_tokens": 8054,
+   "new_tokens": 256,
+   "tok_s": 13.39,
+   "g": 3.19,
+   "accept": 0.273,
+   "prefill_s": 21.6,
+   "ttft_s": 21.68,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 256,
+   "draft_s": 0.549,
+   "ring_wait_s": 18.197,
+   "traversal_s": 18.336,
+   "transport_s": 7.591,
+   "stage_s": 10.745,
+   "per_stage_ms": {
+    "0": [
+     29.18,
+     28.33
+    ],
+    "1": [
+     29.78,
+     29.21
+    ],
+    "2": [
+     11.72,
+     11.47
+    ],
+    "3": [
+     12.37,
+     12.16
+    ],
+    "4": [
+     51.26,
+     49.37
+    ]
+   },
+   "answer": "The user is asking me to reproduce the contents of a specific file from a codebase excerpt. Looking at the request, they want me to output only the contents of `c0mpute/lib/db.ts` exactly as it appears in the codebase.\n\nLet me find the file in the provided codebase:\n\n```\n===== FILE: c0mpute/lib/db.ts =====\nimport Database from 'better-sqlite3';\nimport path from 'path';\nimport { CREDITS_PER_USD } f",
+   "prompt": "[~8000 tokens of prompt_long.txt] + 'Summarize the key points of the document above in 5 concise bullets.'"
+  },
+  {
+   "cell": "ctx-8k-quote",
+   "prompt_tokens": 8053,
+   "new_tokens": 196,
+   "tok_s": 11.76,
+   "g": 3.0,
+   "accept": 0.25,
+   "prefill_s": 8.05,
+   "ttft_s": 8.14,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 196,
+   "draft_s": 0.501,
+   "ring_wait_s": 15.856,
+   "traversal_s": 15.975,
+   "transport_s": 6.906,
+   "stage_s": 9.069,
+   "per_stage_ms": {
+    "0": [
+     28.88,
+     28.08
+    ],
+    "1": [
+     34.43,
+     33.75
+    ],
+    "2": [
+     11.45,
+     11.22
+    ],
+    "3": [
+     12.3,
+     12.1
+    ],
+    "4": [
+     52.47,
+     50.57
+    ]
+   },
+   "answer": "The user is asking me to reproduce the contents of a specific file from a codebase they've provided. Looking at the request, they want me to output the contents of `c0mpute/lib/db.ts` exactly as it appears in the codebase.\n\nLet me find the file in the provided codebase:\n\n```\n===== FILE: c0mpute/lib/db.ts =====\nimport Database from 'better-sqlite3';\nimport path from 'path';\nimport { CREDITS_PER_USD",
+   "prompt": "[~8000 tokens of prompt_long.txt] + 'Repeat the final paragraph of the document above exactly, word for word.'"
+  },
+  {
+   "cell": "ctx-30k-summarize",
+   "prompt_tokens": 30054,
+   "new_tokens": 263,
+   "tok_s": 5.92,
+   "g": 2.05,
+   "accept": 0.131,
+   "prefill_s": 24.39,
+   "ttft_s": 24.5,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 263,
+   "draft_s": 1.713,
+   "ring_wait_s": 41.963,
+   "traversal_s": 42.255,
+   "transport_s": 23.004,
+   "stage_s": 19.251,
+   "per_stage_ms": {
+    "0": [
+     29.24,
+     28.48
+    ],
+    "1": [
+     37.71,
+     37.01
+    ],
+    "2": [
+     16.28,
+     16.04
+    ],
+    "3": [
+     14.96,
+     14.76
+    ],
+    "4": [
+     52.2,
+     50.48
+    ]
+   },
+   "answer": "The user is asking me to reproduce the contents of a specific file from a codebase excerpt. Let me identify what file they want: `c0mpute/lib/db.ts`\n\nLooking at the provided codebase, I can see the file markers:\n\n1. `===== FILE: c0mpute/lib/anon-auth.ts =====`\n2. `===== FILE: c0mpute/lib/db.ts =====` - This is the file they want\n3. `===== FILE: c0mpute/lib/identity.ts =====`\n4. `===== FILE: c0mput",
+   "prompt": "[~30000 tokens of prompt_30k.txt] + 'Summarize the key points of the document above in 5 concise bullets.'"
+  },
+  {
+   "cell": "ctx-30k-quote",
+   "prompt_tokens": 30053,
+   "new_tokens": 194,
+   "tok_s": 6.64,
+   "g": 2.08,
+   "accept": 0.134,
+   "prefill_s": 44.84,
+   "ttft_s": 44.99,
+   "visible_s": 68.2,
+   "think_tokens": 105,
+   "answer_tokens": 89,
+   "draft_s": 1.251,
+   "ring_wait_s": 27.421,
+   "traversal_s": 27.649,
+   "transport_s": 14.06,
+   "stage_s": 13.589,
+   "per_stage_ms": {
+    "0": [
+     28.11,
+     27.36
+    ],
+    "1": [
+     35.45,
+     34.79
+    ],
+    "2": [
+     16.13,
+     15.89
+    ],
+    "3": [
+     14.62,
+     14.42
+    ],
+    "4": [
+     51.8,
+     50.08
+    ]
+   },
+   "answer": "import Database from 'better-sqlite3';\nimport path from 'path';\nimport { CREDITS_PER_USD } from './token-price';\nimport { WORKER_REVENUE_SHARE, MIN_WITHDRAWAL_USD } from './tokenomics';\nimport { realizeMargin } from './treasury-ledger';\nimport { recordReferralEarning, getReferralEarningsTotal } from './referrals';\n\nconst",
+   "prompt": "[~30000 tokens of prompt_30k.txt] + 'Repeat the final paragraph of the document above exactly, word for word.'"
+  }
+ ],
+ "conversation": [
+  {
+   "cell": "turn-1",
+   "prompt_tokens": 51,
+   "new_tokens": 384,
+   "tok_s": 6.28,
+   "g": 2.14,
+   "accept": 0.142,
+   "prefill_s": 0.47,
+   "ttft_s": 0.54,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 384,
+   "draft_s": 2.356,
+   "ring_wait_s": 58.07,
+   "traversal_s": 58.294,
+   "transport_s": 33.207,
+   "stage_s": 25.087,
+   "per_stage_ms": {
+    "0": [
+     29.84,
+     29.06
+    ],
+    "1": [
+     34.38,
+     33.78
+    ],
+    "2": [
+     11.67,
+     11.43
+    ],
+    "3": [
+     12.52,
+     12.32
+    ],
+    "4": [
+     51.73,
+     50.01
+    ]
+   },
+   "answer": "The user asks: \"What is a mixture-of-experts model, in simple terms?\" They want a simple explanation. The user is presumably a layperson or someone wanting a conceptual overview. The answer should be simple, intuitive, maybe with analogies, and perhaps mention the basic idea: a mixture of experts (MoE) is an ensemble learning method where multiple specialized sub-models (experts) are combined, and",
+   "prompt": "What is a mixture-of-experts model, in simple terms?"
+  },
+  {
+   "cell": "turn-2",
+   "prompt_tokens": 462,
+   "new_tokens": 385,
+   "tok_s": 8.4,
+   "g": 2.53,
+   "accept": 0.191,
+   "prefill_s": 2.75,
+   "ttft_s": 2.84,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 385,
+   "draft_s": 1.995,
+   "ring_wait_s": 43.256,
+   "traversal_s": 43.454,
+   "transport_s": 22.609,
+   "stage_s": 20.845,
+   "per_stage_ms": {
+    "0": [
+     29.22,
+     28.44
+    ],
+    "1": [
+     33.95,
+     33.34
+    ],
+    "2": [
+     11.49,
+     11.25
+    ],
+    "3": [
+     12.38,
+     12.18
+    ],
+    "4": [
+     50.1,
+     48.4
+    ]
+   },
+   "answer": "The user is asking about how mixture-of-experts (MoE) models compare to dense models in terms of memory and compute cost at inference time. They want a simple explanation, likely comparing the two.\n\nWe need to explain that in a dense model, all parameters are used for every input, so the memory cost is the full model size, and compute cost is proportional to the number of parameters (or FLOPs). In",
+   "prompt": "How does that compare to a dense model in memory and compute cost at inference time?"
+  },
+  {
+   "cell": "turn-3",
+   "prompt_tokens": 888,
+   "new_tokens": 385,
+   "tok_s": 7.28,
+   "g": 2.27,
+   "accept": 0.159,
+   "prefill_s": 3.5,
+   "ttft_s": 3.57,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 385,
+   "draft_s": 2.327,
+   "ring_wait_s": 49.878,
+   "traversal_s": 50.101,
+   "transport_s": 26.335,
+   "stage_s": 23.766,
+   "per_stage_ms": {
+    "0": [
+     30.43,
+     29.6
+    ],
+    "1": [
+     35.39,
+     34.77
+    ],
+    "2": [
+     11.35,
+     11.14
+    ],
+    "3": [
+     12.37,
+     12.18
+    ],
+    "4": [
+     51.08,
+     49.34
+    ]
+   },
+   "answer": "We need to write a Python function that estimates tokens/sec for a pipelined ring of N stages, given per-stage latency in ms and a speculative accept length g.\n\nWe need to interpret the problem: We have a pipelined ring of N stages. Each stage has a latency (in ms). There's a speculative accept length g, which likely refers to speculative decoding where we accept g tokens in advance? Or it's about",
+   "prompt": "Write a Python function that estimates tokens/sec for a pipelined ring of N stages, given per-stage latency in ms and a speculative accept length g."
+  },
+  {
+   "cell": "turn-4",
+   "prompt_tokens": 1302,
+   "new_tokens": 384,
+   "tok_s": 8.59,
+   "g": 2.9,
+   "accept": 0.238,
+   "prefill_s": 5.81,
+   "ttft_s": 5.89,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 384,
+   "draft_s": 1.582,
+   "ring_wait_s": 42.59,
+   "traversal_s": 42.765,
+   "transport_s": 24.299,
+   "stage_s": 18.466,
+   "per_stage_ms": {
+    "0": [
+     29.21,
+     28.38
+    ],
+    "1": [
+     35.71,
+     35.08
+    ],
+    "2": [
+     11.62,
+     11.38
+    ],
+    "3": [
+     12.39,
+     12.18
+    ],
+    "4": [
+     50.96,
+     49.24
+    ]
+   },
+   "answer": "The user wants me to modify the function so that the speculative accept length g can vary per call via a parameter default, and keep the docstring intact.\n\nWe need to see the previous function. The user previously asked to write a Python function that estimates tokens/sec for a pipelined ring of N stages, given per-stage latency in ms and a speculative accept length g. I wrote a function, but I di",
+   "prompt": "Modify it so g can vary per call via a parameter default; keep the docstring intact."
+  },
+  {
+   "cell": "turn-5",
+   "prompt_tokens": 1712,
+   "new_tokens": 388,
+   "tok_s": 10.38,
+   "g": 3.55,
+   "accept": 0.319,
+   "prefill_s": 8.61,
+   "ttft_s": 8.69,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 388,
+   "draft_s": 1.197,
+   "ring_wait_s": 35.701,
+   "traversal_s": 35.853,
+   "transport_s": 20.408,
+   "stage_s": 15.446,
+   "per_stage_ms": {
+    "0": [
+     29.99,
+     29.09
+    ],
+    "1": [
+     33.9,
+     33.28
+    ],
+    "2": [
+     11.54,
+     11.3
+    ],
+    "3": [
+     14.33,
+     14.14
+    ],
+    "4": [
+     51.95,
+     50.21
+    ]
+   },
+   "answer": "The user is asking me to quote back only the docstring of the function I wrote, exactly as I wrote it. But I haven't actually written the function yet in this conversation. The user previously asked me to write a Python function that estimates tokens/sec for a pipelined ring of N stages, given per-stage latency in ms and a speculative accept length g. I wrote a function in my previous response, bu",
+   "prompt": "Quote back only the docstring of that function, exactly as you wrote it."
+  },
+  {
+   "cell": "turn-6",
+   "prompt_tokens": 2142,
+   "new_tokens": 384,
+   "tok_s": 10.34,
+   "g": 2.54,
+   "accept": 0.192,
+   "prefill_s": 5.53,
+   "ttft_s": 5.65,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 384,
+   "draft_s": 1.785,
+   "ring_wait_s": 34.773,
+   "traversal_s": 34.963,
+   "transport_s": 14.685,
+   "stage_s": 20.278,
+   "per_stage_ms": {
+    "0": [
+     29.18,
+     28.33
+    ],
+    "1": [
+     30.83,
+     30.3
+    ],
+    "2": [
+     11.51,
+     11.28
+    ],
+    "3": [
+     12.46,
+     12.26
+    ],
+    "4": [
+     50.3,
+     48.58
+    ]
+   },
+   "answer": "We need to compute tokens/sec for a pipelined ring with 6 stages, each with latency 35 ms, and g=4.5. We need to use the formula from the function I wrote. But I don't recall the exact formula. However, I can derive a reasonable formula.\n\nWe have a pipelined ring of N stages. Each stage has a latency L (in ms). The pipeline is in a ring, meaning that tokens circulate. The speculative accept length",
+   "prompt": "If a ring has 6 stages at 35 ms each and g is 4.5, what tokens/sec does your formula give? Work it out."
+  },
+  {
+   "cell": "turn-7",
+   "prompt_tokens": 2556,
+   "new_tokens": 384,
+   "tok_s": 10.36,
+   "g": 2.44,
+   "accept": 0.18,
+   "prefill_s": 4.72,
+   "ttft_s": 4.8,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 384,
+   "draft_s": 1.691,
+   "ring_wait_s": 34.737,
+   "traversal_s": 34.938,
+   "transport_s": 13.883,
+   "stage_s": 21.055,
+   "per_stage_ms": {
+    "0": [
+     26.89,
+     26.1
+    ],
+    "1": [
+     31.47,
+     30.91
+    ],
+    "2": [
+     11.46,
+     11.24
+    ],
+    "3": [
+     12.42,
+     12.22
+    ],
+    "4": [
+     51.87,
+     50.14
+    ]
+   },
+   "answer": "The user is asking for the new tokens/sec when g is increased to 6, given the same ring with 6 stages at 35 ms each. We need to compute using the same formula we used previously. We need to recall the formula we used. But we don't have the exact formula because we didn't define it. However, we can derive a formula based on the previous calculation.\n\nWe previously computed for g=4.5, N=6, L=35 ms. ",
+   "prompt": "Now assume a better drafter pushes g to 6. New number? Just the arithmetic."
+  },
+  {
+   "cell": "turn-8",
+   "prompt_tokens": 2960,
+   "new_tokens": 384,
+   "tok_s": 14.87,
+   "g": 3.79,
+   "accept": 0.349,
+   "prefill_s": 4.52,
+   "ttft_s": 4.79,
+   "visible_s": null,
+   "think_tokens": 0,
+   "answer_tokens": 384,
+   "draft_s": 0.876,
+   "ring_wait_s": 24.533,
+   "traversal_s": 24.672,
+   "transport_s": 11.633,
+   "stage_s": 13.039,
+   "per_stage_ms": {
+    "0": [
+     27.27,
+     26.51
+    ],
+    "1": [
+     27.1,
+     26.63
+    ],
+    "2": [
+     11.39,
+     11.16
+    ],
+    "3": [
+     13.04,
+     12.84
+    ],
+    "4": [
+     50.29,
+     48.61
+    ]
+   },
+   "answer": "The user wants a summary of the whole conversation in 3 bullets. Let's review the conversation:\n\n1. The user first asked: \"What is a mixture-of-experts model, in simple terms?\" I answered with a simple explanation.\n\n2. Then the user asked: \"How does that compare to a dense model in memory and compute cost at inference time?\" I answered comparing MoE to dense models.\n\n3. Then the user asked: \"Write",
+   "prompt": "Summarize this whole conversation in 3 bullets."
+  }
+ ],
+ "decode_weighted_tok_s": 8.3,
+ "conversation_mean_tok_s": 9.0
+}
