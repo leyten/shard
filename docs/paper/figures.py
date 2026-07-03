@@ -90,7 +90,7 @@ def fig_alpha_law(T_ms=380.0, depth=4):
     _grid(ax)
     ax.legend(frameon=False, fontsize=7.5, loc="upper left")
     fig.tight_layout()
-    fig.savefig("fig_alpha_law.pdf")
+    fig.savefig("fig_alpha_law.pdf"); fig.savefig("fig_alpha_law.png", dpi=220, bbox_inches="tight")
     print(f"fig_alpha_law.pdf  crossover≈{cross}  tree@0.74={sim_tree(0.74):.2f}g "
           f"pipe@0.97={sim_pipelined(0.97) / slot:.0f}tok/s")
 
@@ -132,7 +132,7 @@ def fig_arms(bench="m25-paper-bench-20260703.json"):
     _grid(ax)
     ax.legend(frameon=False, fontsize=7.5, ncols=3, loc="upper left")
     fig.tight_layout()
-    fig.savefig("fig_arms.pdf")
+    fig.savefig("fig_arms.pdf"); fig.savefig("fig_arms.png", dpi=220, bbox_inches="tight")
     print("fig_arms.pdf")
 
 
@@ -164,7 +164,7 @@ def fig_split(bench="m25-paper-bench-20260703.json"):
     for s in ("top", "right", "left"):
         ax.spines[s].set_visible(False)
     fig.tight_layout()
-    fig.savefig("fig_split.pdf")
+    fig.savefig("fig_split.pdf"); fig.savefig("fig_split.png", dpi=220, bbox_inches="tight")
     print("fig_split.pdf")
 
 
@@ -195,7 +195,7 @@ def fig_hero():
         ax.spines[sp].set_visible(False)
     ax.tick_params(left=False)
     fig.tight_layout()
-    fig.savefig("fig_hero.pdf")
+    fig.savefig("fig_hero.pdf"); fig.savefig("fig_hero.png", dpi=220, bbox_inches="tight")
     print("fig_hero.pdf")
 
 
