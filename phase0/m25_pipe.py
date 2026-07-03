@@ -453,7 +453,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         prefill_s = time.time() - t_pf
         out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
-        rounds = 0; total_committed = 0; wasted = 0; t0 = time.time(); done = False
+        rounds = 0; total_committed = 0; accepted = 0; wasted = 0; t0 = time.time(); done = False
         ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
         inflight = []                                       # chain-burst frames: (off, start, ds, t_sent)
         discard = 0                                         # stale in-flight replies after a mid-burst divergence
@@ -505,6 +505,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
                 eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos
                 rounds += 1; total_committed += len(committed)
+                accepted += len(committed) - 1              # DRAFT tokens accepted (the +1 is correction/bonus)
                 refeed = True; dprefix = None               # the committed path's KV rows are tree nodes -> dirty
                 if on_commit: on_commit(out, time.time() - t0)
                 if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
@@ -521,7 +522,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             for j in range(K):
                 if ds[j] == r[off + j]: n += 1
                 else: break
-            rounds += 1
+            rounds += 1; accepted += n                      # chain semantics: draft tokens accepted, exactly
+                                                            # (a no-bonus full accept is n=K accepted, not K-1)
             if n == K:
                 committed = list(ds)
                 if not inflight and len(r) > off + K:       # full-accept bonus, same rule as coordinate_pipe:
@@ -557,7 +559,9 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         if ee in out: out = out[:out.index(ee)]; break
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
                    else (False if RECEIPTS else None))
-    accepted = total_committed - rounds                     # accept per round = len(committed)-1 (the +1 is the correction/bonus)
+    # mean_accept counts DRAFT tokens accepted per round, same as coordinate_pipe — NOT committed-1:
+    # a pipelined full-accept round commits K with no bonus, and deriving accept from committed under-
+    # reported it by 1 (a 12.5pp phantom accept deficit vs the chain arm at K=8; found adversarially).
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
             "mean_accept": accepted / max(rounds, 1), "toks_per_traversal": total_committed / max(rounds, 1),
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,

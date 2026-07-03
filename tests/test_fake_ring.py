@@ -341,8 +341,9 @@ def test_divergence_trap_chain_bookkeeping():
 
 
 def test_divergence_trap_tree(monkeypatch):
-    """Same trap through the tree path (synchronous: nothing in flight to discard, but the trunk /
-    vbase bookkeeping must survive the n-gram divergence exactly)."""
+    """Same trap through the hybrid path: the n-gram burst speculates across the break with frames in
+    flight -> mid-burst divergence + discard, then the novel run flips to sync tree rounds; the
+    burst<->tree KV bookkeeping (refeed/vbase/send_pos) must survive exactly."""
     _tree_env(monkeypatch, depth=8)
     T = fr.trap_T(560)
     hyb, _ = _hybrid()
@@ -350,3 +351,31 @@ def test_divergence_trap_tree(monkeypatch):
                                    prefill_chunk=24, eagle_ring=True)
     _assert_lossless(res, T, P, 200)
     assert res["n_tokens"] == len(res["output_ids"])
+
+
+@pytest.mark.parametrize("path", ["chain", "tree"])
+def test_extend_pairing_through_divergence(path, monkeypatch):
+    """The EAGLE extend contract THROUGH a mid-stream divergence (adversarial-review gap G4: the
+    pairing test used trap-free text, so a divergence-path regression in aux indexing / base_pos —
+    including on the hybrid's trunk-prefixed refeed frames — was invisible). Same invariants as
+    test_extend_pairing_invariant: per-extend position encoding, left-shift, global contiguity."""
+    monkeypatch.setattr(S, "M25_EAGLE", True)
+    if path == "tree":
+        _tree_env(monkeypatch, depth=4)
+    T = fr.trap_T(560)
+    hyb, rec = _hybrid(record=True)
+    res, ring = fr.run_coordinator(T, P, hyb, K=8, depth=4, max_new=200,
+                                   prefill_chunk=24, eagle_ring=True)
+    _assert_lossless(res, T, P, 200)
+    assert rec.extends, "no extend() calls recorded"
+    for toks, aux, base in rec.extends:
+        for i, t in enumerate(toks):
+            want = base + i
+            assert bool(torch.all(aux[i].flatten() == float(want))), (
+                f"aux[{i}] != position base_pos+{i}={want} (path={path}, through-divergence)")
+            assert t == T[want + 1], f"tokens[{i}] breaks the left-shift at {want + 1} (path={path})"
+    cur, all_toks = 0, []
+    for toks, aux, base in rec.extends:
+        assert base == cur, f"extend base_pos {base} != expected {cur} — gap/overlap across a divergence"
+        cur += len(toks); all_toks += toks
+    assert all_toks == T[1:1 + len(all_toks)]

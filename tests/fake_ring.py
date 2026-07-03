@@ -129,6 +129,15 @@ class FakeRing(threading.Thread):
         # KV the ring never wrote — the cross-mode hybrid bug class). A TREE frame's causal trunk advances
         # clean; its tree NODES do not (their rows are scattered/dirty until re-fed — why pending_path exists).
         self.clean = 0
+        self.written = {}                           # slot -> LAST token written there (KV content model)
+        self._viol = []                             # (frame_idx, junk_slot): a frame read context whose last
+        self._starts = []                           # write != committed text. LEGAL for stale in-flight frames
+                                                    # after a divergence (their replies are discarded and a
+                                                    # recovery frame re-writes the slot later — FIFO makes it
+                                                    # arrive after), so the sound invariant is POST-HOC: every
+                                                    # junk-read slot must be re-written by a later frame with
+                                                    # start <= that slot, else a real ring served a stale row
+                                                    # forever (adversarial-review gaps G1/G2)
         self.backlog = 0                            # times a verify arrived with MORE frames already buffered
                                                     # on the pipe socket == direct evidence of depth>1 pipelining
 
@@ -160,6 +169,13 @@ class FakeRing(threading.Thread):
                         raise AssertionError(
                             f"KV GAP: frame start={s} past clean frontier {self.clean} — the coordinator "
                             f"assumed KV the ring never wrote (dirty pending_path not re-fed?)")
+                    idx = len(self._starts); self._starts.append(s)
+                    for sl in range(min(s, len(self.T))):   # context below start should be committed text
+                        w = self.written.get(sl)
+                        if w is not None and w != self.T[sl]:
+                            self._viol.append((idx, sl))    # judged post-hoc (stale frames may read junk)
+                    for i, t in enumerate(msg["token_ids"]):   # both frame kinds write flat-order at start+i
+                        self.written[s + i] = int(t)
                     if msg.get("tree"):
                         pos = [int(p) for p in msg["pos_ids"]]
                         # leading causal run = re-fed trunk (+ a chain-shaped tree prefix, causally
@@ -192,6 +208,19 @@ class FakeRing(threading.Thread):
                 else:
                     raise ValueError(f"fake ring got unexpected op {op!r}")
         except (OSError, EOFError):                 # coordinator closed its ends — normal shutdown
+            # POST-HOC: every junk-read must be healed by a later frame re-writing that slot. The final
+            # <=tail_slack frames are exempt: when the job ends on a divergence, the drained in-flight
+            # frames read junk with no frame ever following — their replies are discarded by design.
+            cutoff = len(self._starts) - max(getattr(self, "tail_slack", 4), 1)
+            for idx, sl in self._viol:
+                if idx >= cutoff:
+                    continue
+                if not any(st <= sl for st in self._starts[idx + 1:]):
+                    self.error = AssertionError(
+                        f"KV CONTENT: frame #{idx} (start={self._starts[idx]}) read stale slot {sl} "
+                        f"(held {self.written.get(sl)} vs committed T[{sl}]={self.T[sl]}) and NO later "
+                        f"frame ever re-wrote it — a real ring serves that stale row forever")
+                    return
             return
         except Exception as e:                      # anything else is a harness bug — surface it
             self.error = e
@@ -253,6 +282,7 @@ def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefil
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
     ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt, stall_decode=stall_decode)
+    ring.tail_slack = depth                         # end-of-job drain window exempt from the healing check
     ring.start()
     tok = FakeTok(T[:prompt_len])
     try:
