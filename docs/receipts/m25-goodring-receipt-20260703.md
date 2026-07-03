@@ -74,3 +74,31 @@ box's single-thread CPU. Consequences:
 
 Stacked honestly: **~12-14 tok/s interactive reasoning** is reachable on this ring class — at or
 above the step-back's projected ceiling. Path (a) confirmed: execution, no invention required.
+
+---
+
+## Addendum (same day, later): depth-aware hybrid A/B/C — arm 3 on the same warm ring
+
+The #1 lever landed same-session (`feat(coord): depth-aware hybrid`, adversarially reviewed, 64 CPU
+tests): matched n-gram rounds now ride PLAIN pipelined chain frames (up to --depth in flight, flash
+kernel, small payload); novel rounds stay sync tree. Receipt
+`m25-usability-goodring-hybrid-20260703.json`, same ring, same flags + depth=4.
+
+**Caveat first: the ring ran 1.32× slower during arm 3** (measured on tree-routed cells at identical
+g — 441/464/412 ms/round vs 380/315/303 in arm 2; co-tenant load on the EPYC boxes). Raw numbers
+carry that headwind.
+
+- raw decode-weighted: **7.59** (tree arm was 7.83, chain 8.3, per-cell-best bound 9.11)
+- **normalized to the arm-1/2 ring speed: ≈10.0 decode-weighted** — ABOVE the per-cell-best bound,
+  because pipelining adds throughput neither depth-1 arm had.
+- g (ring-independent) confirms the design exactly: novel cells IDENTICAL to the tree arm
+  (reason-math 4.6, reason-logic 3.6, agentic 4.3); verbatim cells strictly better than the tree arm
+  (rag-quote 2.5→2.7 + pipelined → 5.2→6.7 tok/s raw DESPITE the slower ring; ctx-8k-quote 2.2→2.8,
+  5.1→7.6 raw).
+- mean_accept is now honest across arms (review fix: pipelined full-accept rounds counted K, not K-1).
+- Remaining weak cell: ctx-30k-quote (3.5 raw; tree rounds at 30k pay the manual kernel over 30k
+  keys — 807 ms/round). The CUDA-graph/lean-codec levers and a flash tree kernel path are the
+  follow-ups that touch it.
+
+Same-ring-same-time A/B was defeated by time-of-day variance; a calm-window interleaved 3-arm pass
+would tighten the claim, but g-parity + verbatim raw wins on a slower ring already pin the mechanism.

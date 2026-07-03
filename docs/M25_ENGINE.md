@@ -32,11 +32,24 @@ batched 155 agg + draftable/agentic. The receipt run happened same evening (rece
   CPU+load (ring_up now does, crude factor); (2) **CUDA-graphs are UN-DEAD for scattered rings** — the
   ~1.05× dead-end verdict came from a fast-CPU box; on EPYC slices graphs recover ~2-4× of block time, but
   GraphRunner must learn to emit EAGLE aux (python side-effect — graphs skip it today). Scoped code task.
-- **NEXT SESSION, in order:** (1) **depth-aware hybrid** (pipeline n-gram rounds at depth, tree rounds sync;
-  CPU-testable on the fake ring; ~8.3→9.1). (2) **CUDA-graph aux compatibility** (+20-30% on slow-CPU boxes,
-  makes the ring CPU-agnostic). (3) **lean codec / thin-TCP** (transport 55-68% measured — up to +20-30%).
-  Stacked honest ceiling on this ring class: **~12-14 interactive**. (4) then TIER-2 trust (receipt
-  freshness/binding) + TIER-3 gateway/wire hardening = the betanet-integration path.
+- **DEPTH-AWARE HYBRID: DONE + MEASURED (same day, arm 3 on the same ring).** Matched n-gram rounds now
+  ride plain PIPELINED chain frames (up to --depth in flight; the tree's 1-wide-tree framing paid the
+  manual off-flash kernel + trunk re-feed for zero accept gain); novel rounds stay sync tree. Landed as
+  `feat(coord): depth-aware hybrid` + adversarial-review fixes (honest mean_accept on pipelined rounds;
+  fake-ring KV content model + through-divergence pairing tests; 64 CPU tests). **Measured: raw 7.59
+  decode-weighted on a 1.32×-slower ring window (co-tenant jitter, measured at identical g) ≈ 10.0
+  normalized — above the 9.11 per-cell-best bound; g novel == tree exactly, g verbatim strictly up
+  (rag 2.5→2.7, 8k-quote 2.2→2.8; raw tok/s beat the tree arm on those cells DESPITE the slower ring).**
+  Receipt addendum in `docs/receipts/m25-goodring-receipt-20260703.md`.
+- **NEXT SESSION, in order:** (1) **CUDA-graph aux compatibility** (+20-30% on slow-CPU boxes, makes the
+  ring CPU-agnostic; NOTE from review: hybrid refeed frames have variable size L+K ≤ TREE_DEPTH+1+K → up
+  to ~TREE_DEPTH extra graph captures — bound the capture set or bucket sizes). (2) **lean codec /
+  thin-TCP** (transport 55-68% measured — up to +20-30%). (3) a CALM-WINDOW interleaved 3-arm pass to
+  re-pin the hybrid number without time-of-day jitter (cells alternate arms, one warm ring). Stacked
+  honest ceiling on this ring class: **~12-14 interactive**. (4) then TIER-2 trust (receipt
+  freshness/binding) + TIER-3 gateway/wire hardening = the betanet-integration path. Review-logged debt:
+  tree-path resume_ids handling diverges from chain (out excludes resume; pre-existing), 30k tree rounds
+  pay the manual kernel over full ctx (807ms/round — flash tree kernel is the fix).
 - **RING IS WARM (7 boxes, ~$3.6/hr): 5-stage ring CZ900(head)/CZ887/CH/NO/DK + spares IT/HU** (GB spare
   destroyed, load-272 dud). iids 43696900,43696887,43696869,43696886,43696878 + 43696880,43696881. Head ssh
   ssh3.vast.ai:16900; drive reports as SOLE coordinator on the head (report_chain/report_tree.log there).
