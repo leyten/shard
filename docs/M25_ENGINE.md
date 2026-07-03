@@ -13,7 +13,32 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-03: THE GOOD-RING RECEIPT IS BANKED — 10-11 tok/s interactive reasoning MEASURED; fork resolved: path (a) EXECUTE
+### ⇒ 2026-07-03 (late): PAPER v1 DONE + the paper test evening banked; ring DESTROYED (results banked)
+leyten green-lit the c0mpute technical report (author: leyten — c0mpute; inspired-by/positioned-against the
+Dolphin AI 2-GPU LAN study). **`docs/paper/main.typ` → main.pdf (8pp, typst) is a complete v1** with
+receipt-generated figures (figures.py: α-law calibrated MC, 3-arm bars, transport split). The test evening
+(4 phases, ~2.5h, all banked in docs/receipts/m25-paper-*):
+- **Interleaved 3-arm bench** (AR-null-drafter / chain / hybrid, arm order rotated per rep, one warm ring,
+  calm window): AR = 4.8-5.0 tok/s FLAT g=1.00 (the latency wall, measured); interactive novel cells
+  10.7-12.6 median (reason-math chain 12.6 [12.3..13.1]); 64/64 jobs receipts-verified.
+- **Pure-verbatim pipelined regime: 70.7-87.2 tok/s single-stream** (ctx_table think-skip); **B=4 batched
+  150-194 tok/s aggregate** @0.5-2k on this ring (session-9 receipt covers 155@16.4k on 6 stages). NEW
+  systems constraint: batch KV vs stage fatness — the 13-layer tail (weights+KV+lm_head+prefill-logits
+  transients) caps B=4 ctx ~12k where 6-stage rings hit 16k.
+- **Verification is FREE: +0.05ms on an 11.7ms idle-box stage span (~0.4%)**; end-to-end on/off deltas are
+  pure WAN drift (span data bounds the true cost 2 orders below).
+- **FT timeline receipt**: kill -9 coordinator mid-decode t=14s → NEW coordinator completes a full job by
+  t=48s, zero re-warm; receipts PROVE at t=60s.
+- **NEW routing insight**: tree-vs-chain preference is RING-SPEED-DEPENDENT (tree's fixed surcharge loses
+  on fast windows T≈250ms, wins on common T≈400ms) → T-aware router = cheap refinement, queued.
+- Ops: ring + spares DESTROYED (verified 0 live); ~$45 of the $100 mandate used total. Next ring gets
+  provisioned via ring_up's CPU probe (scratchpad/rent_pool.py + ring_up.py = the proven 2-step flow).
+**NEXT:** (1) leyten reviews/publishes the PDF (repo docs/paper/main.pdf; site/X his call). (2) Perf lever
+queue unchanged: CUDA-graph aux compat → lean codec → T-aware router + calm-window re-pin. (3) TIER-2
+trust (freshness/binding — the paper's own Limitations names it).
+
+*(prior same-day state, superseded ops-wise but numbers stand:)*
+### 2026-07-03: THE GOOD-RING RECEIPT IS BANKED — 10-11 tok/s interactive reasoning MEASURED; fork resolved: path (a) EXECUTE
 leyten picked **(a)**: execute to the ceiling, declare the honest number, re-point the perf narrative at
 batched 155 agg + draftable/agentic. The receipt run happened same evening (receipt
 `docs/receipts/m25-goodring-receipt-20260703.md` + the two arm JSONs; ~$6 spent, ~$100-mandate has ~$30 used):

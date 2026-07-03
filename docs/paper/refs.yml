@@ -1,0 +1,59 @@
+borzunov2022petals:
+  type: article
+  title: "Petals: Collaborative Inference and Fine-tuning of Large Models"
+  author: ["Borzunov, Alexander", "Baranchuk, Dmitry", "Dettmers, Tim", "Ryabinin, Max", "Belkada, Younes", "Chumachenko, Artem", "Samygin, Pavel", "Raffel, Colin"]
+  date: 2022
+  serial-number:
+    arxiv: "2209.01188"
+
+
+leviathan2023:
+  type: article
+  title: "Fast Inference from Transformers via Speculative Decoding"
+  author: ["Leviathan, Yaniv", "Kalman, Matan", "Matias, Yossi"]
+  date: 2023
+  parent:
+    type: proceedings
+    title: "Proceedings of the 40th International Conference on Machine Learning"
+
+chen2023:
+  type: article
+  title: "Accelerating Large Language Model Decoding with Speculative Sampling"
+  author: ["Chen, Charlie", "Borgeaud, Sebastian", "Irving, Geoffrey", "Lespiau, Jean-Baptiste", "Sifre, Laurent", "Jumper, John"]
+  date: 2023
+  serial-number:
+    arxiv: "2302.01318"
+
+cai2024medusa:
+  type: article
+  title: "Medusa: Simple LLM Inference Acceleration Framework with Multiple Decoding Heads"
+  author: ["Cai, Tianle", "Li, Yuhong", "Geng, Zhengyang", "Peng, Hongwu", "Lee, Jason D.", "Chen, Deming", "Dao, Tri"]
+  date: 2024
+  serial-number:
+    arxiv: "2401.10774"
+
+li2024eagle:
+  type: article
+  title: "EAGLE: Speculative Sampling Requires Rethinking Feature Uncertainty"
+  author: ["Li, Yuhui", "Wei, Fangyun", "Zhang, Chao", "Zhang, Hongyang"]
+  date: 2024
+  parent:
+    type: proceedings
+    title: "Proceedings of the 41st International Conference on Machine Learning"
+
+li2025eagle3:
+  type: article
+  title: "EAGLE-3: Scaling up Inference Acceleration of Large Language Models via Training-Time Test"
+  author: ["Li, Yuhui", "Wei, Fangyun", "Zhang, Chao", "Zhang, Hongyang"]
+  date: 2025
+  serial-number:
+    arxiv: "2503.01840"
+
+miao2024specinfer:
+  type: article
+  title: "SpecInfer: Accelerating Large Language Model Serving with Tree-based Speculative Inference and Verification"
+  author: ["Miao, Xupeng", "Oliaro, Gabriele", "Zhang, Zhihao", "Cheng, Xinhao", "Wang, Zeyu", "Zhang, Zhengxin", "Wong, Rae Ying Yee", "Zhu, Alan", "Yang, Lijie", "Shi, Xiaoxiang", "Shi, Chunan", "Chen, Zhuoming", "Arfeen, Daiyaan", "Abhyankar, Reyna", "Jia, Zhihao"]
+  date: 2024
+  parent:
+    type: proceedings
+    title: "Proceedings of ASPLOS 2024"
