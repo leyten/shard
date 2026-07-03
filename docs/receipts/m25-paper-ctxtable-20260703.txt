@@ -1,0 +1,17 @@
+[transformers] You are using a model of type `minimax_m2` to instantiate a model of type ``. This may be expected if you are loading a checkpoint that shares a subset of the architecture (e.g., loading a `sam2_video` checkpoint into `Sam2Model`), but is otherwise not supported and can yield errors. Please verify that the checkpoint is compatible with the model you are instantiating.
+ ctx_tok pipe tok/s  B=4 agg  per-strm  B/pipe  accept  b_prefill  coherent
+     561      70.65   149.91     37.48   2.12x     89%      7.47s       yes
+    2097      87.22   194.02     48.50   2.22x     89%     16.85s       yes
+Traceback (most recent call last):
+  File "/root/m25_ctx_table.py", line 42, in <module>
+    rb = P.coordinate_pipe_batch(pipe, tok, [m] * 4, K, MAXNEW, 1800, ret, drs, depth=4, prefill_chunk=1024, max_ctx=131072)
+         ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+  File "/root/m25_pipe.py", line 657, in coordinate_pipe_batch
+    tr = time.time(); rb = recv_msg(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
+                           ^^^^^^^^^^^^
+  File "/root/transport.py", line 108, in recv_msg
+    (n,) = struct.unpack("!Q", _read_exact(sock, 8))
+                               ^^^^^^^^^^^^^^^^^^^^
+  File "/root/transport.py", line 31, in _read_exact
+    raise ConnectionError("sidecar closed the connection")
+ConnectionError: sidecar closed the connection
