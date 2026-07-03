@@ -13,7 +13,7 @@ tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 # think-skip: close the forced <think> so the model emits draftable content from token 1
 _TS = tok("</think>\n\n", add_special_tokens=False)["input_ids"]
 _orig = P.render_ids
-P.render_ids = lambda t, m, tools=None, add_generation_prompt=True: _orig(t, m, tools=tools, add_generation_prompt=add_generation_prompt) + _TS
+P.render_ids = lambda t, m, tools=None, add_generation_prompt=True, **kw: _orig(t, m, tools=tools, add_generation_prompt=add_generation_prompt) + _TS   # **kw: absorb reasoning= (think-skip forces the closed-think path regardless)
 
 HEAD = ("127.0.0.1", int(os.environ.get("HEAD_PORT", "29610")))
 TAIL = ("127.0.0.1", int(os.environ.get("TAIL_PORT", "29612")))
@@ -27,7 +27,8 @@ def prompt_ctx(n):
     ids = tok(WORD * (n + 8), add_special_tokens=False)["input_ids"][:n]
     return [{"role": "user", "content": "Continue this sequence exactly, same word repeated:\n" + tok.decode(ids)}]
 
-CTXS = [512, 2048, 8192, 16384, 20000]
+CTXS = [512, 2048, 8192, 12000]   # 5-stage ring: B=4 KV + lm_head + prefill-logits transients on the 13-layer
+# tail cap maxlen ~12k and prefill_chunk 1024 (6-stage rings, with 3-5GB more tail headroom, reached 16k @2048)
 K = 8; MAXNEW = 128
 # both rates are DECODE-only (prefill excluded) — coordinate_pipe and coordinate_pipe_batch now start the
 # tok/s timer AFTER prefill, so single-stream vs batched-B=4 is apples-to-apples (the old agg_tok_s counted
@@ -36,9 +37,9 @@ print(f"{'ctx_tok':>8} {'pipe tok/s':>10} {'B=4 agg':>8} {'per-strm':>9} {'B/pip
 for n in CTXS:
     m = prompt_ctx(n)
     dr = NgramDrafter(ng=3)
-    rs = P.coordinate_pipe(pipe, tok, m, K, MAXNEW, 1800, 4, ret_sock=ret, local_draft=dr, prefill_chunk=2048, max_ctx=131072)
+    rs = P.coordinate_pipe(pipe, tok, m, K, MAXNEW, 1800, 4, ret_sock=ret, local_draft=dr, prefill_chunk=1024, max_ctx=131072)
     drs = [NgramDrafter(ng=3) for _ in range(4)]
-    rb = P.coordinate_pipe_batch(pipe, tok, [m] * 4, K, MAXNEW, 1800, ret, drs, depth=4, prefill_chunk=2048, max_ctx=131072)
+    rb = P.coordinate_pipe_batch(pipe, tok, [m] * 4, K, MAXNEW, 1800, ret, drs, depth=4, prefill_chunk=1024, max_ctx=131072)
     sp = rs["tok_s"]; ag = rb["agg_tok_s"]
     coh = "swarm" in (rb["streams"][0]["text"].lower())                    # batched output sane (not garbage)?
     print(f"{rs['prompt_tokens']:>8} {sp:>10.2f} {ag:>8.2f} {ag/4:>9.2f} {ag/max(sp,1e-9):>6.2f}x "
