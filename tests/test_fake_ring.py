@@ -231,7 +231,54 @@ def test_accounting_same_drafter_novel(monkeypatch, capsys):
               f"reported_g={res['toks_per_traversal']:.2f} real_g={real_g:.2f}")
 
 
-# ---- 4. STAGE-TIMING / TRANSPORT BREAKDOWN ---------------------------------------------------------
+# ---- 4. DEPTH-AWARE HYBRID (matched rounds = pipelined plain frames; novel rounds = sync tree) -----
+
+def test_hybrid_routes_matched_rounds_as_plain_frames(monkeypatch):
+    """On repetitive text the M25_TREE coordinator must send matched n-gram rounds as PLAIN chain
+    frames (flash kernel, small payload — the 2026-07-03 receipt showed 1-wide TREE framing paid
+    199-303ms/round vs 139ms for zero accept gain), reserving tree frames for novel rounds."""
+    _tree_env(monkeypatch, depth=8)
+    T = fr.repetitive_T(760)
+    hyb, _ = _hybrid()
+    res, ring = fr.run_coordinator(T, 128, hyb, K=8, depth=4, max_new=200,
+                                   prefill_chunk=4096, eagle_ring=True)
+    _assert_lossless(res, T, 128, 200)
+    decode = [e for e in ring.log if e["op"] == "verify" and not e["prefill"]]
+    plain = [e for e in decode if not e["tree"]]
+    trees = [e for e in decode if e["tree"]]
+    assert len(plain) > len(trees), (
+        f"matched rounds still ride tree frames: {len(plain)} plain vs {len(trees)} tree")
+
+
+def test_hybrid_pipelines_matched_bursts(monkeypatch):
+    """Matched streaks must run depth>1: the ring STALLS its first 3 decode replies (200ms) — a
+    pipelining coordinator fills its depth window during the stall, so the ring finds more frames
+    already buffered when it wakes ('backlog'). The old synchronous one-round-in-flight tree loop
+    cannot send frame N+1 before reply N and scores backlog == 0, deterministically."""
+    _tree_env(monkeypatch, depth=8)
+    T = fr.repetitive_T(760)
+    hyb, _ = _hybrid()
+    res, ring = fr.run_coordinator(T, 128, hyb, K=8, depth=4, max_new=200,
+                                   prefill_chunk=4096, eagle_ring=True, stall_decode=(3, 0.2))
+    _assert_lossless(res, T, 128, 200)
+    assert ring.backlog >= 2, f"no pipelining evidence on a pure verbatim run (backlog={ring.backlog})"
+
+
+def test_hybrid_novel_text_stays_sync_tree(monkeypatch):
+    """On novel text the hybrid must remain the synchronous tree: tree frames dominate and there is
+    no burst pipelining (EAGLE needs the verified hidden — depth-1 is structural, not a bug)."""
+    _tree_env(monkeypatch, depth=4)
+    T = fr.novel_T(560)
+    hyb, _ = _hybrid()
+    res, ring = fr.run_coordinator(T, P, hyb, K=8, depth=4, max_new=120,
+                                   prefill_chunk=4096, eagle_ring=True)
+    _assert_lossless(res, T, P, 120)
+    decode = [e for e in ring.log if e["op"] == "verify" and not e["prefill"]]
+    trees = [e for e in decode if e["tree"]]
+    assert len(trees) >= len(decode) - len(trees), "novel text routed away from tree rounds"
+
+
+# ---- 5. STAGE-TIMING / TRANSPORT BREAKDOWN ---------------------------------------------------------
 
 SPANS = [[0, 5.0, 4.0], [1, 3.25, 2.5], [2, 1.5, 1.0]]     # [stage, span_ms, comp_ms]; binary-exact floats
 

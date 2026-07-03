@@ -27,10 +27,12 @@ selects the PSK-free codec; phase0/ and shard/ go on sys.path (node_kv does a fl
 """
 import json
 import os
+import select
 import socket
 import sys
 import tempfile
 import threading
+import time
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 for _p in (os.path.join(_REPO, "phase0"), os.path.join(_REPO, "shard"), os.path.dirname(os.path.abspath(__file__))):
@@ -108,17 +110,27 @@ class FakeRing(threading.Thread):
     oracle answer on the return socket — exactly one reply per message, FIFO, mirroring serve()'s
     per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
 
-    def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None):
+    def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None,
+                 stall_decode=None):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
-        self.T = [int(t) for t in T]
+        self.stall_decode = stall_decode            # (n, seconds): sleep before the first n decode replies —
+        self.stalled = 0                            # a pipelining coordinator fills its depth window during the
+        self.T = [int(t) for t in T]                # stall (deterministic backlog); a sync one cannot send at all
         self.eagle = eagle                          # reply {"toks","aux"} like an M25_EAGLE tail, else plain list
         self.aux_h = aux_h                          # aux hidden width (32 = the synthetic EAGLE head's H)
         self.aux_ids = list(aux_layer_ids if aux_layer_ids is not None else S.EAGLE_AUX_LAYER_IDS)
         self.stage_dt = stage_dt                    # [[stage, span_ms, comp_ms], ...] on every verify reply,
         self.log = []                               # mirroring stages under M25_STAGE_TIMING (bare list -> dict)
         self.error = None
+        # KV dirty-frontier model: `clean` = first slot NOT yet written by a causal frame. A chain/prefill
+        # frame writes [start, start+n) and requires start <= clean (a gap means the coordinator relied on
+        # KV the ring never wrote — the cross-mode hybrid bug class). A TREE frame's causal trunk advances
+        # clean; its tree NODES do not (their rows are scattered/dirty until re-fed — why pending_path exists).
+        self.clean = 0
+        self.backlog = 0                            # times a verify arrived with MORE frames already buffered
+                                                    # on the pipe socket == direct evidence of depth>1 pipelining
 
     # oracle: the target's greedy argmax AT absolute position p is T[p+1] (clamped past the end so
     # deep in-flight speculation never crashes the ring — those replies get discarded anyway)
@@ -143,11 +155,30 @@ class FakeRing(threading.Thread):
                     self.log.append({"op": "receipt"})
                     send_msg(self.ret, msg.get("receipts", []))
                 elif op == "verify":
+                    s = int(msg["start"])
+                    if s > self.clean:
+                        raise AssertionError(
+                            f"KV GAP: frame start={s} past clean frontier {self.clean} — the coordinator "
+                            f"assumed KV the ring never wrote (dirty pending_path not re-fed?)")
                     if msg.get("tree"):
                         pos = [int(p) for p in msg["pos_ids"]]
+                        # leading causal run = re-fed trunk (+ a chain-shaped tree prefix, causally
+                        # identical to more trunk — indistinguishable by design, and equally clean-KV).
+                        # No content check: trunk tokens can't be told from speculation here, and after
+                        # a divergence rollback re-writing junk slots is legitimate; output correctness
+                        # is what the end-to-end losslessness assertion (out == T-prefix) pins.
+                        trunk = 0
+                        while trunk < len(msg["parents"]) and msg["parents"][trunk] == trunk - 1:
+                            trunk += 1
+                        self.clean = max(self.clean, s + trunk)
                     else:
-                        s = int(msg["start"])
                         pos = [s + i for i in range(len(msg["token_ids"]))]
+                        self.clean = max(self.clean, s + len(pos))
+                    if self.stall_decode and not msg.get("prefill") and self.stalled < self.stall_decode[0]:
+                        self.stalled += 1
+                        time.sleep(self.stall_decode[1])
+                    if select.select([self.pipe], [], [], 0)[0]:
+                        self.backlog += 1           # coordinator sent ahead: >1 frame in flight right now
                     self.log.append({"op": "verify", "start": int(msg["start"]),
                                      "n": len(msg["token_ids"]), "tree": bool(msg.get("tree")),
                                      "prefill": bool(msg.get("prefill")),
@@ -164,6 +195,11 @@ class FakeRing(threading.Thread):
             return
         except Exception as e:                      # anything else is a harness bug — surface it
             self.error = e
+            for s_ in (self.pipe, self.ret):        # close our ends so the coordinator fails NOW,
+                try:                                # not after its full recv timeout
+                    s_.close()
+                except OSError:
+                    pass
 
 
 # ---- target-sequence builders ------------------------------------------------------------------
@@ -209,20 +245,27 @@ def trap_T(n, seed=7, break_at=168, novel_len=30):
 # ---- runner --------------------------------------------------------------------------------------
 
 def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefill_chunk=4096,
-                    eagle_ring=False, timeout=30, on_commit=None, stage_dt=None):
+                    eagle_ring=False, timeout=30, on_commit=None, stage_dt=None, stall_decode=None):
     """One coordinate_pipe job against a fresh FakeRing. S.M25_TREE (monkeypatched by the caller)
     routes to coordinate_pipe_tree inside coordinate_pipe, same as production. Returns (result, ring);
     ring.log is the wire-level ground truth."""
     c_pipe, r_pipe = socket.socketpair()
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
-    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt)
+    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt, stall_decode=stall_decode)
     ring.start()
     tok = FakeTok(T[:prompt_len])
     try:
-        res = MP.coordinate_pipe(c_pipe, tok, [{"role": "user", "content": "fake"}], K, max_new,
-                                 timeout, depth, c_ret, drafter,
-                                 prefill_chunk=prefill_chunk, on_commit=on_commit)
+        try:
+            res = MP.coordinate_pipe(c_pipe, tok, [{"role": "user", "content": "fake"}], K, max_new,
+                                     timeout, depth, c_ret, drafter,
+                                     prefill_chunk=prefill_chunk, on_commit=on_commit)
+        except Exception:
+            ring.join(2)                            # a ring-side assert kills the ring first and the
+            if ring.error is not None:              # coordinator only sees the dead socket — surface
+                raise AssertionError(               # the ROOT CAUSE, not the TransportError symptom
+                    f"fake ring crashed: {type(ring.error).__name__}: {ring.error}") from None
+            raise
     finally:
         for s_ in (c_pipe, c_ret):
             try:

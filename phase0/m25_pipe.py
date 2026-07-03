@@ -382,20 +382,29 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
 def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                          tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                          swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
-    """EAGLE TREE-VERIFY coordinator (M25_TREE=1): one draft TREE per ring traversal instead of one linear
-    chain. Each round re-feeds the last committed path as a causal trunk + grows a top-M EAGLE tree off its
-    last node (the anchor); the ring verifies the whole thing in ONE forward under an ancestor-only mask
-    (run_block_tree) and tree_greedy_walk commits the longest accepted path + 1 correction/bonus. depth=1
-    structurally — one tree in flight per traversal — so K/depth are unused; the speculation budget is
-    M25_TREE_M nodes (best-first by cumulative draft log-prob, M25_TREE_TOPB children per expansion, depth
-    cap M25_TREE_DEPTH — the fleet-confirmed fix for the fixed-2^d waste, 62 nodes for +0.7 g).
+    """DEPTH-AWARE HYBRID coordinator (M25_TREE=1): per round, route by what the text is doing.
+    * n-gram MATCHED (verbatim/draftable) -> a PLAIN pipelined chain frame, up to `depth` in flight —
+      the flash kernel + the small payload + pipelining, exactly the regime that wins those cells.
+      (The 2026-07-03 good-ring split showed routing matched rounds as 1-wide TREES paid the manual
+      off-flash kernel + trunk re-feed + wider aux for zero accept gain: 199-303ms/round vs 139ms,
+      ctx-8k-quote 5.1 vs 11.8 tok/s. And both arms ran depth-1, leaving the α≈0.97 streaks unpipelined.)
+    * n-gram MISS (novel/reasoning) -> ONE synchronous EAGLE tree round: top-M best-first tree
+      (M25_TREE_M nodes, M25_TREE_TOPB children, M25_TREE_DEPTH cap) verified in one forward under an
+      ancestor-only mask (run_block_tree); tree_greedy_walk commits the longest path + 1 correction/bonus.
+      Tree rounds stay depth-1 structurally (EAGLE needs the verified hidden to draft the next round).
 
-    GREEDY / LOSSLESS by construction (the ring greedy-verifies every node; the tree only changes WHICH
-    tokens are proposed). CORRECTNESS GATE: with M25_TREE_TOPB=1 the tree degenerates to a single chain and
-    the committed output must byte-match chain-EAGLE greedy (same-kernel caveat: attn_tree is the manual
-    reference kernel, so gate against M25_SDPA=0 stages or accept rare near-tie argmax flips). Prefill, the
-    receipts sweep and the return-dict shape are identical to coordinate_pipe (honest_bench parses it the
-    same; receipts stay ON so the tree A/B carries the same attestation cost as the chain)."""
+    KV DIRTY-FRONTIER CONTRACT (the cross-mode bookkeeping): a tree round leaves the newly committed
+    path's KV rows dirty (they were tree nodes at scattered slots), tracked as `pending_path` @ vbase.
+    The NEXT frame must re-feed them: a tree round re-feeds them as its causal trunk (as before); the
+    FIRST chain frame of a burst prepends them as a causal prefix (start=vbase, accept offset L-1).
+    After any chain commit the only dirty token is `cur` (a correction/bonus is never an input until
+    re-sent), so pending_path collapses to [cur] — which makes the burst's first frame IDENTICAL to
+    coordinate_pipe's standard [anchor]+draft frame. The fake-ring harness models this frontier and
+    asserts no frame ever writes past a KV gap.
+
+    GREEDY / LOSSLESS by construction on BOTH routes (the ring greedy-verifies every proposed token;
+    routing only changes WHICH tokens are proposed and how many frames are in flight). Prefill, the
+    receipts sweep and the return-dict shape are identical to coordinate_pipe."""
     from tree_spec import tree_greedy_walk
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
@@ -444,38 +453,96 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         prefill_s = time.time() - t_pf
         out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
-        rounds = 0; total_committed = 0; t0 = time.time(); done = False
+        rounds = 0; total_committed = 0; wasted = 0; t0 = time.time(); done = False
         ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
+        inflight = []                                       # chain-burst frames: (off, start, ds, t_sent)
+        discard = 0                                         # stale in-flight replies after a mid-burst divergence
+        dprefix = None                                      # committed + speculative tokens (slot i == dprefix[i]); None = rebuild
+        send_pos = 0                                        # slot of the NEXT plain frame's anchor (dprefix[-1])
+        refeed = True                                       # pending_path KV is dirty (post-prefill / post-tree round)
         while not done:
-            L = len(pending_path)
-            td = time.time()
-            tree = None
-            if ng is not None:                              # HYBRID routing, same split as the chain path: n-gram
-                ng.request(prompt_ids + out, K)             # FIRST, K draft tokens (verbatim runs are long — do
-                ds = ng.fetch()                             # NOT cap at tree_depth; the fake-ring harness showed
-                if ds and getattr(ng, "matched", False):    # tree_depth<K silently halves the n-gram g). Miss -> EAGLE tree.
-                    tree = {"tokens": list(ds), "parents": [-1] + list(range(len(ds) - 1)),
-                            "depths": list(range(1, len(ds) + 1))}   # a matched n-gram chain IS a 1-wide tree
-            if tree is None:
+            # ---- FILL: keep plain chain frames in flight while the n-gram matches -------------------
+            while len(inflight) < depth and not done:
+                if dprefix is None:
+                    dprefix = list(gen_ids) + out
+                d = None
+                if ng is not None:
+                    td = time.time()
+                    ng.request(dprefix, K)
+                    d0 = ng.fetch()
+                    t_draft += time.time() - td
+                    if d0 and getattr(ng, "matched", False):
+                        d = list(d0)
+                if d is None:
+                    break                                   # novel text -> tree round (or drain what's in flight)
+                if refeed:                                  # first frame after prefill/tree: re-feed the dirty path
+                    ids = list(pending_path) + d; start = vbase; off = len(pending_path) - 1
+                    refeed = False
+                else:
+                    ids = [dprefix[-1]] + d; start = send_pos; off = 0
+                t_sent = time.monotonic()                   # traversal origin: includes the outbound serialize
+                send_msg(pipe_sock, {"op": "verify", "token_ids": ids, "start": start})
+                inflight.append((off, start, d, t_sent))
+                dprefix = dprefix + d; send_pos = start + off + K   # next anchor = dprefix[-1]'s slot
+            if not inflight:
+                # ---- NOVEL: one synchronous EAGLE tree round ---------------------------------------
+                L = len(pending_path)
+                td = time.time()
                 tree = eg.propose_tree(tree_m, topb=tree_topb, max_depth=tree_depth)
-            t_draft += time.time() - td
-            token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
-            t_sent = time.monotonic()                           # traversal origin: includes the outbound serialize
-            send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
-                                 "parents": parents, "pos_ids": pos_ids, "start": vbase})
+                t_draft += time.time() - td
+                token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
+                t_sent = time.monotonic()
+                send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
+                                     "parents": parents, "pos_ids": pos_ids, "start": vbase})
+                tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+                t_trav += time.monotonic() - t_sent         # depth-1: this IS the clean per-round T_traversal
+                s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+                r, aux = _unpack(resp)
+                path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
+                out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
+                # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
+                # accepted path node (flat node L+path_idx[k-1]). Slice to len(committed) (== 1+len(path_idx)).
+                pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
+                eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos
+                rounds += 1; total_committed += len(committed)
+                refeed = True; dprefix = None               # the committed path's KV rows are tree nodes -> dirty
+                if on_commit: on_commit(out, time.time() - t0)
+                if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+                continue
+            # ---- BURST REPLY: same accept/divergence bookkeeping as coordinate_pipe ----------------
             tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
-            t_trav += time.monotonic() - t_sent                 # depth-1: this IS the clean per-round T_traversal
-            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
             r, aux = _unpack(resp)
-            path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
-            out.extend(committed); vbase += L; pending_path = committed; cur = committed[-1]
-            # EAGLE extend: committed[0] predicted by the anchor (flat node L-1); committed[k>0] by the (k-1)-th
-            # accepted path node (flat node L+path_idx[k-1]). Slice to len(committed) (== 1+len(path_idx)).
-            pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]
-            eg.extend(committed, _eagle_aux_nodes(aux, pred_idx), base_pos=vbase - 1)   # base_pos = anchor's abs pos (predicting hidden), per the extend contract & the chain path
-            rounds += 1; total_committed += len(committed)
-            if on_commit: on_commit(out, time.time() - t0)           # stream: this round's running output
+            off, start, ds, t_sent = inflight.pop(0)
+            t_trav += time.monotonic() - t_sent             # count discarded chunks too — they traversed
+            s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+            if discard > 0:
+                discard -= 1; wasted += 1; continue
+            n = 0
+            for j in range(K):
+                if ds[j] == r[off + j]: n += 1
+                else: break
+            rounds += 1
+            if n == K:
+                committed = list(ds)
+                if not inflight and len(r) > off + K:       # full-accept bonus, same rule as coordinate_pipe:
+                    committed.append(r[off + K])            # only when nothing queued re-derives that position
+                    dprefix = dprefix + [r[off + K]]; send_pos += 1
+            else:
+                committed = ds[:n] + [r[off + n]]
+                discard = len(inflight)                     # everything in flight speculated past the divergence
+            out.extend(committed); cur = committed[-1]
+            total_committed += len(committed)
+            # the only dirty token after a chain commit is cur (a correction/bonus was never an input);
+            # the next plain frame re-sends it as its anchor, so bursts continue with standard framing.
+            vbase = start + off + len(committed); pending_path = [cur]
+            if n < K:
+                dprefix = list(gen_ids) + out; send_pos = vbase   # next anchor = cur @ its own slot
+            if aux is not None:                             # burst frames carry aux rows per frame position:
+                eg.extend(committed, _eagle_aux_range(aux, off, off + len(committed)), base_pos=start + off)
+            if on_commit: on_commit(out, time.time() - t0)
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+        while inflight:                                     # drain replies for frames sent past the finish
+            recv_msg(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
     except EDGE_ERRORS as e:
@@ -493,7 +560,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     accepted = total_committed - rounds                     # accept per round = len(committed)-1 (the +1 is the correction/bonus)
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": rounds,
             "mean_accept": accepted / max(rounds, 1), "toks_per_traversal": total_committed / max(rounds, 1),
-            "tok_s": len(out) / max(dt, 1e-9), "wasted": 0, "prefill_s": prefill_s, "output_ids": out,
+            "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
