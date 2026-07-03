@@ -18,7 +18,7 @@
   #v(0.8em)
   #text(size: 10.5pt)[leyten · #link("https://c0mpute.ai")[c0mpute]]
   #v(0.2em)
-  #text(size: 9pt, fill: gray)[July 2026 · code, receipts and raw measurements: #link("https://github.com/leyten/shard")[github.com/leyten/shard]]
+  #text(size: 9pt, fill: gray)[July 2026 · #link("https://doi.org/10.5281/zenodo.21178431")[doi:10.5281/zenodo.21178431] · code, receipts and raw measurements: #link("https://github.com/leyten/shard")[github.com/leyten/shard]]
 ]
 #v(1em)
 
