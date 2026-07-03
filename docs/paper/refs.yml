@@ -6,12 +6,6 @@ borzunov2022petals:
   serial-number:
     arxiv: "2209.01188"
 
-dolphin2025:
-  type: report
-  title: "Distributed Model Sharding"
-  author: "Dolphin AI"
-  date: 2026
-  note: "Industry technical report; two-node RTX A6000 pipeline/tensor-parallel benchmark study"
 
 leviathan2023:
   type: article
