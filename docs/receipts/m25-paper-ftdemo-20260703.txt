@@ -1,0 +1,48 @@
+[0s] === job1: baseline (fresh warm ring, first coordinator) ===
+[14s] [coord] 55tok  14.74 tok/s  g=6.00  mean_accept=5.00/8  prefill=1.69s  depth=4
+[14s] [coord] OUTPUT:
+[14s] 
+[14s] === job2: coordinator KILLED mid-decode (kill -9 via timeout) ===
+[31s] [coord] pipelined (K=8 depth=4 ngram=3) -> head 127.0.0.1:29610, ret 127.0.0.1:29612
+[31s] [eagle] head loaded from /root/m25-eagle + M2.5 embed on cuda
+[31s] (killed; ring must recover on its own — NO re-warm)
+[34s] 
+[34s] === job3: new coordinator on the SAME ring (the old code wedged here) ===
+[48s] [coord] 49tok  8.99 tok/s  g=3.00  mean_accept=2.00/8  prefill=1.38s  depth=4
+[48s] [coord] OUTPUT:
+[48s] 
+[48s] === job4: receipts PROVE with true-depth coverage (62) ===
+[60s] [coord] 37tok  14.18 tok/s  g=5.29  mean_accept=4.29/8  prefill=1.36s  depth=4
+[60s] 
+[60s] === stage logs: recovery lines across the ring ===
+[61s] --- iid 43696900 ---
+[64s] [s0] forward link rebuilt -> 127.0.0.1:29611
+[64s] [s0] edge closed (ConnectionError); reset + drop forward link
+[64s] [s0] forward link rebuilt -> 127.0.0.1:29611
+[64s] [s0] edge closed (ConnectionError); reset + drop forward link
+[64s] [s0] forward link rebuilt -> 127.0.0.1:29611
+[65s] --- iid 43696887 ---
+[67s] [s1] forward link rebuilt -> 127.0.0.1:29611
+[67s] [s1] edge closed (ConnectionError); reset + drop forward link
+[67s] [s1] forward link rebuilt -> 127.0.0.1:29611
+[67s] [s1] edge closed (ConnectionError); reset + drop forward link
+[67s] [s1] forward link rebuilt -> 127.0.0.1:29611
+[68s] --- iid 43696869 ---
+[70s] [s2] forward link rebuilt -> 127.0.0.1:29611
+[70s] [s2] edge closed (ConnectionError); reset + drop forward link
+[70s] [s2] forward link rebuilt -> 127.0.0.1:29611
+[70s] [s2] edge closed (ConnectionError); reset + drop forward link
+[70s] [s2] forward link rebuilt -> 127.0.0.1:29611
+[71s] --- iid 43696886 ---
+[74s] [s3] forward link rebuilt -> 127.0.0.1:29611
+[74s] [s3] edge closed (ConnectionError); reset + drop forward link
+[74s] [s3] forward link rebuilt -> 127.0.0.1:29611
+[74s] [s3] edge closed (ConnectionError); reset + drop forward link
+[74s] [s3] forward link rebuilt -> 127.0.0.1:29611
+[75s] --- iid 43696878 ---
+[77s] [tail] predecessor edge closed (ConnectionError); re-accepting both channels
+[77s] [tail] predecessor edge closed (ConnectionError); re-accepting both channels
+[77s] [tail] predecessor edge closed (ConnectionError); re-accepting both channels
+[77s] [tail] predecessor edge closed (ConnectionError); re-accepting both channels
+[77s] 
+[77s] SMOKE VERDICT: job3 completing + recovery lines above = wedge fixed.
