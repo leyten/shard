@@ -13,7 +13,40 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ PRIMARY FOCUS (leyten, 2026-07-02 night): BREAK THE ~5 tok/s REASONING FLOOR — step back, find the lever or the breakthrough
+### ⇒ 2026-07-03: THE GOOD-RING RECEIPT IS BANKED — 10-11 tok/s interactive reasoning MEASURED; fork resolved: path (a) EXECUTE
+leyten picked **(a)**: execute to the ceiling, declare the honest number, re-point the perf narrative at
+batched 155 agg + draftable/agentic. The receipt run happened same evening (receipt
+`docs/receipts/m25-goodring-receipt-20260703.md` + the two arm JSONs; ~$6 spent, ~$100-mandate has ~$30 used):
+- **RTT-measured, select_ring-planned 5-stage EU ring** (scratchpad/ring_up.py: pool→mesh-RTT→select_ring→
+  ranged pull; head-first orientation FIXED in shard/topology.py — the old order was undeployable).
+  Loop RTT ≈105ms. Both report arms on ONE warm ring, receipts verified per cell.
+- **Numbers: chain 8.3 decode-weighted / tree 7.83 / per-cell-best 9.11; interactive novel cells (tree):
+  reason-math 10.0, reason-logic 10.1, agentic 11.2, conversation 9.28.** The "10-12" projection is now
+  MEASURED. Tree wins every interactive cell; depth-4 pipelined n-gram wins every verbatim/ctx cell (fast
+  ring ⇒ pipelining pays) — chain took the aggregate, so **depth-aware hybrid is the #1 code lever** (~+1 aggregate).
+- **First transport/compute split (M25_STAGE_TIMING, landed on the branch): transport 55-68% of T_traversal
+  (~170-290ms vs ~105ms RTT floor); stage compute ≈138ms NOT ~40ms.** And the compute is
+  **CPU-KERNEL-LAUNCH-BOUND, not GPU-bound**: identical 5090s (1525GB/s, ~220TF all five), but idle
+  Core-Ultra boxes run 13 layers in 11.5ms while loaded/old EPYC slices take 35-50ms (pyloop 0.09s vs
+  0.28-0.47s, one spare at load-average 272). Consequences: (1) box selection must probe single-thread
+  CPU+load (ring_up now does, crude factor); (2) **CUDA-graphs are UN-DEAD for scattered rings** — the
+  ~1.05× dead-end verdict came from a fast-CPU box; on EPYC slices graphs recover ~2-4× of block time, but
+  GraphRunner must learn to emit EAGLE aux (python side-effect — graphs skip it today). Scoped code task.
+- **NEXT SESSION, in order:** (1) **depth-aware hybrid** (pipeline n-gram rounds at depth, tree rounds sync;
+  CPU-testable on the fake ring; ~8.3→9.1). (2) **CUDA-graph aux compatibility** (+20-30% on slow-CPU boxes,
+  makes the ring CPU-agnostic). (3) **lean codec / thin-TCP** (transport 55-68% measured — up to +20-30%).
+  Stacked honest ceiling on this ring class: **~12-14 interactive**. (4) then TIER-2 trust (receipt
+  freshness/binding) + TIER-3 gateway/wire hardening = the betanet-integration path.
+- **RING IS WARM (7 boxes, ~$3.6/hr): 5-stage ring CZ900(head)/CZ887/CH/NO/DK + spares IT/HU** (GB spare
+  destroyed, load-272 dud). iids 43696900,43696887,43696869,43696886,43696878 + 43696880,43696881. Head ssh
+  ssh3.vast.ai:16900; drive reports as SOLE coordinator on the head (report_chain/report_tree.log there).
+  Same-ring re-measure after the hybrid lands = clean A/B/C.
+- Branch `perf/tree-depth-hybrid` (9 commits, pushed): fake-ring harness + bonus/honest-g + usability
+  harness + panel docs + **M25_STAGE_TIMING** + **topology head-first fix**. PR NOT yet open (no gh token
+  on this box): leyten one-clicks github.com/leyten/shard/compare/master...perf/tree-depth-hybrid.
+
+*(2026-07-02 night panel verdict — the physics this receipt confirms, kept for the record:)*
+### PRIOR FOCUS: BREAK THE ~5 tok/s REASONING FLOOR — step back, find the lever or the breakthrough
 leyten is not satisfied with ~5 tok/s single-stream reasoning and wants this to be THE focus: take a step
 back, think from first principles, decide whether we're missing something buildable or need a genuine
 breakthrough. **Do NOT resume by grinding TIER-1 cleanup — resume HERE.**
