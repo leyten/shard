@@ -18,7 +18,7 @@ internet RTT is asymmetric and doesn't track geography (peering), so we optimize
 both take L (L[i][j] = ms from node i to node j, asymmetric ok), c_out (coordinator->i),
 c_in (i->coordinator). pure python, no deps; run `python -m shard.topology` for a demo.
 """
-from itertools import combinations
+from itertools import combinations, permutations
 
 INF = float("inf")
 _TRIM = 12          # max candidates fed to exhaustive Held-Karp; the network layer funnels bigger pools first
@@ -232,6 +232,24 @@ def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms):
     return roles
 
 
+def _head_first(order, head, L, c_out, c_in):
+    """Deployable orientation: the coordinator lives ON the head box, so the launcher needs the ring
+    path to START at `head` (stage 0 is dialed locally; the head sidecar carries the coord-return to
+    the tail). optimal_loop models the coordinator only through c_out/c_in and may legally end the
+    path at `head` — or even place it mid-path under asymmetric matrices — which is undeployable.
+    Re-solve the ordering with head PINNED FIRST: exhaustive for ring-sized k (<=5040 orders; the
+    trim funnel keeps pools small and rings are ~5-8 nodes). No blind reversal: under the aware
+    matrices (upload rides FORWARD edges by sender) a mirrored path does NOT cost the same."""
+    if order[0] == head:
+        return list(order)
+    rest = [n for n in order if n != head]
+    if len(rest) <= 7:
+        best = min(permutations(rest), key=lambda p: loop_cost([head, *p], L, c_out, c_in))
+        return [head, *best]
+    cand = ([head] + rest, [head] + rest[::-1])                 # oversize fallback (unreachable via the funnel)
+    return list(min(cand, key=lambda p: loop_cost(p, L, c_out, c_in)))
+
+
 def node_capacity(free_vram_mb, layer_vram_mb, kv_mb_per_layer=0):
     """max contiguous layers a node can hold (weights + KV cache), >= 0."""
     per = layer_vram_mb + kv_mb_per_layer
@@ -296,7 +314,8 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
       (+ prefill_ms, request_ms, roles:{dropped_node: role}  when up_mbps is given).
     `require` pins a node that MUST be in the ring (our coordinator runs on the head box, so for
     that deployment pass the head node and set c_out/c_in relative to it -> the loop becomes the
-    correct head->...->tail->head cycle). `exclude` drops nodes outright. NOTE: `slack` is the pool
+    correct head->...->tail->head cycle, and the returned order is GUARANTEED to start at `require`
+    — the launcher puts the coordinator on order[0]'s box, so any other orientation is undeployable). `exclude` drops nodes outright. NOTE: `slack` is the pool
     headroom you rented (N+slack) — selection can only drop bad nodes when the pool exceeds what the
     model strictly needs. Assumes the pool is already pre-filtered to a tractable candidate set (the
     network layer funnels thousands -> ~16 via latency coordinates before calling this); if larger,
@@ -386,6 +405,9 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
                     continue
                 order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
+                if require is not None and order[0] != require:  # deployable orientation: coord box = stage 0
+                    order = (_head_first(order, require, EL, Eout, Ein) if aware
+                             else _head_first(order, require, L, c_out, c_in))
                 alloc = assign_layers(order, n_layers, {n: caps[n] for n in subset}, layer_ms)
                 if alloc is None:
                     continue
