@@ -168,7 +168,39 @@ def fig_split(bench="m25-paper-bench-20260703.json"):
     print("fig_split.pdf")
 
 
+# ---- fig 0: page-one hero — decode throughput by serving mode ----------------------------------
+def fig_hero():
+    """The scroller's chart: four modes, one axis, measured numbers. Bar length is the top measured
+    median per mode; the caption in main.typ carries the ranges and receipts."""
+    rows = [  # (label, value, sublabel, color)
+        ("no speculation\n(the latency wall)", 5.0, "5.0 tok/s", "#8a897f"),
+        ("interactive reasoning\nsingle stream", 12.6, "12.6 tok/s", C["ar"]),
+        ("draftable text\nsingle stream", 87.2, "87.2 tok/s", C["chain"]),
+        ("batched, 4 streams\naggregate", 194.0, "194 tok/s", C["hybrid"]),
+    ]
+    fig, ax = plt.subplots(figsize=(6.4, 2.6))
+    ys = range(len(rows))
+    for y, (lab, v, sub, col) in enumerate(rows):
+        ax.barh(y, v, height=0.62, color=col, zorder=3)
+        ax.annotate(sub, (v, y), xytext=(6, 0), textcoords="offset points",
+                    va="center", fontsize=10.5, fontweight="bold", color=INK)
+    ax.set_yticks(list(ys))
+    ax.set_yticklabels([r[0] for r in rows], fontsize=9)
+    ax.invert_yaxis()
+    ax.set_xlim(0, 225)
+    ax.set_xlabel("decode tokens / second — 229B MoE across five countries, receipts on", fontsize=9)
+    ax.grid(axis="x", color="#e4e3da", lw=0.5, zorder=0)
+    ax.set_axisbelow(True)
+    for sp in ("top", "right", "left"):
+        ax.spines[sp].set_visible(False)
+    ax.tick_params(left=False)
+    fig.tight_layout()
+    fig.savefig("fig_hero.pdf")
+    print("fig_hero.pdf")
+
+
 if __name__ == "__main__":
+    fig_hero()
     fig_alpha_law()
     fig_arms()
     fig_split()

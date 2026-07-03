@@ -38,20 +38,11 @@
 #v(0.8em)
 
 #figure(
-  table(
-    columns: (auto, auto, auto),
-    align: (left, left, left),
-    stroke: 0.4pt + rgb("#c3c2b7"),
-    inset: 5pt,
-    [*Measurement*], [*Result*], [*Receipt*],
-    [Autoregressive baseline (no speculation)], [4.8--5.0 tok/s, every workload], [`m25-paper-bench`],
-    [Interactive reasoning, single stream], [10.7--12.6 tok/s median], [`m25-paper-bench`],
-    [Draftable text, single stream], [70.7--87.2 tok/s], [`m25-paper-ctxtable`],
-    [Batched, 4 streams, aggregate], [150--194 tok/s], [`m25-paper-ctxtable`],
-    [Verification overhead], [0.05 ms per 11.7 ms stage span], [both bench phases],
-    [Coordinator killed mid-decode], [next job completes 17 s later, no re-warm], [`m25-paper-ftdemo`],
-  ),
-  caption: [Results at a glance. One five-stage ring, greedy decoding, receipts on unless stated.]
+  image("fig_hero.pdf", width: 92%),
+  caption: [Measured decode throughput by serving mode, one five-stage ring, greedy decoding.
+  Bars show the top measured median per mode; full ranges: baseline 4.8--5.0, interactive
+  10.7--12.6, draftable 70.7--87.2, batched aggregate 150--194 tokens/s. Verification receipts on
+  (cost: 0.05 ms per 11.7 ms stage span). Receipts: `docs/receipts/m25-paper-*`.]
 )
 #v(0.5em)
 
