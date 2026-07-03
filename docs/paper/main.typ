@@ -16,9 +16,7 @@
     Speculative decoding and verifiable execution on scattered consumer GPUs
   ]
   #v(0.8em)
-  #text(size: 10.5pt)[leyten · #link("https://c0mpute.ai")[c0mpute]]
-  #v(0.2em)
-  #text(size: 9pt, fill: gray)[July 2026 · #link("https://doi.org/10.5281/zenodo.21178431")[doi:10.5281/zenodo.21178431] · code, receipts and raw measurements: #link("https://github.com/leyten/shard")[github.com/leyten/shard]]
+  #text(size: 10.5pt)[leyten · c0mpute.ai · July 3, 2026]
 ]
 #v(1em)
 
@@ -26,7 +24,7 @@
   #set text(size: 9.5pt)
   #set par(justify: true)
   *Abstract.* We serve MiniMax-M2.5, a 229B-parameter mixture-of-experts model, split across five
-  consumer RTX 5090s in five European countries. The stages share nothing but the public internet.
+  consumer RTX 5090s in five European countries. The stages are untrusted and share nothing but the public internet.
   Single-stream decoding reaches 10--13 tokens/s on interactive reasoning and 70--87 tokens/s on
   draftable text. Every request returns cryptographic receipts proving each stage did its work, at
   a measured cost of 0.4% of stage compute. We derive and validate a simple law for speculative
