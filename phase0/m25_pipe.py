@@ -946,11 +946,15 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
 
         while True:
             if pred is None:
-                # re-accept the predecessor (and the return channel unless a live one was carried over)
+                # re-accept the predecessor (and the return channel unless a live one was carried over).
+                # A carried-over live ret means a coordinator that may still push in-flight frames for the
+                # OLD (now KV-reset) job, so STAY stale until its next reset clears the session below; only a
+                # fresh ret with no prior session starts un-stale (its coordinator hellos + resets anyway).
+                carried = ret is not None
                 ret, pred, queued = _tail_accept(srv, pending, ret=ret, timeout=timeout)
                 pending = []                     # consumed (became ret/pred or were closed) — don't double-select
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
-                stale = False                    # any stale in-flight died with the old predecessor
+                stale = carried                  # carried live ret -> drop its stale in-flight until reset
                 print("[tail] predecessor + coord-return connected", flush=True)
             signer = None; job_graph = None          # job_graph: the reset's APPLIED graph arm (None = plain job)
             with torch.no_grad():
@@ -1077,22 +1081,25 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
                         _ret_send(o)
                 except EDGE_ERRORS as e:
-                    # PREDECESSOR death (ret failures are absorbed in _ret_send and never land here):
-                    # tear the session down and re-accept. The ret goes too — a reset-ok must never reach
-                    # a dead coordinator's channel — UNLESS it was JUST replaced by a reconnecting
-                    # coordinator (stale set, no reset consumed yet): then this EOF is the OLD session's
-                    # cascade arriving late, and killing the fresh ret would fail the very retry that
-                    # churn recovery exists for.
-                    keep = ret if (stale and ret is not None) else None
-                    print(f"[tail] predecessor edge closed ({type(e).__name__}); re-accepting "
-                          f"{'predecessor (fresh coord-return kept)' if keep else 'both channels'}", flush=True)
+                    # PREDECESSOR edge died (ret failures are absorbed in _ret_send, never here). This is
+                    # either the coordinator dying (cascade) OR just an INTERNAL ring leg blipping while the
+                    # coordinator is alive — and the tail cannot tell which from a bare EOF. So ALWAYS KEEP
+                    # the coordinator return channel across it: reset the KV, re-accept the predecessor (the
+                    # upstream stage re-dials), and hold the session stale so every in-flight reply is dropped
+                    # until the coordinator's next RESET re-arms it (the `stale` gate below). If the
+                    # coordinator really died, the kept ret is dead-harmless — the next _ret_send drops it, or
+                    # the reconnecting coordinator's hello_return replaces it mid-session. Closing a LIVE
+                    # coordinator's ret here (the old behaviour) forced it into a full reconnect that raced the
+                    # return-tunnel recovery and WEDGED — fatal on a permissionless ring where internal-leg
+                    # blips are the steady state. Symmetric to _ret_send's "ret dies -> keep predecessor + KV".
+                    print(f"[tail] predecessor edge closed ({type(e).__name__}); keeping coord-return, "
+                          f"re-accepting predecessor (job stale until next reset)", flush=True)
                     for L in layers:
                         L.reset()
-                    for s in (pred, None if keep else ret):
-                        if s is not None:
-                            try: s.close()
-                            except OSError: pass
-                    pred, ret = None, keep
+                    try:
+                        if pred is not None: pred.close()
+                    except OSError: pass
+                    pred = None; stale = True             # ret KEPT; `stale` drops in-flight until the reset
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
