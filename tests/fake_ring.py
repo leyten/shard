@@ -158,7 +158,7 @@ class FakeRing(threading.Thread):
                 msg = recv_msg(self.pipe)
                 op = msg.get("op")
                 if op == "reset":
-                    self.log.append({"op": "reset"})
+                    self.log.append({"op": "reset", "graph": msg.get("graph")})   # graph = per-job A/B toggle (None = absent)
                     send_msg(self.ret, "ok")
                 elif op == "receipt":
                     self.log.append({"op": "receipt"})
