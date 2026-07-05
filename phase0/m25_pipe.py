@@ -451,7 +451,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
             raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
         prefill_s = time.time() - t_pf
-        out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
+        out = resume_ids + [cur]; pending_path = [cur]; vbase = len(gen_ids)   # preserve recovered tokens; cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
         rounds = 0; total_committed = 0; accepted = 0; wasted = 0; t0 = time.time(); done = False
         ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
@@ -464,7 +464,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             # ---- FILL: keep plain chain frames in flight while the n-gram matches -------------------
             while len(inflight) < depth and not done:
                 if dprefix is None:
-                    dprefix = list(gen_ids) + out
+                    dprefix = list(prompt_ids) + out       # prompt_ids (not gen_ids): out already carries resume_ids
                 d = None
                 if ng is not None:
                     td = time.time()
@@ -538,7 +538,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             # the next plain frame re-sends it as its anchor, so bursts continue with standard framing.
             vbase = start + off + len(committed); pending_path = [cur]
             if n < K:
-                dprefix = list(gen_ids) + out; send_pos = vbase   # next anchor = cur @ its own slot
+                dprefix = list(prompt_ids) + out; send_pos = vbase   # prompt_ids (not gen_ids): out already carries resume_ids; next anchor = cur @ its own slot
             if aux is not None:                             # burst frames carry aux rows per frame position:
                 eg.extend(committed, _eagle_aux_range(aux, off, off + len(committed)), base_pos=start + off)
             if on_commit: on_commit(out, time.time() - t0)
@@ -1004,6 +1004,18 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             try: s.close()
                             except OSError: pass
                     pred, ret = None, keep
+                except Exception as e:                       # compute / bad-msg fault: reset + re-accept, do NOT kill the
+                    # stage (warm weights stay). The coordinator's in-flight reply is un-sendable, so drop BOTH channels;
+                    # it sees EOF and retries on a fresh session. specpipe kept this guard; the m25 port had dropped it,
+                    # so an over-context request or a CUDA fault took the whole ring down until manual relaunch.
+                    print(f"[tail] bad msg / compute fault ({type(e).__name__}: {str(e)[:80]}); resetting session", flush=True)
+                    for L in layers:
+                        L.reset()
+                    for s in (pred, ret):
+                        if s is not None:
+                            try: s.close()
+                            except OSError: pass
+                    pred, ret = None, None
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
@@ -1097,6 +1109,17 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     if s is not None:                 # sees EOF and cascades, so the WHOLE ring re-handshakes
                         try: s.close()                # fresh (warm weights intact) and a new coordinator can
                         except OSError: pass          # drive it — specpipe's proven recovery choreography
+                nxt_sock = None
+            except Exception as e:                    # compute / bad-msg fault: same reset, don't die (warm weights stay).
+                # A RuntimeError/CUDA fault mid-verify used to escape serve() and kill the stage; treat it exactly like an
+                # edge close so the ring re-handshakes instead of needing a relaunch (specpipe's bad-msg guard, restored).
+                print(f"[s{stage}] bad msg / compute fault ({type(e).__name__}: {str(e)[:80]}); reset + drop forward link", flush=True)
+                for L in layers:
+                    L.reset()
+                for s in (conn, nxt_sock):
+                    if s is not None:
+                        try: s.close()
+                        except OSError: pass
                 nxt_sock = None
 
 
