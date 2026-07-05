@@ -644,6 +644,13 @@ class GraphRunner:
             try:
                 self._capture(alen)
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                # A warmup/capture failure can leave SIDE-STREAM work in flight (the exception
+                # propagates before current_stream().wait_stream(side)): warmup's garbage
+                # kc.index_copy_ at [alen-s, alen) racing the eager fallback's real KV writes on the
+                # default stream would corrupt committed tokens WITH valid receipts. Drain the device
+                # BEFORE any eager work. (The `alen in self.eager` path above needs no sync: it runs
+                # no side-stream work, and the first failure already drained here.)
+                torch.cuda.synchronize()
                 self.eager.add(alen); _GRAPH_SKIPPED += 1
                 print(f"[graph] capture failed (s={self.s}, alen={alen}): {type(e).__name__}: {e} "
                       f"-> bucket marked permanently eager", flush=True)
