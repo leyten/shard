@@ -119,27 +119,64 @@ def _bucket(need):                                  # smallest decode bucket >= 
 # start_pos is carried into the graph by _GR's STATIC buffers: RoPE slice (cos/sin), index_copy_ positions
 # (cp), and a bucketed additive causal mask. Prefill stays eager; default OFF.
 #
-# ⚠️ EXPERIMENTAL / default-OFF — NOT WORTH IT ON CURRENT TORCH (measured 2026-06-28):
-#   * The GraphRunner capture/replay is CORRECT and FAITHFUL — graph vs eager-manual diff = 0.0. The masked
-#     read uses a MANUAL matmul + static additive mask (a microbench showed SDPA+dense-mask falls off flash
-#     8-14x; manual is the fastest GRAPHABLE bucketed variant, and attention is a tiny slice of the block).
-#   * BUT the whole lever only pays when kernel-LAUNCH overhead is high. On torch 2.10+cu128 a fixed-position
-#     probe hit 3.40x; on torch 2.11+cu130 the eager block is already ~3ms (launch overhead is gone) so the
-#     graph nets only ~1.05x — and the masked-read overhead (manual attn + per-call mask build) eats it.
-#     `pip install vllm` now pulls 2.11+, so deployments see ~1.05x → not worth the complexity / the
-#     non-bit-identical-to-eager-flash decode. Left here (opt-in, isolated) for high-launch-overhead torch.
-#   * The real throughput bottleneck is NOT GPU launches on current torch — it's WAN/handoff/drafting. See
-#     the profile + drafting tasks. receipts: m25-cudagraph-production / m25-attn-microbench-20260628.
+# WHEN IT PAYS (updated 2026-07-05): the lever recovers kernel-LAUNCH overhead, so its value tracks the
+# HOST CPU, not the GPU. On an idle-CPU box with torch 2.11 the eager block is already ~3ms (graph nets
+# ~1.05x — the 2026-06-28 "not worth it" verdict); but slow/contended-CPU stages measure 35-50ms/block
+# vs 11.5ms (2026-07-03 receipt: compute is CPU-kernel-launch-bound) where a replay recovers ~2-4x of
+# block time. Numerics + compatibility:
+#   * Capture/replay is CORRECT and FAITHFUL — graph vs eager-manual diff = 0.0. The masked read uses a
+#     MANUAL matmul + static additive mask (a microbench showed SDPA+dense-mask falls off flash 8-14x on
+#     sm_120; manual is the fastest GRAPHABLE bucketed variant, and attention is a tiny slice of the
+#     block). Manual is bit-identical eager-manual<->graph-manual but NOT bit-identical to the eager
+#     SDPA-flash decode — the same accepted-kernel-numerics class as fp8 wire; the ring A/B judges
+#     accept/g regression. receipts: m25-cudagraph-production / m25-attn-microbench-20260628.
+#   * M25_EAGLE is COMPATIBLE: aux capture is baked INTO the graph (a static [s,H] buffer per aux layer
+#     in _GraphState, refreshed by a CAPTURED device-side copy on every replay — see GraphRunner). The
+#     old hard SystemExit guard (stale-aux poisoning) is gone; research/graph_aux_check.py is the
+#     on-box proof (bit-equality + aux freshness across start_pos).
 M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
 if M25_CUDA_GRAPH:
     M25_STATIC_KV = True
-if M25_CUDA_GRAPH and M25_EAGLE:
-    # fail LOUD: GraphRunner replays a captured graph and never re-runs run_block's aux capture, so the
-    # EAGLE drafter would silently feed on STALE prefill aux — accept craters and the measurement lies.
-    raise SystemExit("M25_CUDA_GRAPH is incompatible with M25_EAGLE (graph replay bypasses aux capture "
-                     "-> stale aux poisons the drafter); unset one of them")
+# BOUND the capture set: each (block size s, context bucket) pair is ONE captured graph, and hybrid
+# refeed frames make s VARIABLE (K+1 up to ~K+TREE_DEPTH+2), so unbounded lazy capture could accumulate
+# graphs (each pins its own workspace memory) until the stage OOMs. M25_GRAPH_MAX caps TOTAL captured
+# graphs process-wide; past it a NEW (s,bucket) runs EAGER (silent fallback, counted in _GRAPH_SKIPPED,
+# never a crash) while already-captured shapes keep replaying. See m25_pipe._block for the routing.
+M25_GRAPH_MAX = int(os.environ.get("M25_GRAPH_MAX", "16"))
+_GRAPH_COUNT = 0        # graphs captured so far, across ALL GraphRunners in this process
+_GRAPH_SKIPPED = 0      # blocks run eager because the cap was hit or the bucket's capture failed
+# RUNTIME toggle (the per-job A/B lever): the hot path (m25_pipe._block) consults M25_CUDA_GRAPH_ACTIVE,
+# not the env constant, so ONE warm ring can interleave graph-on/graph-off arms per job — a stage
+# relaunch per arm would reintroduce the time-of-day drift the interleaved methodology exists to kill.
+# Initialized from M25_CUDA_GRAPH; flipped by set_graph() off the coordinator's reset op
+# ({"graph": true/false}; field absent = keep the current setting, so old coordinators change nothing).
+M25_CUDA_GRAPH_ACTIVE = M25_CUDA_GRAPH
 DECODE_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
 _GR = None        # active _GraphState during capture (None = eager); attn reads its static buffers
+
+
+def set_graph(on):
+    """Set the runtime graph route (reset-op plumbing). Enabling REQUIRES M25_STATIC_KV + M25_SDPA from
+    process start — the static KV buffers a graph replays into are allocated at Layer construction — so
+    an A/B ring launches with M25_STATIC_KV=1 M25_EAGLE=1 (M25_CUDA_GRAPH unset) and flips graphs per
+    job; eager-with-static-KV is bit-identical to the cat path (research/m25_statickv_test.py), keeping
+    the graph-off arm representative of master. Without the prereqs a graph=true request is REFUSED
+    loudly and ignored — never crash, never silently claim graphs. Returns the resulting setting (the
+    tail acks it back to the coordinator, which raises on a mismatch — see m25_pipe._check_reset_ack;
+    the refusal string below is GREP-STABLE ("GRAPH REFUSED") because head/middle refusals never reach
+    that ack: the bench runbook greps every stage log for it before trusting an arm)."""
+    global M25_CUDA_GRAPH_ACTIVE
+    on = bool(on)
+    if on and not (M25_STATIC_KV and M25_SDPA):
+        print("[graph] GRAPH REFUSED: reset asked graph=true but M25_STATIC_KV/M25_SDPA are off "
+              "(static buffers are allocated at Layer construction) — staying eager", flush=True)
+        return M25_CUDA_GRAPH_ACTIVE
+    if M25_CUDA_GRAPH_ACTIVE != on:
+        print(f"[graph] decode route -> {'GRAPH' if on else 'EAGER'} (per-job toggle)", flush=True)
+    M25_CUDA_GRAPH_ACTIVE = on
+    return M25_CUDA_GRAPH_ACTIVE
+
+
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
 ROUTED_SCALE = getattr(cfg, "routed_scaling_factor", 1.0)
 
@@ -524,13 +561,18 @@ class _GraphState:
     """Static per-block buffers that carry the varying start_pos INTO a captured graph: the RoPE slice
     (cos/sin), the index_copy_ write positions (cp), and the bucketed additive causal mask. set() updates
     them IN PLACE (the same addresses the graph captured), so a replay attends the correct span at the new
-    start_pos. mask is [1,1,s,alen] additive bf16 — tiny for s=K+1, so materializing it is free."""
-    def __init__(self, s, alen, rd, dv):
+    start_pos. mask is [1,1,s,alen] additive bf16 — tiny for s=K+1, so materializing it is free.
+    `aux_ids` (M25_EAGLE) adds one static [s,H] bf16 OUTPUT buffer per EAGLE aux layer in the runner's
+    range: GraphRunner._layers copy_()s each aux layer's output residual into it during capture, so the
+    copy is PART of the graph and every replay refreshes the buffer — fresh position-correct aux, never
+    the stale prefill aux that used to make M25_CUDA_GRAPH+M25_EAGLE a hard SystemExit."""
+    def __init__(self, s, alen, rd, dv, aux_ids=()):
         self.s, self.alen = s, alen
         self.cos = torch.zeros(s, rd, dtype=torch.bfloat16, device=dv)
         self.sin = torch.zeros(s, rd, dtype=torch.bfloat16, device=dv)
         self.cp = torch.zeros(s, dtype=torch.long, device=dv)
         self.mask = torch.zeros(1, 1, s, alen, dtype=torch.bfloat16, device=dv)
+        self.aux = {li: torch.zeros(s, H, dtype=torch.bfloat16, device=dv) for li in aux_ids}
         self._kpos = torch.arange(alen, device=dv).view(1, alen)
         self._ar = torch.arange(s, device=dv)
 
@@ -552,6 +594,8 @@ class GraphRunner:
         self.layers, self.vcfg, self.s, self.dv = layers, vcfg, s, dv
         self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
         self.graphs = {}                                              # bucket alen -> (graph, h_static, state, out_static)
+        self.eager = set()                                            # buckets whose capture FAILED -> permanently eager
+        self.aux_ids = [L.li for L in layers if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS]   # aux layers this stage publishes
 
     def _bucket(self, total):
         for b in DECODE_BUCKETS:
@@ -560,15 +604,18 @@ class GraphRunner:
         return M25_KV_MAXLEN
 
     def _layers(self, h):
+        st = _GR                                                     # the _GraphState being captured (set by _capture)
         for L in self.layers:
             h = L.forward(h, 0, (self.cos, self.sin))                # start_pos unused in graph mode (attn reads _GR)
+            if L.li in st.aux:                                       # EAGLE aux: a device-side copy into the static
+                st.aux[L.li].copy_(h[0])                             # buffer, CAPTURED -> every replay refreshes it
         return h
 
     def _capture(self, alen):
         from vllm.forward_context import set_forward_context
-        global _GR
+        global _GR, _GRAPH_COUNT
         h = (torch.randn(1, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)   # static input buffer
-        st = _GraphState(self.s, alen, self.rd, self.dv)
+        st = _GraphState(self.s, alen, self.rd, self.dv, self.aux_ids)
         st.set(alen - self.s, self.cos, self.sin)                    # capture-time start_pos (total == alen)
         _GR = st
         try:
@@ -583,17 +630,43 @@ class GraphRunner:
         finally:
             _GR = None                                               # capture done; attn back to eager for prefill
         self.graphs[alen] = (g, h, st, out)
+        _GRAPH_COUNT += 1                                            # counts against the process-wide M25_GRAPH_MAX
 
     def run(self, start_pos, x):
         """Run one verify/decode block at start_pos through the graph. Returns the STATIC output buffer —
-        the caller must consume/copy it before the next run (the serve loop sends .cpu()). Eager-identical."""
+        the caller must consume/copy it before the next run (the serve loop sends .cpu()). Bit-identical
+        to eager-MANUAL attention (see the module comment for the SDPA-flash numerics class). OOM-SAFE:
+        a capture failure mid-serve marks the bucket permanently eager and falls back to run_block — a
+        stage must never die from graph capture."""
+        global _GRAPH_SKIPPED
         alen = self._bucket(start_pos + self.s)
         if alen not in self.graphs:
-            self._capture(alen)
+            if alen in self.eager:
+                _GRAPH_SKIPPED += 1
+                return run_block(self.layers, start_pos, x, self.vcfg)
+            try:
+                self._capture(alen)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                # A warmup/capture failure can leave SIDE-STREAM work in flight (the exception
+                # propagates before current_stream().wait_stream(side)): warmup's garbage
+                # kc.index_copy_ at [alen-s, alen) racing the eager fallback's real KV writes on the
+                # default stream would corrupt committed tokens WITH valid receipts. Drain the device
+                # BEFORE any eager work. (The `alen in self.eager` path above needs no sync: it runs
+                # no side-stream work, and the first failure already drained here.)
+                torch.cuda.synchronize()
+                self.eager.add(alen); _GRAPH_SKIPPED += 1
+                print(f"[graph] capture failed (s={self.s}, alen={alen}): {type(e).__name__}: {e} "
+                      f"-> bucket marked permanently eager", flush=True)
+                return run_block(self.layers, start_pos, x, self.vcfg)
         g, h, st, out = self.graphs[alen]
         st.set(start_pos, self.cos, self.sin)                        # update varying-start_pos buffers IN PLACE
         h.copy_(x)
         g.replay(); torch.cuda.synchronize()
+        # Publish this replay's aux (M25_EAGLE), mirroring run_block's _AUX contract. _AUX[li] ALIASES
+        # the static buffer (no clone): the serve loop consumes _AUX synchronously via _merge_aux
+        # (immediate .cpu()/fp8-pack) before the next replay can overwrite it.
+        for li in self.aux_ids:
+            _AUX[li] = st.aux[li]
         return out
 
 
