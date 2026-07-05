@@ -451,7 +451,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
             raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
         prefill_s = time.time() - t_pf
-        out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
+        out = resume_ids + [cur]; pending_path = [cur]; vbase = len(gen_ids)   # preserve recovered tokens; cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
         rounds = 0; total_committed = 0; accepted = 0; wasted = 0; t0 = time.time(); done = False
         ng = getattr(local_draft, "ngram", None)            # HybridDrafter's n-gram half (None on a bare EagleDrafter)
@@ -464,7 +464,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             # ---- FILL: keep plain chain frames in flight while the n-gram matches -------------------
             while len(inflight) < depth and not done:
                 if dprefix is None:
-                    dprefix = list(gen_ids) + out
+                    dprefix = list(prompt_ids) + out       # prompt_ids (not gen_ids): out already carries resume_ids
                 d = None
                 if ng is not None:
                     td = time.time()
@@ -538,7 +538,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             # the next plain frame re-sends it as its anchor, so bursts continue with standard framing.
             vbase = start + off + len(committed); pending_path = [cur]
             if n < K:
-                dprefix = list(gen_ids) + out; send_pos = vbase   # next anchor = cur @ its own slot
+                dprefix = list(prompt_ids) + out; send_pos = vbase   # prompt_ids (not gen_ids): out already carries resume_ids; next anchor = cur @ its own slot
             if aux is not None:                             # burst frames carry aux rows per frame position:
                 eg.extend(committed, _eagle_aux_range(aux, off, off + len(committed)), base_pos=start + off)
             if on_commit: on_commit(out, time.time() - t0)
