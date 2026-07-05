@@ -713,15 +713,22 @@ def _tail_logits(h, parts):
 
 def _block(grs, layers, start, x, vcfg):
     """Run one block. Route fixed-shape verify/decode blocks (small s = K+1) through a lazily-captured
-    CUDA graph when M25_CUDA_GRAPH (the proven 3.4x lever); prefill (large s) stays eager. grs caches one
-    GraphRunner per block size. The graphed path is bit-equivalent to run_block (proven), so receipts +
-    spec-decode losslessness are preserved."""
+    CUDA graph when M25_CUDA_GRAPH (recovers per-kernel launch overhead — the 35-50ms/block slow-CPU-stage
+    lever); prefill (large s) stays eager. grs caches one GraphRunner per block size; each (s, bucket)
+    pair is ONE captured graph and hybrid refeed frames make s variable, so a NEW pair is captured only
+    while the process-wide S.M25_GRAPH_MAX budget lasts — past it (and after a failed capture, inside
+    run()) the block runs EAGER: silent, counted, never fatal. The graphed path is bit-equivalent to
+    eager-MANUAL attention (proven), so receipts + spec-decode losslessness are preserved; vs the eager
+    SDPA-flash path it is the same accepted-kernel-numerics class as fp8 wire (the ring A/B judges
+    accept/g)."""
     if S.M25_CUDA_GRAPH and x.shape[1] <= 64:
         s = x.shape[1]
         gr = grs.get(s)
         if gr is None:
             grs[s] = gr = S.GraphRunner(layers, vcfg, s)
-        return gr.run(start, x)
+        if gr._bucket(start + s) in gr.graphs or S._GRAPH_COUNT < S.M25_GRAPH_MAX:
+            return gr.run(start, x)                 # replay, or capture within budget (OOM-safe in run())
+        S._GRAPH_SKIPPED += 1                       # budget spent: new (s,bucket) shapes run eager
     return S.run_block(layers, start, x, vcfg)
 
 

@@ -137,6 +137,14 @@ def _bucket(need):                                  # smallest decode bucket >= 
 M25_CUDA_GRAPH = os.environ.get("M25_CUDA_GRAPH", "0") != "0"
 if M25_CUDA_GRAPH:
     M25_STATIC_KV = True
+# BOUND the capture set: each (block size s, context bucket) pair is ONE captured graph, and hybrid
+# refeed frames make s VARIABLE (K+1 up to ~K+TREE_DEPTH+2), so unbounded lazy capture could accumulate
+# graphs (each pins its own workspace memory) until the stage OOMs. M25_GRAPH_MAX caps TOTAL captured
+# graphs process-wide; past it a NEW (s,bucket) runs EAGER (silent fallback, counted in _GRAPH_SKIPPED,
+# never a crash) while already-captured shapes keep replaying. See m25_pipe._block for the routing.
+M25_GRAPH_MAX = int(os.environ.get("M25_GRAPH_MAX", "16"))
+_GRAPH_COUNT = 0        # graphs captured so far, across ALL GraphRunners in this process
+_GRAPH_SKIPPED = 0      # blocks run eager because the cap was hit or the bucket's capture failed
 DECODE_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
 _GR = None        # active _GraphState during capture (None = eager); attn reads its static buffers
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
@@ -556,6 +564,7 @@ class GraphRunner:
         self.layers, self.vcfg, self.s, self.dv = layers, vcfg, s, dv
         self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
         self.graphs = {}                                              # bucket alen -> (graph, h_static, state, out_static)
+        self.eager = set()                                            # buckets whose capture FAILED -> permanently eager
         self.aux_ids = [L.li for L in layers if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS]   # aux layers this stage publishes
 
     def _bucket(self, total):
@@ -574,7 +583,7 @@ class GraphRunner:
 
     def _capture(self, alen):
         from vllm.forward_context import set_forward_context
-        global _GR
+        global _GR, _GRAPH_COUNT
         h = (torch.randn(1, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)   # static input buffer
         st = _GraphState(self.s, alen, self.rd, self.dv, self.aux_ids)
         st.set(alen - self.s, self.cos, self.sin)                    # capture-time start_pos (total == alen)
@@ -591,14 +600,27 @@ class GraphRunner:
         finally:
             _GR = None                                               # capture done; attn back to eager for prefill
         self.graphs[alen] = (g, h, st, out)
+        _GRAPH_COUNT += 1                                            # counts against the process-wide M25_GRAPH_MAX
 
     def run(self, start_pos, x):
         """Run one verify/decode block at start_pos through the graph. Returns the STATIC output buffer —
         the caller must consume/copy it before the next run (the serve loop sends .cpu()). Bit-identical
-        to eager-MANUAL attention (see the module comment for the SDPA-flash numerics class)."""
+        to eager-MANUAL attention (see the module comment for the SDPA-flash numerics class). OOM-SAFE:
+        a capture failure mid-serve marks the bucket permanently eager and falls back to run_block — a
+        stage must never die from graph capture."""
+        global _GRAPH_SKIPPED
         alen = self._bucket(start_pos + self.s)
         if alen not in self.graphs:
-            self._capture(alen)
+            if alen in self.eager:
+                _GRAPH_SKIPPED += 1
+                return run_block(self.layers, start_pos, x, self.vcfg)
+            try:
+                self._capture(alen)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                self.eager.add(alen); _GRAPH_SKIPPED += 1
+                print(f"[graph] capture failed (s={self.s}, alen={alen}): {type(e).__name__}: {e} "
+                      f"-> bucket marked permanently eager", flush=True)
+                return run_block(self.layers, start_pos, x, self.vcfg)
         g, h, st, out = self.graphs[alen]
         st.set(start_pos, self.cos, self.sin)                        # update varying-start_pos buffers IN PLACE
         h.copy_(x)
