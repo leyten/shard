@@ -124,6 +124,7 @@ class FakeRing(threading.Thread):
         self.stage_dt = stage_dt                    # [[stage, span_ms, comp_ms], ...] on every verify reply,
         self.log = []                               # mirroring stages under M25_STAGE_TIMING (bare list -> dict)
         self.error = None
+        self._job_graph = None                      # the reset's graph field (per-job A/B arm) — the tail's job_graph
         # KV dirty-frontier model: `clean` = first slot NOT yet written by a causal frame. A chain/prefill
         # frame writes [start, start+n) and requires start <= clean (a gap means the coordinator relied on
         # KV the ring never wrote — the cross-mode hybrid bug class). A TREE frame's causal trunk advances
@@ -158,11 +159,18 @@ class FakeRing(threading.Thread):
                 msg = recv_msg(self.pipe)
                 op = msg.get("op")
                 if op == "reset":
-                    self.log.append({"op": "reset", "graph": msg.get("graph")})   # graph = per-job A/B toggle (None = absent)
-                    send_msg(self.ret, "ok")
+                    self._job_graph = msg.get("graph")      # per-job A/B toggle (None = absent)
+                    self.log.append({"op": "reset", "graph": self._job_graph})
+                    # mirror the tail's ack contract: a graph-stamped reset acks the APPLIED route +
+                    # counters (the fake always applies as asked); plain resets keep the bare "ok"
+                    send_msg(self.ret, "ok" if self._job_graph is None else
+                             {"ok": 1, "graph": bool(self._job_graph), "graph_captured": 0, "graph_skipped": 0})
                 elif op == "receipt":
                     self.log.append({"op": "receipt"})
-                    send_msg(self.ret, msg.get("receipts", []))
+                    rec = msg.get("receipts", [])           # graph-A/B jobs get the dict-promoted reply, like the tail
+                    send_msg(self.ret, rec if self._job_graph is None else
+                             {"receipts": rec, "graph": bool(self._job_graph),
+                              "graph_captured": 0, "graph_skipped": 0})
                 elif op == "verify":
                     s = int(msg["start"])
                     if s > self.clean:

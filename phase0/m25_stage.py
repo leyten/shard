@@ -161,12 +161,15 @@ def set_graph(on):
     an A/B ring launches with M25_STATIC_KV=1 M25_EAGLE=1 (M25_CUDA_GRAPH unset) and flips graphs per
     job; eager-with-static-KV is bit-identical to the cat path (research/m25_statickv_test.py), keeping
     the graph-off arm representative of master. Without the prereqs a graph=true request is REFUSED
-    loudly and ignored — never crash, never silently claim graphs. Returns the resulting setting."""
+    loudly and ignored — never crash, never silently claim graphs. Returns the resulting setting (the
+    tail acks it back to the coordinator, which raises on a mismatch — see m25_pipe._check_reset_ack;
+    the refusal string below is GREP-STABLE ("GRAPH REFUSED") because head/middle refusals never reach
+    that ack: the bench runbook greps every stage log for it before trusting an arm)."""
     global M25_CUDA_GRAPH_ACTIVE
     on = bool(on)
     if on and not (M25_STATIC_KV and M25_SDPA):
-        print("[graph] reset asked graph=true but M25_STATIC_KV/M25_SDPA are off (static buffers are "
-              "allocated at Layer construction) — REFUSED, staying eager", flush=True)
+        print("[graph] GRAPH REFUSED: reset asked graph=true but M25_STATIC_KV/M25_SDPA are off "
+              "(static buffers are allocated at Layer construction) — staying eager", flush=True)
         return M25_CUDA_GRAPH_ACTIVE
     if M25_CUDA_GRAPH_ACTIVE != on:
         print(f"[graph] decode route -> {'GRAPH' if on else 'EAGER'} (per-job toggle)", flush=True)

@@ -67,6 +67,7 @@ def graph_env(monkeypatch):
     monkeypatch.setattr(S, "_GRAPH_SKIPPED", 0)
     monkeypatch.setattr(S, "GraphRunner", FakeGR)
     monkeypatch.setattr(S, "run_block", fake_run_block)
+    monkeypatch.setattr(MP, "_GRAPH_CAP_LOGGED", set())
     FakeGR.made = []
     return eager_calls
 
@@ -93,7 +94,7 @@ def test_prefill_stays_eager(graph_env):
     assert graph_env == [(128, 0)] and S._GRAPH_COUNT == 0
 
 
-def test_graph_cap_bounds_capture_set(graph_env):
+def test_graph_cap_bounds_capture_set(graph_env, capsys):
     grs = {}
     MP._block(grs, [], 100, _x(9), None)            # (9, 2048)  capture #1
     MP._block(grs, [], 3000, _x(9), None)           # (9, 4096)  capture #2 — budget (2) now spent
@@ -110,6 +111,10 @@ def test_graph_cap_bounds_capture_set(graph_env):
     out = MP._block(grs, [], 150, _x(9), None)      # (9, 2048) replay
     assert out == ("graph", 9, 150) and S._GRAPH_COUNT == 2
     assert graph_env == [(12, 100), (9, 10000)]
+    assert capsys.readouterr().out.count("[graph] cap:") == 2   # F3: logged once per skipped shape
+    MP._block(grs, [], 120, _x(12), None)           # repeat (12, 2048) skip: counted, NOT re-logged
+    assert S._GRAPH_SKIPPED == 3
+    assert "[graph] cap:" not in capsys.readouterr().out
 
 
 def test_graph_route_inactive_is_all_eager(graph_env, monkeypatch):
@@ -140,12 +145,23 @@ def test_set_graph_flips_block_routing(graph_env, monkeypatch):
 def test_set_graph_refused_without_static_kv(graph_env, monkeypatch, capsys):
     monkeypatch.setattr(S, "M25_STATIC_KV", False)
     monkeypatch.setattr(S, "M25_CUDA_GRAPH_ACTIVE", False)
-    MP._reset_flags({"op": "reset", "graph": True})
+    assert MP._reset_flags({"op": "reset", "graph": True}) is False   # the APPLIED value the tail acks
     assert S.M25_CUDA_GRAPH_ACTIVE is False                   # refused, ignored — never crash
-    assert "REFUSED" in capsys.readouterr().out               # ...but LOUD in the stage log
+    assert "GRAPH REFUSED" in capsys.readouterr().out         # ...but LOUD + grep-stable in the stage log
     assert MP._block({}, [], 100, _x(9), None)[0] == "eager"  # and never silently claims graphs
-    MP._reset_flags({"op": "reset", "graph": False})          # graph=false is always honored
+    assert MP._reset_flags({"op": "reset", "graph": False}) is False  # graph=false is always honored
     assert S.M25_CUDA_GRAPH_ACTIVE is False
+
+
+def test_set_graph_refused_without_sdpa(graph_env, monkeypatch, capsys):
+    """F9: M25_STATIC_KV on but M25_SDPA off — the graphed block still needs the SDPA-era routing
+    (GraphRunner asserts both), so the toggle must refuse through the same loud path."""
+    monkeypatch.setattr(S, "M25_STATIC_KV", True)
+    monkeypatch.setattr(S, "M25_SDPA", False)
+    monkeypatch.setattr(S, "M25_CUDA_GRAPH_ACTIVE", False)
+    assert MP._reset_flags({"op": "reset", "graph": True}) is False
+    assert S.M25_CUDA_GRAPH_ACTIVE is False
+    assert "GRAPH REFUSED" in capsys.readouterr().out
 
 
 def test_reset_op_stamps_graph_field(monkeypatch):
@@ -158,9 +174,24 @@ def test_reset_op_stamps_graph_field(monkeypatch):
     assert o["op"] == "reset" and o["swarm_id"] == "sw" and o["job_id"] == "jb" and o["temp"] == 0.0
 
 
+def test_check_reset_ack():
+    """F2: a graph-stamped job must FAIL LOUDLY when the tail didn't apply the toggle — a silently
+    eager 'graph' arm banks a lying A/B. Plain jobs accept the bare 'ok' unchanged."""
+    assert MP._check_reset_ack({"op": "reset"}, "ok") is None           # no graph field: any ack passes
+    ack = {"ok": 1, "graph": True, "graph_captured": 3, "graph_skipped": 1}
+    assert MP._check_reset_ack({"op": "reset", "graph": True}, ack) is ack
+    assert MP._check_reset_ack({"op": "reset", "graph": False},
+                               {"ok": 1, "graph": False})["graph"] is False
+    with pytest.raises(RuntimeError, match="GRAPH REFUSED"):            # old stage: bare "ok" to a graph job
+        MP._check_reset_ack({"op": "reset", "graph": True}, "ok")
+    with pytest.raises(RuntimeError, match="graph A/B poisoned"):       # refused toggle: applied != asked
+        MP._check_reset_ack({"op": "reset", "graph": True}, {"ok": 1, "graph": False})
+
+
 def test_coordinator_sends_graph_field_end_to_end(monkeypatch):
     """A real coordinate_pipe job over the fake ring: with M25_GRAPH_JOB set the ring must SEE the
-    graph field on the job-opening reset (and the job still completes lossless)."""
+    graph field on the job-opening reset, the dict ack must PASS _check_reset_ack, and the job still
+    completes lossless. Without receipts there is no sweep, so graph_arm stays None."""
     from ngram_draft import NgramDrafter
     monkeypatch.setattr(MP, "M25_GRAPH_JOB", True)
     T = fr.repetitive_T(360)
@@ -169,17 +200,36 @@ def test_coordinator_sends_graph_field_end_to_end(monkeypatch):
     assert res["ok"] and res["output_ids"] == T[60:60 + len(res["output_ids"])]
     resets = [e for e in ring.log if e["op"] == "reset"]
     assert resets and all(e["graph"] is True for e in resets)
+    assert res["graph_arm"] is None
+
+
+def test_job_record_shows_graph_arm(monkeypatch):
+    """F3: with receipts on, a graph-stamped job's receipt sweep returns the tail's graph counters and
+    the coordinator surfaces them in the result — the 'how graphed was this arm ACTUALLY' record."""
+    from ngram_draft import NgramDrafter
+    monkeypatch.setattr(MP, "M25_GRAPH_JOB", True)
+    monkeypatch.setattr(MP, "RECEIPTS", True)
+    T = fr.repetitive_T(360)
+    res, ring = fr.run_coordinator(T, 60, NgramDrafter(ng=3, min_match=1, margin=64),
+                                   K=8, depth=4, max_new=80, eagle_ring=False)
+    assert res["ok"] and res["output_ids"] == T[60:60 + len(res["output_ids"])]
+    assert res["graph_arm"] == {"graph": True, "graph_captured": 0, "graph_skipped": 0}
+    assert res["receipts"] == [] and res["receipts_ok"] is False        # fake ring signs nothing; fails closed
 
 
 # ---- 3. guard removal: import with BOTH flags must not SystemExit ----------------------------------
 
 def test_import_with_graph_and_eagle_does_not_exit():
     env = dict(os.environ, M25_CUDA_GRAPH="1", M25_EAGLE="1", SHARD_TRANSPORT="libp2p",
+               M25_GRAPH_JOB="no",                            # F6: "no" must parse False (explicit truthy set)
                M25_DIR=os.environ["M25_DIR"])                 # fake model dir from the fake_ring bootstrap
-    code = ("import sys; sys.path.insert(0, {p!r}); import m25_stage as S; "
+    shard = os.path.join(os.path.dirname(PHASE0), "shard")
+    code = ("import sys; sys.path.insert(0, {p!r}); sys.path.insert(0, {sh!r}); "
+            "import m25_stage as S; "
             "assert S.M25_CUDA_GRAPH and S.M25_EAGLE and S.M25_STATIC_KV; "
             "assert S.M25_CUDA_GRAPH_ACTIVE is True and S.M25_GRAPH_MAX == 16; "
-            "print('IMPORT_OK')").format(p=PHASE0)
+            "import m25_pipe as MP; assert MP.M25_GRAPH_JOB is False; "
+            "print('IMPORT_OK')").format(p=PHASE0, sh=shard)
     r = subprocess.run([sys.executable, "-c", code], env=env, capture_output=True, text=True, timeout=300)
     assert r.returncode == 0, f"import died (the old SystemExit guard?)\nstdout={r.stdout}\nstderr={r.stderr}"
     assert "IMPORT_OK" in r.stdout
