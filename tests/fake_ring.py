@@ -158,8 +158,10 @@ class FakeRing(threading.Thread):
                 msg = recv_msg(self.pipe)
                 op = msg.get("op")
                 if op == "reset":
-                    self.log.append({"op": "reset"})
+                    self.log.append({"op": "reset", "keepwarm_ms": msg.get("keepwarm_ms")})
                     send_msg(self.ret, "ok")
+                elif op == "noop":                  # cwnd keep-warm frame: leg-local, never answered —
+                    self.log.append({"op": "noop"})  # mirrors serve()'s skip; logged so tests can see it
                 elif op == "receipt":
                     self.log.append({"op": "receipt"})
                     send_msg(self.ret, msg.get("receipts", []))
