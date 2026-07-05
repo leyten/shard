@@ -139,12 +139,14 @@ def test_send_lock_interleave_safety():
     t = threading.Thread(target=rx, daemon=True)
     t.start()
     kw = MP._KeepWarm(a, interval_ms=1)
+    t_send = time.monotonic()
     try:
         for i in range(N):                          # header+tensor-blob frames: multi-part on the wire
             kw.send({"op": "data", "i": i, "h": torch.full((4,), float(i), dtype=torch.float32)})
             if i % 25 == 0:
                 time.sleep(0.003)                   # yield so the noop thread interleaves for real
     finally:
+        send_wall = time.monotonic() - t_send
         kw.stop()
     t.join(10)
     assert not err, f"receiver hit a decode error (stream corrupted): {err[0]}"
@@ -154,7 +156,62 @@ def test_send_lock_interleave_safety():
         assert torch.equal(f["h"], torch.full((4,), float(f["i"]), dtype=torch.float32)), \
             f"tensor payload scrambled in frame {f['i']}"
     assert noops[0] >= 1, "noop thread never interleaved — test exercised nothing"
+    # FORWARD PROGRESS: the noop path (non-blocking acquire) must never stall real sends. 300 sends on
+    # a drained socketpair are sub-second; a lock-queue regression or a 2s-bounded noop stall would
+    # blow way past this. Generous bound (5s) so it's about "not stalled", not raw throughput.
+    assert send_wall < 5.0, f"real sends stalled by the noop path: {send_wall:.2f}s for {N} sends"
     a.close(); b.close()
+
+
+def test_stuck_real_send_does_not_pin_noop_thread():
+    """NON-BLOCKING acquire: while a real send holds the send lock (here: simulated stuck), the noop
+    thread must NOT block inside lock.acquire() — it skips the tick and stays responsive, so a lockless
+    stop() still exits it promptly. With a BLOCKING acquire the thread would be pinned on the lock and
+    stop() (which never touches the send lock) could not wake it until the send released."""
+    a, b = _pair()
+    kw = MP._KeepWarm(a, interval_ms=5)
+    th = kw._runner
+    kw.lock.acquire()                               # stand in for a real/stuck send holding the lock
+    try:
+        time.sleep(0.05)                            # the noop thread hits its acquire attempt (and skips)
+        kw.stop()                                   # lockless kill
+        th.join(1.0)
+        assert not th.is_alive(), "noop thread pinned on the send lock — non-blocking acquire regressed"
+    finally:
+        kw.lock.release()
+    a.close(); b.close()
+
+
+def test_stuck_noop_send_never_blocks_attach_or_stop():
+    """The blocker: a noop send stuck in sendall on a live-TCP-but-app-hung peer (full send buffer,
+    untimed socket) must not block attach()/stop(). Fill the send buffer so the noop's sendall blocks,
+    give the thread time to get stuck, then assert attach()+stop() return in well under the time the
+    unbounded send would take — proving neither takes the send lock the stuck noop holds."""
+    a, b = _pair()
+    for s in (a, b):                                # shrink buffers so a small blob fills the pipe
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 2048)
+        s.setsockopt(socket.SOL_SOCKET, socket.SO_RCVBUF, 2048)
+    a.setblocking(False)                            # prefill a's send buffer; b never reads it
+    try:
+        while True:
+            a.send(b"x" * 8192)
+    except (BlockingIOError, OSError):
+        pass
+    a.setblocking(True); a.settimeout(None)         # untimed like the tail's reconnected ret: an
+    kw = MP._KeepWarm(a, interval_ms=10)            # unbounded noop send would block ~forever here
+    th = kw._runner
+    time.sleep(0.1)                                 # noop thread is now stuck in the 2s-bounded sendall
+    t0 = time.monotonic()
+    a2, b2 = _pair()
+    kw.attach(a2)                                   # churn reconnect — must not wait on the stuck send
+    kw.stop()                                       # teardown — must not wait on the stuck send
+    dt = time.monotonic() - t0
+    assert dt < 3.0, f"attach()/stop() blocked {dt:.2f}s behind a stuck noop send (regressed churn-safety)"
+    th.join(3.0)                                    # the stuck send is <=2s-bounded, then the thread exits
+    assert not th.is_alive(), "noop thread did not exit after its bounded send released"
+    for s in (a, b, a2, b2):
+        try: s.close()
+        except OSError: pass
 
 
 # ---- 3. RECV SKIP ----------------------------------------------------------------------------------
