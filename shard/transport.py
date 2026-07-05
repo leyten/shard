@@ -16,11 +16,18 @@ frame wire: 8-byte big-endian length + JSON header + raw tensor blobs (matches t
 phase0/wire.py framing so call sites are unchanged).
 """
 import json
+import os
 import socket
 import struct
 
 import numpy as np
 import torch
+
+# Upper bound on one inbound frame. The sidecar's libp2p link authenticates the peer but
+# authorizes nothing, so a ring neighbour (or anyone who dials the sidecar) can stream an
+# arbitrary length prefix; without a cap, recv_msg buffers up to 2**64 bytes into RAM. A
+# real activation/KV frame is far below this; raise SHARD_MAX_FRAME if a larger model needs it.
+_MAX_FRAME = int(os.environ.get("SHARD_MAX_FRAME", str(2 << 30)))   # 2 GiB
 
 
 def _read_exact(sock: socket.socket, n: int) -> bytes:
@@ -79,7 +86,11 @@ def _unpack(buf: bytes):
                 if dt is None:
                     raise ValueError(f"unknown tensor dtype {node['dtype']!r}")
                 shape, blob = node["shape"], blobs[node["__t__"]]
-                if not blob:
+                if not blob:                              # an empty blob is only legit for a 0-element tensor; a
+                    numel = 1                             # non-empty shape with no bytes is a memory-amplification
+                    for d in shape: numel *= d            # bomb -- torch.empty would allocate the full shape from a
+                    if numel != 0:                        # few header bytes, so reject it as a malformed frame
+                        raise ValueError(f"empty blob for non-empty tensor shape {shape}")
                     return torch.empty(shape, dtype=dt)
                 raw = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy())
                 return raw.view(dt).reshape(shape)
@@ -106,6 +117,8 @@ def recv_msg(sock: socket.socket):
     this guard since the pickle removal; this production path lost it — one malformed frame, e.g. a
     PSK-mode peer dialing a libp2p-mode ring, crashed the stage and its warm weights)."""
     (n,) = struct.unpack("!Q", _read_exact(sock, 8))
+    if n > _MAX_FRAME:                                    # refuse before allocating: a bogus length is a dead
+        raise ConnectionError(f"frame length {n} exceeds SHARD_MAX_FRAME ({_MAX_FRAME})")   # edge, not an OOM
     frame = _read_exact(sock, n)
     try:
         return _unpack(frame)
