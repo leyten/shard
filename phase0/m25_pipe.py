@@ -14,7 +14,7 @@ fire-forward, the tail returns straight to the coordinator (serve_tail_direct's 
   coord:  SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_pipe.py coord --head 127.0.0.1:29610 \
               --tail 127.0.0.1:29612 --K 6 --depth 4 --max-new 256 --prompt-file p.txt
 """
-import os, sys, socket, select, time, argparse, hashlib, torch
+import os, sys, socket, select, time, threading, argparse, hashlib, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("M25_DIR", "/root/m25")
 import json
@@ -87,6 +87,101 @@ def _hrecv(msg):
     if isinstance(msg, dict) and "h8" in msg:
         msg["h"] = _unpack_h(msg["h"], msg.pop("h8"))
     return msg
+
+
+class _KeepWarm:
+    """cwnd keep-warm for one SENDING socket. TCP slow-start-after-idle collapses cwnd whenever a
+    connection idles >RTO, and our serial decode idles every ring leg for a full traversal between
+    frames — measured on a 40ms-RTT vast leg (2026-07-05 leg probe): idle<=300ms keeps 30KB-1.6MB
+    frames at ~1 RTT, idle=900ms costs 2-4 RTTs on the SAME frames (cwnd_p50 167->94). The kernel
+    knob (tcp_slow_start_after_idle) is read-only in vast containers, so the engine keeps its own
+    sockets warm: a daemon thread posts a tiny {"op":"noop"} frame whenever the socket has idled
+    past `interval_ms` (idle=100ms measured to preserve cwnd fully). Noops are LEG-LOCAL: receivers
+    skip them; they are never forwarded, answered, attested, or counted in metrics.
+
+    EVERY real send on a wrapped socket must go through send() — it takes the same lock as the noop
+    thread; two threads calling sendall() on one socket interleave partial frames and corrupt the
+    stream. Interval from M25_CWND_KEEPWARM_MS (default 0 = OFF, master behavior unchanged) or
+    set_interval() at runtime. attach() swaps the socket on churn (re-dial /
+    ret re-adoption) WITHOUT closing anything — socket lifecycle stays the serve loop's; a dead
+    socket just makes the noop thread's send fail silently until the loop replaces it."""
+
+    def __init__(self, sock=None, interval_ms=None):
+        self.sock = sock
+        self.lock = threading.Lock()
+        self._last = time.monotonic()
+        self._interval = 0.0
+        self._runner = None
+        self.set_interval(os.environ.get("M25_CWND_KEEPWARM_MS", "0")
+                          if interval_ms is None else interval_ms)
+
+    def attach(self, sock):
+        with self.lock:
+            self.sock = sock
+            self._last = time.monotonic()
+
+    def set_interval(self, ms):
+        with self.lock:
+            self._interval = max(int(ms or 0), 0) / 1e3
+            if self._interval > 0 and self._runner is None:   # 0 makes the runner exit; >0 respawns one
+                self._runner = t = threading.Thread(target=self._run, daemon=True, name="cwnd-keepwarm")
+                t.start()
+
+    def send(self, obj):
+        with self.lock:
+            n = send_msg(self.sock, obj)
+            self._last = time.monotonic()
+            return n
+
+    def _run(self):
+        me = threading.current_thread()
+        while True:
+            with self.lock:
+                if self._runner is not me:                  # stop()ed or superseded
+                    return
+                iv = self._interval
+                if iv <= 0:                                 # toggled off: exit; _runner cleared UNDER the
+                    self._runner = None                     # lock so set_interval can't race a respawn
+                    return
+                if self.sock is not None and time.monotonic() - self._last > iv:
+                    try:
+                        send_msg(self.sock, {"op": "noop"})
+                    except Exception:
+                        pass                                # dead socket = the serve loop's problem — never
+                    self._last = time.monotonic()           # crash, never close; retry at cadence, not spin
+            time.sleep(iv / 3.0)
+
+    def stop(self):
+        with self.lock:
+            self._runner = None
+
+    def close(self):
+        with self.lock:
+            self._runner = None
+            s, self.sock = self.sock, None
+        if s is not None:
+            try: s.close()
+            except OSError: pass
+
+
+def recv_data(sock):
+    """recv_msg that skips keep-warm noop frames — a noop must never pop `inflight`, count as a
+    reply/ack, or be receipts. Blocking sites only (the coordinator's rx and coord()'s ret_ok); the
+    stages' select-multiplexed loops skip inline instead, so a noop-only idle peer can't starve the
+    select set. A peer whose noop thread is alive but whose compute is wedged would reset the socket
+    timeout on every noop, so the caller's recv timeout is enforced as an overall deadline here."""
+    try:
+        to = sock.gettimeout()
+    except (OSError, AttributeError):
+        to = None
+    deadline = time.monotonic() + to if to else None
+    while True:
+        m = recv_msg(sock)
+        if isinstance(m, dict) and m.get("op") == "noop":
+            if deadline is not None and time.monotonic() > deadline:
+                raise socket.timeout("recv timed out (peer sent only keepwarm noops)")
+            continue
+        return m
 
 
 def _act_digest(t):
@@ -242,6 +337,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                                     resumable=resumable, reasoning=reasoning)
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
+    # cwnd keep-warm on the coord->head leg, wrapped HERE (not at the call boundary) so every caller
+    # (coord CLI, gateway, sweep) gets one lock per socket with zero call-site changes; the socket is
+    # only ever driven by one job at a time, so a per-job wrapper owns all sends for its lifetime.
+    kw = _KeepWarm(pipe_sock)
     def d_request(ids, k): local_draft.request(ids, k)
     def d_fetch(): return local_draft.fetch()
     # discard a stale pending request WITHOUT computing it — fetch() runs the whole proposal (on the
@@ -257,8 +356,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
-        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        kw.send({"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+                 "swarm_id": swarm_id, "job_id": job_id}); recv_data(rx)
         t_pf = time.time()
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
@@ -273,16 +372,16 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                                    _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
         if prefill_chunk and len(gen_ids) > prefill_chunk:
             starts = list(range(0, len(gen_ids), prefill_chunk))
-            def _send_pf(i): send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
+            def _send_pf(i): kw.send({"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
             d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
-                toks, aux = _unpack(recv_msg(rx))
+                toks, aux = _unpack(recv_data(rx))
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
+            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_data(rx)); cur = toks[-1]
             _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
@@ -297,10 +396,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             while len(inflight) < cur_depth and not done:
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
                 t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
-                send_msg(pipe_sock, {"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
+                kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
-            tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
             r, aux = _unpack(resp)
             sp, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
@@ -346,9 +445,9 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         d_cancel()
-        while inflight: recv_msg(rx); inflight.pop(0)
+        while inflight: recv_data(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
-            send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+            kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
     except EDGE_ERRORS as e:
         if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes (not restart)
             committed = out if out else list(resume_ids)
@@ -356,6 +455,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                     "output_ids": committed, "n_tokens": len(committed),
                     "text": tok.decode(committed, skip_special_tokens=True)}
         raise TransportError(f"pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    finally:
+        kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     dt = time.time() - t0
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
@@ -408,6 +509,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     from tree_spec import tree_greedy_walk
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
+    kw = _KeepWarm(pipe_sock)                               # cwnd keep-warm, same design as coordinate_pipe
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompt_ids = render_ids(tok, messages, tools=tools, reasoning=reasoning)
@@ -424,8 +526,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if not hasattr(eg, "propose_tree"):
         raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
     try:
-        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        kw.send({"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+                 "swarm_id": swarm_id, "job_id": job_id}); recv_data(rx)
         t_pf = time.time()                                  # ---- prefill: IDENTICAL to coordinate_pipe ----
         eg.reset()                                          # fresh EAGLE context per job (drafter is a shared singleton)
         from eagle_draft import prefill_pair_tokens
@@ -437,16 +539,16 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                           _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
         if prefill_chunk and len(gen_ids) > prefill_chunk:
             starts = list(range(0, len(gen_ids), prefill_chunk))
-            def _send_pf(i): send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
+            def _send_pf(i): kw.send({"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
             d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
-                toks, aux = _unpack(recv_msg(rx))
+                toks, aux = _unpack(recv_data(rx))
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)            # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
-            send_msg(pipe_sock, {"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_msg(rx)); cur = toks[-1]
+            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_data(rx)); cur = toks[-1]
             _pf_extend(0, toks, aux)
         if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
             raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
@@ -481,7 +583,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 else:
                     ids = [dprefix[-1]] + d; start = send_pos; off = 0
                 t_sent = time.monotonic()                   # traversal origin: includes the outbound serialize
-                send_msg(pipe_sock, {"op": "verify", "token_ids": ids, "start": start})
+                kw.send({"op": "verify", "token_ids": ids, "start": start})
                 inflight.append((off, start, d, t_sent))
                 dprefix = dprefix + d; send_pos = start + off + K   # next anchor = dprefix[-1]'s slot
             if not inflight:
@@ -492,9 +594,9 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 t_draft += time.time() - td
                 token_ids, parents, pos_ids = _build_tree_msg(pending_path, tree, vbase)
                 t_sent = time.monotonic()
-                send_msg(pipe_sock, {"op": "verify", "tree": True, "token_ids": token_ids,
-                                     "parents": parents, "pos_ids": pos_ids, "start": vbase})
-                tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+                kw.send({"op": "verify", "tree": True, "token_ids": token_ids,
+                         "parents": parents, "pos_ids": pos_ids, "start": vbase})
+                tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
                 t_trav += time.monotonic() - t_sent         # depth-1: this IS the clean per-round T_traversal
                 s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
                 r, aux = _unpack(resp)
@@ -511,7 +613,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
                 continue
             # ---- BURST REPLY: same accept/divergence bookkeeping as coordinate_pipe ----------------
-            tr = time.time(); resp = recv_msg(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
             r, aux = _unpack(resp)
             off, start, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent             # count discarded chunks too — they traversed
@@ -544,9 +646,9 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             if on_commit: on_commit(out, time.time() - t0)
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         while inflight:                                     # drain replies for frames sent past the finish
-            recv_msg(rx); inflight.pop(0)
+            recv_data(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
-            send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+            kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
     except EDGE_ERRORS as e:
         if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes
             committed = out if out else list(resume_ids)
@@ -554,6 +656,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                     "output_ids": committed, "n_tokens": len(committed),
                     "text": tok.decode(committed, skip_special_tokens=True)}
         raise TransportError(f"tree pipeline edge failed at token {len(out)} ({type(e).__name__}: {e})") from e
+    finally:
+        kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     dt = time.time() - t0
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
@@ -610,69 +714,73 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
     pipe_sock.settimeout(timeout)
+    kw = _KeepWarm(pipe_sock)                            # cwnd keep-warm, same design as coordinate_pipe
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompts = [render_ids(tok, m, tools=tools, reasoning=reasoning) for m in messages_list]
     mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     t_recv = 0.0; t_pf = time.time()
-    send_msg(pipe_sock, {"op": "reset_batch", "B": B}); recv_msg(rx)
-    for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
-        gen = prompts[b]
-        if prefill_chunk and len(gen) > prefill_chunk:
-            rr = None
-            for i in range(0, len(gen), prefill_chunk):
-                send_msg(pipe_sock, {"op": "verify", "stream": b, "token_ids": gen[i:i + prefill_chunk], "start": i, "prefill": True})
-                rr = recv_msg(rx)
-            cur[b] = rr[-1]
-        else:
-            send_msg(pipe_sock, {"op": "verify", "stream": b, "token_ids": gen, "start": 0, "prefill": True}); cur[b] = recv_msg(rx)[-1]
-        pos[b] = len(gen); out[b] = [cur[b]]
-        if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
-        drafters[b].request(prompts[b] + [cur[b]], K)
-    prefill_s = time.time() - t_pf; t0 = time.time()        # start the DECODE-rate timer after prefill (matches coordinate_pipe; agg_tok_s is steady-state decode, not TTFT-polluted)
-    # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
-    # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
-    # Each round speculatively advances ALL B streams; on a stream's divergence we drop that stream's stale
-    # in-flight chunks (per-row discard) and re-draft. Each stream stays data-isolated (output depends on B, not
-    # on batch-mates) and byte-faithful to solo up to the batched-matmul tiling. Mirrors coordinate_pipe per row.
-    rounds = 0; wasted = 0
-    dprefix = [prompts[b] + [cur[b]] for b in range(B)]     # speculative continuation per stream (prefill already requested)
-    spos = list(pos)                                        # send position per stream (advances K per drafted chunk)
-    discard = [0] * B                                       # stale-chunk skip counter per stream after a divergence
-    inflight = []                                           # FIFO of rounds; each = [(spos_b, ds_b) | None] over b
-    while not all(done) or inflight:
-        while len(inflight) < depth and not all(done):      # fill the in-flight window (speculative per stream)
-            tids = []; row = []; sb = []
+    try:
+        kw.send({"op": "reset_batch", "B": B}); recv_data(rx)
+        for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
+            gen = prompts[b]
+            if prefill_chunk and len(gen) > prefill_chunk:
+                rr = None
+                for i in range(0, len(gen), prefill_chunk):
+                    kw.send({"op": "verify", "stream": b, "token_ids": gen[i:i + prefill_chunk], "start": i, "prefill": True})
+                    rr = recv_data(rx)
+                cur[b] = rr[-1]
+            else:
+                kw.send({"op": "verify", "stream": b, "token_ids": gen, "start": 0, "prefill": True}); cur[b] = recv_data(rx)[-1]
+            pos[b] = len(gen); out[b] = [cur[b]]
+            if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
+            drafters[b].request(prompts[b] + [cur[b]], K)
+        prefill_s = time.time() - t_pf; t0 = time.time()        # start the DECODE-rate timer after prefill (matches coordinate_pipe; agg_tok_s is steady-state decode, not TTFT-polluted)
+        # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
+        # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
+        # Each round speculatively advances ALL B streams; on a stream's divergence we drop that stream's stale
+        # in-flight chunks (per-row discard) and re-draft. Each stream stays data-isolated (output depends on B, not
+        # on batch-mates) and byte-faithful to solo up to the batched-matmul tiling. Mirrors coordinate_pipe per row.
+        rounds = 0; wasted = 0
+        dprefix = [prompts[b] + [cur[b]] for b in range(B)]     # speculative continuation per stream (prefill already requested)
+        spos = list(pos)                                        # send position per stream (advances K per drafted chunk)
+        discard = [0] * B                                       # stale-chunk skip counter per stream after a divergence
+        inflight = []                                           # FIFO of rounds; each = [(spos_b, ds_b) | None] over b
+        while not all(done) or inflight:
+            while len(inflight) < depth and not all(done):      # fill the in-flight window (speculative per stream)
+                tids = []; row = []; sb = []
+                for b in range(B):
+                    if done[b]:
+                        tids.append([cur[b]] * (K + 1)); row.append(None); sb.append(pos[b]); continue
+                    ds = drafters[b].fetch()
+                    tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
+                    dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
+                kw.send({"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
+                inflight.append(row)
+            if not inflight:
+                break
+            tr = time.time(); rb = recv_data(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
+            row = inflight.pop(0); rounds += 1
             for b in range(B):
-                if done[b]:
-                    tids.append([cur[b]] * (K + 1)); row.append(None); sb.append(pos[b]); continue
-                ds = drafters[b].fetch()
-                tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
-                dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
-            send_msg(pipe_sock, {"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
-            inflight.append(row)
-        if not inflight:
-            break
-        tr = time.time(); rb = recv_msg(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
-        row = inflight.pop(0); rounds += 1
-        for b in range(B):
-            if row[b] is None or done[b]:
-                continue
-            if discard[b] > 0:                              # stale chunk from before this stream's last divergence
-                discard[b] -= 1; wasted += 1; continue
-            _, ds = row[b]; r = rb[b]; n = 0
-            for j in range(K):
-                if ds[j] == r[j]: n += 1
-                else: break
-            if n == K:
-                out[b].extend(ds); pos[b] += K; cur[b] = ds[-1]; committed = ds
-            else:                                           # divergence: commit prefix, drop this stream's stale in-flight, re-draft
-                committed = ds[:n] + [r[n]]; out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
-                discard[b] = sum(1 for rr in inflight if rr[b] is not None)
-                drafters[b].fetch(); dprefix[b] = prompts[b] + out[b]; spos[b] = pos[b]; drafters[b].request(dprefix[b], K)
-            if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
-                done[b] = True
+                if row[b] is None or done[b]:
+                    continue
+                if discard[b] > 0:                              # stale chunk from before this stream's last divergence
+                    discard[b] -= 1; wasted += 1; continue
+                _, ds = row[b]; r = rb[b]; n = 0
+                for j in range(K):
+                    if ds[j] == r[j]: n += 1
+                    else: break
+                if n == K:
+                    out[b].extend(ds); pos[b] += K; cur[b] = ds[-1]; committed = ds
+                else:                                           # divergence: commit prefix, drop this stream's stale in-flight, re-draft
+                    committed = ds[:n] + [r[n]]; out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
+                    discard[b] = sum(1 for rr in inflight if rr[b] is not None)
+                    drafters[b].fetch(); dprefix[b] = prompts[b] + out[b]; spos[b] = pos[b]; drafters[b].request(dprefix[b], K)
+                if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
+                    done[b] = True
+    finally:
+        kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     dt = time.time() - t0
     res = []
     for b in range(B):                                  # trim at first eos, per stream
@@ -836,8 +944,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         _keepalive(s)
         return s
     nxt_sock = None
-    if not parts["tail"]:
+    nxt_kw = _KeepWarm()                              # cwnd keep-warm on the forward ring leg (idle a full
+    if not parts["tail"]:                             # traversal between frames); attach() tracks re-dials
         nxt_sock = _dial_fwd()                        # launch-time dial stays strict: a dead --next at boot is a launcher bug
+        nxt_kw.attach(nxt_sock)
         print(f"[s{stage}] forward connected -> {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind(("0.0.0.0", port)); srv.listen(2)
@@ -855,6 +965,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         # This tail was the wedge's first domino: it closed pred whenever ret died, which EOF'd every
         # upstream stage in turn and left the whole warm ring needing a relaunch per coordinator.
         ret = pred = None; pending = []; stale = False
+        ret_kw = _KeepWarm()                     # cwnd keep-warm on the tail->coordinator return leg;
+                                                 # attach() tracks every ret (re)adoption below
 
         def _ret_send(o):
             # Deliver a reply to the coordinator-return. On failure the RETURN channel is dead, not the
@@ -863,17 +975,18 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
             if ret is None:
                 return
             try:
-                send_msg(ret, o)
+                ret_kw.send(o)
             except EDGE_ERRORS as e:
                 print(f"[tail] return edge died on send ({type(e).__name__}); keeping predecessor+KV", flush=True)
                 try: ret.close()
                 except OSError: pass
-                ret = None; stale = True
+                ret = None; stale = True; ret_kw.attach(None)
 
         while True:
             if pred is None:
                 # re-accept the predecessor (and the return channel unless a live one was carried over)
                 ret, pred, queued = _tail_accept(srv, pending, ret=ret, timeout=timeout)
+                ret_kw.attach(ret)               # after ret_ok went out — a noop can never precede the ack
                 pending = []                     # consumed (became ret/pred or were closed) — don't double-select
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
                 stale = False                    # any stale in-flight died with the old predecessor
@@ -916,11 +1029,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     ret = spoke
                                     try:
                                         send_msg(ret, "ret_ok"); ret.settimeout(None)   # ret is untimed, like bring-up
+                                        ret_kw.attach(ret)                   # after ret_ok: noop never precedes the ack
                                         print("[tail] coord-return (re)connected mid-session", flush=True)
                                     except EDGE_ERRORS:    # reconnector died between hello and ack: not a pred event
                                         try: ret.close()
                                         except OSError: pass
-                                        ret = None
+                                        ret = None; ret_kw.attach(None)
                                 elif isinstance(hello, dict) and "op" in hello:
                                     # a NEW predecessor speaking its first job frame (direct-TCP stage
                                     # replacement after a silent pred death) — adopt it, keep the frame
@@ -935,6 +1049,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if pred not in ready:
                                 continue
                             msg = _hrecv(recv_msg(pred))
+                        if msg.get("op") == "noop":           # predecessor keep-warm frame: leg-local, never
+                            continue                          # answered/forwarded/attested/timed (back to select)
                         t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                         if stale or ret is None:
                             # These messages belong to a job whose coordinator died: don't compute them,
@@ -1003,7 +1119,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if s is not None:
                             try: s.close()
                             except OSError: pass
-                    pred, ret = None, keep
+                    pred, ret = None, keep; ret_kw.attach(keep)
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
@@ -1013,6 +1129,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         while nxt_sock is None:                       # forward link dropped (churn cascade): rebuild it BEFORE
             try:                                      # accepting a new predecessor, so the ring re-handshakes
                 nxt_sock = _dial_fwd()                # front-to-back onto WARM stages — no relaunch, no reload
+                nxt_kw.attach(nxt_sock)
                 print(f"[s{stage}] forward link rebuilt -> {nxt}", flush=True)
             except OSError:
                 tries += 1                            # dial forever: a stage holding warm weights is worth more
@@ -1026,6 +1143,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
             try:
                 while True:
                     msg = _hrecv(recv_msg(conn))
+                    if msg.get("op") == "noop":                 # predecessor keep-warm frame: leg-local,
+                        continue                                # never forwarded/answered/attested/timed
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg["op"] == "reset":
                         for L in layers:
@@ -1033,28 +1152,28 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if RECEIPTS:                            # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), lo, hi)
-                        send_msg(nxt_sock, msg); continue       # propagate reset down the chain
+                        nxt_kw.send(msg); continue              # propagate reset down the chain
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
-                        send_msg(nxt_sock, msg); continue
+                        nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
                         for L in layers: L.reset()
-                        send_msg(nxt_sock, msg); continue
+                        nxt_kw.send(msg); continue
                     if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor(msg["token_ids_b"], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
                         h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
-                        send_msg(nxt_sock, _hsend({"op": "verify_batch", "h": h, "start_b": msg["start_b"]})); continue
+                        nxt_kw.send(_hsend({"op": "verify_batch", "h": h, "start_b": msg["start_b"]})); continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
                         h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
-                        send_msg(nxt_sock, _hsend({"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True})); continue
+                        nxt_kw.send(_hsend({"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True})); continue
                     if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
@@ -1072,7 +1191,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         fwd = _hsend(fwd)
                         if S.M25_STAGE_TIMING:
                             fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                        send_msg(nxt_sock, fwd); continue
+                        nxt_kw.send(fwd); continue
                     if "token_ids" in msg:                      # head: embed the coordinator's token ids
                         h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                     else:
@@ -1088,7 +1207,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     fwd = _hsend(fwd)
                     if S.M25_STAGE_TIMING:
                         fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                    send_msg(nxt_sock, fwd)
+                    nxt_kw.send(fwd)
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset + drop forward link", flush=True)
                 for L in layers:
@@ -1097,7 +1216,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     if s is not None:                 # sees EOF and cascades, so the WHOLE ring re-handshakes
                         try: s.close()                # fresh (warm weights intact) and a new coordinator can
                         except OSError: pass          # drive it — specpipe's proven recovery choreography
-                nxt_sock = None
+                nxt_sock = None; nxt_kw.attach(None)
 
 
 def _sweep_summary(rows):
@@ -1184,7 +1303,7 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
     pipe = socket.create_connection((hh, int(hp)), timeout=timeout); pipe.setsockopt(*NODELAY)
     ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
     send_msg(ret, {"op": "hello_return"})                       # identify the return channel to the tail
-    recv_msg(ret)                                               # wait ret_ok: tail confirmed ret before any reset flows
+    recv_data(ret)                                              # wait ret_ok: tail confirmed ret before any reset flows
     messages = [{"role": "user", "content": prompt}]
 
     if validate:                                               # full usability pass (tools+multi-turn+long-ctx+receipts)
