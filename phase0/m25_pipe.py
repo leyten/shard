@@ -102,28 +102,38 @@ class _KeepWarm:
     EVERY real send on a wrapped socket must go through send() — it takes the same lock as the noop
     thread; two threads calling sendall() on one socket interleave partial frames and corrupt the
     stream. Interval from M25_CWND_KEEPWARM_MS (default 0 = OFF, master behavior unchanged) or
-    set_interval() at runtime (the reset-op toggle). attach() swaps the socket on churn (re-dial /
-    ret re-adoption) WITHOUT closing anything — socket lifecycle stays the serve loop's; a dead
-    socket just makes the noop thread's send fail silently until the loop replaces it."""
+    set_interval() at runtime (the reset-op toggle).
+
+    CHURN-SAFE: a stuck noop send must NEVER be able to block a reconnect/teardown (the paid-ring
+    fault is a GPU/driver hang whose TCP stays alive, so sendall blocks up to the socket's PRODUCTION
+    timeout — 1800s on the gateway, forever on the tail's untimed ret). Three guards compose: (1) the
+    noop thread acquires the send lock NON-BLOCKING — if a real send holds it the leg isn't idle, so
+    it skips the tick rather than queueing; (2) the noop send is time-bounded (<=2s) independent of
+    the socket's production timeout, so it releases the lock in ~2s even against a full-buffer peer;
+    (3) attach()/set_interval()/stop()/close() NEVER take the send lock (attach = atomic ref swap;
+    lifecycle uses a separate _life lock + a lockless _stop flag), so teardown is never blockable by
+    an in-flight noop. attach() swaps the socket on churn WITHOUT closing anything — lifecycle stays
+    the serve loop's; a dead socket just makes the noop send fail silently until the loop replaces it."""
 
     def __init__(self, sock=None, interval_ms=None):
         self.sock = sock
-        self.lock = threading.Lock()
-        self._last = time.monotonic()
+        self.lock = threading.Lock()          # serializes sendall() on the wrapped socket ONLY; a stuck
+        self._life = threading.Lock()         # noop send holds THIS — no teardown path takes it
+        self._last = time.monotonic()         # (runner spawn/exit) — never held across a send
         self._interval = 0.0
+        self._stop = False                    # lockless kill flag: a stuck send can't block stop()
         self._runner = None
         self.set_interval(os.environ.get("M25_CWND_KEEPWARM_MS", "0")
                           if interval_ms is None else interval_ms)
 
     def attach(self, sock):
-        with self.lock:
-            self.sock = sock
-            self._last = time.monotonic()
+        self.sock = sock                      # atomic ref swap under the GIL; NO send lock, so a stuck
+        self._last = time.monotonic()         # noop send can never block a churn reconnect/teardown
 
     def set_interval(self, ms):
-        with self.lock:
+        with self._life:                      # _life (not the send lock): can't block on a stuck send
             self._interval = max(int(ms or 0), 0) / 1e3
-            if self._interval > 0 and self._runner is None:   # 0 makes the runner exit; >0 respawns one
+            if self._interval > 0 and self._runner is None and not self._stop:   # 0 exits; >0 respawns
                 self._runner = t = threading.Thread(target=self._run, daemon=True, name="cwnd-keepwarm")
                 t.start()
 
@@ -133,32 +143,58 @@ class _KeepWarm:
             self._last = time.monotonic()
             return n
 
+    def _noop_once(self):
+        """Send one noop, called holding self.lock. Bounds the lock-hold to <=2s regardless of the
+        socket's production timeout, so a hung/full-buffer peer can't pin the lock (and a real send
+        queued behind it) for minutes. Re-reads self.sock ONCE into a local — attach() may swap it
+        concurrently, and a noop racing the just-detached old socket is harmless. Swallows all errors:
+        a dead socket is the serve loop's problem, never the noop thread's to crash on."""
+        sock = self.sock
+        if sock is None:
+            return
+        try:
+            old = sock.gettimeout()
+        except OSError:
+            return
+        try:
+            sock.settimeout(2.0 if old is None else min(old, 2.0))
+            send_msg(sock, {"op": "noop"})
+        except Exception:
+            pass
+        finally:
+            try: sock.settimeout(old)         # restore the production timeout for the next real send
+            except OSError: pass
+            self._last = time.monotonic()      # reset cadence even on failure — retry at interval, not spin
+
     def _run(self):
         me = threading.current_thread()
-        while True:
-            with self.lock:
-                if self._runner is not me:                  # stop()ed or superseded
-                    return
-                iv = self._interval
-                if iv <= 0:                                 # toggled off: exit; _runner cleared UNDER the
-                    self._runner = None                     # lock so set_interval can't race a respawn
-                    return
+        while not self._stop and self._runner is me:
+            iv = self._interval
+            if iv <= 0:                                     # toggled off
+                break
+            try:
                 if self.sock is not None and time.monotonic() - self._last > iv:
-                    try:
-                        send_msg(self.sock, {"op": "noop"})
-                    except Exception:
-                        pass                                # dead socket = the serve loop's problem — never
-                    self._last = time.monotonic()           # crash, never close; retry at cadence, not spin
+                    if self.lock.acquire(blocking=False):   # a real send in progress => not idle => skip,
+                        try:                                # never queue behind (and get pinned by) a send
+                            self._noop_once()
+                        finally:
+                            self.lock.release()
+            except Exception:
+                pass                                        # bulletproof: the noop thread never dies on error
             time.sleep(iv / 3.0)
+        with self._life:                                    # clear identity so set_interval can respawn; if
+            if self._runner is me:                          # a set_interval raced our exit, respawn now so a
+                self._runner = None                         # toggle-on can't be lost to the exit window
+                if self._interval > 0 and not self._stop:
+                    self._runner = t = threading.Thread(target=self._run, daemon=True, name="cwnd-keepwarm")
+                    t.start()
 
     def stop(self):
-        with self.lock:
-            self._runner = None
+        self._stop = True                                   # lockless: teardown must not wait on a stuck send
 
     def close(self):
-        with self.lock:
-            self._runner = None
-            s, self.sock = self.sock, None
+        self._stop = True
+        s, self.sock = self.sock, None
         if s is not None:
             try: s.close()
             except OSError: pass
