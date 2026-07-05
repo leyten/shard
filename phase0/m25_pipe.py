@@ -102,7 +102,7 @@ class _KeepWarm:
     EVERY real send on a wrapped socket must go through send() — it takes the same lock as the noop
     thread; two threads calling sendall() on one socket interleave partial frames and corrupt the
     stream. Interval from M25_CWND_KEEPWARM_MS (default 0 = OFF, master behavior unchanged) or
-    set_interval() at runtime. attach() swaps the socket on churn (re-dial /
+    set_interval() at runtime (the reset-op toggle). attach() swaps the socket on churn (re-dial /
     ret re-adoption) WITHOUT closing anything — socket lifecycle stays the serve loop's; a dead
     socket just makes the noop thread's send fail silently until the loop replaces it."""
 
@@ -340,7 +340,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     # cwnd keep-warm on the coord->head leg, wrapped HERE (not at the call boundary) so every caller
     # (coord CLI, gateway, sweep) gets one lock per socket with zero call-site changes; the socket is
     # only ever driven by one job at a time, so a per-job wrapper owns all sends for its lifetime.
-    kw = _KeepWarm(pipe_sock)
+    kw_job = os.environ.get("M25_KEEPWARM_JOB")
+    kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)
     def d_request(ids, k): local_draft.request(ids, k)
     def d_fetch(): return local_draft.fetch()
     # discard a stale pending request WITHOUT computing it — fetch() runs the whole proposal (on the
@@ -356,8 +357,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
-        kw.send({"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                 "swarm_id": swarm_id, "job_id": job_id}); recv_data(rx)
+        rst = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+               "swarm_id": swarm_id, "job_id": job_id}
+        if kw_job not in (None, ""):                        # runtime ring-wide toggle (interleaved A/B)
+            rst["keepwarm_ms"] = int(kw_job)
+        kw.send(rst); recv_data(rx)
         t_pf = time.time()
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
@@ -509,7 +513,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     from tree_spec import tree_greedy_walk
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
-    kw = _KeepWarm(pipe_sock)                               # cwnd keep-warm, same design as coordinate_pipe
+    kw_job = os.environ.get("M25_KEEPWARM_JOB")             # cwnd keep-warm, same design as coordinate_pipe
+    kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)
     _eos = tok.eos_token_id
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompt_ids = render_ids(tok, messages, tools=tools, reasoning=reasoning)
@@ -526,8 +531,11 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if not hasattr(eg, "propose_tree"):
         raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
     try:
-        kw.send({"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                 "swarm_id": swarm_id, "job_id": job_id}); recv_data(rx)
+        rst = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+               "swarm_id": swarm_id, "job_id": job_id}
+        if kw_job not in (None, ""):                        # runtime ring-wide toggle (interleaved A/B)
+            rst["keepwarm_ms"] = int(kw_job)
+        kw.send(rst); recv_data(rx)
         t_pf = time.time()                                  # ---- prefill: IDENTICAL to coordinate_pipe ----
         eg.reset()                                          # fresh EAGLE context per job (drafter is a shared singleton)
         from eagle_draft import prefill_pair_tokens
@@ -714,8 +722,9 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
     pipe_sock.settimeout(timeout)
-    kw = _KeepWarm(pipe_sock)                            # cwnd keep-warm, same design as coordinate_pipe
-    _eos = tok.eos_token_id
+    kw_job = os.environ.get("M25_KEEPWARM_JOB")          # cwnd keep-warm, same design as coordinate_pipe;
+    kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)   # NOTE: reset_batch
+    _eos = tok.eos_token_id                              # carries no keepwarm_ms — stage toggling is reset-only
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
     prompts = [render_ids(tok, m, tools=tools, reasoning=reasoning) for m in messages_list]
     mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
@@ -1063,6 +1072,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "reset":
                             for L in layers:
                                 L.reset()
+                            if "keepwarm_ms" in msg:        # coordinator toggle rode the reset (interleaved A/B)
+                                ret_kw.set_interval(msg["keepwarm_ms"])
                             if RECEIPTS:                    # start this job's per-stage activation hash-chain
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                        msg.get("job_id", "job"), lo, hi)
@@ -1149,10 +1160,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     if msg["op"] == "reset":
                         for L in layers:
                             L.reset()
+                        if "keepwarm_ms" in msg:                # coordinator toggle rode the reset (interleaved A/B)
+                            nxt_kw.set_interval(msg["keepwarm_ms"])
                         if RECEIPTS:                            # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), lo, hi)
-                        nxt_kw.send(msg); continue              # propagate reset down the chain
+                        nxt_kw.send(msg); continue              # propagate reset down the chain UNCHANGED (field intact)
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
