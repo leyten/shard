@@ -145,8 +145,35 @@ if M25_CUDA_GRAPH:
 M25_GRAPH_MAX = int(os.environ.get("M25_GRAPH_MAX", "16"))
 _GRAPH_COUNT = 0        # graphs captured so far, across ALL GraphRunners in this process
 _GRAPH_SKIPPED = 0      # blocks run eager because the cap was hit or the bucket's capture failed
+# RUNTIME toggle (the per-job A/B lever): the hot path (m25_pipe._block) consults M25_CUDA_GRAPH_ACTIVE,
+# not the env constant, so ONE warm ring can interleave graph-on/graph-off arms per job — a stage
+# relaunch per arm would reintroduce the time-of-day drift the interleaved methodology exists to kill.
+# Initialized from M25_CUDA_GRAPH; flipped by set_graph() off the coordinator's reset op
+# ({"graph": true/false}; field absent = keep the current setting, so old coordinators change nothing).
+M25_CUDA_GRAPH_ACTIVE = M25_CUDA_GRAPH
 DECODE_BUCKETS = (2048, 4096, 8192, 16384, 32768, 65536, 131072)
 _GR = None        # active _GraphState during capture (None = eager); attn reads its static buffers
+
+
+def set_graph(on):
+    """Set the runtime graph route (reset-op plumbing). Enabling REQUIRES M25_STATIC_KV + M25_SDPA from
+    process start — the static KV buffers a graph replays into are allocated at Layer construction — so
+    an A/B ring launches with M25_STATIC_KV=1 M25_EAGLE=1 (M25_CUDA_GRAPH unset) and flips graphs per
+    job; eager-with-static-KV is bit-identical to the cat path (research/m25_statickv_test.py), keeping
+    the graph-off arm representative of master. Without the prereqs a graph=true request is REFUSED
+    loudly and ignored — never crash, never silently claim graphs. Returns the resulting setting."""
+    global M25_CUDA_GRAPH_ACTIVE
+    on = bool(on)
+    if on and not (M25_STATIC_KV and M25_SDPA):
+        print("[graph] reset asked graph=true but M25_STATIC_KV/M25_SDPA are off (static buffers are "
+              "allocated at Layer construction) — REFUSED, staying eager", flush=True)
+        return M25_CUDA_GRAPH_ACTIVE
+    if M25_CUDA_GRAPH_ACTIVE != on:
+        print(f"[graph] decode route -> {'GRAPH' if on else 'EAGER'} (per-job toggle)", flush=True)
+    M25_CUDA_GRAPH_ACTIVE = on
+    return M25_CUDA_GRAPH_ACTIVE
+
+
 NORM_TOPK = getattr(cfg, "norm_topk_prob", True)
 ROUTED_SCALE = getattr(cfg, "routed_scaling_factor", 1.0)
 
