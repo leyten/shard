@@ -61,6 +61,14 @@ M25_FP8_WIRE = bool(int(os.environ.get("M25_FP8_WIRE", "0")))
 # could move, and per-tensor-scale e4m3 on O(1) hidden states is well inside the head's tolerance.
 # Defaults to the M25_FP8_WIRE setting (one "fp8 on the wire" concept); override with M25_FP8_AUX=0/1.
 M25_FP8_AUX = bool(int(os.environ.get("M25_FP8_AUX", "1" if M25_FP8_WIRE else "0")))
+# Per-job CUDA-graph arm for the interleaved A/B: when not None the coordinator stamps {"graph": bool}
+# on its reset op and every stage flips its runtime graph route for that job (S.set_graph via
+# _reset_flags; the ring launches with M25_STATIC_KV=1, M25_CUDA_GRAPH unset). None (default) = field
+# absent, stages keep their current route — old coordinators and old stages are mutually unaffected.
+# Set via env, or flipped in-process between jobs by a bench (m25_pipe.M25_GRAPH_JOB = True/False).
+M25_GRAPH_JOB = os.environ.get("M25_GRAPH_JOB")
+if M25_GRAPH_JOB is not None:
+    M25_GRAPH_JOB = M25_GRAPH_JOB.strip().lower() in ("1", "true", "yes", "on")   # explicit truthy set: "no"/"off"/"0" = False
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -228,6 +236,35 @@ def make_drafter(ngram_n=3):
     return HybridDrafter(ng, _eagle_singleton())
 
 
+def _reset_op(swarm_id, job_id):
+    """The job-opening reset frame (sampling pinned greedy). M25_GRAPH_JOB (per-job A/B) optionally
+    stamps the runtime graph toggle the stages apply — via _reset_flags — before ack'ing."""
+    o = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
+         "swarm_id": swarm_id, "job_id": job_id}
+    if M25_GRAPH_JOB is not None:
+        o["graph"] = M25_GRAPH_JOB
+    return o
+
+
+def _check_reset_ack(op, ack):
+    """Job-open ack verification (measurement validity): when the reset carried a 'graph' field the
+    tail acks {"ok":1, "graph": <applied>, ...counters}, and a mismatch means the toggle was REFUSED
+    (M25_STATIC_KV off on a stage) or the ring runs a pre-toggle build — either way the "graph" arm
+    would silently run eager and the paid A/B would bank a lie, so raise LOUDLY instead of measuring.
+    Only the TAIL's applied value is visible here; head/middle refusals stay invisible (fine when the
+    ring shares one launch env) — the bench runbook must grep every stage log for 'GRAPH REFUSED'
+    before trusting an arm. Plain resets ack a bare "ok" (old builds mutually compatible); returns the
+    ack dict (carrying the tail's graph_captured/graph_skipped snapshot) or None."""
+    if "graph" not in op:
+        return None
+    applied = ack.get("graph") if isinstance(ack, dict) else None
+    if applied != op["graph"]:
+        raise RuntimeError(f"graph A/B poisoned: reset asked graph={op['graph']} but the tail applied "
+                           f"{applied} (M25_STATIC_KV off on the ring, or an old stage build) — grep "
+                           f"stage logs for 'GRAPH REFUSED'")
+    return ack
+
+
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
@@ -254,11 +291,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     gen_ids = list(prompt_ids) + resume_ids
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
-    out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []
+    out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []; graph_arm = None
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
-        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        rop = _reset_op(swarm_id, job_id)
+        send_msg(pipe_sock, rop); _check_reset_ack(rop, recv_msg(rx))   # raises LOUDLY on a refused graph toggle
         t_pf = time.time()
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
@@ -349,6 +386,9 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         while inflight: recv_msg(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+            if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
+                graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
+                receipts = receipts.get("receipts", [])
     except EDGE_ERRORS as e:
         if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes (not restart)
             committed = out if out else list(resume_ids)
@@ -371,6 +411,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
+            "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
             # decode-loop breakdown: draft_s = serial drafter compute, ring_wait_s = blocked on the ring's
             # return channel, decode_s = the whole decode wall. What's NOT wait or draft is coordinator-side
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
@@ -415,7 +456,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     gen_ids = list(prompt_ids) + resume_ids
     if max_ctx:
         max_new = max(len(resume_ids) + 16, min(max_new, max_ctx - len(gen_ids) - 16))
-    out = []; prefill_s = 0.0; t_draft = t_recv = 0.0; receipts = []
+    out = []; prefill_s = 0.0; t_draft = t_recv = 0.0; receipts = []; graph_arm = None
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     tree_m = int(os.environ.get("M25_TREE_M", "12"))
     tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
@@ -424,8 +465,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if not hasattr(eg, "propose_tree"):
         raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
     try:
-        send_msg(pipe_sock, {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-                             "swarm_id": swarm_id, "job_id": job_id}); recv_msg(rx)
+        rop = _reset_op(swarm_id, job_id)
+        send_msg(pipe_sock, rop); _check_reset_ack(rop, recv_msg(rx))   # raises LOUDLY on a refused graph toggle
         t_pf = time.time()                                  # ---- prefill: IDENTICAL to coordinate_pipe ----
         eg.reset()                                          # fresh EAGLE context per job (drafter is a shared singleton)
         from eagle_draft import prefill_pair_tokens
@@ -547,6 +588,9 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             recv_msg(rx); inflight.pop(0)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             send_msg(pipe_sock, {"op": "receipt", "receipts": []}); receipts = recv_msg(rx)
+            if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
+                graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
+                receipts = receipts.get("receipts", [])
     except EDGE_ERRORS as e:
         if resumable:                                       # a node died: hand committed tokens back so the control plane heals + resumes
             committed = out if out else list(resume_ids)
@@ -567,6 +611,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             "tok_s": len(out) / max(dt, 1e-9), "wasted": wasted, "prefill_s": prefill_s, "output_ids": out,
             "prompt_tokens": len(prompt_ids), "resume_tokens": len(resume_ids),
             "receipts": receipts, "receipts_ok": receipts_ok,
+            "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
             "final_confidence": None}
@@ -711,18 +756,47 @@ def _tail_logits(h, parts):
     return (x.to(torch.bfloat16) @ parts["lm_head_w"].t())   # [1, s, vocab]
 
 
+_GRAPH_CAP_LOGGED = set()                           # (s, bucket) shapes already reported as cap-skipped
+
+
 def _block(grs, layers, start, x, vcfg):
     """Run one block. Route fixed-shape verify/decode blocks (small s = K+1) through a lazily-captured
-    CUDA graph when M25_CUDA_GRAPH (the proven 3.4x lever); prefill (large s) stays eager. grs caches one
-    GraphRunner per block size. The graphed path is bit-equivalent to run_block (proven), so receipts +
-    spec-decode losslessness are preserved."""
-    if S.M25_CUDA_GRAPH and x.shape[1] <= 64:
+    CUDA graph when the graph route is ACTIVE (env M25_CUDA_GRAPH, or per job via the reset op's
+    {"graph": true/false} -> S.set_graph; recovers per-kernel launch overhead — the 35-50ms/block
+    slow-CPU-stage lever); prefill (large s) stays eager. grs caches one GraphRunner per block size; each (s, bucket)
+    pair is ONE captured graph and hybrid refeed frames make s variable, so a NEW pair is captured only
+    while the process-wide S.M25_GRAPH_MAX budget lasts — past it (and after a failed capture, inside
+    run()) the block runs EAGER: silent, counted, never fatal. The graphed path is bit-equivalent to
+    eager-MANUAL attention (proven), so receipts + spec-decode losslessness are preserved; vs the eager
+    SDPA-flash path it is the same accepted-kernel-numerics class as fp8 wire (the ring A/B judges
+    accept/g)."""
+    if S.M25_CUDA_GRAPH_ACTIVE and x.shape[1] <= 64:
         s = x.shape[1]
         gr = grs.get(s)
         if gr is None:
             grs[s] = gr = S.GraphRunner(layers, vcfg, s)
-        return gr.run(start, x)
+        alen = gr._bucket(start + s)
+        if alen in gr.graphs or S._GRAPH_COUNT < S.M25_GRAPH_MAX:
+            return gr.run(start, x)                 # replay, or capture within budget (OOM-safe in run())
+        S._GRAPH_SKIPPED += 1                       # budget spent: new (s,bucket) shapes run eager
+        if (s, alen) not in _GRAPH_CAP_LOGGED:      # log ONCE per skipped shape (count every block)
+            _GRAPH_CAP_LOGGED.add((s, alen))
+            print(f"[graph] cap: s={s} bucket={alen} -> eager "
+                  f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
     return S.run_block(layers, start, x, vcfg)
+
+
+def _reset_flags(msg):
+    """Stage-side per-job flags off a reset frame, applied BEFORE the reset is ack'd/propagated:
+    'graph' flips the runtime CUDA-graph route (S.set_graph — refused loudly, 'GRAPH REFUSED' in the
+    stage log, if the M25_STATIC_KV prereq is off). Field absent = keep the current setting, so
+    pre-toggle coordinators change nothing. Head/middle stages forward the reset msg unchanged, which
+    carries the field down the ring — every stage of the warm ring flips together, per job (the
+    interleaved A/B lever). Returns the APPLIED route (bool) when the frame carried 'graph', else
+    None — the tail acks it back so the coordinator can catch a refused toggle (_check_reset_ack)."""
+    if "graph" in msg:
+        return S.set_graph(msg["graph"])
+    return None
 
 
 def _merge_aux(upstream):
@@ -878,7 +952,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
                 stale = False                    # any stale in-flight died with the old predecessor
                 print("[tail] predecessor + coord-return connected", flush=True)
-            signer = None
+            signer = None; job_graph = None          # job_graph: the reset's APPLIED graph arm (None = plain job)
             with torch.no_grad():
                 try:
                     while True:
@@ -945,16 +1019,31 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 continue
                             stale = False
                         if msg["op"] == "reset":
+                            job_graph = _reset_flags(msg)   # per-job runtime flags (graph A/B toggle)
                             for L in layers:
                                 L.reset()
                             if RECEIPTS:                    # start this job's per-stage activation hash-chain
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                        msg.get("job_id", "job"), lo, hi)
-                            _ret_send("ok"); continue
+                            # Graph-stamped resets ack the APPLIED route + counters so the coordinator
+                            # can catch a refused toggle before it poisons the A/B (_check_reset_ack).
+                            # Plain resets keep the bare "ok" (old-coordinator compat). Only the TAIL's
+                            # applied value rides this ack — a head/middle refusal is only visible as
+                            # 'GRAPH REFUSED' in that stage's own log (the runbook greps for it).
+                            _ret_send("ok" if job_graph is None else
+                                      {"ok": 1, "graph": job_graph, "graph_captured": S._GRAPH_COUNT,
+                                       "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "receipt":          # job done: sign + return the full ring's receipts
                             if RECEIPTS and signer is not None:
                                 msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
-                            _ret_send(msg.get("receipts", [])); continue
+                            # graph-A/B jobs: promote the reply to a dict carrying the tail's graph
+                            # counters, so the job record shows how graphed the arm ACTUALLY was;
+                            # plain jobs keep the bare receipts list (old-coordinator compat)
+                            rec = msg.get("receipts", [])
+                            _ret_send(rec if job_graph is None else
+                                      {"receipts": rec, "graph": job_graph,
+                                       "graph_captured": S._GRAPH_COUNT,
+                                       "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
                             for L in layers: L.reset()
                             _ret_send("ok"); continue
@@ -1028,12 +1117,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     msg = _hrecv(recv_msg(conn))
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg["op"] == "reset":
+                        _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
                         for L in layers:
                             L.reset()
                         if RECEIPTS:                            # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), lo, hi)
-                        send_msg(nxt_sock, msg); continue       # propagate reset down the chain
+                        send_msg(nxt_sock, msg); continue       # propagate reset down the chain (carries 'graph')
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
