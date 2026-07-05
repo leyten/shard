@@ -22,7 +22,9 @@ LIBP2P, ENG_IN, FWD_RING, FWD_RET = 29600, 29610, 29611, 29612
 # measurement (e.g. M25_EAGLE=1 warmed aux-capturing stages while the coordinator drafted n-gram-only).
 ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAGLE_DIR",
            "M25_EAGLE_NEXT_HIDDEN", "M25_FP8_WIRE", "M25_FP8_AUX", "M25_NGRAM_MINMATCH",
-           "M25_CONF_SCHED", "M25_SDPA", "M25_STATIC_KV", "M25_CUDA_GRAPH", "M25_MOE_BACKEND",
+           "M25_CONF_SCHED", "M25_SDPA", "M25_STATIC_KV", "M25_CUDA_GRAPH", "M25_GRAPH_MAX",
+           "M25_GRAPH_JOB",                                               # per-job graph A/B: stages need the cap, the coordinator the reset stamp
+           "M25_MOE_BACKEND",
            "M25_DEFAULT_REASONING", "M25_MAX_POS",
            "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH",   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four
            "M25_STAGE_TIMING"]                                            # per-stage [span,compute] stamps -> coordinator transport split
