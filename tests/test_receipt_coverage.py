@@ -56,6 +56,14 @@ def test_overlap_fails():
         verify_coverage(_ring([(0, 30), (20, 62)]), N_LAYERS)
 
 
+def test_zero_length_block_fails():
+    """A zero-length block [lo:lo) attests nothing but tiles cleanly (its neighbours meet at lo),
+    so it slips past the gap/overlap cursor. The per-block range check must reject it (lo < hi),
+    or a signer is in the paid tiling for a block it never held."""
+    with pytest.raises(ReceiptError):
+        verify_coverage(_ring([(0, 31), (31, 31), (31, 62)]), N_LAYERS)
+
+
 def test_block_outside_model_fails():
     """A receipt attesting layers beyond the model's depth is as fake as a missing one."""
     with pytest.raises(ReceiptError):
