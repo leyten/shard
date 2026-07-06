@@ -13,6 +13,52 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-05/06: FOUR things SHIPPED to master (graph-aux + churn fix + safe_kill + keep-warm); ring DESTROYED
+Perf-lever evening → became a perf + robustness sweep. All merged to master via clean PRs (no Claude trailer):
+- **PR #25 graph-aux** — CUDA-graph EAGLE-aux compatibility. THE win: on slow-CPU boxes stage compute drops
+  **157→40ms/traversal (~4×, drift-proof per-stage timing)**; ring decode-weighted **chain 13.6→+graph 23.7
+  = +74%** (clean 4-rep rotated; the earlier raw +167% was WAN-drift-inflated baseline). Reason-math 18→32,
+  agentic 14→31. Runtime per-job toggle via reset op; bounded capture set (M25_GRAPH_MAX, default 16);
+  OOM-safe. Requires M25_STATIC_KV; use `--kv-maxlen 16384` on graph rings (graph pools pressure the fat tail).
+  GPU-validated (research/graph_aux_check.py: graph≡eager-manual for h+aux, aux-freshness proven).
+- **PR #26 return-channel churn fix** — PoC-CRITICAL. The tail closed a LIVE coordinator's return channel on
+  ANY internal-ring blip (kept ret only when already stale) → forced full reconnect → raced the return-tunnel
+  recovery → WEDGE. Fatal for permissionless (internal-leg blips are the steady state; reproduced repeatedly
+  live). Fix: keep ret across a predecessor blip, hold session `stale` until the next reset re-arms
+  (stale=carried on re-accept). Adversarially reviewed correctness-safe; validated live (a mid-decode blip
+  healed via coordinator retry instead of wedging). **DEBT (review F6/F8):** a short per-reply recv heartbeat
+  so blip failover is seconds not up-to-timeout; an in-process serve()-tail churn test (fake_ring mocks the tail).
+- **PR #27 safe_kill** — permanent fix for the self-killing `pkill -f` footgun (kills its own launcher shell
+  whose cmdline contains the pattern → silent launch-wipe; bit us ~5× this session). `phase0/safe_kill.sh`
+  excludes self+ancestors, deployed to every box via push_code. Memory rule [[never-raw-pkill-f-use-safe-kill]].
+- **PR #28 keep-warm** — cwnd keep-warm noops on idle legs (TCP slow-start-after-idle collapses cwnd between
+  tokens → 2-4× slower frames; measured on the leg probe). A CONSISTENCY/tail-latency lever for jittery
+  public-internet paths, NOT throughput. **Default-ON for --serve (interactive gateway)**; off for measurement
+  paths. Neutral on calm rings (4-rep A/B ratio 1.01-1.04 — an earlier 'breaks pipelining' read was drift).
+  **DEBT: ring-level benefit proven only at TCP layer; owe a keep-warm ON/OFF A/B on a jittery/residential path
+  (ties to the DoubleZero pilot) before defaulting on beyond interactive.**
+
+**DoubleZero assessment banked** (Austin Federa contact, memory [[doublezero-pilot-assessment]]): thesis-
+compatible underlay, ZERO engine changes, but median tok/s gain is under the noise floor; the real prize is
+tail-latency/jitter elimination (DZ p99≈median) + flagship-AI-tenant partnership. NOT feasible on vast
+(GRE/no-NAT); needs bare-metal (HOSTKEY/vshosting). It's the natural home for the keep-warm jitter A/B.
+
+**RING DESTROYED** end of session (all 7 vast boxes, verified `instances-v1`==0; results banked). Next ring
+via the proven rent_pool→ring_up 2-step (scratchpad). ~$? of the vast balance used this evening.
+
+**NEXT (pick up here):** (1) Perf queue: graph-aux is THE lever landed (+74% mech-verified). Remaining =
+churn **F6 heartbeat** (short per-reply recv deadline → seconds-level blip failover instead of up-to-timeout)
++ **serve()-tail churn test** (F8; fake_ring mocks the tail so the return-channel fix has no CI coverage yet),
+then the **keep-warm jitter validation** (ON/OFF A/B on a jittery/residential path — the DoubleZero pilot is
+the natural home). (2) FWD_RET return-tunnel setup flakiness bit hard this session (slow/variable to establish
+after warm; wedged several bench relaunches) — worth a robustness look (it's a single fragile libp2p tunnel;
+the return path could dial the tail directly instead of routing through the head sidecar). (3) Rep2 of the
+full 6-arm interleaved lever bench never completed cleanly (churn-wedge + tunnel flakiness) — graph-aux is
+mechanism-verified so the verdict stands; a clean full rep2 is optional polish. (4) Bench tool committed:
+`research/m25_lever_bench.py`. Receipt data lived in scratchpad (rep1_complete.json 36 jobs + confirm.json
+48-job keep-warm×graph A/B) — bank to docs/receipts/ if a permanent record is wanted.
+
+*(prior entry, superseded ops-wise; paper is PUBLISHED now per leyten:)*
 ### ⇒ 2026-07-03 (late): PAPER v1 DONE + the paper test evening banked; ring DESTROYED (results banked)
 leyten green-lit the c0mpute technical report (author: leyten — c0mpute; inspired-by/positioned-against the
 Dolphin AI 2-GPU LAN study). **`docs/paper/main.typ` → main.pdf (8pp, typst) is a complete v1** with
@@ -389,6 +435,7 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 ## PROVEN  (numbers + receipts — measured, honest)
 | capability | status / number | source |
 |---|---|---|
+| **CUDA-graph EAGLE-aux (slow-CPU rings)** | **stage compute 157→40ms/traversal (~4×, drift-proof); decode-weighted chain 13.6→23.7 = +74%** (4-rep rotated EU ring); reason-math 18→32, agentic 14→31. Kernel-launch overhead removed on slow-CPU boxes | **master** (PR #25), receipt scratchpad rep1/confirm json, GPU-check research/graph_aux_check.py |
 | Batched throughput | **155 tok/s agg @16k (2.60× single), coherent** (B=4, batched-MoE, fp8 KV) | commit f3894d6, m25-batched-serving-fixed |
 | Single-stream DRAFTABLE (copy/RAG/verbatim) | 50–81 tok/s (n-gram, accept high) | m25_ctx_table |
 | **Single-stream NORMAL reasoning-ON (EAGLE hybrid)** | **~5.7 tok/s decode-wtd on a jittery lottery ring / ~7 on a good tight EU ring** (2026-07-02 warm A/B, merged serial-path; was ~3 n-gram-only, ~1.8 raw) | receipt m25-eagle-serial-path-ab-20260702 |
