@@ -24,7 +24,10 @@ KEY = os.path.expanduser("~/.ssh/vast_c0mpute")
 IMAGE = "vastai/base-image:cuda-13.2.1-auto"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null",
         "-o", "ConnectTimeout=25", "-o", "BatchMode=yes", "-o", "ServerAliveInterval=20"]
-NLAYERS, NDENSE, PER = 78, 3, 4   # 78 layers, first 3 dense, 4 NVFP4 layers/node
+# S1: layer count is model-specific, not a global 78 (that was GLM-5.2). gpt-oss-120B
+# has 36 layers (gateway.py, ROADMAP.md, PROOF.md all agree). The CLI --total-layers
+# overrides; this default matches the default --model (gpt-oss-120b).
+NLAYERS, NDENSE, PER = 36, 3, 4   # 36 layers (gpt-oss-120B), first 3 dense, 4 NVFP4 layers/node
 STAGE_PORT = 29600
 
 def sh(cmd, timeout=120):

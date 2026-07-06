@@ -1,0 +1,46 @@
+{
+  "schema": "shard-models/1",
+  "version": 1,
+  "models": [
+    {
+      "id": "shard-glm-5.2",
+      "hfArch": "Glm4MoeForCausalLM",
+      "workerModel": "GLM-5.2",
+      "enginePath": "/root/models/GLM-5.2",
+      "layerCount": 78,
+      "gbPerLayer": 1.05,
+      "kvGbPerLayer": 0.04,
+      "quant": "nvfp4",
+      "adapter": "glm-nvfp4",
+      "tokenizerId": "zai-org/GLM-5.2",
+      "chatTemplate": null,
+      "weightManifestCid": "",
+      "defaults": {
+        "K": 4,
+        "depth": 2,
+        "draftCtx": 16384
+      }
+    },
+    {
+      "id": "shard-gpt-oss-120b",
+      "hfArch": "GptOssForCausalLM",
+      "workerModel": "gpt-oss-120b",
+      "enginePath": "/root/models/gpt-oss-120b",
+      "layerCount": 36,
+      "gbPerLayer": 0.95,
+      "kvGbPerLayer": 0.03,
+      "quant": "mxfp4",
+      "adapter": "generic-vllm",
+      "tokenizerId": "openai/gpt-oss-120b",
+      "chatTemplate": null,
+      "weightManifestCid": "",
+      "defaults": {
+        "K": 4,
+        "depth": 2,
+        "draftCtx": 16384
+      }
+    }
+  ],
+  "publisher_pubkey": "6h33H3h5QTmNW+ddFd2fDNPGGrBNpWZSXSgRzT4EHuE=",
+  "signature": "2qFu7UKgIfXMSlZyEL8Gkzod8Eb4TTQkNGXV+VK3iLbxJXbsfh6/bKzCbfLhwwk9BIbkPxRk5oTFvpcg7C01BQ=="
+}
