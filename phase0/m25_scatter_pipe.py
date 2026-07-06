@@ -27,6 +27,7 @@ ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAG
            "M25_MOE_BACKEND",
            "M25_DEFAULT_REASONING", "M25_MAX_POS",
            "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH",   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four
+           "M25_CWND_KEEPWARM_MS", "M25_KEEPWARM_JOB",                    # cwnd keep-warm: stage senders keep idle legs warm (default-ON for --serve interactive)
            "M25_STAGE_TIMING"]                                            # per-stage [span,compute] stamps -> coordinator transport split
 
 
@@ -129,6 +130,13 @@ def main():
     ap.add_argument("--batch", type=int, default=1, help="continuous batching: stages allocate [B,...] KV (M25_BATCH); warm the ring with --serve then drive coordinate_pipe_batch")
     ap.add_argument("--kv-maxlen", type=int, default=0, help="cap M25_KV_MAXLEN (batched KV is B*MAXLEN per layer; 40960 default OOMs the tail at B>=4)")
     a = ap.parse_args()
+    # Interactive deploy (--serve = the OpenAI gateway) defaults cwnd keep-warm ON: single-stream legs
+    # idle between tokens long enough to trip TCP slow-start-after-idle (cwnd collapse -> the next frame
+    # eats 2-4 extra RTTs), so tiny noops keep every leg hot. eng_env() forwards it to the stages AND the
+    # gateway. Neutral on busy/batched rings (legs never idle); override via the env, set =0 to disable.
+    # The measurement paths (one-shot coord / --warm-only) stay OFF for A/B purity.
+    if a.serve and "M25_CWND_KEEPWARM_MS" not in os.environ:
+        os.environ["M25_CWND_KEEPWARM_MS"] = "150"
     nodes = []
     for spec in a.order:
         region, iid, lo, hi = spec.split(":")
