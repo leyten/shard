@@ -47,6 +47,7 @@ def sh(host, port, cmd, timeout=120):
 def push_code(host, port):
     for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/ngram_draft.py", "phase0/eagle_draft.py",
               "phase0/tree_spec.py", "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
+              "phase0/safe_kill.sh",                       # every box gets the self-match-proof killer for ad-hoc ops (bash /root/safe_kill.sh PATTERN)
               "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
         for attempt in (1, 2):                       # fail LOUD: a silently-dropped scp launches a stale/mixed-version ring
