@@ -160,11 +160,13 @@ class FakeRing(threading.Thread):
                 op = msg.get("op")
                 if op == "reset":
                     self._job_graph = msg.get("graph")      # per-job A/B toggle (None = absent)
-                    self.log.append({"op": "reset", "graph": self._job_graph})
+                    self.log.append({"op": "reset", "graph": self._job_graph, "keepwarm_ms": msg.get("keepwarm_ms")})
                     # mirror the tail's ack contract: a graph-stamped reset acks the APPLIED route +
                     # counters (the fake always applies as asked); plain resets keep the bare "ok"
                     send_msg(self.ret, "ok" if self._job_graph is None else
                              {"ok": 1, "graph": bool(self._job_graph), "graph_captured": 0, "graph_skipped": 0})
+                elif op == "noop":                  # cwnd keep-warm frame: leg-local, never answered —
+                    self.log.append({"op": "noop"})  # mirrors serve()'s skip; logged so tests can see it
                 elif op == "receipt":
                     self.log.append({"op": "receipt"})
                     rec = msg.get("receipts", [])           # graph-A/B jobs get the dict-promoted reply, like the tail
