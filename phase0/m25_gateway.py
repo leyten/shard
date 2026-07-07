@@ -26,8 +26,19 @@ MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
 # override per-call with {"reasoning": true/false} or {"reasoning_effort": "none"|...}. Default ON (quality).
 DEFAULT_REASONING = os.environ.get("M25_DEFAULT_REASONING", "1") != "0"
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+# A stalled streaming client must not pin the single-stream ring: bound each chunk write so a client
+# that stops reading is dropped in seconds, not up to the ring timeout (was ~30 min). Env-tunable.
+STREAM_WRITE_TIMEOUT = float(os.environ.get("M25_STREAM_WRITE_TIMEOUT", "30"))
 _ids = itertools.count(1)
 RING_LOCK = threading.Lock()   # the ring is single-stream: one generation at a time
+
+
+class ClientGone(Exception):
+    """The HTTP client's socket died or stalled mid-stream (write failed / timed out). NOT a ring
+    fault — so generate() must NEVER retry or re-run the generation (the old behaviour: a client
+    disconnect surfaced as an OSError, which coordinate_pipe absorbed as a ring EDGE_ERROR, so the
+    gateway reconnected and ran the ENTIRE generation a second time). A plain Exception, deliberately
+    NOT an OSError, so coordinate_pipe's `except EDGE_ERRORS` lets it propagate untouched."""
 
 A = None
 tok = None
@@ -46,11 +57,19 @@ def _engine_init():
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 
 
-def _connect(timeout):
+def _drop_socks():
+    """Close + forget the ring sockets so the next request reconnects fresh. Closing (not just
+    clearing the dict) matters on an aborted job: the head sees EOF and the tail sees its return
+    channel die, both handled by the churn recovery (PR #26 keeps pred+KV), so a fresh reset re-arms
+    the warm ring. The old `SOCKS.clear()`-without-close also leaked the fds until GC."""
     for s in SOCKS.values():
         try: s.close()
         except OSError: pass
     SOCKS.clear()
+
+
+def _connect(timeout):
+    _drop_socks()
     hh, hp = A.head.rsplit(":", 1); th, tp = A.tail.rsplit(":", 1)
     pipe = socket.create_connection((hh, int(hp)), timeout=timeout); pipe.setsockopt(*NODELAY)
     ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
@@ -63,7 +82,7 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
     """Run one chat completion through the ring (or a canned reply in MOCK). Returns the
     coordinate_pipe result dict ({text, n_tokens, prompt_tokens, tok_s, mean_accept, ...})."""
     if MOCK:
-        return _mock_generate(messages, tools, max_new, on_commit)
+        return _mock_generate(messages, tools, max_new, on_commit, reasoning)
     for attempt in (1, 2):
         try:
             if "pipe" not in SOCKS or attempt == 2:
@@ -72,23 +91,29 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
             return coordinate_pipe(SOCKS["pipe"], tok, messages, A.K, max_new, timeout, A.depth,
                                    ret_sock=SOCKS["ret"], local_draft=drafter, tools=tools,
                                    prefill_chunk=4096, max_ctx=A.max_ctx, on_commit=on_commit, reasoning=reasoning)
+        except ClientGone:
+            _drop_socks()   # the client died mid-decode -> stale in-flight replies on the ring; drop the
+            raise           # (now desynced) sockets and abort. NEVER retry: re-running wastes a full ring pass
         except Exception:
-            SOCKS.clear()
+            _drop_socks()
             if attempt == 2:
                 raise
 
 
-def _mock_generate(messages, tools, max_new, on_commit):
+def _mock_generate(messages, tools, max_new, on_commit, reasoning=True):
     """No-GPU canned completion that exercises the real parse/stream/assembly path. If tools are
-    offered, emits a tool call; else a short answer. Streams in slices so on_commit/diff is tested."""
+    offered, emits a tool call; else a short answer. Streams in slices so on_commit/diff is tested.
+    Honours `reasoning`: with it off the output carries NO <think> block (mirrors render_ids closing
+    it in the prompt), so the stream path is exercised in both modes."""
     last = messages[-1]["content"] if messages else ""
+    think = f"\nThinking about it.\n{THINK_END}" if reasoning else ""
     if tools:
         name = tools[0]["function"]["name"]
-        text = (f"\nThe user asked: {last[:40]}. I'll call {name}.\n{THINK_END}\n\n"
+        text = (f"{f'{chr(10)}The user asked: {last[:40]}. I will call {name}.{chr(10)}{THINK_END}' if reasoning else ''}\n\n"
                 f"Let me look that up.{TOOLCALL_BEGIN}\n<invoke name=\"{name}\">\n"
                 f"<parameter name=\"query\">{last[:30]}</parameter>\n</invoke>\n</minimax:tool_call>")
     else:
-        text = f"\nThinking about it.\n{THINK_END}\n\nHere is a concise answer to: {last[:60]}."
+        text = f"{think}\n\nHere is a concise answer to: {last[:60]}."
     if on_commit:
         for i in range(8, len(text) + 8, 8):
             on_commit_text = text[:i]
@@ -99,9 +124,19 @@ def _mock_generate(messages, tools, max_new, on_commit):
 
 # ---------- OpenAI request handling ----------
 
-def _split_stream(text):
-    """Monotonic split for streaming: generation starts inside the forced <think>, so reasoning is
-    everything up to </think>; content is after it, up to any tool-call block (never leak XML)."""
+def _split_stream(text, reasoning_on=True):
+    """Monotonic split of the running generation into (reasoning, content).
+
+    reasoning ON: generation starts inside the forced <think>, so reasoning is everything up to
+    </think> and content is after it (up to any tool-call block — never leak XML).
+
+    reasoning OFF: render_ids already CLOSED <think> in the prompt, so the OUTPUT has no think block
+    and is pure content. Without the flag, a </think>-less output fell through to the last return and
+    streamed the WHOLE answer as reasoning_content — then the end-of-stream flush re-emitted it as
+    content, DUPLICATING the answer. So when reasoning is off, everything is content."""
+    if not reasoning_on:
+        content = text.split(THINK_END)[-1]            # defensive: drop an echoed think-close if any
+        return "", content.split(TOOLCALL_BEGIN)[0] if TOOLCALL_BEGIN in content else content
     if THINK_END in text:
         head, _, tail = text.partition(THINK_END)
         reasoning = head.split(THINK_BEGIN)[-1]
@@ -165,8 +200,8 @@ class H(BaseHTTPRequestHandler):
                     self._stream(cid, created, messages, tools, max_new, reasoning)
                 else:
                     self._complete(cid, created, messages, tools, max_new, reasoning)
-        except BrokenPipeError:
-            pass
+        except (BrokenPipeError, ClientGone):
+            pass                                          # client is gone — nothing to send, ring already released
         except Exception as e:
             err = {"error": {"message": f"{type(e).__name__}: {str(e)[:200]}", "type": "engine_error"}}
             try: self._json(err, 500)
@@ -193,26 +228,30 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+        self.connection.settimeout(STREAM_WRITE_TIMEOUT)   # a stalled client write must not pin the ring
 
         def chunk(delta, finish=None):
             o = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
-            self.wfile.write(f"data: {json.dumps(o)}\n\n".encode()); self.wfile.flush()
+            try:
+                self.wfile.write(f"data: {json.dumps(o)}\n\n".encode()); self.wfile.flush()
+            except OSError as e:                           # client disconnected OR stalled past the timeout:
+                raise ClientGone(f"{type(e).__name__}: {e}") from e   # abort the job, never retry (see generate)
 
         chunk({"role": "assistant"})
         state = {"r": 0, "c": 0}
         def on_commit(out, _dt):
             text = _decode_running(out, self)
-            reasoning, content = _split_stream(text)
-            if len(reasoning) > state["r"]:
-                chunk({"reasoning_content": reasoning[state["r"]:]}); state["r"] = len(reasoning)
+            reasoning_txt, content = _split_stream(text, reasoning)   # `reasoning` = the request's bool (closure)
+            if len(reasoning_txt) > state["r"]:
+                chunk({"reasoning_content": reasoning_txt[state["r"]:]}); state["r"] = len(reasoning_txt)
             if len(content) > state["c"]:
                 chunk({"content": content[state["c"]:]}); state["c"] = len(content)
 
         r = generate(messages, tools, max_new, on_commit=on_commit, reasoning=reasoning)
         parsed = parse_completion(r["text"])
         # flush any tail not yet streamed (final trimmed text), then tool calls
-        _, fcontent = _split_stream(r["text"])
+        _, fcontent = _split_stream(r["text"], reasoning)
         final_content = parsed["content"] or ""
         if len(final_content) > state["c"]:
             chunk({"content": final_content[state["c"]:]})
