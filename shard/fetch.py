@@ -85,6 +85,8 @@ class MirrorProvider(Provider):
         if have > total:  # stale/corrupt partial — start over
             os.remove(part)
             have = 0
+        if have == total:  # a prior attempt already fetched the whole body
+            return
         req = Request(url, headers={"User-Agent": "shard/1", **self.headers})
         if have:
             req.add_header("Range", f"bytes={have}-")
@@ -92,6 +94,11 @@ class MirrorProvider(Provider):
             resumed = have > 0 and getattr(r, "status", 200) == 206
             with open(part, "ab" if resumed else "wb") as f:
                 shutil.copyfileobj(r, f, 1 << 20)
+        got = os.path.getsize(part)
+        if got != total:  # dropped connection => a partial body with NO exception; keep the partial
+            raise FetchError(  # and RAISE so fetch()'s retry loop resumes it via Range (the size-only
+                f"incomplete download {got}/{total} bytes for "  # bug that let a truncated shard reach
+                f"{url.rsplit('/', 1)[-1]} — resuming")          # _verify, which then hard-failed the pull)
 
 
 class LocalDirProvider(Provider):
