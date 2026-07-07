@@ -228,6 +228,23 @@ def recv_data(sock):
         return m
 
 
+def _reply_timeout(timeout):
+    """Per-reply recv deadline for the coordinator's DECODE loop (F6). An internal-ring leg can blip
+    while the coordinator is alive — the steady state on a permissionless ring — and the tail then
+    holds the job stale until the coordinator's next reset (the PR #26 return-channel fix), dropping
+    the in-flight replies meanwhile. So a blocked recv would otherwise wait the full production
+    `timeout` (1800s on the gateway) before EDGE_ERRORS fires the resume/retry. Bound each decode
+    round-trip to a few seconds instead, so blip failover is seconds not up-to-timeout. PREFILL keeps
+    the full timeout (a big activation over a slow uplink is legitimately slow), as does the batched
+    coordinator (throughput tier, not latency-failover-sensitive). Env M25_REPLY_TIMEOUT (seconds);
+    0/empty disables (falls back to the full timeout); never longer than the production timeout."""
+    try:
+        hb = float(os.environ.get("M25_REPLY_TIMEOUT", "20") or "0")
+    except ValueError:
+        hb = 20.0
+    return min(timeout, hb) if hb > 0 else timeout
+
+
 def _act_digest(t):
     """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
@@ -410,6 +427,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                                     resumable=resumable, reasoning=reasoning)
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
+    rx.settimeout(timeout)                       # full budget for reset-ack + prefill (a reused gateway socket may carry a prior job's decode heartbeat)
     # cwnd keep-warm on the coord->head leg, wrapped HERE (not at the call boundary) so every caller
     # (coord CLI, gateway, sweep) gets one lock per socket with zero call-site changes; the socket is
     # only ever driven by one job at a time, so a per-job wrapper owns all sends for its lifetime.
@@ -460,6 +478,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_data(rx)); cur = toks[-1]
             _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
+        rx.settimeout(_reply_timeout(timeout))              # F6: tighten the per-reply deadline for decode — a mid-decode ring blip fails over in seconds, not up to the full timeout
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
         if on_commit: on_commit(out, 0.0)               # stream: first token from prefill
         inflight = []; discard = 0; send_pos = pos; dprefix = gen_ids + [cur]
@@ -589,6 +608,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     from tree_spec import tree_greedy_walk
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
+    rx.settimeout(timeout)                                  # full budget for reset-ack + prefill (see coordinate_pipe); decode tightens below
     kw_job = os.environ.get("M25_KEEPWARM_JOB")             # cwnd keep-warm, same design as coordinate_pipe
     kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)
     _eos = tok.eos_token_id
@@ -636,6 +656,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
             raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
         prefill_s = time.time() - t_pf
+        rx.settimeout(_reply_timeout(timeout))                      # F6: per-reply decode deadline (see coordinate_pipe) — fast blip failover
         out = [cur]; pending_path = [cur]; vbase = len(gen_ids)      # cur = first gen token at abs pos vbase
         if on_commit: on_commit(out, 0.0)                            # stream: first token from prefill
         rounds = 0; total_committed = 0; accepted = 0; wasted = 0; t0 = time.time(); done = False
