@@ -519,9 +519,11 @@ Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25
 - **Gateway** (`m25_gateway`, 4 high): reconnect wedges the warm ring; client-disconnect mid-stream silently
   re-runs the ENTIRE generation; `reasoning=False` streaming duplicates the whole answer as reasoning+content; a
   slow/stalled streaming client blocks the single-stream ring up to 30 min (add a write timeout / decouple).
-- **Wire/transport** (2 high, security): unauthenticated 64-bit length prefix → any peer forces unbounded alloc
-  (cap it pre-alloc); the libp2p PRODUCTION transport LOST wire.py's malformed-frame hardening (one bad frame
-  kills a stage — port the try/except).
+- **✅ Wire/transport (DONE, PR fix/wire-alloc-dos, 25 hostile-frame tests):** the 64-bit length prefix is now
+  capped pre-alloc (`MAX_FRAME`, env `M25_MAX_FRAME`, default 256 MiB) in BOTH codecs, and `_unpack` validates a
+  tensor's declared shape against its blob length — closing an EMPTY-blob + huge-shape frame that drove
+  `torch.empty(attacker_shape)` (a third alloc vector beyond the finding). The libp2p transport's malformed-frame
+  guard was already restored earlier. Adversarially verified (pre-fix allocated a 1M-elem tensor from a 0-byte blob).
 - **Contained bugs:** batched-decode KV write has no `M25_KV_MAXLEN` guard (OOB scatter kills the stage — copy
   the prefill guard); `select_ring` false-infeasible (require-blind `>_TRIM` funnel returns None when a feasible
   ring exists — TIER 1.3 depends on this).
