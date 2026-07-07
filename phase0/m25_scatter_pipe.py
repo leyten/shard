@@ -28,7 +28,8 @@ ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAG
            "M25_DEFAULT_REASONING", "M25_MAX_POS",
            "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH",   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four
            "M25_CWND_KEEPWARM_MS", "M25_KEEPWARM_JOB",                    # cwnd keep-warm: stage senders keep idle legs warm (default-ON for --serve interactive)
-           "M25_STAGE_TIMING"]                                            # per-stage [span,compute] stamps -> coordinator transport split
+           "M25_STAGE_TIMING",                                            # per-stage [span,compute] stamps -> coordinator transport split
+           "SHARD_RECEIPT_DUMP"]                                          # coordinator exports the signed receipt set for the c0mpute settle seam
 
 
 def eng_env():
