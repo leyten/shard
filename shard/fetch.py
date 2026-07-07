@@ -23,6 +23,7 @@ Per the boundary law: pure engine. Knows about manifests, shards, and bytes — 
 about c0mpute's catalog or accounts (the caller passes the pinned publisher pubkey in).
 """
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -43,6 +44,31 @@ class ProviderUnavailable(Exception):
 
 def _log(msg: str) -> None:
     print(f"[fetch] {msg}", flush=True)
+
+
+def _resume_offset(resp) -> int:
+    """The byte offset this response body starts at. A 206 declares it in Content-Range
+    ('bytes 19922944-4998528135/4998528136'); a 200 — or a 206 whose Range a redirect/CDN
+    dropped, so the body is the WHOLE file — starts at 0. Trusting the bare 206 status and
+    appending a full body is the live-ring bug that grew a shard to have+total bytes."""
+    if getattr(resp, "status", 200) != 206:
+        return 0
+    cr = (getattr(resp, "headers", None) or {}).get("Content-Range", "") or ""
+    m = re.match(r"\s*bytes\s+(\d+)-", cr)
+    return int(m.group(1)) if m else 0  # a 206 with no parseable range: treat as a full body
+
+
+def _copy_capped(src, dst, limit: int, bufsize: int = 1 << 20) -> None:
+    """Copy at most `limit` bytes src->dst. A guard so a broken or hostile mirror that streams
+    past the manifest size cannot flood the disk — an overshoot is bounded and then caught by the
+    size check. A short read (dropped connection) just stops early; the retry loop resumes it."""
+    remaining = limit
+    while remaining > 0:
+        chunk = src.read(min(bufsize, remaining))
+        if not chunk:
+            break
+        dst.write(chunk)
+        remaining -= len(chunk)
 
 
 # ── providers (the source seam) ───────────────────────────────────────────────
@@ -81,6 +107,7 @@ class MirrorProvider(Provider):
         raise FetchError(f"mirror could not fetch {shard['path']} after {self.retries} tries")
 
     def _download(self, url: str, part: str, total: int) -> None:
+        name = url.rsplit("/", 1)[-1]
         have = os.path.getsize(part) if os.path.exists(part) else 0
         if have > total:  # stale/corrupt partial — start over
             os.remove(part)
@@ -91,14 +118,26 @@ class MirrorProvider(Provider):
         if have:
             req.add_header("Range", f"bytes={have}-")
         with urlopen(req, timeout=120) as r:
-            resumed = have > 0 and getattr(r, "status", 200) == 206
-            with open(part, "ab" if resumed else "wb") as f:
-                shutil.copyfileobj(r, f, 1 << 20)
+            # Place the body by its Content-Range, NOT the bare 206 status. A mirror/CDN can answer
+            # a Range request with the WHOLE file (a 200, or a 206 starting at 0 when a redirect
+            # drops the Range header). Appending that to our partial overshoots to have+total bytes —
+            # the live-ring bug. Only append when the server actually resumed at our offset.
+            start = _resume_offset(r)
+            if start == have and have:      # a genuine resume: append the tail
+                mode, cap = "ab", total - have
+            elif start == 0:                # the whole body (200, or a 206 whose Range was dropped)
+                mode, cap = "wb", total
+            else:                           # a range we can't place — drop the partial, restart clean
+                if os.path.exists(part):    # (may be absent: a hostile 206 on a fresh, no-Range GET)
+                    os.remove(part)
+                raise FetchError(f"{name}: server resumed at {start}, expected {have} — restarting")
+            with open(part, mode) as f:
+                _copy_capped(r, f, cap)     # never write past `total`, whatever the mirror streams
         got = os.path.getsize(part)
         if got != total:  # dropped connection => a partial body with NO exception; keep the partial
             raise FetchError(  # and RAISE so fetch()'s retry loop resumes it via Range (the size-only
-                f"incomplete download {got}/{total} bytes for "  # bug that let a truncated shard reach
-                f"{url.rsplit('/', 1)[-1]} — resuming")          # _verify, which then hard-failed the pull)
+                f"incomplete download {got}/{total} bytes for {name} — resuming")  # bug that let a
+                # truncated shard reach _verify, which then hard-failed the whole block pull
 
 
 class LocalDirProvider(Provider):
