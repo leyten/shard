@@ -114,6 +114,17 @@ def _bucket(need):                                  # smallest decode bucket >= 
         if b >= need:
             return min(b, M25_KV_MAXLEN)
     return M25_KV_MAXLEN
+
+
+def _decode_kv_check(starts_max, s):
+    """Bound the batched-decode KV write to the static buffer. A stream whose absolute position runs
+    past M25_KV_MAXLEN would scatter OUT OF BOUNDS along the MAXLEN axis — a device-side CUDA assert
+    that kills the stage (and its warm weights). Raise a clean, recoverable RuntimeError instead
+    (mirrors the batched-prefill guard). Returns the total context length (max written index + 1)."""
+    total = starts_max + s
+    if total > M25_KV_MAXLEN:
+        raise RuntimeError(f"batched decode context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise --kv-maxlen or shorten the prompt)")
+    return total
 # CUDA-graph decode (opt-in M25_CUDA_GRAPH): capture run_block at a FIXED (s=K+1, bucket) shape so a verify
 # block replays as ONE graph — removes per-kernel launch overhead. Needs M25_STATIC_KV + M25_SDPA. Varying
 # start_pos is carried into the graph by _GR's STATIC buffers: RoPE slice (cos/sin), index_copy_ positions
@@ -441,8 +452,9 @@ class Layer:
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
+        mx = _decode_kv_check(int(starts.max().item()), s)   # clean error, not an OOB scatter CUDA-assert that kills the stage
         self.bkc[:B].scatter_(2, idx, _kv_enc(k)); self.bvc[:B].scatter_(2, idx, _kv_enc(v))   # write all rows (fp8 bytes if M25_KV_FP8)
-        alen = _bucket(int(starts.max().item()) + s)
+        alen = _bucket(mx)
         # HYBRID: small/medium context -> ONE batched manual matmul (fast, ~3x batched throughput); big context ->
         # per-stream flash SDPA (the GQA-repeat [B,48,alen,HD] would OOM at big alen, and a batched dense mask
         # forces SDPA->MATH which also OOMs). Threshold on the GQA-repeat size (kk+vv bf16 bytes).
