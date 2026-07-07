@@ -43,6 +43,12 @@ _NONCE = 12                                  # ChaCha20-Poly1305 nonce length
 _DTYPES = {str(d): d for d in (torch.float32, torch.float16, torch.bfloat16,
                                torch.float8_e4m3fn, torch.float8_e5m2,   # fp8 activation transport (M25_FP8_WIRE) — keep in lockstep with shard/transport.py
                                torch.int64, torch.int32, torch.uint8, torch.bool)}
+_DSIZE = {d: torch.empty(0, dtype=d).element_size() for d in set(_DTYPES.values())}  # bytes/element, to size-check a blob
+
+# Hard cap on one inbound frame's declared length. n is read (and the body buffered) BEFORE the AEAD
+# seal is verified, so an unauthenticated peer's oversized claim must be refused BEFORE allocating the
+# body — else any peer that can reach the port OOMs the node. Env M25_MAX_FRAME; default 256 MiB.
+MAX_FRAME = int(os.environ.get("M25_MAX_FRAME") or 256 * 1024 * 1024)
 
 
 def use_key(material):
@@ -100,7 +106,15 @@ def _unpack(buf):
                 if dt is None:
                     raise ValueError(f"unknown tensor dtype {node['dtype']!r}")
                 shape, blob = node["shape"], blobs[node["__t__"]]
-                if not blob:
+                numel = 1
+                for d in shape:
+                    if not isinstance(d, int) or d < 0:
+                        raise ValueError(f"bad tensor dim {d!r}")
+                    numel *= d
+                if numel * _DSIZE[dt] != len(blob):    # declared shape must match the blob EXACTLY — a lying
+                    raise ValueError(                  # shape (esp. an empty blob + huge shape) must never
+                        f"tensor {shape} needs {numel * _DSIZE[dt]} bytes, blob has {len(blob)}")  # drive torch.empty
+                if numel == 0:
                     return torch.empty(shape, dtype=dt)
                 raw = torch.from_numpy(np.frombuffer(blob, dtype=np.uint8).copy())
                 return raw.view(dt).reshape(shape)
@@ -148,6 +162,8 @@ def send_msg(sock, obj):
 
 def recv_msg(sock):
     (n,) = struct.unpack("!Q", _recvall(sock, 8))
+    if n > MAX_FRAME:                                  # refuse an oversized length BEFORE buffering the body (pre-auth)
+        raise ConnectionError(f"frame length {n} exceeds MAX_FRAME ({MAX_FRAME})")
     frame = _recvall(sock, n)
     # any frame we can't authenticate AND parse into a message is a dead edge: re-raise as
     # ConnectionError so the existing `except EDGE_ERRORS` supervision resets the connection
