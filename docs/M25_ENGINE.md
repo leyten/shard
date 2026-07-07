@@ -13,18 +13,33 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" hardening sweep — THREE PRs (no spend, ring stayed down)
-Code-first betanet-critical-path work, all prove-locally-first, CPU-tested. Merged: **PR #34** churn (F6
-per-reply decode heartbeat → blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail churn test,
-adversarially verified against the pre-#26 bug). **PR #35** wire DoS (`MAX_FRAME` length cap + tensor
-shape/blob-size validation closing an empty-blob→`torch.empty(huge)` OOM, both codecs; adversarially verified
-pre-fix allocated a 1M-elem tensor from 0 bytes). **Branch `fix/receipt-freshness-binding`** (the MOAT, TIER 2.2):
-per-job nonce (anti-replay) + `out_root==in_root` chain binding, coordinator-trusted-challenge model (leyten's
-call), gated `not M25_FP8_WIRE`; 13 tests. Also fixed the stale tok/s number (→ ~24/~30, graph-aux). Suite 148 green.
-**NEXT (leyten said pause+report after the moat, then):** TIER 3 **gateway hardening** (client-disconnect re-runs
-the whole gen; slow client blocks the ring ≤30min; reconnect wedge; reasoning=False stream dup) — his pick for
-what's next. Then TIER 2.4 verified weight-fetch, and the endpoint receipt bindings (head-input↔prompt,
-tail-output↔observed tokens) noted as follow-ups. The keep-warm jitter A/B + FWD_RET tunnel look still need a ring.
+### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" sweep — FIVE PRs merged + WARM-RING VALIDATION (autonomous)
+Full autonomous CTO loop (leyten granted full merge + full vast-balance spend auth, then went out). **5 hardening
+PRs merged to master, all CPU-tested + adversarially verified:** **#34** churn (F6 per-reply decode heartbeat →
+blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail churn test, teeth-checked vs the pre-#26 bug).
+**#35** wire DoS (`MAX_FRAME` cap + tensor shape/blob validation → closed empty-blob→`torch.empty(huge)` OOM, both
+codecs; pre-fix allocated a 1M-elem tensor from 0 bytes). **#36** the MOAT (TIER 2.2): per-job nonce (anti-replay)
++ `out_root==in_root` chain binding, coordinator-trusted-challenge, gated `not M25_FP8_WIRE`. **#37** gateway
+(client-disconnect no longer re-runs the whole gen via `ClientGone`; stream write timeout bounds a stalled client;
+`reasoning=False` stream-dup fixed). **#38** batched-decode KV bound guard (no OOB scatter crash). `select_ring`
+false-infeasible was already fixed (stale roadmap). Also fixed the stale tok/s number (→ ~24/~30). Suite **162 green**.
+
+**WARM-RING VALIDATION (live 5-stage EU ring, ~$3-4, receipt `docs/receipts/m25-warmring-validation-20260707.md`):**
+provisioned autonomously (rent_pool→ring_up), pushed master engine code, and PRODUCTION-VALIDATED the two
+never-before-live-tested pieces. **① Receipt moat (#36) LIVE:** the 5 signed per-stage receipts chain EXACTLY
+(`out_root[i]==in_root[i+1]` across all 5 scattered stages) — PROVE verdict ALL valid + full coverage + nonce +
+chain (lossless wire). **② Churn (#34/#26) LIVE:** killed the coordinator MID-DECODE, a NEW coordinator completed a
+job on the same ring with NO re-warm. graph-aux rep2 skipped (mechanism-verified; this ring slow-CPU/lossless, won't
+re-pin 24 without a STATIC_KV re-warm). **OPS LESSON banked:** FWD_RET/FWD_RING tunnels take ~3-5min to establish
+after warm (initial dial refused → CONN DIRECT later) — the first post-warm coord WEDGES until they're up; give it a
+long timeout / background it, don't kill early. Ring TORN DOWN (instances-v1==0 verified).
+
+**NEXT:** remaining code-first: **TIER 2.4 verified weight-fetch** (route the real 115GB HF pull through the
+`shard/fetch.py` content-addressed manifest check — currently `ring_up` uses raw `snapshot_download`; needs an M2.5
+manifest, a bigger build) + **endpoint receipt bindings** (head-input↔prompt, tail-output↔observed tokens — the
+#36 follow-ups, need a design panel). **FWD_RET robustness** (dial the tail directly instead of via the head
+sidecar — the tunnel flakiness above is the motivation). **keep-warm jitter A/B** still needs a jittery/residential
+(DoubleZero) path.
 
 ### ⇒ 2026-07-05/06: FOUR things SHIPPED to master (graph-aux + churn fix + safe_kill + keep-warm); ring DESTROYED
 Perf-lever evening → became a perf + robustness sweep. All merged to master via clean PRs (no Claude trailer):
@@ -460,9 +475,9 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 | Single-stream DRAFTABLE (copy/RAG/verbatim) | 50–81 tok/s (n-gram, accept high) | m25_ctx_table |
 | **Single-stream NORMAL reasoning-ON (EAGLE hybrid)** | **~5.7 tok/s decode-wtd on a jittery lottery ring / ~7 on a good tight EU ring** (2026-07-02 warm A/B, merged serial-path; was ~3 n-gram-only, ~1.8 raw) | receipt m25-eagle-serial-path-ab-20260702 |
 | **TREE-verify v2 (hybrid, tight EU ring)** | **+18% decode-wtd over chain on the SAME warm ring (3.9→4.6); reason-math 4.8→6.0, reason-logic 3.0→4.7, code-edit 4.5→6.1; g novel 3.7→4.5 at M=12** — flips v1's 'tree loses tok/s on tight rings' (payload, not physics). rag-quote gap = sync tree vs pipelined n-gram | receipt m25-tree-verify-v2-ab-20260702, branch eagle/tree-verify-v2 |
-| **Ring churn survival (wedge fix)** | coord kill -9 mid-decode → new coordinator, same ring, NO re-warm (6.7→6.6 tok/s); forward links rebuild, tail keeps warm KV | receipt m25-ring-wedge-smoke-20260702, branch fix/ring-wedge-receipt-truth |
+| **Ring churn survival (wedge fix + heartbeat)** | coord kill -9 mid-decode → new coordinator, same ring, NO re-warm — **WARM-VALIDATED LIVE 2026-07-07** on a 5-stage EU ring (coord B 66 tok completed after A killed mid-decode). + F6 per-reply decode heartbeat (blip failover in seconds) | receipts m25-ring-wedge-smoke-20260702 + **m25-warmring-validation-20260707**, PRs #26/#34 |
 | Tools / multi-turn / long-ctx(≥30k needle) | PASS | _validate pass, prior receipts |
-| Trustless verification | signed per-stage receipts, lossless — coverage now vs TRUE model depth, fail-closed on empty (fix on branch fix/ring-wedge-receipt-truth; freshness/replay binding still open, TIER 2.2) | shard/receipt.py, tests/test_receipt_coverage.py |
+| Trustless verification (moat) | signed per-stage receipts, lossless, coverage vs TRUE depth + fail-closed + **per-job nonce (anti-replay) + `out_root==in_root` chain binding (#36)** — **WARM-VALIDATED LIVE 2026-07-07**: 5-stage chain held exactly across scattered EU stages, PROVE ALL valid. TIER 2.2 CLOSED (endpoint bindings = follow-up) | shard/receipt.py, tests/test_receipt_binding.py, receipt m25-warmring-validation-20260707 |
 | Reasoning control (no-think fast mode) | wired (`reasoning` flag, render_ids closes `<think>`) | commit da9f11d |
 | **EAGLE hybrid drafter (reasoning)** | **WORKS: reason-math 34%/g3.7/11.8tok/s, open-chat 13%, agentic 50%/g5.0; ~7 tok/s decode-weighted** (was 0.9 broken). Bug was missing context attention (persistent context KV); aux layers {1,30,58} | **merged to master** (PR #7) |
 | **Self-optimizer core (`select_ring`)** | UPLOAD-AWARE: minimizes total request time (prefill+D·decode) with per-node uplink first-class; tails/drops slow-upload nodes + relegates them to off-critical roles; picks subset+order+layer-split; adversarially reviewed (3 false-infeasible bugs fixed total), 10 regression tests, byte-identical legacy path | **master** (`shard/topology.py`, `tests/test_topology.py`) |
