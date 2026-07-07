@@ -49,9 +49,12 @@ background it, don't kill early. Ring TORN DOWN (instances-v1==0 verified).
   rel-norm guard). Also boundary-law: token/I/O semantics belong in the c0mpute economics layer, not the engine's
   activation receipt. REVISIT only if coordinators become untrusted for output attribution → then build a
   client-facing receipt-of-service at the c0mpute layer over (prompt, answer), never a `tok_out_root` in the chain.
-- **TIER 2.4 weight-fetch deploy-wiring** — verification is now proven (#40); remaining is routing `ring_up`'s real
-  115GB pull through `fetch_block`, which needs a signed M2.5 manifest (an offline shard-hashing job) + swapping
-  `snapshot_download`. Bigger build; can't fully validate without a ring.
+- **TIER 2.4 weight-fetch deploy-wiring** — the trust root is now fully tested BOTH sides: verify (`fetch_block`,
+  #40) AND generate (`publish_manifest`, #44 — build_from_dir round-trips through fetch_block). And generating the
+  real M2.5 manifest is a SECONDS-long `publish_manifest.py --hf <repo>` command (HF LFS oid == sha256 → no 115GB
+  download). REMAINING is not a build blocker but two decisions/steps: (a) PUBLISHER IDENTITY — who signs the M2.5
+  manifest + where the key/catalog pin lives (a c0mpute-catalog / trust-root call, leyten's); (b) swap `ring_up`'s
+  `snapshot_download` for `fetch_block(manifest)` and validate the verified pull on a ring. Needs (a) + a ring.
 - **FWD_RET robustness** — the return path could dial the tail directly instead of via the head sidecar (the
   ~3-5min tunnel-establish flakiness above is the motivation). libp2p/sidecar infra change — can't CPU-validate.
 - **keep-warm jitter A/B** — needs a jittery/residential (DoubleZero) bare-metal path.
