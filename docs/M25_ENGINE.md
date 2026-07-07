@@ -13,7 +13,7 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" sweep — FIVE PRs merged + WARM-RING VALIDATION (autonomous)
+### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" sweep — SEVEN PRs merged + WARM-RING VALIDATION (autonomous)
 Full autonomous CTO loop (leyten granted full merge + full vast-balance spend auth, then went out). **5 hardening
 PRs merged to master, all CPU-tested + adversarially verified:** **#34** churn (F6 per-reply decode heartbeat →
 blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail churn test, teeth-checked vs the pre-#26 bug).
@@ -21,8 +21,10 @@ blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail churn test, tee
 codecs; pre-fix allocated a 1M-elem tensor from 0 bytes). **#36** the MOAT (TIER 2.2): per-job nonce (anti-replay)
 + `out_root==in_root` chain binding, coordinator-trusted-challenge, gated `not M25_FP8_WIRE`. **#37** gateway
 (client-disconnect no longer re-runs the whole gen via `ClientGone`; stream write timeout bounds a stalled client;
-`reasoning=False` stream-dup fixed). **#38** batched-decode KV bound guard (no OOB scatter crash). `select_ring`
-false-infeasible was already fixed (stale roadmap). Also fixed the stale tok/s number (→ ~24/~30). Suite **162 green**.
+`reasoning=False` stream-dup fixed). **#38** batched-decode KV bound guard (no OOB scatter crash). **#40** adversarial tests for the verified
+weight-fetch trust root (`shard/fetch.py`/`manifest.py`, 14 tests: tamper+delete / path-traversal / bad-sig /
+wrong-pin / cache re-hash — the primitive had ZERO coverage). `select_ring` false-infeasible was already fixed
+(stale roadmap). Also fixed the stale tok/s number (→ ~24/~30). Suite **176 green**.
 
 **WARM-RING VALIDATION (live 5-stage EU ring, ~$3-4, receipt `docs/receipts/m25-warmring-validation-20260707.md`):**
 provisioned autonomously (rent_pool→ring_up), pushed master engine code, and PRODUCTION-VALIDATED the two
@@ -34,12 +36,23 @@ re-pin 24 without a STATIC_KV re-warm). **OPS LESSON banked:** FWD_RET/FWD_RING 
 after warm (initial dial refused → CONN DIRECT later) — the first post-warm coord WEDGES until they're up; give it a
 long timeout / background it, don't kill early. Ring TORN DOWN (instances-v1==0 verified).
 
-**NEXT:** remaining code-first: **TIER 2.4 verified weight-fetch** (route the real 115GB HF pull through the
-`shard/fetch.py` content-addressed manifest check — currently `ring_up` uses raw `snapshot_download`; needs an M2.5
-manifest, a bigger build) + **endpoint receipt bindings** (head-input↔prompt, tail-output↔observed tokens — the
-#36 follow-ups, need a design panel). **FWD_RET robustness** (dial the tail directly instead of via the head
-sidecar — the tunnel flakiness above is the motivation). **keep-warm jitter A/B** still needs a jittery/residential
-(DoubleZero) path.
+**NEXT — the safe CPU-testable hardening backlog is now DRAINED; remaining work is a bigger tier that wants
+leyten's direction (autonomous loop STOPPED here after 7 PRs + the live validation):**
+- **Endpoint receipt bindings** (#36 follow-up) — need a TRUST-MODEL decision first, not just a design panel:
+  the naive token binding (`tok_in_root` = hash of the head's input token_ids) is WEAK — a node that already
+  KNOWS the tokens (the coordinator sent them) can hash the right ones without computing on them; a real
+  input↔compute binding is the proof-of-compute (crypto-later) seam. Decide what guarantee is actually wanted
+  before building.
+- **TIER 2.4 weight-fetch deploy-wiring** — verification is now proven (#40); remaining is routing `ring_up`'s
+  real 115GB pull through `fetch_block`, which needs a signed M2.5 manifest (an offline shard-hashing job) +
+  swapping `snapshot_download`. Bigger build; can't fully validate without a ring.
+- **FWD_RET robustness** — the return path could dial the tail directly instead of via the head sidecar (the
+  ~3-5min tunnel-establish flakiness above is the motivation). libp2p/sidecar infra change — can't CPU-validate.
+- **keep-warm jitter A/B** — needs a jittery/residential (DoubleZero) bare-metal path.
+- **The real remaining project = Bucket B: the c0mpute permissionless loop** (join→admit→place→run→pay driving
+  the engine). `select_ring` is built in shard; it needs to graduate into c0mpute. This is the north-star gap.
+All of these need a strategy/prioritization call — the reason the autonomous loop stopped rather than barrelling
+into a moat-critical design or a ring-dependent build unsupervised.
 
 ### ⇒ 2026-07-05/06: FOUR things SHIPPED to master (graph-aux + churn fix + safe_kill + keep-warm); ring DESTROYED
 Perf-lever evening → became a perf + robustness sweep. All merged to master via clean PRs (no Claude trailer):
