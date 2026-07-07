@@ -549,8 +549,11 @@ Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25
    activation proof-of-compute stays the crypto-later seam.
 3. **✅ DONE (earlier) — tree-verify path emits receipts** — the `M25_TREE` blocks now call `signer.observe` on both
    the tail and head/middle stages (verification no longer silently off under trees).
-4. Verified-fetch trust root (`shard/fetch.py`) is bypassed by the real M2.5 deploy path (HF pull, unverified) —
-   route the betanet weight pull through the content-addressed manifest check.
+4. Verified-fetch trust root (`shard/fetch.py`) — the verification primitive is now HARDENED + TESTED (14
+   adversarial tests, `tests/test_fetch.py`: tampered/size/CID reject+delete, path-traversal refused,
+   bad-sig/wrong-pin/unsigned manifest rejected, cache re-hash). REMAINING: the real M2.5 deploy still
+   bypasses it (`ring_up` uses raw `snapshot_download`) — route the betanet weight pull through `fetch_block`,
+   which needs a signed M2.5 manifest (an offline shard-hashing job) + swapping the deploy pull. Bigger build.
 
 **TIER 3 — ROBUSTNESS (gateway + wire + contained bugs; a batch-into-one-session hardening pass):**
 - **✅ Gateway (DONE, PR #37, 11 tests):** client-disconnect no longer re-runs the whole generation (client write
