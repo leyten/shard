@@ -13,6 +13,51 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-07 (later) — PERMISSIONLESS LOOP DEMONSTRATED end-to-end (sim, REAL seams); #46 fixed; 2 FORKS to leyten
+Acted on the PIVOT below. The loop now runs end-to-end — **announce → admit → PLACE → assign → (pull/form/serve
+sim) → SETTLE → pay per shard** — against the REAL shard decision code, and dishonest settlements pay NOBODY.
+
+**SHIPPED (merged to shard master):**
+- **#48 — the #46 over-sized-download bug FIXED.** Root cause pinned exactly: the overshoot was `have_partial(19MiB)
+  + full_total` — a resume the CDN answered with the WHOLE body tagged 206 (Content-Range from 0, redirect drops
+  the Range), and `_download` trusted the bare 206 and APPENDED. Fix: place the body by its **Content-Range**, cap
+  writes at the manifest size, drop-and-restart on an unplaceable range. Adversarially verified SOUND (overshoot
+  class eliminated by construction; residual soft cases caught by the sha256 backstop). The verified pull is safe now.
+- **#49 `shard.plan` (PLACE seam)** + **#50 `shard.verify` (SETTLE seam)** — the graduation bricks. `plan_ring`
+  lifts ring_up's calibration (VRAM reserves, launch-bound layer_ms, head placement) into a tracked, tested fn;
+  `python3 -m shard.plan` / `shard.verify` are JSON-in/out CLIs so a TS orchestrator drives the same proven
+  `select_ring` + `receipt.verify_coverage` over stdio (deps still one way). The three shard pieces — plan, fetch
+  (verified), verify — are contract-compatible and now callable from the network layer.
+
+**OPEN for leyten's review — c0mpute PR #14 (`net/permissionless-loop`), NOT merged (product/economics-fork-dependent):**
+The graduation into the orchestrator. `lib/orchestrator/swarm.ts` (`SwarmManager`: admit → candidate pool →
+`formSwarm` calls the plan seam + emits `swarm:assign` → `markReady` → `settleJob` calls the verify seam + splits
+pay per shard) + `swarm-seam.ts` (spawns the shard modules) + `swarm-loop.ts` wired into `orchestrator.ts` in ONE
+additive constructor call (+20 lines; the whole-model worker path is untouched). `scripts/swarm-loop-demo.ts`
+proves it with NO GPU against the real seams: 6 nodes announce, a 4GB node refused, `shard.plan` forms a 5-stage
+ring (coordinator = most-central node, slow low-uplink 4090 relegated to verifier/standby), a 480-tok job splits
+per shard (77+101+101+101+100=480), and replayed-nonce + coverage-gap settlements pay nobody. Full project tsc clean.
+Built in an isolated worktree; leyten's uncommitted c0mpute work (onchain-staking.ts) was left untouched.
+
+**⇒ 2 GENUINE FORKS surfaced to leyten (labelled in `SwarmConfig`, defaults reversible — see c0mpute/PERMISSIONLESS_LOOP.md §A/B):**
+- **A. Admission — curated vs open** (§10.3): curated allowlist (betanet-first, the default) vs open proven-VRAM
+  floor (permissionless). Mechanism is identical; only *who may announce* differs. Recommend build-both (done),
+  run first live rings curated, flip to open on his word.
+- **B. Pay split across stages** (§6): `layers` (proportional to work, default) vs `equal`, with room for a
+  boundary-role premium. Recommend `layers` for the PoC, revisit with the privacy stance.
+- (Decided for the PoC, not a fork: coordinator runs the planner centrally — §10.1, the likely A→B path.)
+
+**NEXT (after leyten weighs the forks / reviews #14):**
+1. **Real-ring pass** = the ultimate proof. Needs two things still owed: (a) the **watcher-based ring
+   orchestration** (task below / the PIVOT's ask — still NOT built; needed before spinning a ring); (b) a
+   **sharded node-agent** that listens for `swarm:assign` and runs `fetch_block_range` (verified pull) +
+   `m25_scatter_pipe` (the c0mpute-worker is whole-model today). Then: announce real vast boxes → orchestrator
+   places → they pull verified → ring serves → receipts settle. Costs vast $ — gate on leyten.
+2. **RTT probe + auto-form trigger** — `formSwarm` needs a measured RTT matrix over the candidate pool (a short
+   node-probe round) + a trigger (pool reaches a coverable set / demand). Manager exposes `formSwarm(...)` for it.
+3. **Pay wiring** — map the verified per-shard split onto `recordEarning()` once fork B is decided (the split is
+   already correct; only the $ mapping waits). **RING: none live** (vast instances-v1 == 0 verified this session).
+
 ### ⇒ 2026-07-07 (late) — PIVOT: build the permissionless loop, and use REAL orchestration for rings
 The engine-hardening + trust-primitive work is DONE and over-invested (a review found the day drifted into
 "safe CPU-testable" engine internals while the actual PoC gap — the permissionless network driving a sharded
