@@ -396,6 +396,26 @@ def _check_reset_ack(op, ack):
     return ack
 
 
+# M25_CORRHEDGE (coordinator-only, default OFF = master bit-exact): correction-token
+# hedged wait-window drafting on the EAGLE chain path. Per novel round, while the parent verify
+# frame is in flight (~RTT idle), pre-draft K-token continuations from the drafter's top-r
+# CORRECTION candidates at the highest-mass (rejection depth j, rank r) branches and send them as
+# ordinary verify frames at start = sp0+j (descending start, so each branch's ring prefix is the
+# parent's still-intact rows — the stage KV is crop-to-start: writes at lower starts would corrupt
+# deeper branches' hypotheses). A RESTORE frame (exact parent copy) follows the branches, rewriting
+# rows [sp0, sp0+K] bit-identically, so after the hedge block the ring state is EXACTLY post-parent
+# and a miss costs nothing but the wasted drafts/frames (which ride the B=1 idle window).
+# On a partial accept whose correction r[n] matches a sent branch (j=n+1, c=r[n]), that branch's
+# already-in-flight reply IS the next round: consume it (two rounds' commits for ~one RTT + the
+# branch's queue offset); a RESEND frame (exact branch copy) repairs the branch rows that the
+# lower-start branches + restore overwrote, so the following round anchors on committed rows.
+# Every commit stays verifier-greedy on a bit-identical ring prefix -> output byte-identity with
+# OFF is structural, not statistical. Branch set: top-5 branches by measured q-profile mass
+# q=(673,128,59,39)/1189 (per-depth correction rank profile, pre-registered before the A/B).
+M25_CORRHEDGE = bool(int(os.environ.get("M25_CORRHEDGE", "0")))
+_HEDGE_ORDER = ((3, 2), (2, 2), (1, 2), (1, 3), (1, 4))   # (rejection depth j, correction rank r)
+
+
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
@@ -467,6 +487,103 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         conf = (ConfidenceScheduler(1, depth, lo=0.3, hi=0.7)               # opt-in DSpark depth throttle (M25_CONF_SCHED)
                 if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
         d_request(dprefix, K)
+        # M25_CORRHEDGE: correction-token hedged wait-window drafting (see module header).
+        # Kept as a SEPARATE loop so the flag-OFF surface below stays byte-identical to master.
+        hedge_on = M25_CORRHEDGE and S.M25_EAGLE and hasattr(local_draft, "fetch_hedge")
+        h_stats = None
+        if hedge_on:
+            h_stats = {"rounds_hedged": 0, "branches_sent": 0, "hits": 0, "by_branch": {},
+                       "rounds_matched": 0, "order": [list(b) for b in _HEDGE_ORDER]}
+            # v2: LAZY reply draining. Stale replies (miss branches, restore,
+            # resend) are drained AFTER the next round's frames are sent — they arrived during the
+            # drafting/flight window, so the drain overlaps the next parent's RTT instead of adding
+            # dead wait to every hedged round (a v1 synchronous drain measured 0.73x: hits in
+            # band, timing killed by the drain).
+            stale = 0                                           # replies in the pipe ahead of the next parent reply
+            while not done:
+                td = time.time(); ds, cands = local_draft.fetch_hedge(); t_draft += time.time() - td
+                sp0 = send_pos
+                t_sent = time.monotonic()
+                kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": sp0})   # parent frame
+                branches = []                                   # (j, rank, c, cont) actually sent
+                if cands is None:
+                    h_stats["rounds_matched"] += 1              # n-gram matched round: no ranking -> no hedges
+                else:
+                    seen = set()
+                    for bj, br in _HEDGE_ORDER:
+                        if bj > len(ds) or br > len(cands[bj - 1]): continue
+                        c = cands[bj - 1][br - 1]
+                        if c == ds[bj - 1] or (bj, c) in seen: continue   # d2t collision = unhittable; dedupe
+                        seen.add((bj, c))
+                        td = time.time(); cont = local_draft.propose_ahead(ds[:bj - 1] + [c], K); t_draft += time.time() - td
+                        # hedge frame = EXACTLY the frame master would send next round under outcome
+                        # (reject at bj, correction c). Descending start (_HEDGE_ORDER) keeps every
+                        # branch's ring prefix = parent rows (crop-to-start writes never precede reads).
+                        kw.send({"op": "verify", "token_ids": [c] + cont, "start": sp0 + bj})
+                        branches.append((bj, br, c, cont))
+                    if branches:                                # RESTORE: rewrite parent rows bit-identically
+                        kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": sp0})
+                        h_stats["rounds_hedged"] += 1; h_stats["branches_sent"] += len(branches)
+                for _ in range(stale):                          # drain the PRIOR round's leftovers (overlapped)
+                    resp = recv_data(rx); s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+                    wasted += 1
+                stale = 0
+                tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+                r, aux = _unpack(resp)
+                t_trav += time.monotonic() - t_sent
+                s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
+                n = 0
+                for j in range(K):
+                    if ds[j] == r[j]: n += 1
+                    else: break
+                valid += 1; accepted += n
+                if n == K:                                      # master commit rule verbatim (depth-1: bonus lives)
+                    out.extend(ds); pos += K; cur = ds[-1]; committed = ds
+                    if len(r) > K:
+                        out.append(r[K]); committed = ds + [r[K]]; cur = r[K]; pos += 1
+                else:
+                    committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
+                if eagle_on and aux is not None:
+                    local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp0)
+                if on_commit: on_commit(out, time.time() - t0)
+                if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+                hit = None
+                if not done and n < K:                          # outcome key (j=n+1, correction r[n])
+                    for bi, (bj, br, c, cont) in enumerate(branches):
+                        if bj == n + 1 and c == r[n]: hit = bi; break
+                if hit is None:
+                    stale += len(branches) + (1 if branches else 0)   # misses + restore: drain lazily next round
+                else:
+                    bj, br, c, cont = branches[hit]
+                    for bi in range(hit + 1):                   # FIFO: pop discards up to the hit reply
+                        tr = time.time(); resp_b = recv_data(rx); t_recv += time.time() - tr
+                        s_, c2_ = _acc_stage_dt(resp_b, per_stage); t_stage += s_; t_stage_comp += c2_
+                        if bi < hit: wasted += 1
+                    r_b, aux_b = _unpack(resp_b)                # HIT: this reply IS the next round
+                    h_stats["hits"] += 1
+                    hk = f"{bj},{br}"; h_stats["by_branch"][hk] = h_stats["by_branch"].get(hk, 0) + 1
+                    nb = 0
+                    for j in range(K):
+                        if cont[j] == r_b[j]: nb += 1
+                        else: break
+                    valid += 1; accepted += nb
+                    if nb == K:
+                        out.extend(cont); pos += K; cur = cont[-1]; committed = cont
+                        if len(r_b) > K:
+                            out.append(r_b[K]); committed = cont + [r_b[K]]; cur = r_b[K]; pos += 1
+                    else:
+                        committed = cont[:nb] + [r_b[nb]]; out.extend(committed); cur = r_b[nb]; pos += nb + 1
+                    if eagle_on and aux_b is not None:
+                        local_draft.extend(committed, _eagle_aux_range(aux_b, 0, len(committed)), base_pos=sp0 + bj)
+                    if on_commit: on_commit(out, time.time() - t0)
+                    if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
+                    stale += (len(branches) - hit - 1) + 1      # remaining misses + restore
+                    if not done:                                # RESEND: repair the hit branch's rows that the
+                        kw.send({"op": "verify", "token_ids": [c] + cont, "start": sp0 + bj})
+                        stale += 1                              # lower-start branches + restore overwrote
+                d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+            for _ in range(stale):
+                recv_data(rx); wasted += 1
         while not done:
             cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
             while len(inflight) < cur_depth and not done:
@@ -543,7 +660,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     # let a layer-omitting ring pass). Fail CLOSED when receipts were requested but none came back.
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
                    else (False if RECEIPTS else None))
+    if h_stats is not None and h_stats["rounds_hedged"]:
+        h_stats["hit_rate"] = h_stats["hits"] / h_stats["rounds_hedged"]
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
+            "hedge": h_stats,
             # HONEST g: committed tokens per verify round = frontier advance (pos) / rounds. NOT the old
             # (accepted+valid)/valid, which counted a bonus token on EVERY full-accept round even when the
             # pipelined path dropped it -> up to +1 inflation, not comparable to the tree arm's exact g.
