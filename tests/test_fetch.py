@@ -26,7 +26,7 @@ sys.path.insert(0, _REPO)
 
 from shard import manifest as mf                    # noqa: E402
 from shard.fetch import (FetchError, LocalDirProvider, Provider, block_for_stage,  # noqa: E402
-                         fetch_block, shards_for_block)
+                         fetch_block, fetch_block_range, shards_for_block)
 from shard.manifest import ManifestError            # noqa: E402
 
 
@@ -233,3 +233,38 @@ def test_wrong_content_cache_is_refetched(repo):
     sha, _ = mf.sha256_file(stale)                        # and now it holds the correct verified bytes
     assert sha == next(s["sha256"] for s in repo["manifest"]["shards"]
                        if s["path"] == "model-00001.safetensors")
+
+
+# ---- 6. fetch_block_range: the explicit-range (uneven-split) deploy entry point --------------------
+
+def test_fetch_block_range_uneven_middle_spans_files(repo):
+    """A middle stage assigned layers [1:3] spans the file boundary (layer 1 in file1, layer 2 in
+    file2) — the deploy's uneven select_ring splits aren't stage-aligned. Both files must come."""
+    paths = fetch_block_range(repo["manifest"], repo["dest"], 1, 3, is_head=False, is_tail=False,
+                              role="stage", provider=LocalDirProvider(repo["src"]),
+                              expected_pubkey=repo["pub"])
+    got = {os.path.basename(p) for p in paths}
+    assert "model-00001.safetensors" in got and "model-00002.safetensors" in got  # spans both
+    assert "tokenizer.json" not in got                    # a middle stage pulls no tokenizer
+
+
+def test_fetch_block_matches_range_on_even_split(repo):
+    """fetch_block(stage=0,nstages=2) is just fetch_block_range over block_for_stage's [0:2]."""
+    a = fetch_block(repo["manifest"], str(repo["dest"] + "_a"), stage=0, nstages=2, role="coordinator",
+                    provider=LocalDirProvider(repo["src"]), expected_pubkey=repo["pub"])
+    b = fetch_block_range(repo["manifest"], str(repo["dest"] + "_b"), 0, 2, is_head=True, is_tail=False,
+                          role="coordinator", provider=LocalDirProvider(repo["src"]),
+                          expected_pubkey=repo["pub"])
+    assert {os.path.basename(p) for p in a} == {os.path.basename(p) for p in b}
+
+
+def test_fetch_block_range_verifies_bytes(repo):
+    """The range path re-hashes too: a tampered shard is rejected + deleted."""
+    bad = os.path.join(repo["src"], "model-00002.safetensors")
+    n = os.path.getsize(bad)                              # size BEFORE opening 'wb' truncates it
+    with open(bad, "wb") as f:
+        f.write(b"X" * n)                                 # same size, different bytes -> sha mismatch
+    with pytest.raises(FetchError, match="sha256 mismatch"):
+        fetch_block_range(repo["manifest"], repo["dest"], 2, 4, is_head=False, is_tail=True,
+                          role="stage", provider=LocalDirProvider(repo["src"]), expected_pubkey=repo["pub"])
+    assert not os.path.exists(os.path.join(repo["dest"], "model-00002.safetensors"))
