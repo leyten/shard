@@ -1536,6 +1536,12 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
         if r.get("receipts"):
             print(f"[coord] === PROVE: {len(r['receipts'])} signed per-stage receipts ===", flush=True)
             print(f"[coord] PROVE verdict: {'ALL receipts valid + full layer coverage' if r.get('receipts_ok') else 'FAILED'}", flush=True)
+            dump = os.environ.get("SHARD_RECEIPT_DUMP")     # export the signed bodies for the c0mpute settle seam
+            if dump:                                        # (strip the unsigned 'stage' tag -> exactly the signed dict)
+                bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in r["receipts"]]
+                json.dump({"receipts": bodies, "receipts_ok": r.get("receipts_ok"),
+                           "n_tokens": r.get("n_tokens")}, open(dump, "w"))
+                print(f"[coord] receipts exported -> {dump}", flush=True)
         print("SHA:", hashlib.sha256(r["text"].encode()).hexdigest()[:12], flush=True)
     else:
         print("[coord] FAILED:", r, flush=True)
