@@ -250,12 +250,14 @@ def _act_digest(t):
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
 
 
-def _verify_receipts(receipts, layer_count):
+def _verify_receipts(receipts, layer_count, expected_nonce=None, check_chain=False):
     """Coordinator-side PROVE: every per-stage receipt's signature must verify AND the blocks must
     tile [0:layer_count] with no gap/overlap — so no node is paid without proving its own block and
     the coordinator cannot fabricate one. layer_count is the model's TRUE depth (config), never
     derived from the receipts under test: a ring that omits layers must FAIL coverage, not shrink
-    the target to whatever it did attest. Returns True/False (fails closed). Prints a per-stage line."""
+    the target to whatever it did attest. `expected_nonce` binds the set to THIS job (rejects a
+    replayed receipt); `check_chain` asserts adjacent out_root==in_root (bind to one real ring pass —
+    lossless wire only). Returns True/False (fails closed). Prints a per-stage line."""
     bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in receipts]
     ok = True
     for rr, body in zip(receipts, bodies):
@@ -267,7 +269,7 @@ def _verify_receipts(receipts, layer_count):
         except Exception as e:
             ok = False; print(f"  stage {rr.get('stage')}: sig FAILED ({e})", flush=True)
     try:
-        verify_coverage(bodies, layer_count)
+        verify_coverage(bodies, layer_count, expected_nonce=expected_nonce, check_chain=check_chain)
     except Exception as e:
         ok = False; print(f"  coverage FAILED: {e}", flush=True)
     return ok
@@ -384,11 +386,15 @@ def make_drafter(ngram_n=3):
     return HybridDrafter(ng, _eagle_singleton())
 
 
-def _reset_op(swarm_id, job_id):
+def _reset_op(swarm_id, job_id, nonce=None):
     """The job-opening reset frame (sampling pinned greedy). M25_GRAPH_JOB (per-job A/B) optionally
-    stamps the runtime graph toggle the stages apply — via _reset_flags — before ack'ing."""
+    stamps the runtime graph toggle the stages apply — via _reset_flags — before ack'ing. `nonce` is
+    the coordinator's per-job receipt freshness challenge: it rides the reset to every stage so each
+    stage signs it into its receipt (a replayed old receipt then carries a stale nonce)."""
     o = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
          "swarm_id": swarm_id, "job_id": job_id}
+    if nonce is not None:
+        o["nonce"] = nonce
     if M25_GRAPH_JOB is not None:
         o["graph"] = M25_GRAPH_JOB
     return o
@@ -448,7 +454,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []; graph_arm = None
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
-        rop = _reset_op(swarm_id, job_id)                   # graph toggle field (if M25_GRAPH_JOB set)
+        job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+        rop = _reset_op(swarm_id, job_id, nonce=job_nonce)  # graph toggle field (if M25_GRAPH_JOB set)
         if kw_job not in (None, ""):                        # + keepwarm toggle (interleaved A/B), one reset
             rop["keepwarm_ms"] = int(kw_job)
         kw.send(rop); _check_reset_ack(rop, recv_data(rx))  # kw lock; recv_data skips noops; raises on refused graph
@@ -560,7 +567,10 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         if ee in out: out = out[:out.index(ee)]; break
     # True depth from the model config — never from the receipts themselves (self-referential coverage
     # let a layer-omitting ring pass). Fail CLOSED when receipts were requested but none came back.
-    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
+    # expected_nonce binds the set to THIS job (anti-replay); check_chain (lossless wire only, fp8 is
+    # intentionally lossy so out_root!=in_root) binds them to one real ring pass.
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    check_chain=not M25_FP8_WIRE) if receipts
                    else (False if RECEIPTS else None))
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
             # HONEST g: committed tokens per verify round = frontier advance (pos) / rounds. NOT the old
@@ -627,7 +637,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if not hasattr(eg, "propose_tree"):
         raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
     try:
-        rop = _reset_op(swarm_id, job_id)                   # graph toggle field (if M25_GRAPH_JOB set)
+        job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+        rop = _reset_op(swarm_id, job_id, nonce=job_nonce)  # graph toggle field (if M25_GRAPH_JOB set)
         if kw_job not in (None, ""):                        # + keepwarm toggle (interleaved A/B), one reset
             rop["keepwarm_ms"] = int(kw_job)
         kw.send(rop); _check_reset_ack(rop, recv_data(rx))  # kw lock; recv_data skips noops; raises on refused graph
@@ -768,7 +779,8 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     dt = time.time() - t0
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
-    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers) if receipts
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    check_chain=not M25_FP8_WIRE) if receipts
                    else (False if RECEIPTS else None))
     # mean_accept counts DRAFT tokens accepted per round, same as coordinate_pipe — NOT committed-1:
     # a pipelined full-accept round commits K with no bonus, and deriving accept from committed under-
@@ -1210,7 +1222,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 ret_kw.set_interval(msg["keepwarm_ms"])
                             if RECEIPTS:                    # start this job's per-stage activation hash-chain
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
-                                                       msg.get("job_id", "job"), lo, hi)
+                                                       msg.get("job_id", "job"), lo, hi,
+                                                       nonce=msg.get("nonce"))   # sign the job freshness challenge in
                             # Graph-stamped resets ack the APPLIED route + counters so the coordinator
                             # can catch a refused toggle before it poisons the A/B (_check_reset_ack).
                             # Plain resets keep the bare "ok" (old-coordinator compat). Only the TAIL's
@@ -1316,7 +1329,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             nxt_kw.set_interval(msg["keepwarm_ms"])
                         if RECEIPTS:                            # start this job's per-stage activation hash-chain
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
-                                                   msg.get("job_id", "job"), lo, hi)
+                                                   msg.get("job_id", "job"), lo, hi,
+                                                   nonce=msg.get("nonce"))   # sign the job freshness challenge in
                         nxt_kw.send(msg); continue              # propagate reset down chain UNCHANGED (carries 'graph' + 'keepwarm_ms')
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
                         if RECEIPTS and signer is not None:
