@@ -37,10 +37,18 @@ dial refused → CONN DIRECT later) — the first post-warm coord WEDGES until t
 background it, don't kill early. Ring TORN DOWN (instances-v1==0 verified).
 
 **NEXT — the safe CPU-testable hardening backlog is DRAINED; what remains is a bigger tier (in progress):**
-- **Endpoint receipt bindings** (#36 follow-up) — wants a TRUST-MODEL decision first, not just a design pass: the
-  naive token binding (`tok_in_root` = hash of the head's input token_ids) is WEAK — a node that already KNOWS the
-  tokens (the coordinator sent them) can hash the right ones without computing on them; a real input↔compute
-  binding is the proof-of-compute (crypto-later) seam. Pin the intended guarantee before building.
+- **Endpoint receipt bindings — DECIDED: DEFER, not building (2-perspective trust-model review).** The token
+  binding is security theater under coordinator-trusted-challenge: `tok_out_root` (tail) is a TAUTOLOGY — the
+  coordinator observing/using the reply tokens IS the binding, there's no independent correct-answer oracle;
+  `tok_in_root` (head) only proves a node SAW the tokens (handed to it for free), and the coordinator can ALREADY
+  bit-exactly recompute the head's `in_root` from `embedding(token_ids)` (embedding is a pure gather → hardware-
+  independent) if it wants — strictly stronger than `tok_in_root`, no new field. Neither proves COMPUTE; a node
+  hashes the correct endpoint values it already holds while skipping the matmuls. Compute-honesty (the real gap)
+  is `shard/challenge.py`'s job — seeded redundant-recompute + cosine spot-check — **now covered by 13 adversarial
+  tests** (`tests/test_challenge.py`: honest recompute passes, lazy/constant/wrong block fails, ULP-drift tolerant,
+  rel-norm guard). Also boundary-law: token/I/O semantics belong in the c0mpute economics layer, not the engine's
+  activation receipt. REVISIT only if coordinators become untrusted for output attribution → then build a
+  client-facing receipt-of-service at the c0mpute layer over (prompt, answer), never a `tok_out_root` in the chain.
 - **TIER 2.4 weight-fetch deploy-wiring** — verification is now proven (#40); remaining is routing `ring_up`'s real
   115GB pull through `fetch_block`, which needs a signed M2.5 manifest (an offline shard-hashing job) + swapping
   `snapshot_download`. Bigger build; can't fully validate without a ring.
