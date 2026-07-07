@@ -46,11 +46,15 @@ tail-latency/jitter elimination (DZ p99≈median) + flagship-AI-tenant partnersh
 **RING DESTROYED** end of session (all 7 vast boxes, verified `instances-v1`==0; results banked). Next ring
 via the proven rent_pool→ring_up 2-step (scratchpad). ~$? of the vast balance used this evening.
 
-**NEXT (pick up here):** (1) Perf queue: graph-aux is THE lever landed (+74% mech-verified). Remaining =
-churn **F6 heartbeat** (short per-reply recv deadline → seconds-level blip failover instead of up-to-timeout)
-+ **serve()-tail churn test** (F8; fake_ring mocks the tail so the return-channel fix has no CI coverage yet),
-then the **keep-warm jitter validation** (ON/OFF A/B on a jittery/residential path — the DoubleZero pilot is
-the natural home). (2) FWD_RET return-tunnel setup flakiness bit hard this session (slow/variable to establish
+**NEXT (pick up here):** (1) Perf queue: graph-aux is THE lever landed (+74% mech-verified). Churn
+follow-ups **F6 heartbeat** + **F8 serve()-tail churn test** are DONE (PR fix/churn-heartbeat-tail-test,
+110 tests green): F6 = a per-reply DECODE deadline (`M25_REPLY_TIMEOUT`, default 20s) so a mid-decode
+internal-leg blip fails over in seconds, not up-to-timeout (prefill + batched keep the full budget); F8 =
+CPU coverage driving the REAL serve() tail through a pred blip (ret survives + stale gate) and a
+mid-session hello_return (new ret adopted, pred+KV survive), adversarially verified to fail on the pre-#26
+close-ret bug. Remaining perf/robustness: the **keep-warm jitter validation** (ON/OFF A/B on a
+jittery/residential path — the DoubleZero pilot is the natural home). (2) FWD_RET return-tunnel setup
+flakiness bit hard this session (slow/variable to establish
 after warm; wedged several bench relaunches) — worth a robustness look (it's a single fragile libp2p tunnel;
 the return path could dial the tail directly instead of routing through the head sidecar). (3) Rep2 of the
 full 6-arm interleaved lever bench never completed cleanly (churn-wedge + tunnel flakiness) — graph-aux is
