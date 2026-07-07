@@ -33,10 +33,12 @@ On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, n
 - **Publisher key was ephemeral/test** — the durable manifest-signing identity is still a c0mpute-catalog call (leyten's).
 
 **NEXT:** the loop is proven both in sim (control plane, PR #14) AND live (physical path). Remaining to make it a
-standing service: (1) the ring **watcher** (task #2) with the two fault-recoveries above; (2) leyten's 2 forks
-(admission curated-vs-open, pay split) to unblock c0mpute PR #14; (3) the **socket node-agent** so nodes announce
-to the orchestrator over the wire (this pass drove assign→pull via SSH push); (4) **P2P shard propagation**
-(task #4). None blocking — the loop works.
+standing service: (1) **SAFETY RAILS = the OPEN-launch blocker** — leyten LOCKED admission=**open** + pay=**by
+layers** (c0mpute PR #14 MERGED), and open admission ≠ open traffic: boundary-layer pinning (leaky embed/final
+→ staked nodes, strangers hold deep-middle) + graded reputation + layer-block spot-check must be live before
+serving untrusted jobs; (2) the ring **watcher** (task #2) with the two fault-recoveries above; (3) the **socket
+node-agent** so nodes announce to the orchestrator over the wire (this pass drove assign→pull via SSH push);
+(4) **P2P shard propagation** (task #4). The loop MECHANISM works (sim + live); the rails gate the open service.
 
 ### ⇒ 2026-07-07 (later) — PERMISSIONLESS LOOP DEMONSTRATED end-to-end (sim, REAL seams); #46 fixed; 2 FORKS to leyten
 Acted on the PIVOT below. The loop now runs end-to-end — **announce → admit → PLACE → assign → (pull/form/serve
