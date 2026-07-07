@@ -70,6 +70,50 @@ M25_GRAPH_JOB = os.environ.get("M25_GRAPH_JOB")
 if M25_GRAPH_JOB is not None:
     M25_GRAPH_JOB = M25_GRAPH_JOB.strip().lower() in ("1", "true", "yes", "on")   # explicit truthy set: "no"/"off"/"0" = False
 
+# Adaptive K (opt-in M25_ADAPTIVE_K=1, coordinator-only, zero wire/stage change):
+# the chain coordinator's round length K is per-FRAME, not per-connection (each verify frame is
+# [anchor]+ds at a `start`; stages crop KV by start and take any s — prefill already sends s=512
+# chunks). The measured cell-A profile (mosaic-m25wan-rankprofile-20260706) shows per-depth q1
+# RISING on accept streaks (0.58 at d1 -> 0.73-0.75 at d7-8), so after a high-accept round the
+# NEXT round's expected accept is higher: upsizing K only then harvests streaks (a full-accept
+# K=16 round advances the frontier ~2x a K=8 one) while bust rounds keep the base-K payload.
+# Losslessness untouched: K changes what is DRAFTED per round, never what is committed (the ring
+# greedy-verifies every proposal). Default OFF = byte-identical deployed behavior.
+M25_ADAPTIVE_K = bool(int(os.environ.get("M25_ADAPTIVE_K", "0")))
+M25_AK_TRACE = bool(int(os.environ.get("M25_AK_TRACE", "0")))   # opt-in: emit per-round (kf, n) trace in the result row
+
+
+class _AdaptiveK:
+    """Streak-adaptive round length: a two-state policy over the base K.
+    After a round that accepted the whole frame OR >= M25_AK_UP tokens, the next requested draft
+    is M25_AK_HI tokens; any other round decays straight back to base. Pure bookkeeping (no torch,
+    no I/O) so the local test rig can exec this class out of the file source and drive the REAL
+    policy code without CUDA."""
+
+    def __init__(self, base_k, enabled=None):
+        self.base = int(base_k)
+        self.enabled = M25_ADAPTIVE_K if enabled is None else bool(enabled)
+        self.hi = int(os.environ.get("M25_AK_HI", "16"))    # streak round length
+        self.up = int(os.environ.get("M25_AK_UP", "6"))     # accepts needed to (stay) upsized
+        self.k = self.base
+        self.hi_rounds = 0                                  # verified (non-discarded) upsized frames
+        self.trace = []                                     # (kf, n) per non-discarded verify round
+
+    def next_k(self):
+        """Round length for the NEXT draft request (== base always when the flag is off)."""
+        return self.k if self.enabled else self.base
+
+    def observe(self, n, kf):
+        """One non-discarded verify reply: n of kf drafted tokens accepted. Discarded (post-
+        divergence pipelined) frames must NOT be fed here — their accept count is against a
+        rewound prefix (the coordinator's discard path already skips them)."""
+        if kf > self.base:
+            self.hi_rounds += 1
+        self.trace.append((int(kf), int(n)))
+        if not self.enabled:
+            return
+        self.k = self.hi if (n >= kf or n >= self.up) else self.base
+
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
     residual-stream OUTLIER channels inside e4m3's ±448 range. Returns (fp8_cpu_tensor, float_scale)."""
@@ -466,26 +510,34 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         valid = accepted = wasted = 0; t0 = time.time(); done = False
         conf = (ConfidenceScheduler(1, depth, lo=0.3, hi=0.7)               # opt-in DSpark depth throttle (M25_CONF_SCHED)
                 if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
-        d_request(dprefix, K)
+        ak = _AdaptiveK(K)                                  # streak-adaptive round length (M25_ADAPTIVE_K; off -> next_k() == K always)
+        d_request(dprefix, ak.next_k()); ak_pend = ak.next_k()
         while not done:
             cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
             while len(inflight) < cur_depth and not done:
+                if ak.enabled and ak.next_k() != ak_pend:   # policy moved since the pending d_request (its reply
+                    d_cancel()                              # landed after the request went out): re-request at the
+                    d_request(dprefix, ak.next_k())         # new k. request->fetch is snapshot-only on both drafters
+                    ak_pend = ak.next_k()                   # (ngram_draft.py:59-64, eagle_draft.py:306-311), so a
+                                                            # re-request costs nothing; flag OFF never enters here.
                 td = time.time(); ds = d_fetch(); t_draft += time.time() - td
                 t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
                 kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
-                inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
-                d_request(dprefix, K)
+                inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += len(ds)   # len(ds) == the k requested for THIS frame (== K when adaptive off)
+                d_request(dprefix, ak.next_k()); ak_pend = ak.next_k()
             tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
             r, aux = _unpack(resp)
             sp, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
             s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
             if discard > 0: discard -= 1; wasted += 1; continue
+            kf = len(ds)                                        # THIS frame's round length (== K when adaptive off)
             n = 0
-            for j in range(K):
+            for j in range(kf):
                 if ds[j] == r[j]: n += 1
                 else: break
             valid += 1; accepted += n
+            ak.observe(n, kf)                                   # streak state: sizes the NEXT d_request (no-op when off)
             if os.environ.get("M25_EAGLE_DEBUG") and S.M25_EAGLE and valid <= 3:   # diagnostic: is aux arriving + is EAGLE drafting?
                 _mt = getattr(local_draft, "matched", None)
                 if aux is None:
@@ -500,22 +552,22 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                         _fc = torch.nn.functional.linear(_sd.reshape(-1).to(_eg.fc.dtype).to(_eg.fc.device).unsqueeze(0), _eg.fc)
                         _fcs = f"norm={float(_fc.norm()):.2f} v3={[round(x,3) for x in _fc[0,:3].float().tolist()]}"
                     print(f"[eagle-dbg] r{valid}: seednorm={_nm:.1f} fc(aux):{_fcs} matched={_mt} ds={ds[:5]} r={r[:5]} acc={n}", flush=True)
-            if conf: conf.observe(n, K)                                     # acceptance EMA (free, from the verify result)
-            if n == K:
-                out.extend(ds); pos += K; cur = ds[-1]; committed = ds
-                # FULL-ACCEPT BONUS: r[K] is the target's greedy token at the position just past the last
+            if conf: conf.observe(n, kf)                                    # acceptance EMA (free, from the verify result)
+            if n == kf:
+                out.extend(ds); pos += kf; cur = ds[-1]; committed = ds
+                # FULL-ACCEPT BONUS: r[kf] is the target's greedy token at the position just past the last
                 # accepted draft (lossless — the whole draft matched, so the prefix IS the greedy sequence).
                 # When nothing is in flight (depth-1: EAGLE/tree) that position is NOT covered by a queued
-                # chunk, so committing it now advances the frontier K+1 not K -> ~1/K fewer WAN round-trips on
+                # chunk, so committing it now advances the frontier kf+1 not kf -> ~1/K fewer WAN round-trips on
                 # draftable text, and makes toks_per_traversal honest. Under pipelining (depth>1) the next
                 # in-flight chunk already re-derives it at no extra RTT, so we leave it (committing would
                 # collide with that chunk's start).
-                if not inflight and len(r) > K:
-                    out.append(r[K]); committed = ds + [r[K]]; cur = r[K]
-                    pos += 1; send_pos += 1; dprefix = dprefix + [r[K]]
+                if not inflight and len(r) > kf:
+                    out.append(r[kf]); committed = ds + [r[kf]]; cur = r[kf]
+                    pos += 1; send_pos += 1; dprefix = dprefix + [r[kf]]
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
-                discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
+                discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, ak.next_k()); ak_pend = ak.next_k()
             if eagle_on and aux is not None:                 # grow the EAGLE context with the newly committed positions
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
@@ -557,6 +609,11 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
+            # adaptive-K diagnostics ONLY when the flag is on — the OFF result row stays byte-identical
+            **({"ak_base": ak.base, "ak_hi": ak.hi, "ak_up": ak.up, "ak_hi_rounds": ak.hi_rounds}
+               if ak.enabled else {}),
+            # per-round (kf, n) trace, opt-in via M25_AK_TRACE=1 (both-flags-unset row unchanged)
+            **({"ak_trace": ak.trace} if M25_AK_TRACE else {}),
             "final_confidence": conf.confidence() if conf else None}
 
 
