@@ -57,6 +57,16 @@ Built in an isolated worktree; leyten's uncommitted c0mpute work (onchain-stakin
    node-probe round) + a trigger (pool reaches a coverable set / demand). Manager exposes `formSwarm(...)` for it.
 3. **Pay wiring** — map the verified per-shard split onto `recordEarning()` once fork B is decided (the split is
    already correct; only the $ mapping waits). **RING: none live** (vast instances-v1 == 0 verified this session).
+4. **P2P layer-shard propagation (leyten-flagged 2026-07-07) — the "torrent" half; removes the centralized HF
+   download so a joining node pulls its verified range from PEERS.** Python side is READY: `shard/fetch.py` has the
+   `Libp2pProvider` seam (stubbed) + `fetch_block_range(provider=...)` is pluggable; verification (hash vs signed
+   manifest) is unchanged, so an untrusted peer source is safe — swapping `MirrorProvider`→`Libp2pProvider` is
+   additive and changes nothing about trust. `weight-seeder` is already a `select_ring` relegation role (a
+   low-uplink node relegated to seed shards). UNBUILT = the **Go sidecar transfer** (roadmap step 8): PROVIDE/seed
+   (announce to the DHT this node holds CID X), FIND-PROVIDERS (discover peers holding a CID), block exchange
+   (fetch bytes peer→peer, bitswap-style), + the fallback chain (peer → HF origin when no peer has it) and the
+   seeding lifecycle. NOTE: the sidecar source isn't in the shard repo (binary at `/tmp/sidecar`) — may need the
+   sidecar codebase. Slots after/parallel to the real-ring pass. See task #4.
 
 ### ⇒ 2026-07-07 (late) — PIVOT: build the permissionless loop, and use REAL orchestration for rings
 The engine-hardening + trust-primitive work is DONE and over-invested (a review found the day drifted into
