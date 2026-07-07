@@ -274,8 +274,10 @@ def test_fetch_block_range_verifies_bytes(repo):
 # ---- 7. MirrorProvider survives a truncated (dropped-connection) download --------------------------
 
 class _FakeResp:
-    def __init__(self, payload, status=200):
+    def __init__(self, payload, status=200, content_range=None):
         self._buf, self.status = io.BytesIO(payload), status
+        # a real 206 always carries Content-Range; _download trusts it to place the body
+        self.headers = {"Content-Range": content_range} if content_range else {}
 
     def read(self, n=-1):
         return self._buf.read(n)
@@ -302,7 +304,8 @@ def test_mirror_provider_resumes_truncated_download(tmp_path, monkeypatch):
         body = full[start:]
         if calls["n"] == 1:                              # first attempt drops at ~40%
             body = body[:2000]
-        return _FakeResp(body, status=206 if start else 200)
+        cr = f"bytes {start}-{len(full) - 1}/{len(full)}" if start else None
+        return _FakeResp(body, status=206 if start else 200, content_range=cr)
 
     monkeypatch.setattr(F, "urlopen", fake_open)
     monkeypatch.setattr(F.time, "sleep", lambda s: None)   # don't wait between retries
@@ -312,6 +315,58 @@ def test_mirror_provider_resumes_truncated_download(tmp_path, monkeypatch):
     with open(dest, "rb") as f:
         assert f.read() == full                          # resumed to the EXACT bytes, not corrupted
     assert calls["n"] >= 2, "should have taken at least one resume"
+
+
+def test_mirror_provider_no_overshoot_when_206_returns_full_body(tmp_path, monkeypatch):
+    """The live-ring oversize bug (4,998,528,136 -> 5,018,451,080 = have + total). A mirror answered
+    a Range request with the WHOLE body but a 206 status (Content-Range from 0 — a redirect/CDN
+    dropped the Range). The old code trusted the 206 and APPENDED, growing the shard to have+total.
+    Now the body is placed by its Content-Range, so a full body OVERWRITES — exact size, no overshoot."""
+    from shard import fetch as F
+    full = bytes((i * 53) % 256 for i in range(6000))
+    calls = {"n": 0}
+
+    def fake_open(req, timeout=None):
+        calls["n"] += 1
+        if calls["n"] == 1:                              # first attempt lands a partial, then drops
+            return _FakeResp(full[:1500], status=200)
+        # resume attempt: server IGNORES the Range and streams the whole file, tagged 206-from-0
+        return _FakeResp(full, status=206, content_range=f"bytes 0-{len(full) - 1}/{len(full)}")
+
+    monkeypatch.setattr(F, "urlopen", fake_open)
+    monkeypatch.setattr(F.time, "sleep", lambda s: None)
+    dest = str(tmp_path / "shard.bin")
+    F.MirrorProvider("http://mirror/", retries=6).fetch({"path": "shard.bin", "size": len(full)}, dest)
+    assert os.path.getsize(dest) == len(full)            # NOT 1500 + 6000
+    with open(dest, "rb") as f:
+        assert f.read() == full
+
+
+def test_mirror_provider_caps_a_body_that_streams_past_size(tmp_path, monkeypatch):
+    """A mirror that streams MORE than the manifest size can't overshoot onto disk: the copy is
+    capped at the shard size (the sha256 in fetch_block still guards the bytes' correctness)."""
+    from shard import fetch as F
+    full = bytes((i * 17) % 256 for i in range(4000))
+    monkeypatch.setattr(F, "urlopen",
+                        lambda req, timeout=None: _FakeResp(full + b"\xff" * 500, status=200))
+    monkeypatch.setattr(F.time, "sleep", lambda s: None)
+    dest = str(tmp_path / "x.bin")
+    F.MirrorProvider("http://mirror/", retries=2).fetch({"path": "x.bin", "size": len(full)}, dest)
+    assert os.path.getsize(dest) == len(full)            # capped, not 4500
+    with open(dest, "rb") as f:
+        assert f.read() == full
+
+
+def test_mirror_provider_unplaceable_range_fails_closed(tmp_path, monkeypatch):
+    """A hostile/broken server answers a FRESH GET (no Range sent, no .part on disk) with a 206
+    claiming a non-zero start. There is nothing to place it against, so we fail closed with a
+    FetchError (not a stray FileNotFoundError from removing an absent .part)."""
+    from shard import fetch as F
+    monkeypatch.setattr(F, "urlopen", lambda req, timeout=None:
+                        _FakeResp(b"x" * 100, status=206, content_range="bytes 500-599/9999"))
+    monkeypatch.setattr(F.time, "sleep", lambda s: None)
+    with pytest.raises(FetchError):
+        F.MirrorProvider("http://mirror/", retries=2).fetch({"path": "x", "size": 9999}, str(tmp_path / "x"))
 
 
 def test_mirror_provider_gives_up_after_retries(tmp_path, monkeypatch):
