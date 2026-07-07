@@ -219,28 +219,25 @@ def _cached(path: str, shard: dict) -> bool:
         return False
 
 
-def fetch_block(manifest: dict, model_dir: str, *, stage: int, nstages: int,
-                role: str, provider: Provider, expected_pubkey: str | None = None,
-                tied: bool = False) -> list[str]:
-    """Fetch + verify exactly this node's block into model_dir, then it's ready for
-    pipeline.load_stage(model_dir, stage, nstages). Verifies the manifest signature
-    (and the catalog-pinned publisher, if given) first; verifies every byte of every
-    shard on arrival. Returns the list of local file paths. Raises on any failure —
-    nothing half-verified is left for the loader.
+def fetch_block_range(manifest: dict, model_dir: str, lo: int, hi: int, *,
+                      is_head: bool, is_tail: bool, role: str, provider: Provider,
+                      expected_pubkey: str | None = None, tied: bool = False) -> list[str]:
+    """Fetch + verify exactly the shards covering layers [lo:hi) (plus the head/tail boundary weights
+    and, for a coordinator/head, the tokenizer) into model_dir. Verifies the manifest signature (and
+    the catalog-pinned publisher, if given) first; re-hashes every byte of every shard on arrival.
+    Returns the local file paths; raises on any failure — nothing half-verified is left for the loader.
 
-    role: "coordinator" | "stage". The coordinator (and head stage 0) also pull the
-    tokenizer; tie_word_embeddings is passed as `tied`."""
+    This is the EXPLICIT-RANGE entry point: the scattered deploy splits layers UNEVENLY across stages
+    (the self-optimizer's `select_ring` picks variable per-stage blocks, e.g. 10/13/13/13/13, not an
+    even n/nstages split), so the puller passes the stage's actual [lo:hi] rather than a stage index."""
     mf.verify_manifest(manifest, expected_pubkey)
     os.makedirs(model_dir, exist_ok=True)
-
-    lo, hi = block_for_stage(manifest["layer_count"], stage, nstages)
-    is_head, is_tail = stage == 0, stage == nstages - 1
     want_tok = role == "coordinator" or is_head
     shards = shards_for_block(manifest, lo, hi, is_head=is_head, is_tail=is_tail,
                               tied=tied, want_tokenizer=want_tok)
     weights = [s for s in shards if s.get("kind", "weights") == "weights"]
     total = sum(s["size"] for s in shards)
-    _log(f"stage {stage}/{nstages} layers [{lo}:{hi}] role={role}: "
+    _log(f"layers [{lo}:{hi}] role={role} head={is_head} tail={is_tail}: "
          f"{len(shards)} shards ({len(weights)} weights), {total / 1e9:.2f} GB")
 
     paths = []
@@ -257,6 +254,19 @@ def fetch_block(manifest: dict, model_dir: str, *, stage: int, nstages: int,
         paths.append(dest)
     _log(f"block verified: {len(paths)} files in {model_dir}")
     return paths
+
+
+def fetch_block(manifest: dict, model_dir: str, *, stage: int, nstages: int,
+                role: str, provider: Provider, expected_pubkey: str | None = None,
+                tied: bool = False) -> list[str]:
+    """Fetch + verify this node's block by stage index (EVEN n/nstages split) into model_dir, ready for
+    pipeline.load_stage(model_dir, stage, nstages). Thin wrapper over fetch_block_range; the scattered
+    deploy uses fetch_block_range directly with select_ring's uneven per-stage [lo:hi]. role:
+    "coordinator" | "stage" — the coordinator (and head stage 0) also pull the tokenizer."""
+    lo, hi = block_for_stage(manifest["layer_count"], stage, nstages)
+    return fetch_block_range(manifest, model_dir, lo, hi, is_head=stage == 0,
+                             is_tail=stage == nstages - 1, role=role, provider=provider,
+                             expected_pubkey=expected_pubkey, tied=tied)
 
 
 if __name__ == "__main__":  # tiny smoke check of the pure logic, no network
