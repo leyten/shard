@@ -13,6 +13,32 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-07 (late) — PIVOT: build the permissionless loop, and use REAL orchestration for rings
+The engine-hardening + trust-primitive work is DONE and over-invested (a review found the day drifted into
+"safe CPU-testable" engine internals while the actual PoC gap — the permissionless network driving a sharded
+swarm — sat at zero). **NEXT SESSION'S JOB = the permissionless loop, NOT more engine hardening:** a minimal
+end-to-end path where a node ANNOUNCES capability → c0mpute ADMITS + PLACES a layer range → it PULLS that range
+verified (#45) → the ring AUTO-FORMS + serves → per-shard-per-token METERING fires. `select_ring` (built in
+shard/topology.py) must GRADUATE into the c0mpute orchestrator (`c0mpute/lib/orchestrator/orchestrator.ts` today
+drives whole-model single-GPU workers, NOT sharded swarms). Surface the design/economics forks (curated-vs-open,
+pay model, coordinator trust, shard↔c0mpute boundary) to leyten — don't guess them.
+
+**RING PROVISIONING — STOP hand-driving `rent_pool`/`ring_up` + manual polling.** It cost this session two
+rabbit holes (a truncated-download bug, then a size mismatch) babysat by hand. Use proper WATCHER-based
+orchestration (automated fault detection + recovery), like the detached `swarm_master.sh`-style flow, not inline
+poll-and-debug. Sort the robust provisioning approach BEFORE the next ring session.
+
+**Verified weight-fetch (#45/#46) status:** the deploy path (`fetch_block_range` + `phase0/m25_pull_verified.py`)
++ manifest generate/verify are shipped and CPU-tested; a real 5GB M2.5 shard pulled + sha-matched the signed
+manifest launcher-side. But the full-ring validation is INCOMPLETE and **#46 (the truncated-download resume fix)
+has a bug: it produced OVER-sized downloads on the live ring (5,018,451,080 vs the manifest+HF x-linked-size
+4,998,528,136).** Investigate before trusting the verified pull (likely the Range resume double-appends, or HF
+returns a full 200 body on a 206 request). The real M2.5 manifest generates in seconds via
+`publish_manifest.py --hf nvidia/MiniMax-M2.5-NVFP4`. Ring TORN DOWN (instances-v1==0 verified).
+
+**GIT stays clean (memory git-voice-solo-shard):** every commit/PR/tracked doc reads as leyten's OWN solo work —
+no autonomous/AI/loop framing.
+
 ### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" sweep — 7 hardening PRs + warm-ring validation
 Cleared the safe, CPU-testable hardening backlog. **Merged #34-#40, all CPU-tested + adversarially verified:**
 **#34** churn (F6 per-reply decode heartbeat → blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail
