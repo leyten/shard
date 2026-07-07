@@ -111,11 +111,13 @@ class FakeRing(threading.Thread):
     per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
 
     def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None,
-                 stall_decode=None):
+                 stall_decode=None, stall_prefill=None):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
         self.stall_decode = stall_decode            # (n, seconds): sleep before the first n decode replies —
+        self.stall_prefill = stall_prefill          # (n, seconds): sleep before the first n PREFILL replies —
+        self.stalled_pf = 0                         # the F6 heartbeat exempts prefill, so this must NOT trip it
         self.stalled = 0                            # a pipelining coordinator fills its depth window during the
         self.T = [int(t) for t in T]                # stall (deterministic backlog); a sync one cannot send at all
         self.eagle = eagle                          # reply {"toks","aux"} like an M25_EAGLE tail, else plain list
@@ -203,6 +205,9 @@ class FakeRing(threading.Thread):
                     if self.stall_decode and not msg.get("prefill") and self.stalled < self.stall_decode[0]:
                         self.stalled += 1
                         time.sleep(self.stall_decode[1])
+                    if self.stall_prefill and msg.get("prefill") and self.stalled_pf < self.stall_prefill[0]:
+                        self.stalled_pf += 1
+                        time.sleep(self.stall_prefill[1])
                     if select.select([self.pipe], [], [], 0)[0]:
                         self.backlog += 1           # coordinator sent ahead: >1 frame in flight right now
                     self.log.append({"op": "verify", "start": int(msg["start"]),
@@ -284,14 +289,16 @@ def trap_T(n, seed=7, break_at=168, novel_len=30):
 # ---- runner --------------------------------------------------------------------------------------
 
 def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefill_chunk=4096,
-                    eagle_ring=False, timeout=30, on_commit=None, stage_dt=None, stall_decode=None):
+                    eagle_ring=False, timeout=30, on_commit=None, stage_dt=None, stall_decode=None,
+                    stall_prefill=None):
     """One coordinate_pipe job against a fresh FakeRing. S.M25_TREE (monkeypatched by the caller)
     routes to coordinate_pipe_tree inside coordinate_pipe, same as production. Returns (result, ring);
     ring.log is the wire-level ground truth."""
     c_pipe, r_pipe = socket.socketpair()
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
-    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt, stall_decode=stall_decode)
+    ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt, stall_decode=stall_decode,
+                    stall_prefill=stall_prefill)
     ring.tail_slack = depth                         # end-of-job drain window exempt from the healing check
     ring.start()
     tok = FakeTok(T[:prompt_len])
