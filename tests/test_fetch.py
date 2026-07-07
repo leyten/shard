@@ -16,6 +16,7 @@ with a synthetic signed manifest + LocalDirProvider (no network):
 
 Run: python3 -m pytest tests/test_fetch.py -q
 """
+import io
 import os
 import sys
 
@@ -268,3 +269,55 @@ def test_fetch_block_range_verifies_bytes(repo):
         fetch_block_range(repo["manifest"], repo["dest"], 2, 4, is_head=False, is_tail=True,
                           role="stage", provider=LocalDirProvider(repo["src"]), expected_pubkey=repo["pub"])
     assert not os.path.exists(os.path.join(repo["dest"], "model-00002.safetensors"))
+
+
+# ---- 7. MirrorProvider survives a truncated (dropped-connection) download --------------------------
+
+class _FakeResp:
+    def __init__(self, payload, status=200):
+        self._buf, self.status = io.BytesIO(payload), status
+
+    def read(self, n=-1):
+        return self._buf.read(n)
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def test_mirror_provider_resumes_truncated_download(tmp_path, monkeypatch):
+    """A dropped HTTP connection returns a PARTIAL body with no exception. The old code os.replace'd
+    the short file and only _verify (later) caught the size mismatch — hard-failing the whole pull.
+    Now _download rejects the short body and fetch()'s retry loop RESUMES it via Range to completion."""
+    from shard import fetch as F
+    full = bytes((i * 37) % 256 for i in range(5000))
+    calls = {"n": 0}
+
+    def fake_open(req, timeout=None):
+        rng = req.get_header("Range")
+        start = int(rng[len("bytes="):].rstrip("-")) if rng else 0
+        calls["n"] += 1
+        body = full[start:]
+        if calls["n"] == 1:                              # first attempt drops at ~40%
+            body = body[:2000]
+        return _FakeResp(body, status=206 if start else 200)
+
+    monkeypatch.setattr(F, "urlopen", fake_open)
+    monkeypatch.setattr(F.time, "sleep", lambda s: None)   # don't wait between retries
+    dest = str(tmp_path / "shard.bin")
+    F.MirrorProvider("http://mirror/", retries=6).fetch({"path": "shard.bin", "size": len(full)}, dest)
+    assert os.path.getsize(dest) == len(full)
+    with open(dest, "rb") as f:
+        assert f.read() == full                          # resumed to the EXACT bytes, not corrupted
+    assert calls["n"] >= 2, "should have taken at least one resume"
+
+
+def test_mirror_provider_gives_up_after_retries(tmp_path, monkeypatch):
+    """If the stream never completes, fetch raises (not a silent short file for _verify to catch late)."""
+    from shard import fetch as F
+    monkeypatch.setattr(F, "urlopen", lambda req, timeout=None: _FakeResp(b"tiny"))  # always short
+    monkeypatch.setattr(F.time, "sleep", lambda s: None)
+    with pytest.raises(FetchError):
+        F.MirrorProvider("http://mirror/", retries=2).fetch({"path": "x", "size": 9999}, str(tmp_path / "x"))
