@@ -421,12 +421,15 @@ before warm. (4) **Ring wedges after each coordinator** → re-warm before every
 ## North star → current goal
 - **North star:** torrent-for-compute — permissionless scattered GPUs serving big models, trustless. M2.5 = PoC.
 - **Current goal:** a sharded M2.5 engine that is *usable + viable*. NOT one metric — the whole product.
-- **tok/s TARGET (normal reasoning-ON, single-stream, scattered ring — the honest projection):** today **~5.7–7**
-  (merged serial-path). After TIER-1 perf (tree-verify fixed + topology order + small levers): **~10–12 on a good
-  tight EU ring**, **~5–6 on high-RTT global scatter** — approaching the ~12–20 physics cap (a perfect drafter can't
-  accept every novel reasoning token; the reason-math cell is the hard floor, ~7–9 even post-tree). NOTE: most of
-  the 79 fleet findings are NOT tok/s (trust/gateway/wire); tree-verify + topology are the only real speed levers
-  left on this path. This number is ON the scattered ring — NOT via co-location ([[never-colocate-usable-speed-on-scattered]]).
+- **tok/s MEASURED (normal reasoning-ON, single-stream, scattered ring):** post-graph-aux (PR #25) **~24
+  decode-weighted on a good EU ring; reasoning-heavy cells ~30–32** (reason-math 32, agentic 31; +74% over the
+  13.6 no-graph chain, one clean 4-rep rotated rep — a full rep2 is outstanding polish). Graph-aux cut stage
+  compute **157→40 ms/traversal** on slow-CPU boxes, which lowered T_traversal and RAISED the old WAN-bound
+  ~12–20 estimate (that cap assumed ~138 ms stage compute; the lever helps MOST on loaded/old boxes = the
+  permissionless steady state). **Pre-graph-aux** this projected to ~10–12 on a good tight EU ring / ~5–6 on
+  high-RTT global scatter (DROPPED as a target). NOTE: most of the 79 fleet findings are NOT tok/s
+  (trust/gateway/wire); on the perf path graph-aux is the landed lever and tree-verify/topology remain. This
+  number is ON the scattered ring — NOT via co-location ([[never-colocate-usable-speed-on-scattered]]).
 - **TWO-TIER framing (decided):** **scattered ring = cheap/permissionless/THROUGHPUT** (latency-tolerant); a
   **co-located/regional node or mini-cluster = fast/INTERACTIVE** (M2.5-NVFP4 ~115 GB fits on 1× H200 / 2× H200 /
   4× RTX6000-Blackwell → no WAN → 30–50 tok/s, physics-guaranteed). WAN-sharded single-stream is the *hardest*
