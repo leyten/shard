@@ -13,6 +13,31 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-07 (night) — REAL-RING PASS PASSED: the permissionless loop closed end-to-end on LIVE GPUs
+On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, no co-location), the whole loop ran:
+**place (`select_ring`) → VERIFIED PULL (signed manifest, #48 fix) → auto-form → serve → SETTLE (`shard.verify`)
+→ pay per shard.** Receipt `docs/receipts/m25-realring-loop-20260707.md` + the signed set
+`m25-realring-loop-receipts-20260707.json`:
+- **Verified pull proven at scale:** each stage pulled ONLY its layer range from the signed
+  `nvidia/MiniMax-M2.5-NVFP4` manifest (62L, 29 weight shards, 139.9GB), re-hashed every byte; all 5 landed
+  clean (24–33GB/box), the #48 resume fix held on every one.
+- **Served** 160 tokens over the ring (3.84 tok/s — novel prompt, n-gram g=1.0, high-RTT hop; perf not the point).
+- **Settled on REAL receipts:** 5 signed per-stage receipts, every sig VALID, activation chain intact
+  (`out_root[i]==in_root[i+1]` across all 5), full [0:62) coverage, per-job nonce; `shard.verify` ok=True; the
+  per-shard-per-token split fired 26+34+34+33+33 = 160. **PR #53** added `SHARD_RECEIPT_DUMP` (the coordinator
+  exports the receipt set for the settle seam) — merged, proven live.
+- **OPS lessons for the ring watcher (task #2, still owed):** (a) a box that fails to bootstrap (transient
+  scp/ssh drop → no `boot.log`) is polled forever — detect + re-bootstrap/swap; (b) a GPU-driver dud (`CUDA
+  803`) passed the VRAM health check but failed `torch.cuda.init()` — health checks must probe CUDA init. Both
+  hit this pass and were hand-fixed. **RING TORN DOWN** (instances-v1==0 verified); ~$? of vast credit used.
+- **Publisher key was ephemeral/test** — the durable manifest-signing identity is still a c0mpute-catalog call (leyten's).
+
+**NEXT:** the loop is proven both in sim (control plane, PR #14) AND live (physical path). Remaining to make it a
+standing service: (1) the ring **watcher** (task #2) with the two fault-recoveries above; (2) leyten's 2 forks
+(admission curated-vs-open, pay split) to unblock c0mpute PR #14; (3) the **socket node-agent** so nodes announce
+to the orchestrator over the wire (this pass drove assign→pull via SSH push); (4) **P2P shard propagation**
+(task #4). None blocking — the loop works.
+
 ### ⇒ 2026-07-07 (later) — PERMISSIONLESS LOOP DEMONSTRATED end-to-end (sim, REAL seams); #46 fixed; 2 FORKS to leyten
 Acted on the PIVOT below. The loop now runs end-to-end — **announce → admit → PLACE → assign → (pull/form/serve
 sim) → SETTLE → pay per shard** — against the REAL shard decision code, and dishonest settlements pay NOBODY.
