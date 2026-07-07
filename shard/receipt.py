@@ -60,11 +60,13 @@ class ReceiptSigner:
     job — a node that skipped or altered any chunk produces a different root and is caught."""
 
     def __init__(self, priv: ed25519.Ed25519PrivateKey, swarm_id: str, job_id: str,
-                 layer_start: int, layer_end: int):
+                 layer_start: int, layer_end: int, nonce: str | None = None):
         self.priv = priv
         self.meta = {"swarm_id": swarm_id, "job_id": job_id,
                      "layer_start": layer_start, "layer_end": layer_end}
-        self._in = hashlib.sha256()
+        if nonce is not None:                        # per-JOB freshness challenge (coordinator-issued,
+            self.meta["nonce"] = nonce               # random): signed into the receipt so a replayed
+        self._in = hashlib.sha256()                  # receipt from an earlier job carries a stale nonce
         self._out = hashlib.sha256()
         self.n = 0
 
@@ -117,16 +119,24 @@ def load_or_make_node_key(path: str) -> ed25519.Ed25519PrivateKey:
 
 
 def verify_coverage(receipts: list[dict], layer_count: int,
-                    expected_by_signer: dict | None = None) -> None:
+                    expected_by_signer: dict | None = None,
+                    expected_nonce: str | None = None,
+                    check_chain: bool = False) -> None:
     """The job-level check c0mpute runs before paying: the set of per-stage receipts must
     (1) each verify, (2) tile [0, layer_count) with NO gap or overlap (every layer was attested
-    by exactly one node), and (3) chain — each stage's in_root continuity is the coordinator's to
-    assert across the ring; here we enforce the coverage tiling, which is what stops a node from
-    being paid for a block it didn't hold. expected_by_signer maps pubkey -> the block c0mpute
-    assigned it (optional pinning)."""
-    spans = []
+    by exactly one node), (3) — with expected_nonce — carry the coordinator's per-JOB freshness
+    challenge, so a receipt replayed from an earlier job (stale/absent nonce) is rejected, and
+    (4) — with check_chain — CHAIN: each block's out_root equals the next block's in_root, i.e. the
+    activation a node attests it output is byte-identical to what the next node attests it received.
+    Chaining catches fabricated roots and binds the receipt set to one real ring pass; it holds by
+    construction only on the LOSSLESS wire (the caller passes check_chain=not fp8_wire, since fp8
+    activation transport is intentionally lossy). expected_by_signer maps pubkey -> the block
+    c0mpute assigned it (optional pinning)."""
+    entries = []
     for r in receipts:
         verify_receipt(r, None)
+        if expected_nonce is not None and r.get("nonce") != expected_nonce:
+            raise ReceiptError(f"receipt nonce {r.get('nonce')!r} != job nonce (stale or replayed receipt)")
         lo, hi = r["layer_start"], r["layer_end"]
         if not (0 <= lo < hi <= layer_count):
             raise ReceiptError(f"receipt block [{lo}:{hi}] outside [0:{layer_count}]")
@@ -134,12 +144,19 @@ def verify_coverage(receipts: list[dict], layer_count: int,
             want = expected_by_signer.get(r["pubkey"])
             if want is not None and tuple(want) != (lo, hi):
                 raise ReceiptError(f"signer {r['pubkey'][:12]}.. attested [{lo}:{hi}], assigned {tuple(want)}")
-        spans.append((lo, hi))
-    spans.sort()
+        entries.append((lo, hi, r))
+    entries.sort(key=lambda e: e[0])
     cursor = 0
-    for lo, hi in spans:
+    for lo, hi, _ in entries:
         if lo != cursor:
             raise ReceiptError(f"layer coverage broken at {cursor}: next block starts {lo} (gap or overlap)")
         cursor = hi
     if cursor != layer_count:
         raise ReceiptError(f"layer coverage ends at {cursor}, expected {layer_count}")
+    if check_chain:                                  # entries are now sorted + provably contiguous
+        for (lo_a, hi_a, ra), (lo_b, hi_b, rb) in zip(entries, entries[1:]):
+            if ra["out_root"] != rb["in_root"]:
+                raise ReceiptError(
+                    f"chain break: block [{lo_a}:{hi_a}] out_root {ra['out_root'][:12]} != "
+                    f"block [{lo_b}:{hi_b}] in_root {rb['in_root'][:12]} — an attested output is not "
+                    f"what the next stage attests it received (fabricated roots or a spliced receipt)")

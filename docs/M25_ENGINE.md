@@ -13,6 +13,19 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-07: "SAFE TO BE PERMISSIONLESS" hardening sweep — THREE PRs (no spend, ring stayed down)
+Code-first betanet-critical-path work, all prove-locally-first, CPU-tested. Merged: **PR #34** churn (F6
+per-reply decode heartbeat → blip failover in seconds not up-to-1800s; F8 real-`serve()`-tail churn test,
+adversarially verified against the pre-#26 bug). **PR #35** wire DoS (`MAX_FRAME` length cap + tensor
+shape/blob-size validation closing an empty-blob→`torch.empty(huge)` OOM, both codecs; adversarially verified
+pre-fix allocated a 1M-elem tensor from 0 bytes). **Branch `fix/receipt-freshness-binding`** (the MOAT, TIER 2.2):
+per-job nonce (anti-replay) + `out_root==in_root` chain binding, coordinator-trusted-challenge model (leyten's
+call), gated `not M25_FP8_WIRE`; 13 tests. Also fixed the stale tok/s number (→ ~24/~30, graph-aux). Suite 148 green.
+**NEXT (leyten said pause+report after the moat, then):** TIER 3 **gateway hardening** (client-disconnect re-runs
+the whole gen; slow client blocks the ring ≤30min; reconnect wedge; reasoning=False stream dup) — his pick for
+what's next. Then TIER 2.4 verified weight-fetch, and the endpoint receipt bindings (head-input↔prompt,
+tail-output↔observed tokens) noted as follow-ups. The keep-warm jitter A/B + FWD_RET tunnel look still need a ring.
+
 ### ⇒ 2026-07-05/06: FOUR things SHIPPED to master (graph-aux + churn fix + safe_kill + keep-warm); ring DESTROYED
 Perf-lever evening → became a perf + robustness sweep. All merged to master via clean PRs (no Claude trailer):
 - **PR #25 graph-aux** — CUDA-graph EAGLE-aux compatibility. THE win: on slow-CPU boxes stage compute drops
@@ -510,8 +523,17 @@ Warm-validated **+33% decode-weighted + rag-quote accept 13→44%** (receipt m25
    passes → a node can skip its block and still be paid. ~10-line fix (pass the model's true `n_layers`
    explicitly). **Do alongside the wedge branch — a skip-compute-and-get-paid hole shouldn't sit open even in a
    perf sprint.**
-2. Receipts have no freshness/content binding (old receipts replay); bind to the job's actual tokens/activations.
-3. Tree-verify path emits NO receipts (verification silently off under M25_TREE) — wire the hash-chain through it.
+2. **✅ DONE (branch fix/receipt-freshness-binding, 13 tests) — freshness + chain binding.** Coordinator issues a
+   per-JOB random nonce on the reset frame; every stage signs it into its receipt; `verify_coverage(expected_nonce=)`
+   rejects a set whose nonce isn't this job's → a replayed old receipt (stale nonce) fails closed. Plus CHAIN binding:
+   `verify_coverage(check_chain=)` asserts each block's `out_root == next block's in_root` (an attested output must be
+   what the next node attests it received) — catches fabricated/spliced roots, holds by construction on the lossless
+   wire (gated `not M25_FP8_WIRE`, since fp8 transport is intentionally lossy). Coordinator-trusted-challenge threat
+   model (leyten's call). SCOPE: chain binds interior edges; the head's input (↔ prompt embedding) and the tail's
+   final output (↔ coordinator's observed reply tokens) are endpoint bindings, noted as follow-ups. The deeper
+   activation proof-of-compute stays the crypto-later seam.
+3. **✅ DONE (earlier) — tree-verify path emits receipts** — the `M25_TREE` blocks now call `signer.observe` on both
+   the tail and head/middle stages (verification no longer silently off under trees).
 4. Verified-fetch trust root (`shard/fetch.py`) is bypassed by the real M2.5 deploy path (HF pull, unverified) —
    route the betanet weight pull through the content-addressed manifest check.
 
