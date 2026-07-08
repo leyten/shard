@@ -13,7 +13,78 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-08 (STRATEGIC SHIFT — leyten): make the PoC TORRENT-LIKE. Stop hardening/privacy; build these 3.
+### ⇒ 2026-07-08 (later) — TORRENT-FIRST session: P2P propagation BUILT+WAN-proven, heterogeneous 4090 PROVEN, market design panelled
+Acted on the three torrent tasks. All three moved; the loop still serves (regression pass ran live).
+
+**1. HETEROGENEOUS DEVICES — non-Blackwell PROVEN, tier table shipped (shard PR #61).** A live-rented 4090
+(sm_89, Ada) RUNS the M2.5 NVFP4 MoE via **marlin** (`M25_MOE_BACKEND`): cutlass REFUSES pre-sm_120
+("kernel does not support current device"), emulation is sm_120-only Triton (illegal-memory on Ada), marlin
+loads the SAME signed NVFP4 checkpoint via dequant-in-kernel at **4.08 GB/layer (~2.4× the cutlass 1.7 GB
+footprint) and 0.35 ms/tok** decode MoE. So a 4090 is ring-worthy with FEWER layers — exactly what the
+VRAM-sized planner already does. Shipped `M25_MOE_BACKEND=auto` (cutlass on sm_120+, marlin below — a
+stage's arch is a node fact, byte-identical to old default on 5090s). `docs/HETERO_DEVICES.md` = the device
+tier table vs the 20 tok/s bar (NVIDIA line + Apple Silicon MLX [a big Mac out-decodes a mid NVIDIA card;
+M3 Ultra 512GB holds the WHOLE model = the natural full-replica auditor] + AMD [7900 XTX ring-worthy behind
+a llama.cpp backend] + CPU [seeder / torch-free challenge judge]) + the any-device build list (ranked:
+compute probe → per-node backend+layer_vram → MlxRuntime → per-format manifest v2 → format-matched
+spot-check). `research/hetero_moe_probe.py` + `hetero_moe_xcheck.py` (deterministic cross-kernel cosine dump;
+marlin dump banked, cutlass reference is a one-box follow-up). 3090 (Ampere) probe was pip-slow, non-blocking
+— predicted marlin-same. leyten's "not just NVIDIA — any device (MacBook/Mac/AMD)" is answered: the ENGINE
+seam (ModelRuntime + per-arch backend + per-format manifest + cosine spot-check) is heterogeneity-first; the
+one genuinely new build is per-format artifacts + format-matched auditing.
+
+**2. TORRENT WEIGHT-FETCH — BUILT, WAN-proven live, adversarially hardened (shard PR #61, the big one).**
+The Go sidecar SOURCE was in the repo after all (`sidecar/main.go`, the M25_ENGINE "binary only" gotcha was
+STALE). Extended it (`sidecar/blockx.go`): kad-DHT (`/shard` prefix, isolated from public IPFS), `-seed
+manifest=modelDir` (PROVIDE every held shard CID + serve `/shard/blockx/1.0.0`, offset-resumable), `-fetch-cid`
+(find-providers → block-exchange, direct-dials bootstrap peers when the DHT is dry). Python: `Libp2pProvider`
+(real, was the stub) + `ChainProvider` (peers first, mirror/HF origin last, verified PER SOURCE so a hostile
+seeder is dropped and the pull continues; trust unchanged — every byte re-hashed vs the signed manifest).
+**PROVEN**: 6 local 2-peer tests (`tests/test_blockx.py`: peer fetch w/ empty mirror, A→B→C propagation with A
+dead, hostile-seeder fallback, hostile+honest race → honest bytes win, dead-peer mirror fallback, fail-closed)
+AND **over the real internet** — a rented FR 4090 seeded, this box pulled a 5 GB shard at **95 MB/s, sha-matched**
+(+ config shard 0.2s). An **adversarial review** found the trust root INTACT (no path to VRAM poison — every
+attack ends in the re-hash deleting the file + mirror recovery) but 4 real open-net holes, ALL FIXED +
+regression-tested: uncapped control-frame `make()` → OOM (capped 1 MiB), no stream deadlines → slowloris
+(idle deadlines both sides), one shared `.p2p.part` let a hostile seeder poison honest transfers → forced
+permanent mirror fallback (per-peer pid-scoped partials, no cross-peer resume), partials never cleaned
+(removed on exit). Seeding lifecycle wired into both launchers (`--seed-shards`: a stage seeds its verified
+range from the SAME tunnel daemon; DHT setup backgrounded so it never delays 'tunnel up'). NOTE: live
+on-ring `--seed-shards` NOT validated this pass — the ring boxes hold the OLD `/tmp/sidecar` (no `-seed`
+flag); the WAN transfer proof (4090→box 5GB) stands independently. Next ring must push `/tmp/sidecar_new`.
+
+**3. MARKET DECENTRALIZATION — design-panelled, c0mpute PR #16 OPEN for leyten (NOT merged — product direction).**
+3 design agents (market-mechanism / distributed-systems / migration-pragmatics) + synthesis →
+`c0mpute/MARKET_DECENTRALIZATION.md`. The shape for §10.1-B: **ask = µUSD per layer-token** (composes into
+`splitTokens`, no settlement change); the **adequacy floor**, not the price unit, prices the slow-node
+externality (pay-per-token already couples node revenue to ring speed); **deterministic auditable ring
+formation** around the UNCHANGED `shard.plan` + signed RingCharters (members verify-and-sign, no auctioneer,
+no consensus); **chunked client-ack settlement** (`paid = min(claim, client ack)`) closes the token-count gap
+AND deletes the central settler; DHT/gossip discovery on the sidecar (same DHT the propagation ships). 6
+migration stages, each locally testable + visibly decentralizing (flagship: a swarm forms with the
+orchestrator DEAD). Honest central-residue table + hard problems named (emissions wash-trading is #1 — design
+before any emission schedule). Left OPEN — it's a product-direction decision.
+
+**REGRESSION RING PASS — the loop STILL SERVES (control-plane changes did NOT touch the decode hot path).**
+Warm 5×5090 EU ring (BG→UK→NO→DE→BG, 0/10/13/13/13/13 split), verified pull landed clean on all 5 (signed
+manifest, session publisher key). Novel-reasoning job: 200 coherent tokens, **2.90 tok/s** (g=2.24, n-gram
+mean_accept 1.24/8, transport 79% — a high-RTT ring, s4 hop ~51ms), **5 signed per-stage receipts ALL VALID +
+full [0:62) coverage + chain intact**. That novel number matches prior real-ring novel prompts (3.84 on
+2026-07-07, perf-not-the-point). Copy/draftable job: 220 tokens, **5.58 tok/s** (g=4.29, mean_accept 3.29/8, transport 78% — draftable ~doubled the novel number, ~linear in g as the WAN-bound model predicts; 10-12 needs a lower-RTT ring, this one's s4 hop was ~52ms), receipts ALL VALID. The regression QUESTION — did the
+session's control-plane/docs changes break serving? — is answered NO.
+
+**RING: TORN DOWN (instances-v1==0 verified) — all 5 ring + 4090 + 3090 probe boxes.** Vast credit ~$127 start (this session used ~$5.13). Live iids tracked in
+/tmp/live_iids.txt. The 4090 seeder (iid 44216090) + 3090 (44216970) are separate probe boxes.
+
+**NEXT (torrent critical path continues):** (a) push `/tmp/sidecar_new` into the ring bootstrap (ring_up +
+scatter_pipe) so `--seed-shards` is live-validated on a ring (peer pulls its range from a ringmate, mirror
+only as fallback); (b) `MlxRuntime` — the flagship any-device build (MLX has the model, the 4-bit artifact,
+per-layer callability + native bf16; days not weeks) + per-format manifest v2; (c) market migration stage 1
+(asks in announce + cheapest-adequate formation) IF leyten greenlights PR #16; (d) the cross-kernel cutlass
+xcheck one-box run (confirm marlin-vs-cutlass cosine ≥ 0.99 so the spot-check won't false-flag a 4090).
+
+
+### ⇒ 2026-07-08 (STRATEGIC SHIFT — leyten) [EXECUTED this session — see the block above; kept for the task detail]: make the PoC TORRENT-LIKE.
 leyten's direction: the recent sessions drifted into hardening + privacy, which is NOT the key path. The
 north star ([[north-star-torrent-for-compute]]) is a permissionless, torrent-like compute fabric. Privacy is
 DEFERRED (PoC runs fully open); trust/hardening is DONE ENOUGH. **The next session works these three, in
