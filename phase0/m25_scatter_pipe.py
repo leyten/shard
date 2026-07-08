@@ -91,13 +91,17 @@ def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_boots
     return False
 
 
-def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0):
+def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
+    # per-stage graph-aux override: CUDA-graph capture of the NVFP4 MoE is proven on the sm_120 cutlass
+    # path; a non-Blackwell (marlin) stage runs eager (this env assignment comes AFTER eng_env()'s, so
+    # bash uses the last one). A marlin card holds few layers, so it barely benefits from graph anyway.
+    goff = "M25_CUDA_GRAPH=0 " if graph_off else ""
     cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} {eng_env()}"
+           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} {eng_env()}{goff}"
            f"{kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
@@ -161,7 +165,11 @@ def main():
         push_code(nd["host"], nd["port"])
         nd["pid"] = peerid(nd["host"], nd["port"])
         nd["maddr"] = f"/ip4/{nd['pip']}/tcp/{nd['pport']}/p2p/{nd['pid']}"
-        print(f"  {nd['region']} {nd['pip']}:{nd['pport']} [{nd['lo']},{nd['hi']}) {nd['pid'][:14]}..", flush=True)
+        g = sh(nd["host"], nd["port"], "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1", 20)
+        nd["gpu"] = (g.stdout.strip().splitlines() or ["?"])[-1].strip()
+        nd["graph_off"] = not any(b in nd["gpu"] for b in ("5090", "5080", "5070"))  # graph-aux = sm_120 cutlass only
+        print(f"  {nd['region']} {nd['gpu']} {nd['pip']}:{nd['pport']} [{nd['lo']},{nd['hi']}) "
+              f"{'eager' if nd['graph_off'] else 'graph'} {nd['pid'][:14]}..", flush=True)
 
     print("[pipe] sidecars (direct-return: head forwards ring+ret) ...", flush=True)
     for k, nd in enumerate(nodes):
@@ -183,7 +191,7 @@ def main():
 
     print("[pipe] stages tail-first ...", flush=True)
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, a.kv_maxlen)
+        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, a.kv_maxlen, graph_off=nodes[k].get("graph_off", False))
     for k in range(n - 1, -1, -1):
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
