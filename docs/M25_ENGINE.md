@@ -13,6 +13,62 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-08 — SAFETY RAILS BUILT + PROVEN: open admission is now safe for untrusted traffic
+The OPEN-launch blocker is cleared. All three trust rails are built, CPU-tested, adversarially fuzzed,
+and proven end-to-end against the REAL shard seams. Open ADMISSION was already live; these make open
+TRAFFIC safe (a stranger can no longer see a prompt-revealing activation).
+
+**SHIPPED — shard branch `net/boundary-pinning` (3 commits; suite 231 green):**
+- **Boundary-layer pinning** (`select_ring(trusted={...}, boundary_in, boundary_out)` + `shard.plan`
+  `privacy=` seam). The head/tail roles and every stage holding a `[0,b_in)` or `[62-b_out,62)` layer
+  must be trusted; strangers hold only deep-middle. Grounded in the inversion literature (2602.16760,
+  2507.16372): naive prompt-token recovery ~59%→35% by 8 layers, output side leaks worse (logit lens)
+  → default 8/8, `b_out ≥ b_in`, floor 4/4, regulated tier 12/12. Trust is a CONSTRAINT not a score;
+  `trusted=None` is byte-identical legacy (goldens unchanged). Order search is ends-constrained +
+  boundary-spill-aware (`_pin_floors`): a trusted contiguous prefix/suffix covers the window even when
+  a single end node is too small. FAILS CLOSED (no trusted node / untrusted require → None).
+- **Torch-free challenge seam** (`python3 -m shard.challenge`, `compare_sketches`): the control plane
+  judges spot-check sketches with no CUDA stack (the GPU nodes produce them). Fail-closed on malformed.
+- **Adversarial verification (self-run):** 8000-case leak fuzz (5571 rings, 10486 boundary
+  intersections) = **0 leaks**; a 4000-case **brute-force feasibility oracle** cross-check found a
+  false-infeasible (boundary spilling a small end node), which is now FIXED — select_ring matches the
+  oracle exactly (0 mismatches). A deeper adversarial subagent review was also run.
+
+**SHIPPED — c0mpute branch `net/safety-rails` (2 commits; full tsc clean):**
+- **GradedReputation** (`lib/orchestrator/reputation.ts`) — per-node score gating `boundary`
+  (STAKE-gated: score alone never earns it) / `middle` (open-admission default) / `relegated`
+  (off-stage) / `rejected` (refused at announce). Recent-behaviour scoring like the canary ban; 2
+  consecutive spot-check fails reject. Replaces the binary ban for shard nodes. snapshot/restore.
+- **SwarmManager wiring** — `SwarmConfig.privacy` (default 8/8) feeds `shard.plan` a per-node `trusted`
+  flag ASSIGNED from stake+reputation (never self-reported); fails CLOSED without a trust oracle; a
+  plan that put a stranger on a boundary stage is rejected before any assign is emitted. `startSpotCheck`
+  → `shard.challenge` judges a stranger's redundant recompute, verdict feeds reputation, silent suspect
+  fails on timeout, a failed check degrades the swarm. Settlement/churn also feed reputation.
+- **Proven** headless (`scripts/rails-test.ts`, 18 assertions) AND end-to-end vs the REAL shard.plan +
+  shard.challenge (`scripts/rails-demo.ts`): 3 staked + 4 stranger nodes, the real planner keeps every
+  stranger off the boundary layers, the real spot-check catches a faked block (cosine ≈ 0) → struck → relegated.
+
+**RING WATCHER (task #2) — the two live-pass fault-recoveries, CPU-tested** (`scratchpad/health_probe.py`
+self-tests pass; `scratchpad/ring_watcher.py`): (a) CUDA-803 dud now caught by a real `torch.cuda.init()`
++ alloc probe (the old `nvidia-smi`+VRAM gate PASSED it → crashed at launch); (b) NO-BOOT box (transient
+scp/ssh drop → no `boot.log`) distinguished from PENDING so the watcher re-bootstraps/swaps instead of
+polling the full 35-min window. Wraps the proven rent_pool→ring_up flow; live-validated only on a ring.
+
+**⇒ GENUINE FORK for leyten (surfaced, awaiting his call — `c0mpute/PERMISSIONLESS_LOOP.md`):**
+1. **Privacy STANCE:** (a) boundary-pin-only [SHIPPING DEFAULT, honest framing: removes the trivial +
+   free-output leaks, shrinks the attacker pool from "any lazy node" to "a trained white-box attacker
+   who gets partial *semantic* deep-middle reconstruction" — defense-in-depth, NOT a guarantee] vs (b)
+   per-request trusted routing [paid private tier — vetted/staked-only ring or higher window on demand]
+   vs (c) activation obfuscation [R&D]. Recommend ship (a) now, design (b) next, park (c).
+2. **WHO is a "trusted/staked" node** the boundary pins to — the economics of what stake buys a
+   `boundary` role (ties into `lib/onchain-staking.ts`; `GradedReputation.isStaked` is the seam).
+
+**⇒ NEXT (after leyten's fork call): PUSH + open the two PRs, then MERGE** (branches ready, tested; not
+yet pushed). Then the remaining loop-integration items are unchanged and NOT rails: RTT probe + auto-form
+trigger, pay wiring onto `recordEarning`, token-attested pay, P2P shard propagation (torrent half). A
+mixed trusted/untrusted LIVE ring is the one thing the rails haven't seen (all CPU/sim proven) — worth a
+vast pass once the watcher is live-validated. **RING: none live.** Vast credit ~$130 (this session: $0).
+
 ### ⇒ 2026-07-07 (night) — REAL-RING PASS PASSED: the permissionless loop closed end-to-end on LIVE GPUs
 On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, no co-location), the whole loop ran:
 **place (`select_ring`) → VERIFIED PULL (signed manifest, #48 fix) → auto-form → serve → SETTLE (`shard.verify`)
