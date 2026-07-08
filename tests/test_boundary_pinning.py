@@ -122,6 +122,31 @@ def test_boundary_spans_two_trusted_stages_when_end_is_thin():
     print("ok  boundary may span multiple stages iff every holder is trusted")
 
 
+def test_no_false_infeasible_boundary_spill_needs_order_search():
+    """REGRESSION (adversarial fuzz 2026-07-08): when b_out exceeds the tail node's capacity the
+    output boundary SPILLS onto the second-to-last stage, so it too must be trusted. The old code
+    floored only the two ends, picked ONE min-latency order, and rejected the subset if that order's
+    greedy fill spilled onto an untrusted neighbor — even when another order of the SAME subset seats
+    a trusted node there. Here the only safe ring needs the order search to place the two small
+    trusted tails (cap 8 each < b_out 9) adjacent at the back; a single-order search false-infeasibles."""
+    n = 5
+    # caps: node0->25 (fat, trusted head), node1->25 (fat, untrusted middle), node2,3->8 (thin trusted),
+    # node4->12 (untrusted). Only trusted nodes {0,2,3}; tail+its neighbor must be trusted to cover b_out=9.
+    free = {0: 48000.0, 1: 48000.0, 2: 16000.0, 3: 16000.0, 4: 24000.0}
+    sub = {0: "s4", 1: "s3", 2: "s0", 3: "s1", 4: "sX"}
+    L, c_out, c_in, _, _, _ = _flat_pool(n)
+    lms = {i: 10.0 for i in range(n)}
+    r = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                    slack=n, require=0, trusted={0, 2, 3}, boundary_in=8, boundary_out=9, **MODEL)
+    assert r is not None, "false infeasible: a boundary-spill ring exists but the order search missed it"
+    assert r["order"][0] == 0
+    holders = _boundary_holders(r, 8, 9)
+    assert holders <= {0, 2, 3}, f"boundary spilled onto an untrusted node: {holders - {0,2,3}}"
+    # both tail and its neighbor are the thin trusted pair covering the 9-layer output boundary
+    assert r["order"][-1] in {2, 3} and r["order"][-2] in {0, 2, 3}
+    print("ok  no false-infeasible when the boundary spills onto a trusted neighbor (order search finds it)")
+
+
 def test_honest_infeasible_cases():
     """pinning with no trusted nodes, an untrusted require, or trusted nodes that can't cover the
     ends must return None — never a ring that leaks."""
@@ -204,15 +229,30 @@ def test_relegation_untrusted_twin_never_boundary_hot_standby():
 
 def test_all_trusted_matches_legacy_objective():
     """when EVERY node is trusted and boundaries are 0, the constraint is vacuous — the chosen ring
-    must equal the legacy optimum (trust is a constraint, never a score)."""
+    must be as GOOD as the legacy optimum (trust is a constraint, never a score). On a symmetric mesh
+    several orders tie at the optimum; the two order searches break the tie differently, so we assert
+    cost-equivalence (same step_ms, same k, same layer multiset), not an identical tie-break. An
+    asymmetric mesh with a unique optimum then pins the exact order too."""
     n = 6
     L, c_out, c_in, free, lms, sub = _flat_pool(n)
     legacy = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
                          slack=n, require=0, **MODEL)
     pinned = _ring(n, trusted=set(range(n)))
-    assert pinned["order"] == legacy["order"] and pinned["layers"] == legacy["layers"]
-    assert pinned["step_ms"] == legacy["step_ms"]
-    print("ok  all-trusted + b=0 == legacy optimum (constraint, not a score)")
+    assert pinned["step_ms"] == legacy["step_ms"] and pinned["k"] == legacy["k"]
+    assert sorted(pinned["layers"].values()) == sorted(legacy["layers"].values())
+    # asymmetric mesh: a unique cheapest loop -> the exact order must match too
+    import random
+    rng = random.Random(5)
+    La = [[0.0 if i == j else round(rng.uniform(10, 60), 2) for j in range(n)] for i in range(n)]
+    ca_out = [round(rng.uniform(8, 40), 2) for _ in range(n)]
+    ca_in = [round(rng.uniform(8, 40), 2) for _ in range(n)]
+    leg = select_ring(range(n), La, ca_out, ca_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                      slack=n, require=0, **MODEL)
+    pin = select_ring(range(n), La, ca_out, ca_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                      slack=n, require=0, trusted=set(range(n)), boundary_in=0, boundary_out=0, **MODEL)
+    assert pin["order"] == leg["order"], f"{pin['order']} != {leg['order']} on a unique-optimum mesh"
+    assert pin["step_ms"] == leg["step_ms"]
+    print("ok  all-trusted + b=0 == legacy optimum (cost-equivalent; exact order on a unique optimum)")
 
 
 def test_purity_deterministic_no_mutation():
@@ -261,7 +301,8 @@ def test_plan_seam_threads_privacy():
 
 TESTS = [test_legacy_unchanged_without_trusted, test_ends_always_trusted_even_without_boundary_layers,
          test_untrusted_never_holds_boundary_layers, test_trusted_end_absorbs_boundary_instead_of_spilling,
-         test_boundary_spans_two_trusted_stages_when_end_is_thin, test_honest_infeasible_cases,
+         test_boundary_spans_two_trusted_stages_when_end_is_thin,
+         test_no_false_infeasible_boundary_spill_needs_order_search, test_honest_infeasible_cases,
          test_ends_constrained_search_not_post_hoc_rejection, test_funnel_keeps_trusted_cover,
          test_relegation_untrusted_twin_never_boundary_hot_standby, test_all_trusted_matches_legacy_objective,
          test_purity_deterministic_no_mutation, test_plan_seam_threads_privacy]

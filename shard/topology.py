@@ -88,56 +88,6 @@ def _held_karp(nodes, L, c_out, c_in):
     return order, best
 
 
-def _held_karp_ends(nodes, L, c_out, c_in, start, ends):
-    """exact min-latency loop with order[0] == `start` and order[-1] in `ends` (boundary pinning:
-    both ring ends must be trusted, so the order search is END-CONSTRAINED — rejecting the
-    unconstrained optimum's order after the fact would skip subsets that DO admit a valid ring,
-    the classic false-infeasible class). One dp run per start answers every end. O(k^2 2^k)."""
-    idx = list(nodes)
-    k = len(idx)
-    if k == 1:
-        n = idx[0]
-        return ([n], c_out[n] + c_in[n]) if n == start and n in ends else (None, INF)
-    pos = {n: i for i, n in enumerate(idx)}
-    s = pos[start]
-    dp = [[INF] * k for _ in range(1 << k)]
-    par = [[-1] * k for _ in range(1 << k)]
-    dp[1 << s][s] = c_out[start]
-    for mask in range(1 << k):
-        if not (mask >> s) & 1:
-            continue
-        for j in range(k):
-            if dp[mask][j] == INF or not (mask >> j) & 1:
-                continue
-            base = dp[mask][j]
-            for m in range(k):
-                if (mask >> m) & 1:
-                    continue
-                nmask = mask | (1 << m)
-                cand = base + L[idx[j]][idx[m]]
-                if cand < dp[nmask][m]:
-                    dp[nmask][m] = cand
-                    par[nmask][m] = j
-    full = (1 << k) - 1
-    best, bj = INF, -1
-    for j in range(k):
-        if idx[j] not in ends or j == s:
-            continue
-        c = dp[full][j] + c_in[idx[j]]
-        if c < best:
-            best, bj = c, j
-    if bj < 0:
-        return None, INF
-    order, mask, j = [], full, bj                               # reconstruct
-    while j != -1:
-        order.append(idx[j])
-        pj = par[mask][j]
-        mask ^= (1 << j)
-        j = pj
-    order.reverse()
-    return order, best
-
-
 def _pin_order_oversize(nodes, L, c_out, c_in, heads, ends):
     """heuristic ends-constrained order for k>16 (outside Held-Karp reach; rings are ~5-8 so this
     is a widen-fallback safety net, not a hot path): for each trusted (head, tail) pair, greedy
@@ -532,20 +482,62 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                                 prefill_chunks, prefill_layer_ms)
         return pf + D * step, step, pf                          # rank by total request time
 
-    def _pin_order(subset, k):
-        """min-cost order with TRUSTED ends: order[0] a trusted head (require when pinned there),
-        order[-1] a trusted tail. Exact (ends-constrained Held-Karp) for k<=16."""
+    def _pin_floors(order, subset_caps):
+        """Layer floors that FORCE the boundary onto a trusted CONTIGUOUS prefix/suffix of `order`,
+        or None if this order can't hold the boundary safely. The input boundary [0,b_in) must fall on
+        a trusted run from the front (each front node trusted until b_in layers are covered); likewise
+        [n-b_out,n) on a trusted run from the back. This is what makes the boundary guarantee hold when
+        a single end node is too small (b_out > tail cap) — the spill lands on the next trusted stage by
+        construction, not by luck of the greedy fill. Both ends are trusted regardless (role leak)."""
+        if order[0] not in trust or order[-1] not in trust:
+            return None
+        floors = {}
+        need, i = b_in, 0
+        while need > 0 and i < len(order):
+            nd = order[i]
+            if nd not in trust:
+                return None                                          # untrusted node inside the input boundary
+            take = min(subset_caps[nd], need)
+            floors[nd] = max(floors.get(nd, 0), take)
+            need -= take; i += 1
+        if need > 0:
+            return None                                              # trusted prefix can't cover b_in
+        need, j = b_out, len(order) - 1
+        while need > 0 and j >= 0:
+            nd = order[j]
+            if nd not in trust:
+                return None                                          # untrusted node inside the output boundary
+            take = min(subset_caps[nd], need)
+            floors[nd] = max(floors.get(nd, 0), take)
+            need -= take; j -= 1
+        if need > 0:
+            return None
+        return floors
+
+    def _pin_orders(subset, k):
+        """Cost-ordered orders with a trusted head (require when pinned) + trusted tail. Yields ALL of
+        them (cheapest first) so _search can take the cheapest that also holds the boundary safely —
+        picking only the single min-latency order (then rejecting it) is the false-infeasible class:
+        another order of the same subset may seat the trusted nodes where the boundary needs them.
+        Exhaustive for ring-sized k (<=8 middles); a heuristic single order above (unreached via trim)."""
         Lm, om, im = (EL, Eout, Ein) if aware else (L, c_out, c_in)
         heads = [require] if require is not None else [n for n in subset if n in trust]
         ends = {n for n in subset if n in trust}
-        if k > 16:
-            return _pin_order_oversize(subset, Lm, om, im, heads, ends)[0]
-        best_o, best_c = None, INF
+        if k == 1:
+            return [[h] for h in heads if h in ends]
+        if k - 1 > 8:                                                # oversize fallback (funnel keeps k small)
+            o = _pin_order_oversize(subset, Lm, om, im, heads, ends)[0]
+            return [o] if o else []
+        cand = []
         for h in heads:
-            o, c = _held_karp_ends(subset, Lm, om, im, h, ends if k == 1 else ends - {h})
-            if o is not None and c < best_c:
-                best_o, best_c = o, c
-        return best_o
+            mids = [n for n in subset if n != h]
+            for perm in permutations(mids):
+                if perm[-1] not in ends:                             # trusted tail
+                    continue
+                order = [h, *perm]
+                cand.append((loop_cost(order, Lm, om, im), order))
+        cand.sort(key=lambda x: x[0])
+        return [o for _, o in cand]
 
     def _search(k_lo, k_hi):
         found = None
@@ -557,27 +549,31 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                     continue                                             # both ends must be trusted (distinct if k>1)
                 if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
                     continue
+                subset_caps = {n: caps[n] for n in subset}
                 if pin:
-                    order = _pin_order(subset, k)
-                    if order is None:
-                        continue
-                else:
-                    order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
-                    if require is not None and order[0] != require:  # deployable orientation: coord box = stage 0
-                        order = (_head_first(order, require, EL, Eout, Ein) if aware
-                                 else _head_first(order, require, L, c_out, c_in))
-                floors = None
-                if pin:                                                  # a trusted end absorbs its whole boundary
-                    floors = {}                                          # range when its VRAM allows, so leaky layers
-                    if b_in:                                             # don't spill onto an untrusted neighbor
-                        floors[order[0]] = min(b_in, caps[order[0]])
-                    if b_out:
-                        floors[order[-1]] = max(floors.get(order[-1], 0), min(b_out, caps[order[-1]]))
-                alloc = assign_layers(order, n_layers, {n: caps[n] for n in subset}, layer_ms, floors)
+                    # cheapest order whose trusted prefix/suffix can hold the boundary AND whose greedy
+                    # fill keeps every boundary layer trusted. Ordered by cost, so the first hit is best.
+                    for order in _pin_orders(subset, k):
+                        floors = _pin_floors(order, subset_caps)
+                        if floors is None:
+                            continue
+                        alloc = assign_layers(order, n_layers, subset_caps, layer_ms, floors)
+                        if alloc is None:
+                            continue
+                        if not _boundary_nodes(order, alloc, n_layers, b_in, b_out) <= trust:
+                            continue                                     # a spilled boundary layer (belt-and-braces)
+                        rank, step, pf = _score(order, alloc)
+                        if found is None or rank < found[0]:
+                            found = (rank, order, alloc, k, step, pf)
+                        break                                            # cost-ordered -> first valid is this subset's best
+                    continue
+                order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
+                if require is not None and order[0] != require:      # deployable orientation: coord box = stage 0
+                    order = (_head_first(order, require, EL, Eout, Ein) if aware
+                             else _head_first(order, require, L, c_out, c_in))
+                alloc = assign_layers(order, n_layers, subset_caps, layer_ms)
                 if alloc is None:
                     continue
-                if pin and not _boundary_nodes(order, alloc, n_layers, b_in, b_out) <= trust:
-                    continue                                             # boundary spilled past the trusted stages
                 rank, step, pf = _score(order, alloc)
                 if found is None or rank < found[0]:                     # ties: smaller k wins (k ascending, strict <)
                     found = (rank, order, alloc, k, step, pf)
