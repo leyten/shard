@@ -57,10 +57,9 @@ def main():
     base = a.base_url or f"https://huggingface.co/{manifest['model_id']}/resolve/main/"
     provider = fetch.MirrorProvider(base)
     if a.source == "libp2p":
-        try:
-            fetch.Libp2pProvider().fetch(manifest["shards"][0], os.devnull)
-        except fetch.ProviderUnavailable as e:
-            print(f"[node_pull] {e}; using mirror", file=sys.stderr)
+        # torrent-first: peers on the shard DHT (SHARD_DHT_BOOTSTRAP / SHARD_SIDECAR env),
+        # mirror as the origin fallback. Verification is identical either way.
+        provider = fetch.ChainProvider([fetch.Libp2pProvider(), provider])
 
     paths = fetch.fetch_block(
         manifest, a.model_dir, stage=a.stage, nstages=a.nstages, role=a.role,

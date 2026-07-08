@@ -180,6 +180,13 @@ func main() {
 	announce := flag.String("announce", "", "advertise this public multiaddr ahead of auto-detected ones (e.g. /ip4/PUBIP/tcp/PORT)")
 	prove := flag.String("prove", "", "identity binding: sign this challenge with the node key; print PEERID + SIG")
 	verify := flag.String("verify", "", "identity binding: verify a proof 'peerid,nonce,b64sig' -> OK/FAIL (reference for c0mpute)")
+	var dhtBootstrap stringList
+	flag.Var(&dhtBootstrap, "dht-bootstrap", "shard-DHT bootstrap peer /p2p multiaddr (repeatable)")
+	seedSpec := flag.String("seed", "", "seed manifest shards: manifest.json=modelDir (announce CIDs on the DHT + serve blockx)")
+	fetchCid := flag.String("fetch-cid", "", "one-shot: fetch this shard CID from providers on the DHT, then exit")
+	fetchOut := flag.String("fetch-out", "", "destination path for -fetch-cid")
+	fetchSize := flag.Int64("fetch-size", 0, "expected byte size for -fetch-cid (0 = trust the peer's size header)")
+	fetchTimeout := flag.Int("fetch-timeout", 900, "overall -fetch-cid deadline in seconds (find providers + transfer)")
 	flag.Parse()
 
 	// Identity-binding verify: prove a PeerId controls its key, from (peerid, nonce, sig)
@@ -286,6 +293,56 @@ func main() {
 		}
 		h.ConnManager().Protect(relay.ID, "relay")
 		log.Printf("RESERVED relay slot on %s (expires %s)", relay.ID, res.Expiration)
+	}
+
+	// DHT content routing — the torrent half of the verified weight-fetch. -seed
+	// announces + serves this node's manifest shards (composes with tunnel mode: a
+	// ring node seeds while it serves); -fetch-cid is the one-shot pull a joiner's
+	// shard/fetch.py spawns (find providers -> block-exchange -> exit; the caller
+	// re-hashes every byte against the signed manifest).
+	tunneling := *inbound != "" || len(forwards) > 0
+	if *fetchCid != "" {
+		// one-shot fetch: blocking, then exit (the joiner's shard/fetch.py drives it).
+		ctx := context.Background()
+		kd, known, err := setupDHT(ctx, h, dhtBootstrap)
+		if err != nil {
+			log.Fatalf("dht: %v", err)
+		}
+		if *fetchOut == "" {
+			log.Fatalf("-fetch-cid needs -fetch-out")
+		}
+		if err := runFetchCid(ctx, h, kd, known, *fetchCid, *fetchOut, *fetchSize, time.Duration(*fetchTimeout)*time.Second); err != nil {
+			log.Fatalf("fetch: %v", err)
+		}
+		return
+	}
+	if *seedSpec != "" {
+		pp := strings.SplitN(*seedSpec, "=", 2)
+		if len(pp) != 2 {
+			log.Fatalf("bad -seed %q (want manifest.json=modelDir)", *seedSpec)
+		}
+		// Bring up the DHT + seeder in the BACKGROUND so it never delays the tunnel's
+		// "tunnel up" line — a ring node seeds WHILE it serves, and the launcher's
+		// readiness check (greps 'tunnel up') must not wait on DHT bootstrap. When there
+		// is no tunnel, block here after setup so the seeder serves until killed.
+		start := func() {
+			ctx := context.Background()
+			kd, _, err := setupDHT(ctx, h, dhtBootstrap)
+			if err != nil {
+				log.Printf("dht (seed): %v", err) // non-fatal: the ring keeps serving
+				return
+			}
+			if err := runSeeder(ctx, h, kd, pp[0], pp[1]); err != nil {
+				log.Printf("seed: %v", err)
+			}
+		}
+		if tunneling {
+			go start()
+		} else {
+			start()
+			log.Printf("seeding (no tunnel); serving blockx until killed")
+			select {}
+		}
 	}
 
 	// Tunnel mode: a transparent TCP<->libp2p bridge. The engine keeps its own socket

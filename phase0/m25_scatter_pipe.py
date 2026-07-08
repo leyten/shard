@@ -68,12 +68,16 @@ def peerid(host, port):
     raise RuntimeError(f"no PeerId {host}:{port}: {r.stdout[-200:]}{r.stderr[-200:]}")
 
 
-def launch_sidecar(host, port, announce, inbound, forwards):
+def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None):
     fw = " ".join(f"-forward {f}" for f in forwards)
     inb = f"-inbound {inbound}" if inbound else ""
+    # seeding lifecycle (torrent): a stage that verified-pulled its layer range seeds it on the
+    # shard DHT from the SAME tunnel daemon — 'manifest.json=modelDir' + neighbour bootstrap addrs.
+    sd = f"-seed {seed}" if seed else ""
+    bs = " ".join(f"-dht-bootstrap {b}" for b in (dht_bootstrap or []))
     cmd = (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
            f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-           f"-announce {announce} {inb} {fw} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
+           f"-announce {announce} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):
@@ -130,6 +134,10 @@ def main():
     ap.add_argument("--warm-only", action="store_true", help="warm stages+sidecars then STOP (no coord/gateway) so a measurement tool can run as the SOLE first coordinator on the head box")
     ap.add_argument("--batch", type=int, default=1, help="continuous batching: stages allocate [B,...] KV (M25_BATCH); warm the ring with --serve then drive coordinate_pipe_batch")
     ap.add_argument("--kv-maxlen", type=int, default=0, help="cap M25_KV_MAXLEN (batched KV is B*MAXLEN per layer; 40960 default OOMs the tail at B>=4)")
+    ap.add_argument("--seed-shards", action="store_true",
+                    help="torrent seeding lifecycle: every stage's sidecar also SEEDS its verified layer range "
+                         "on the shard DHT (/root/m25_manifest.json=/root/m25, neighbours as bootstrap) so "
+                         "joiners can pull from peers instead of the mirror")
     a = ap.parse_args()
     # Interactive deploy (--serve = the OpenAI gateway) defaults cwnd keep-warm ON: single-stream legs
     # idle between tokens long enough to trip TCP slow-start-after-idle (cwnd collapse -> the next frame
@@ -164,7 +172,11 @@ def main():
             forwards.append(f"127.0.0.1:{FWD_RING}={nodes[k+1]['maddr']}")
         if k == 0:
             forwards.append(f"127.0.0.1:{FWD_RET}={nodes[-1]['maddr']}")   # head also tunnels coord-return -> tail
-        ok = launch_sidecar(nd["host"], nd["port"], announce, inbound, forwards)
+        seed = "/root/m25_manifest.json=/root/m25" if a.seed_shards else None
+        # bootstrap through the PREDECESSOR's sidecar only — it launched before us (k asc), so the
+        # DHT link is up when we dial; the successor reciprocates when it launches. k=0 seeds solo.
+        bsp = [nodes[k - 1]["maddr"]] if (a.seed_shards and k > 0) else None
+        ok = launch_sidecar(nd["host"], nd["port"], announce, inbound, forwards, seed=seed, dht_bootstrap=bsp)
         print(f"  {'OK' if ok else 'FAIL'} {nd['region']}", flush=True)
         if not ok:
             print(sh(nd["host"], nd["port"], "tail -4 /root/sidecar.log", 20).stdout); return

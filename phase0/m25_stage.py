@@ -211,7 +211,15 @@ def vllm_ctx():
     init_distributed_environment(world_size=1, rank=0, local_rank=0, distributed_init_method="env://", backend="nccl")
     vcfg = VllmConfig()
     try:                                              # cutlass (native FP4, fast, NON-invariant) | emulation (Triton in-kernel dequant: amortizing + batch-INVARIANT under VLLM_BATCH_INVARIANT=1, sm_120, NVFP4 footprint) | marlin
-        vcfg.kernel_config.moe_backend = os.environ.get("M25_MOE_BACKEND", "cutlass")
+        # "auto" picks per-arch so a heterogeneous ring needs no per-node env: cutlass is the
+        # sm_120 native-FP4 fast path and REFUSES older cards; marlin runs the same NVFP4
+        # checkpoint on Ada/Ampere (4090-probed: dequant-in-kernel, ~2x weight VRAM, emulation
+        # is sm_120-only Triton). A stage's arch is a node fact, not a ring-wide setting.
+        want = os.environ.get("M25_MOE_BACKEND", "auto")
+        if want == "auto":
+            want = "cutlass" if torch.cuda.get_device_capability(0) >= (12, 0) else "marlin"
+            print(f"[stage] moe_backend auto -> {want} (sm_{''.join(map(str, torch.cuda.get_device_capability(0)))})", flush=True)
+        vcfg.kernel_config.moe_backend = want
     except Exception as e:
         print("warn moe_backend:", e, flush=True)
     ctx = set_current_vllm_config(vcfg); ctx.__enter__()

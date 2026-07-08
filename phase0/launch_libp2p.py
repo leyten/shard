@@ -41,12 +41,17 @@ def maddr(inst, pid):
     return f"/ip4/{ip}/tcp/{port}/p2p/{pid}"
 
 
-def launch_sidecar(inst, announce, inbound, forwards):
+def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=None):
     """forwards: list of 'localaddr=peer_multiaddr'. inbound: engine addr or '' (head has none).
+    seed: 'manifest.json=modelDir' — the seeding lifecycle: a ring node that verified-pulled its
+    layer range SEEDS it on the shard DHT (torrent-style; composes with the tunnel — same daemon).
+    dht_bootstrap: peer multiaddrs to join the DHT through (ring neighbours work fine).
     RETRIES: vast SSH is flaky (rc=255 'try again after a few seconds'), and a missed sidecar launch =
     the engine's forward connect gets refused. So launch + verify ('listening' in sidecar.log) up to 4×."""
     fw = " ".join(f"-forward {f}" for f in forwards)
     inb = f"-inbound {inbound}" if inbound else ""
+    sd = f"-seed {seed}" if seed else ""
+    bs = " ".join(f"-dht-bootstrap {b}" for b in (dht_bootstrap or []))
     # proper detach (setsid bash -c '...' </dev/null >/dev/null 2>&1 &) — a bare setsid keeps the ssh
     # channel's fds and the daemon dies when ssh closes (the round-trip self-test only stayed up this way).
     # NB: do NOT `pkill -f /tmp/sidecar` here — this command STRING contains "/tmp/sidecar", so pkill -f
@@ -54,7 +59,7 @@ def launch_sidecar(inst, announce, inbound, forwards):
     # Free the libp2p port instead (kills any old sidecar bound there; never matches the launch shell).
     cmd = (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
            f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-           f"-announce {announce} {inb} {fw} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
+           f"-announce {announce} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
     for attempt in range(6):
         fire(inst, cmd)
         for _ in range(4):                              # tolerant verify: vast ssh rc=255 can flake the CHECK too
