@@ -13,10 +13,19 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-08 — SAFETY RAILS BUILT + PROVEN: open admission is now safe for untrusted traffic
-The OPEN-launch blocker is cleared. All three trust rails are built, CPU-tested, adversarially fuzzed,
-and proven end-to-end against the REAL shard seams. Open ADMISSION was already live; these make open
-TRAFFIC safe (a stranger can no longer see a prompt-revealing activation).
+### ⇒ 2026-07-08 — PoC RUNS FULLY OPEN (privacy deferred); cheat-detection rails BUILT + PROVEN
+**leyten's call (2026-07-08):** for the PoC, **any machine joins any swarm and holds any slice.** Prompt
+privacy is a **known, accepted limitation** — mandatory boundary pinning would need trusted nodes in ~40%
+of every ring and re-introduce the supply bottleneck open admission exists to avoid. What runs on the open
+network is **CHEAT detection** (needs no trusted stage in a ring): **receipts** (skip/fabricate/replay →
+pay nobody), a **spot-check** verified by a we-run **auditor** (a few boxes we operate off-ring — the
+sharded canary analogue, zero supply tax), and **graded reputation** (kicks repeat cheaters at admission).
+Cheat-detection catches a node doing the work WRONG; it can't catch one doing it right while copying the
+prompt (snooping is passive) — that residual IS the deferred privacy gap. `DEFAULT_SWARM_CONFIG.privacy =
+null` (open). The boundary-pinning rails below stay BUILT + PROVEN as the **opt-in private tier** for later.
+
+All three rails are built, CPU-tested, adversarially fuzzed, and proven end-to-end against the REAL shard
+seams (the pinning path via `rails-demo.ts`; the open path via `swarm-loop-demo.ts`).
 
 **SHIPPED — shard branch `net/boundary-pinning` (5 commits; suite 233 green):**
 - **Boundary-layer pinning** (`select_ring(trusted={...}, boundary_in, boundary_out)` + `shard.plan`
@@ -59,20 +68,20 @@ self-tests pass; `scratchpad/ring_watcher.py`): (a) CUDA-803 dud now caught by a
 scp/ssh drop → no `boot.log`) distinguished from PENDING so the watcher re-bootstraps/swaps instead of
 polling the full 35-min window. Wraps the proven rent_pool→ring_up flow; live-validated only on a ring.
 
-**⇒ GENUINE FORK for leyten (surfaced, awaiting his call — `c0mpute/PERMISSIONLESS_LOOP.md`):**
-1. **Privacy STANCE:** (a) boundary-pin-only [SHIPPING DEFAULT, honest framing: removes the trivial +
-   free-output leaks, shrinks the attacker pool from "any lazy node" to "a trained white-box attacker
-   who gets partial *semantic* deep-middle reconstruction" — defense-in-depth, NOT a guarantee] vs (b)
-   per-request trusted routing [paid private tier — vetted/staked-only ring or higher window on demand]
-   vs (c) activation obfuscation [R&D]. Recommend ship (a) now, design (b) next, park (c).
-2. **WHO is a "trusted/staked" node** the boundary pins to — the economics of what stake buys a
-   `boundary` role (ties into `lib/onchain-staking.ts`; `GradedReputation.isStaked` is the seam).
+**⇒ PRIVACY FORK — DECIDED (leyten 2026-07-08): run the PoC fully OPEN, defer prompt privacy.** Mandatory
+pinning was rejected (taxes open supply). The pinning rails stay built as the opt-in private tier; the one
+economics decision that remains leyten's — WHO counts as a staked/trusted node — only matters when that
+private tier is turned on, NOT on the PoC critical path (`GradedReputation.isStaked` seam →
+`lib/onchain-staking.ts`).
 
-**⇒ NEXT (after leyten's fork call): PUSH + open the two PRs, then MERGE** (branches ready, tested; not
-yet pushed). Then the remaining loop-integration items are unchanged and NOT rails: RTT probe + auto-form
-trigger, pay wiring onto `recordEarning`, token-attested pay, P2P shard propagation (torrent half). A
-mixed trusted/untrusted LIVE ring is the one thing the rails haven't seen (all CPU/sim proven) — worth a
-vast pass once the watcher is live-validated. **RING: none live.** Vast credit ~$130 (this session: $0).
+**⇒ NEXT: PUSH + open the two PRs, then MERGE** (branches ready, tested; not yet pushed — privacy stance
+now decided, so unblocked). shard `net/boundary-pinning` (6 commits), c0mpute `net/safety-rails` (4:
+rails + fork-doc + adversarial hardening + fully-open PoC). Then the remaining loop-integration items, NOT
+rails: RTT probe + auto-form trigger, pay wiring onto `recordEarning`, token-attested pay, P2P shard
+propagation (torrent half), and standing up the **spot-check auditor node(s)** (the we-run recompute box
+the open-PoC spot-check verifies against). A LIVE fully-open ring end-to-end (announce→place→pull→serve→
+settle with receipts + a live spot-check) is the next real-hardware milestone. **RING: none live.** Vast
+credit ~$130 (this session: $0).
 
 ### ⇒ 2026-07-07 (night) — REAL-RING PASS PASSED: the permissionless loop closed end-to-end on LIVE GPUs
 On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, no co-location), the whole loop ran:
