@@ -18,7 +18,7 @@ The OPEN-launch blocker is cleared. All three trust rails are built, CPU-tested,
 and proven end-to-end against the REAL shard seams. Open ADMISSION was already live; these make open
 TRAFFIC safe (a stranger can no longer see a prompt-revealing activation).
 
-**SHIPPED — shard branch `net/boundary-pinning` (3 commits; suite 231 green):**
+**SHIPPED — shard branch `net/boundary-pinning` (5 commits; suite 233 green):**
 - **Boundary-layer pinning** (`select_ring(trusted={...}, boundary_in, boundary_out)` + `shard.plan`
   `privacy=` seam). The head/tail roles and every stage holding a `[0,b_in)` or `[62-b_out,62)` layer
   must be trusted; strangers hold only deep-middle. Grounded in the inversion literature (2602.16760,
@@ -29,10 +29,15 @@ TRAFFIC safe (a stranger can no longer see a prompt-revealing activation).
   a single end node is too small. FAILS CLOSED (no trusted node / untrusted require → None).
 - **Torch-free challenge seam** (`python3 -m shard.challenge`, `compare_sketches`): the control plane
   judges spot-check sketches with no CUDA stack (the GPU nodes produce them). Fail-closed on malformed.
-- **Adversarial verification (self-run):** 8000-case leak fuzz (5571 rings, 10486 boundary
-  intersections) = **0 leaks**; a 4000-case **brute-force feasibility oracle** cross-check found a
-  false-infeasible (boundary spilling a small end node), which is now FIXED — select_ring matches the
-  oracle exactly (0 mismatches). A deeper adversarial subagent review was also run.
+- **Adversarial verification (self-run + a deep subagent, ~8500 machine-checked specs):** the privacy
+  guarantee is **SOUND** — 0 untrusted nodes on a boundary across every returned spec. The review found
+  **5 non-leak bugs, ALL FIXED + regression-locked**: (1) a false-infeasible when the window spills a
+  small end node (self-found via a brute-force oracle); (2) a **FAIL-OPEN seam** — plan.py read the
+  `trusted` flag by truthiness, so a string `"false"` would admit strangers → now strict bool
+  (fail-closed); (3) an overlap false-infeasible (b_in+b_out ≥ n_layers double-counted floors, refused
+  even all-trusted rings); (4) oversize windows didn't clamp; (5) duplicate node ids collided. After the
+  fixes select_ring matches the brute-force feasibility oracle **exactly** on 5000 cases that include the
+  overlap/oversize regime (0 mismatch, 0 false-infeasible, 0 leaks).
 
 **SHIPPED — c0mpute branch `net/safety-rails` (2 commits; full tsc clean):**
 - **GradedReputation** (`lib/orchestrator/reputation.ts`) — per-node score gating `boundary`
