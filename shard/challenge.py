@@ -23,29 +23,38 @@ into the same seam (docs/INTEGRATION.md §6b, §9, §11).
 Pure engine (boundary law): knows activations, blocks, tensors — nothing about c0mpute's
 reputation policy. shard provides "run this block on this input -> output"; *when* to probe,
 *how* to score, *when* to eject is c0mpute policy.
+
+SEAM: `python3 -m shard.challenge` compares two sketches over stdio (JSON in/out), mirroring
+`shard.plan`/`shard.verify` — the TS control plane drives the ONE comparison implementation
+instead of re-porting the tolerance math. compare_sketches is deliberately TORCH-FREE (pure
+python over the 256-dim projections): sketches come FROM the GPU nodes; the control plane's
+host needs no CUDA stack to judge them. torch imports are lazy for the same reason.
 """
 import hashlib
-
-import torch
+import json
+import math
+import sys
 
 
 def derive_challenge(seed: str, n_tokens: int, hidden_size: int,
-                     device="cuda", dtype=torch.bfloat16) -> torch.Tensor:
+                     device="cuda", dtype=None):
     """A deterministic [1, n_tokens, hidden_size] activation derived from `seed`. The verifier
     and the challenged node both derive the SAME input from the same seed, so only the block's
     transform is under test. Seeded CPU generation -> identical bytes on any host (the input is
     reproducible even though the block's OUTPUT is not), then moved to device."""
+    import torch
     h = hashlib.sha256(seed.encode()).digest()
     g = torch.Generator()                                  # CPU generator: host-independent draw
     g.manual_seed(int.from_bytes(h[:8], "big"))
     x = torch.randn(1, n_tokens, hidden_size, generator=g, dtype=torch.float32)
-    return x.to(device=device, dtype=dtype)
+    return x.to(device=device, dtype=torch.bfloat16 if dtype is None else dtype)
 
 
-def block_forward(parts, x: torch.Tensor, start: int = 0) -> torch.Tensor:
+def block_forward(parts, x, start: int = 0):
     """Run ONE forward of a node's loaded block (pipeline.load_stage parts) on input x at
     absolute position `start`, eager + causal, no cache write. Returns the block output hidden
     states. This is exactly the transform a stage applies on the hot path, isolated for probing."""
+    import torch
     from pipeline import run_block
     from transformers import DynamicCache
     cache = DynamicCache()
@@ -53,10 +62,11 @@ def block_forward(parts, x: torch.Tensor, start: int = 0) -> torch.Tensor:
         return run_block(x, parts, cache, start)
 
 
-def sketch(h: torch.Tensor) -> dict:
+def sketch(h) -> dict:
     """A compact, transport-friendly fingerprint of a block output: shape, L2 norm, and a
     low-dim random projection (enough to compare via cosine without shipping the full tensor).
     The projection seed is fixed so verifier and node project identically."""
+    import torch
     hf = h.detach().to(torch.float32).flatten()
     g = torch.Generator(device=hf.device if hf.is_cuda else "cpu")
     g.manual_seed(1234567)
@@ -65,11 +75,36 @@ def sketch(h: torch.Tensor) -> dict:
     return {"n": int(hf.numel()), "norm": float(hf.norm()), "proj": hf[idx].cpu().tolist()}
 
 
+def compare_sketches(a: dict, b: dict, cos_thresh: float = 0.99) -> dict:
+    """Torch-free sketch comparison — the control-plane side of the spot-check. Same tolerance
+    semantics as compare(): cosine over the fixed-seed projections + relative L2 norm. Malformed
+    or shape-mismatched sketches FAIL CLOSED (a cheater must not be able to dodge the check by
+    sending a sketch the verifier can't line up with its own)."""
+    try:
+        va, vb = list(map(float, a["proj"])), list(map(float, b["proj"]))
+        na, nb = float(a["norm"]), float(b["norm"])
+        n_a, n_b = int(a["n"]), int(b["n"])
+    except (KeyError, TypeError, ValueError):
+        return {"cosine": 0.0, "rel_norm": 1.0, "passed": False, "error": "malformed sketch"}
+    if not va or len(va) != len(vb) or n_a != n_b:
+        return {"cosine": 0.0, "rel_norm": 1.0, "passed": False, "error": "sketch shape mismatch"}
+    dot = sum(x * y for x, y in zip(va, vb))
+    pa = math.sqrt(sum(x * x for x in va)) or 1e-9
+    pb = math.sqrt(sum(y * y for y in vb)) or 1e-9
+    cos = dot / (pa * pb)
+    rel_norm = abs(na - nb) / max(na, nb, 1e-9)
+    passed = cos >= cos_thresh and rel_norm < 0.05
+    return {"cosine": cos, "rel_norm": rel_norm, "passed": passed}
+
+
 def compare(a, b, cos_thresh: float = 0.99) -> dict:
     """Compare two block outputs (full tensors or sketches) by cosine similarity + relative norm.
     PASS = the node ran the real block (cosine ~1, a few ULPs); FAIL = garbage/wrong block.
     cos_thresh 0.99 sits far above honest ULP drift (cosine ~0.9999) and far above any
     independent/garbage output (cosine ~0)."""
+    if isinstance(a, dict) and isinstance(b, dict):
+        return compare_sketches(a, b, cos_thresh)
+    import torch
     va = torch.tensor(a["proj"]) if isinstance(a, dict) else a.detach().to(torch.float32).flatten()
     vb = torch.tensor(b["proj"]) if isinstance(b, dict) else b.detach().to(torch.float32).flatten()
     na = a["norm"] if isinstance(a, dict) else float(va.norm())
@@ -90,3 +125,25 @@ def challenge_block(suspect_parts, trusted_parts, seed: str, n_tokens: int, hidd
     h_suspect = block_forward(suspect_parts, x, start)
     h_trusted = block_forward(trusted_parts, x, start)
     return compare(h_suspect, h_trusted, cos_thresh)
+
+
+def _main() -> int:
+    """`python3 -m shard.challenge` — JSON in ({a: sketch, b: sketch, cos_thresh?}), JSON out
+    (the compare_sketches verdict). `a` = the suspect node's sketch, `b` = the trusted replica's.
+    Torch-free by design: the control plane judges sketches, the GPU nodes produce them."""
+    try:
+        req = json.load(sys.stdin)
+    except Exception as e:  # noqa: BLE001 — a malformed request is a caller error, report it as JSON
+        json.dump({"error": f"bad request json: {e}"}, sys.stdout)
+        return 2
+    try:
+        out = compare_sketches(req["a"], req["b"], float(req.get("cos_thresh", 0.99)))
+    except KeyError as e:
+        json.dump({"error": f"missing field: {e}"}, sys.stdout)
+        return 2
+    json.dump(out, sys.stdout)
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
