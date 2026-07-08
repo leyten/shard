@@ -155,28 +155,66 @@ class LocalDirProvider(Provider):
 
 
 class Libp2pProvider(Provider):
-    """Fetch a shard by its CID over libp2p content routing, via the Go sidecar.
+    """Fetch a shard by its CID from PEERS over libp2p content routing (the torrent path).
 
-    The *contract* — shard_id is a CIDv1(raw, sha2-256) the sidecar validates — is live
-    now (`sidecar -fetch-cid`). The *transfer* (DHT find-providers + block exchange)
-    lands in step 8; until then fetch() raises ProviderUnavailable so the caller falls
-    back to the mirror. This is the seam, wired end-to-end and stubbed at the edge — not
-    a rewrite waiting to happen."""
+    Spawns the Go sidecar one-shot: `-fetch-cid` finds providers for the shard's CIDv1
+    on the shard DHT (kad, /shard prefix) and block-exchanges the bytes from the first
+    peer that serves them, resuming a partial across providers by offset. The peer is
+    UNTRUSTED by design — fetch_block re-hashes every byte against the signed manifest,
+    so a hostile seeder can waste time, never poison weights (the same property the
+    mirror path has). Anything short of a complete transfer raises ProviderUnavailable
+    so a ChainProvider can hand the shard to the mirror/origin."""
 
-    def __init__(self, sidecar_bin: str = "sidecar", key: str | None = None):
-        self.bin = sidecar_bin
+    def __init__(self, bootstrap: list[str] | None = None, sidecar_bin: str | None = None,
+                 key: str | None = None, timeout: int = 1800):
+        self.bin = sidecar_bin or os.environ.get("SHARD_SIDECAR", "/tmp/sidecar")
+        env_bs = [b for b in os.environ.get("SHARD_DHT_BOOTSTRAP", "").split(",") if b]
+        self.bootstrap = list(bootstrap) if bootstrap is not None else env_bs
         self.key = key
+        self.timeout = timeout
 
     def fetch(self, shard: dict, dest: str) -> None:
-        cmd = [self.bin, "-fetch-cid", shard["shard_id"]]
+        cmd = [self.bin, "-fetch-cid", shard["shard_id"], "-fetch-out", dest,
+               "-fetch-size", str(shard["size"]), "-fetch-timeout", str(self.timeout)]
+        for b in self.bootstrap:
+            cmd += ["-dht-bootstrap", b]
         if self.key:
             cmd += ["-key", self.key]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
-            detail = (r.stdout or r.stderr).strip()
+            r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout + 60)
         except FileNotFoundError:
-            detail = f"sidecar binary {self.bin!r} not found"
-        raise ProviderUnavailable(f"libp2p content routing not enabled (step 8): {detail}")
+            raise ProviderUnavailable(f"sidecar binary {self.bin!r} not found")
+        except subprocess.TimeoutExpired:
+            raise ProviderUnavailable(f"libp2p fetch of {shard['path']} timed out ({self.timeout}s)")
+        if r.returncode != 0:
+            tail = ((r.stderr or r.stdout).strip().splitlines() or ["no output"])[-1]
+            raise ProviderUnavailable(f"libp2p fetch failed: {tail[:160]}")
+
+
+class ChainProvider(Provider):
+    """Try providers in order — peers first, mirror/origin last. A provider that raises
+    ProviderUnavailable/FetchError hands the shard down the chain; so does one whose
+    delivered bytes fail the manifest hash (a hostile seeder must not be able to wedge
+    the pull when an honest source remains — its garbage is deleted and the next source
+    tried). fetch_block's own re-hash stays as the fail-closed backstop either way.
+    Only when every provider failed does the fetch fail closed."""
+
+    def __init__(self, providers: list[Provider]):
+        if not providers:
+            raise ValueError("ChainProvider needs at least one provider")
+        self.providers = list(providers)
+
+    def fetch(self, shard: dict, dest: str) -> None:
+        errs = []
+        for p in self.providers:
+            try:
+                p.fetch(shard, dest)
+                _verify(dest, shard)        # deletes dest on mismatch — a bad source is not fatal
+                return
+            except (ProviderUnavailable, FetchError) as e:
+                errs.append(f"{type(p).__name__}: {str(e)[:120]}")
+                _log(f"  {type(p).__name__} could not serve {shard['path']} -> next provider")
+        raise FetchError(f"all providers failed for {shard['path']}:\n    " + "\n    ".join(errs))
 
 
 # ── block resolution (mirrors pipeline.load_stage) ────────────────────────────
@@ -317,5 +355,5 @@ def fetch_block(manifest: dict, model_dir: str, *, stage: int, nstages: int,
 
 if __name__ == "__main__":  # tiny smoke check of the pure logic, no network
     print("shard.fetch loaded; providers:",
-          [c.__name__ for c in (MirrorProvider, LocalDirProvider, Libp2pProvider)],
+          [c.__name__ for c in (MirrorProvider, LocalDirProvider, Libp2pProvider, ChainProvider)],
           file=sys.stderr)
