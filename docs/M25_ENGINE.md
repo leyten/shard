@@ -36,6 +36,13 @@ this order of leyten's emphasis — all on-thesis "make it more torrent":**
      roles (seeder/verifier), which are too slow. Build list: per-node compute PROBE feeding layer_ms, the
      per-arch kernel selection in ModelRuntime (M25_MOE_BACKEND per node), mixed-precision-stage numeric
      compatibility on the wire/receipts, VRAM+compute admission floor per GPU class.
+   - **DECIDED (leyten): the minimum usable-speed bar = 20 tok/s+.** The allow-list is "cards that keep a ring
+     at ≥20 tok/s." HONEST TENSION to reconcile, not fake: 20 is AT/ABOVE the measured single-stream novel-
+     reasoning ceiling on scatter (~10-12 on a good 5090 ring — physics, WAN-bound). So 20 tok/s lives in the
+     BATCHED-aggregate (155 agg proven) / draftable-verbatim (50-80) / topology-tightened regimes, NOT
+     single-stream novel reasoning — and heterogeneity must not be what drops a ring below it. Do NOT
+     co-locate/datacenter to manufacture the number ([[never-colocate-usable-speed-on-scattered]]); pair the
+     GPU work with the real perf levers (batched, draftable, RTT-ordered topology, graph-aux).
 
 **2. NODE PROPAGATION for shards — BUILD + TEST the torrent weight-fetch (the "torrent" half).**
    - Today a joining node pulls its verified layer range from HF (`MirrorProvider`). The torrent path — pull
@@ -53,19 +60,30 @@ this order of leyten's emphasis — all on-thesis "make it more torrent":**
 **3. NETWORK STRUCTURE — decentralize the orchestrator (leyten wants NO central orchestrator).**
    - Today c0mpute has a CENTRAL control plane (admission, placement via `shard.plan`, per-swarm coordinator,
      settlement). NETWORK_ARCHITECTURE.md §5/§10.1 frames the fork: (A) central scheduler first vs (B)
-     market-as-optimizer; the control plane holds NO weights/keys BY DESIGN so it can decentralize later.
-     leyten's call = push toward decentralized NOW, torrent-style. Map where centralization lives (discovery,
-     admission, placement, coordination, settlement) and design the migration: **DHT discovery** (libp2p is
-     already the transport — announce/find over the DHT, no central registry), **self-forming swarms** (nodes
-     gossip capability + locally form a coverable low-RTT ring vs. a central planner call), **coordinator**
-     (per-swarm head or elected, not a central driver), **settlement** (peer-attested receipts / on-chain vs a
-     central settler). Decide what decentralizes cheaply for the PoC vs. what's genuinely hard; stage it.
+     market-as-optimizer; the control plane holds NO weights/keys BY DESIGN so it can decentralize.
+     **DECIDED (leyten): go for the MARKET (option B)** — nodes PRICE their compute, requests route to
+     cheapest-adequate, supply/demand balances the network with NO central planner; the market IS the
+     self-optimizer (most decentralized end-state, dovetails with economics §6). Central-first (A) is NOT the
+     path. Map where centralization lives (discovery, admission, placement, coordination, settlement) and
+     design the market migration: **DHT discovery** (libp2p is already the transport — announce/find over the
+     DHT, no central registry), **self-forming swarms** (nodes gossip capability + PRICE and locally form a
+     coverable low-RTT ring vs. a central planner call), **coordinator** (per-swarm head or elected, not a
+     central driver), **settlement** (peer-attested receipts / on-chain vs a central settler), and the
+     **pricing/bidding** clearing that balances supply↔demand. Decide what's cheap for the PoC vs. genuinely
+     hard; stage it. This is the deepest build — design-panel it, surface the shape to leyten before committing.
 
 **OWED — a REGRESSION "does it still work" ring pass** (leyten flagged, rightly, that it's been days + many
 changes with no live validation). NOTE: this session's changes were placement/control-plane + docs, NOT the
 decode hot path (m25_pipe / m25_scatter_pipe untouched), so serving speed should be unmoved — but we still
-owe ONE warm ring pass confirming the loop serves at the expected ~10-12 tok/s before trusting the stack.
-Fold it into the first ring session for #1 or #2 (don't spin a ring just for it).
+owe ONE warm ring pass confirming the loop serves at the expected ~10-12 tok/s single-stream (or the higher
+batched/draftable numbers) before trusting the stack. Do it early.
+
+**RINGS — TEST ON FULL RINGS FREELY (leyten): the vast balance (~$130) is there to USE.** Don't be timid
+about spinning real rings to validate #1 (heterogeneous cards live) and #2 (peer propagation live) — the
+one-box + 2-local-peer probes are the CHEAP first step, but graduate to a full ring without asking. Use the
+DETACHED watcher (scratchpad/ring_watcher.py + health_probe.py: CUDA-803 + no-boot recoveries baked in),
+keep rings WARM through an investigation, kill zombie/dud extras, track live iids. Tear down when the work
+is banked.
 
 **Shipped-and-parked (do NOT keep polishing):** the safety rails — boundary pinning (opt-in private tier),
 graded reputation, layer-block spot-check — are MERGED (shard #57, c0mpute #15) and the PoC runs fully open.
