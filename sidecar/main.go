@@ -300,31 +300,46 @@ func main() {
 	// ring node seeds while it serves); -fetch-cid is the one-shot pull a joiner's
 	// shard/fetch.py spawns (find providers -> block-exchange -> exit; the caller
 	// re-hashes every byte against the signed manifest).
-	if *seedSpec != "" || *fetchCid != "" {
+	tunneling := *inbound != "" || len(forwards) > 0
+	if *fetchCid != "" {
+		// one-shot fetch: blocking, then exit (the joiner's shard/fetch.py drives it).
 		ctx := context.Background()
 		kd, known, err := setupDHT(ctx, h, dhtBootstrap)
 		if err != nil {
 			log.Fatalf("dht: %v", err)
 		}
-		if *seedSpec != "" {
-			pp := strings.SplitN(*seedSpec, "=", 2)
-			if len(pp) != 2 {
-				log.Fatalf("bad -seed %q (want manifest.json=modelDir)", *seedSpec)
+		if *fetchOut == "" {
+			log.Fatalf("-fetch-cid needs -fetch-out")
+		}
+		if err := runFetchCid(ctx, h, kd, known, *fetchCid, *fetchOut, *fetchSize, time.Duration(*fetchTimeout)*time.Second); err != nil {
+			log.Fatalf("fetch: %v", err)
+		}
+		return
+	}
+	if *seedSpec != "" {
+		pp := strings.SplitN(*seedSpec, "=", 2)
+		if len(pp) != 2 {
+			log.Fatalf("bad -seed %q (want manifest.json=modelDir)", *seedSpec)
+		}
+		// Bring up the DHT + seeder in the BACKGROUND so it never delays the tunnel's
+		// "tunnel up" line — a ring node seeds WHILE it serves, and the launcher's
+		// readiness check (greps 'tunnel up') must not wait on DHT bootstrap. When there
+		// is no tunnel, block here after setup so the seeder serves until killed.
+		start := func() {
+			ctx := context.Background()
+			kd, _, err := setupDHT(ctx, h, dhtBootstrap)
+			if err != nil {
+				log.Printf("dht (seed): %v", err) // non-fatal: the ring keeps serving
+				return
 			}
 			if err := runSeeder(ctx, h, kd, pp[0], pp[1]); err != nil {
-				log.Fatalf("seed: %v", err)
+				log.Printf("seed: %v", err)
 			}
 		}
-		if *fetchCid != "" {
-			if *fetchOut == "" {
-				log.Fatalf("-fetch-cid needs -fetch-out")
-			}
-			if err := runFetchCid(ctx, h, kd, known, *fetchCid, *fetchOut, *fetchSize, time.Duration(*fetchTimeout)*time.Second); err != nil {
-				log.Fatalf("fetch: %v", err)
-			}
-			return
-		}
-		if *inbound == "" && len(forwards) == 0 {
+		if tunneling {
+			go start()
+		} else {
+			start()
 			log.Printf("seeding (no tunnel); serving blockx until killed")
 			select {}
 		}
