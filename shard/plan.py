@@ -68,6 +68,8 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     if n == 0:
         return None
     ids = [nd["id"] for nd in nodes]
+    if len(set(ids)) != len(ids):                            # duplicate ids collide in the output maps
+        raise ValueError("duplicate node id in `nodes`")     # (order/roles/boundary_stages) -> mis-deploy
     layer_vram, kv = float(m["layer_vram_mb"]), float(m["kv_mb_per_layer"])
     cap_layers = int(m["cap_layers"])
     per_layer_mb = layer_vram + kv
@@ -83,7 +85,11 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     #    Under privacy pinning the coordinator sees the raw prompt, so the head must be TRUSTED —
     #    rank centrality over trusted capable nodes only.
     pin = privacy is not None
-    trusted = {i for i in range(n) if nodes[i].get("trusted")} if pin else None
+    # STRICT bool — trust is the security boundary, so read it fail-CLOSED: only a genuine `True`
+    # (JSON `true`) marks a node trusted. A truthy string like "false"/"0" or an int must NOT sneak a
+    # node into the trust set (a control plane that serialized the flag as a string would otherwise
+    # fail OPEN — the one way a stranger could reach a boundary while the plan claims to be pinned).
+    trusted = {i for i in range(n) if nodes[i].get("trusted") is True} if pin else None
     head_pool = [i for i in cap_ok if i in trusted] if pin else cap_ok
     if not head_pool:
         return None                                          # pinning on, but no trusted node can hold a block

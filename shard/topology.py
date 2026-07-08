@@ -394,7 +394,10 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         raise ValueError("`require` and `exclude` name the same node")
     pin = trusted is not None
     trust = set(trusted) if pin else set()
-    b_in, b_out = (max(0, int(boundary_in)), max(0, int(boundary_out))) if pin else (0, 0)
+    # clamp each window to [0, n_layers]: a window >= n_layers means "that whole end is leaky" and
+    # must not overflow the layer math (an unclamped b_in > n_layers false-infeasibled every ring).
+    b_in = min(max(0, int(boundary_in)), n_layers) if pin else 0
+    b_out = min(max(0, int(boundary_out)), n_layers) if pin else 0
     nodes = [n for n in nodes if not exclude or n not in exclude]
     caps = {n: node_capacity(free_vram_mb[n], layer_vram_mb, kv_mb_per_layer) for n in nodes}
     usable = [n for n in nodes if caps[n] > 0]
@@ -491,6 +494,11 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         construction, not by luck of the greedy fill. Both ends are trusted regardless (role leak)."""
         if order[0] not in trust or order[-1] not in trust:
             return None
+        if b_in + b_out >= n_layers:
+            # the two windows meet/overlap -> the WHOLE model is boundary, every stage must be trusted.
+            # Don't sum a front + back floor here (that double-counts the shared layers and false-
+            # infeasibles even an all-trusted ring): require all-trusted, let assign_layers tile freely.
+            return {} if all(n in trust for n in order) else None
         floors = {}
         need, i = b_in, 0
         while need > 0 and i < len(order):
@@ -519,13 +527,15 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
         them (cheapest first) so _search can take the cheapest that also holds the boundary safely —
         picking only the single min-latency order (then rejecting it) is the false-infeasible class:
         another order of the same subset may seat the trusted nodes where the boundary needs them.
-        Exhaustive for ring-sized k (<=8 middles); a heuristic single order above (unreached via trim)."""
+        Exhaustive for ring-sized k (<=7 middles, 5040 orders); a heuristic single order above — rings
+        are ~5-8 stages and the network funnels the pool to ~16 before calling, so the exhaustive path
+        is the hot one and the k! is bounded; the fallback only guards a pathologically wide pool."""
         Lm, om, im = (EL, Eout, Ein) if aware else (L, c_out, c_in)
         heads = [require] if require is not None else [n for n in subset if n in trust]
         ends = {n for n in subset if n in trust}
         if k == 1:
             return [[h] for h in heads if h in ends]
-        if k - 1 > 8:                                                # oversize fallback (funnel keeps k small)
+        if k - 1 > 7:                                                # oversize fallback (funnel keeps k small)
             o = _pin_order_oversize(subset, Lm, om, im, heads, ends)[0]
             return [o] if o else []
         cand = []

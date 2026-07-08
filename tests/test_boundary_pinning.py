@@ -271,6 +271,66 @@ def test_purity_deterministic_no_mutation():
     print("ok  pure under pinning: deterministic, no input mutation")
 
 
+def test_overlap_and_oversize_boundaries_not_false_infeasible():
+    """REGRESSION (adversarial review 2026-07-08): when the two windows meet/overlap
+    (b_in + b_out >= n_layers) the WHOLE model is boundary. The old code summed an independent front
+    and back floor -> double-counted the shared layers -> assign_layers None even for an ALL-TRUSTED
+    ring (it failed hardest exactly when the operator was most cautious). And an oversize single window
+    (b_in > n_layers) overflowed the layer math. Both now: clamp to n_layers, and the overlap branch
+    requires all-trusted + tiles freely."""
+    n = 5
+    L, c_out, c_in, free, lms, sub = _flat_pool(n, free_mb=80000.0)
+    # all trusted, overlapping windows -> every layer boundary -> must FORM (all-trusted is always safe)
+    r = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                    slack=n, require=0, trusted=set(range(n)), boundary_in=40, boundary_out=40, **MODEL)
+    assert r is not None, "false infeasible: all-trusted overlapping-boundary ring refused"
+    assert set(r["order"]) <= set(range(n)) and sum(r["layers"].values()) == 62
+    # oversize single window clamps to n_layers, still forms all-trusted
+    r2 = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                     slack=n, require=0, trusted=set(range(n)), boundary_in=1000, boundary_out=0, **MODEL)
+    assert r2 is not None, "false infeasible: oversize b_in didn't clamp"
+    # whole-model boundary with an untrusted node: it must be EXCLUDED (every layer is leaky) or None
+    r3 = select_ring(range(n), L, c_out, c_in, free_vram_mb=free, layer_ms=lms, subnet=sub,
+                     slack=n, require=0, trusted={0, 1, 2, 3}, boundary_in=40, boundary_out=40, **MODEL)
+    assert r3 is None or 4 not in r3["order"], "LEAK: untrusted node in a whole-model-boundary ring"
+    # only one trusted node but the model needs untrusted capacity -> fail closed
+    tight = {0: 80000.0, 1: 16000.0, 2: 16000.0, 3: 16000.0, 4: 16000.0}
+    r4 = select_ring(range(n), L, c_out, c_in, free_vram_mb=tight, layer_ms=lms, subnet=sub,
+                     slack=n, require=0, trusted={0}, boundary_in=40, boundary_out=40, **MODEL)
+    assert r4 is None, "whole-model boundary must fail closed when it needs an untrusted node"
+    print("ok  overlap/oversize boundaries: no false-infeasible, whole-model stays all-trusted")
+
+
+def test_seam_trusted_flag_is_fail_closed():
+    """REGRESSION (adversarial review 2026-07-08): the plan.py `trusted` flag is the security boundary
+    and must be read fail-CLOSED — only a genuine bool True marks a node trusted. A truthy STRING like
+    "false" (a plausible mis-serialization) must NOT sneak a stranger into the trust set (that would
+    fail OPEN — the one path to a stranger on a boundary while the plan claims to be pinned). Also:
+    duplicate node ids are rejected (they'd collide in the output maps)."""
+    n = 6
+    rtt = [[0.0 if i == j else 20.0 for j in range(n)] for i in range(n)]
+    # every node self-reports trusted:"false" (truthy string) -> NONE are trusted -> can't pin -> null
+    bad = [{"id": f"x{i}", "free_vram_mb": 32000.0, "subnet": f"{i}.0/24", "trusted": "false"} for i in range(n)]
+    assert plan_ring(bad, rtt, privacy={"boundary_in": 8, "boundary_out": 8}) is None, \
+        "fail-OPEN: a truthy-string trusted flag admitted strangers"
+    # genuine bool True still works
+    good = [{"id": f"y{i}", "free_vram_mb": 32000.0, "subnet": f"{i}.0/24", "trusted": i < 3} for i in range(n)]
+    p = plan_ring(good, rtt, privacy={"boundary_in": 8, "boundary_out": 8})
+    assert p is not None and p["head"] in ("y0", "y1", "y2")
+    # int 1 is NOT accepted (strict bool) -> those nodes untrusted -> too few trusted -> null
+    inty = [{"id": f"z{i}", "free_vram_mb": 32000.0, "subnet": f"{i}.0/24", "trusted": 1} for i in range(n)]
+    assert plan_ring(inty, rtt, privacy={"boundary_in": 8, "boundary_out": 8}) is None, \
+        "int truthy must not mark trusted (strict bool)"
+    # duplicate node ids rejected
+    dup = [{"id": "same", "free_vram_mb": 32000.0, "subnet": f"{i}.0/24", "trusted": True} for i in range(3)]
+    try:
+        plan_ring(dup, [[0, 1, 1], [1, 0, 1], [1, 1, 0]], privacy={"boundary_in": 4, "boundary_out": 4})
+        assert False, "duplicate node ids should raise"
+    except ValueError:
+        pass
+    print("ok  seam trusted flag fail-closed (strict bool); duplicate ids rejected")
+
+
 def test_plan_seam_threads_privacy():
     """plan_ring: trusted flags + privacy thread through; head = most central TRUSTED node; stages
     carry `boundary`; the privacy block lists the trust-critical stages; privacy=None == before."""
@@ -305,6 +365,7 @@ TESTS = [test_legacy_unchanged_without_trusted, test_ends_always_trusted_even_wi
          test_no_false_infeasible_boundary_spill_needs_order_search, test_honest_infeasible_cases,
          test_ends_constrained_search_not_post_hoc_rejection, test_funnel_keeps_trusted_cover,
          test_relegation_untrusted_twin_never_boundary_hot_standby, test_all_trusted_matches_legacy_objective,
+         test_overlap_and_oversize_boundaries_not_false_infeasible, test_seam_trusted_flag_is_fail_closed,
          test_purity_deterministic_no_mutation, test_plan_seam_threads_privacy]
 
 if __name__ == "__main__":
