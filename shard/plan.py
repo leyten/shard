@@ -34,30 +34,42 @@ M25_PROFILE = {
 _UNREACHABLE = 9000.0            # RTT sentinel: treat >= this as "no usable path" when ranking centrality
 
 
-def plan_ring(nodes, rtt, model=None, *, slack=None):
+def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
 
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
              "cpu_factor": float=1.0,          # >=1; pyloop/0.10 + load — a slow/loaded box drafts slower
-             "up_mbps": float|None}]           # optional; present on ALL nodes -> upload-aware placement
+             "up_mbps": float|None,            # optional; present on ALL nodes -> upload-aware placement
+             "trusted": bool=False}]           # ASSIGNED by the control plane (stake/reputation), never
+                                               # self-reported by the node
     rtt:   NxN one-way ms matrix, row/col order aligned to `nodes` (rtt[i][i] ignored).
     model: profile dict (see M25_PROFILE); defaults to M2.5.
     slack: select_ring pool headroom; defaults to len(nodes) (let it drop any weak/co-located box).
+    privacy: {"boundary_in": int, "boundary_out": int} — turn on BOUNDARY-LAYER PINNING: the ring's
+             head/tail (they handle raw prompt / output tokens) and every stage holding a boundary
+             layer must be `trusted` nodes; strangers hold only deep-middle layers. The head is the
+             most central TRUSTED capable node under pinning (it runs the coordinator, which sees
+             the raw prompt). None (default) = placement exactly as before.
 
-    Returns a plan dict, or None if the pool genuinely can't hold the model:
+    Returns a plan dict, or None if the pool genuinely can't hold the model (with pinning: can't
+    hold it SAFELY — e.g. no trusted node for an end):
       {"order":  [node_id, ...],                       # head-first, deployable
        "head":   node_id,
-       "stages": [{"id", "index", "lo", "hi", "head", "tail", "layers"}...],
+       "stages": [{"id", "index", "lo", "hi", "head", "tail", "layers",
+                   "boundary"}...],                    # "boundary" only when privacy pinning is on
        "dropped":[node_id, ...],
        "roles":  {node_id: role},                      # only when every node carries up_mbps
        "step_ms", "tok_s_per_g", "k",
-       "request_ms", "prefill_ms"}                     # only when upload-aware
+       "request_ms", "prefill_ms",                     # only when upload-aware
+       "privacy": {"boundary_in", "boundary_out", "boundary_stages"}}   # only when pinning is on
     """
     m = {**M25_PROFILE, **(model or {})}
     n = len(nodes)
     if n == 0:
         return None
     ids = [nd["id"] for nd in nodes]
+    if len(set(ids)) != len(ids):                            # duplicate ids collide in the output maps
+        raise ValueError("duplicate node id in `nodes`")     # (order/roles/boundary_stages) -> mis-deploy
     layer_vram, kv = float(m["layer_vram_mb"]), float(m["kv_mb_per_layer"])
     cap_layers = int(m["cap_layers"])
     per_layer_mb = layer_vram + kv
@@ -70,9 +82,21 @@ def plan_ring(nodes, rtt, model=None, *, slack=None):
         return None                                          # no node can hold even one layer
 
     # 2) head = most central capable node (lowest total RTT to the rest); it runs the coordinator.
+    #    Under privacy pinning the coordinator sees the raw prompt, so the head must be TRUSTED —
+    #    rank centrality over trusted capable nodes only.
+    pin = privacy is not None
+    # STRICT bool — trust is the security boundary, so read it fail-CLOSED: only a genuine `True`
+    # (JSON `true`) marks a node trusted. A truthy string like "false"/"0" or an int must NOT sneak a
+    # node into the trust set (a control plane that serialized the flag as a string would otherwise
+    # fail OPEN — the one way a stranger could reach a boundary while the plan claims to be pinned).
+    trusted = {i for i in range(n) if nodes[i].get("trusted") is True} if pin else None
+    head_pool = [i for i in cap_ok if i in trusted] if pin else cap_ok
+    if not head_pool:
+        return None                                          # pinning on, but no trusted node can hold a block
+
     def centrality(i):
         return sum(rtt[i][j] for j in range(n) if j != i and rtt[i][j] < _UNREACHABLE)
-    head = min(cap_ok, key=centrality)
+    head = min(head_pool, key=centrality)
     free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
 
     # 3) launch-bound per-layer time: base * the node's cpu_factor; the head pays a coordinator penalty.
@@ -95,6 +119,11 @@ def plan_ring(nodes, rtt, model=None, *, slack=None):
                  "decode_steps": int(m.get("decode_steps", 1)),
                  "prefill_chunks": int(m.get("prefill_chunks", 1))}
 
+    if pin:
+        extra["trusted"] = trusted
+        extra["boundary_in"] = int(privacy.get("boundary_in", 0))
+        extra["boundary_out"] = int(privacy.get("boundary_out", 0))
+
     spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
                        subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=layer_vram,
                        kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
@@ -103,13 +132,17 @@ def plan_ring(nodes, rtt, model=None, *, slack=None):
         return None
     assert spec["order"][0] == head, "select_ring must return a head-first (deployable) order"
 
+    boundary = set(spec.get("boundary", []))
     order = [ids[i] for i in spec["order"]]
     last = len(spec["order"]) - 1
     stages = []
     for k, i in enumerate(spec["order"]):
         lo, hi = spec["blocks"][i]
-        stages.append({"id": ids[i], "index": k, "lo": lo, "hi": hi,
-                       "head": k == 0, "tail": k == last, "layers": hi - lo})
+        st = {"id": ids[i], "index": k, "lo": lo, "hi": hi,
+              "head": k == 0, "tail": k == last, "layers": hi - lo}
+        if pin:
+            st["boundary"] = i in boundary
+        stages.append(st)
     out = {
         "order": order,
         "head": ids[head],
@@ -123,6 +156,9 @@ def plan_ring(nodes, rtt, model=None, *, slack=None):
         out["request_ms"] = spec.get("request_ms")
         out["prefill_ms"] = spec.get("prefill_ms")
         out["roles"] = {ids[int(i)]: r for i, r in spec.get("roles", {}).items()}
+    if pin:
+        out["privacy"] = {"boundary_in": extra["boundary_in"], "boundary_out": extra["boundary_out"],
+                          "boundary_stages": [ids[i] for i in spec["order"] if i in boundary]}
     return out
 
 
@@ -134,7 +170,8 @@ def _main() -> int:
         json.dump({"error": f"bad request json: {e}"}, sys.stdout)
         return 2
     try:
-        plan = plan_ring(req["nodes"], req["rtt"], req.get("model"), slack=req.get("slack"))
+        plan = plan_ring(req["nodes"], req["rtt"], req.get("model"), slack=req.get("slack"),
+                         privacy=req.get("privacy"))
     except KeyError as e:
         json.dump({"error": f"missing field: {e}"}, sys.stdout)
         return 2
