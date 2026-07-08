@@ -37,10 +37,11 @@ is not.)
 ## Device tier table (against the ≥20 tok/s bar)
 
 Usable-speed frame: `tok/s = g / T_traversal`; a stage holding K layers adds `K × layer_ms` to the
-ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). The 20 tok/s bar
-lives in the **batched-aggregate / draftable-verbatim / topology-tightened** regimes (single-stream
-novel reasoning tops out ~10-12 on a good 5090 ring — WAN physics), so heterogeneity must not be
-what drops a ring below it. Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
+ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). Single-stream WITH
+graph-aux (`M25_GRAPH` + `M25_STATIC_KV`, PR #25) does **~24 decode-weighted / 30-32 reasoning-heavy**
+on a good EU ring; draftable-verbatim and batched-aggregate go higher still. So the 20 tok/s bar is
+comfortably above what a heterogeneous ring must protect — heterogeneity must not be what drops a
+ring below it, and every perf ring MUST launch with graph-aux on (a no-graph run under-measures ~2×). Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
 co-locate to manufacture the number — every verdict below is for scattered WAN placement.
 
 | Device | BW GB/s | Mem GB | ~layers @ arch footprint | est layer_ms | Verdict |
