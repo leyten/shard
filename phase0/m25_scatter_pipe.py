@@ -167,7 +167,12 @@ def main():
         nd["maddr"] = f"/ip4/{nd['pip']}/tcp/{nd['pport']}/p2p/{nd['pid']}"
         g = sh(nd["host"], nd["port"], "nvidia-smi --query-gpu=name --format=csv,noheader 2>/dev/null | head -1", 20)
         nd["gpu"] = (g.stdout.strip().splitlines() or ["?"])[-1].strip()
-        nd["graph_off"] = not any(b in nd["gpu"] for b in ("5090", "5080", "5070"))  # graph-aux = sm_120 cutlass only
+        # graph-aux runs on EVERY arch by default: marlin (Ada 4090) is CUDA-graph-safe — proven live,
+        # the 4090 stage dropped 32.65ms -> 8.02ms, receipts still valid — so a non-Blackwell card is a
+        # FULL-speed ring stage, not an eager drag. M25_EAGER_NONBLACKWELL=1 restores eager for a card
+        # whose backend turns out not to be graph-safe (the warm check would otherwise catch a crash).
+        eager_nb = os.environ.get("M25_EAGER_NONBLACKWELL", "0") != "0"
+        nd["graph_off"] = eager_nb and not any(b in nd["gpu"] for b in ("5090", "5080", "5070"))
         print(f"  {nd['region']} {nd['gpu']} {nd['pip']}:{nd['pport']} [{nd['lo']},{nd['hi']}) "
               f"{'eager' if nd['graph_off'] else 'graph'} {nd['pid'][:14]}..", flush=True)
 
