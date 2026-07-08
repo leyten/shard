@@ -13,6 +13,65 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-08 (STRATEGIC SHIFT — leyten): make the PoC TORRENT-LIKE. Stop hardening/privacy; build these 3.
+leyten's direction: the recent sessions drifted into hardening + privacy, which is NOT the key path. The
+north star ([[north-star-torrent-for-compute]]) is a permissionless, torrent-like compute fabric. Privacy is
+DEFERRED (PoC runs fully open); trust/hardening is DONE ENOUGH. **The next session works these three, in
+this order of leyten's emphasis — all on-thesis "make it more torrent":**
+
+**1. HETEROGENEOUS GPUs — let cards OTHER than the 5090 join swarms (which GPUs keep usable speed?).**
+   - The planner ALREADY handles the easy half: `assign_layers`/`select_ring` (shard/topology.py) size each
+     node's block by VRAM + measured per-layer time, so a smaller/slower card just gets FEWER layers. What's
+     missing is (a) making the ENGINE run a shard on non-Blackwell arch, and (b) admission tiers + a compute probe.
+   - **THE gating question = NVFP4 kernel portability.** The checkpoint is `nvidia/MiniMax-M2.5-NVFP4` (4-bit
+     experts, Blackwell-native sm_120). Can a 4090 (Ada sm_89) / 3090 (Ampere sm_86) run the NVFP4 MoE at all,
+     or only Blackwell (5090/5080/5070)? **Lead found this session:** the MoE backend is already selectable —
+     `M25_MOE_BACKEND` = `cutlass | emulation | marlin` (phase0/m25_stage.py ~L213). cutlass is the sm_120 fast
+     path; `emulation`/`marlin` are the likely non-Blackwell fallbacks (dequant NVFP4→fp8/bf16). VERIFY on a
+     single rented 4090/3090 (~$0.30, one-box probe): does the shard load + run a block, at what VRAM cost
+     (4-bit→8/16-bit inflates 2-4×, so a 4090 holds fewer layers) and what layer_ms.
+   - **Usable-speed frame:** tok/s = g / T_traversal; a slow card raises its stage compute. Decode is
+     memory-bandwidth + CPU-launch bound (5090≈1792, 4090≈1008, 3090≈936, 4070Ti≈672, 3060≈360 GB/s). Produce
+     an ALLOWED-GPU tier table: which cards are ring-worthy (fine with fewer layers), which only fit off-ring
+     roles (seeder/verifier), which are too slow. Build list: per-node compute PROBE feeding layer_ms, the
+     per-arch kernel selection in ModelRuntime (M25_MOE_BACKEND per node), mixed-precision-stage numeric
+     compatibility on the wire/receipts, VRAM+compute admission floor per GPU class.
+
+**2. NODE PROPAGATION for shards — BUILD + TEST the torrent weight-fetch (the "torrent" half).**
+   - Today a joining node pulls its verified layer range from HF (`MirrorProvider`). The torrent path — pull
+     from PEERS holding the range — is the seam `Libp2pProvider` (shard/fetch.py:157), wired end-to-end but
+     STUBBED (raises `ProviderUnavailable` → falls back to mirror). Verification is unchanged (re-hash vs the
+     signed manifest), so an untrusted peer source is SAFE — swapping the source changes nothing about trust.
+   - UNBUILT: the actual transfer — **provide/seed** (announce to the DHT this node holds CID X for layers
+     [lo,hi)), **find-providers** (discover peers with a CID), **block-exchange** (fetch bytes peer→peer,
+     bitswap-style), + the **fallback chain** (peer → HF origin) and the seeding lifecycle. CID contract is
+     live (`sidecar -fetch-cid`, CIDv1 raw sha2-256). **GOTCHA:** the Go sidecar SOURCE isn't in the repo
+     (binary only) — step 1 is sorting the sidecar (get/rebuild its source, or build the transfer in Python
+     libp2p). Much of this is CPU-testable with **2 local peers, no GPU** (seed a manifest's shards from peer
+     A, fetch+verify on peer B, kill A → fall back to HF). Build it, test it locally, THEN on a ring.
+
+**3. NETWORK STRUCTURE — decentralize the orchestrator (leyten wants NO central orchestrator).**
+   - Today c0mpute has a CENTRAL control plane (admission, placement via `shard.plan`, per-swarm coordinator,
+     settlement). NETWORK_ARCHITECTURE.md §5/§10.1 frames the fork: (A) central scheduler first vs (B)
+     market-as-optimizer; the control plane holds NO weights/keys BY DESIGN so it can decentralize later.
+     leyten's call = push toward decentralized NOW, torrent-style. Map where centralization lives (discovery,
+     admission, placement, coordination, settlement) and design the migration: **DHT discovery** (libp2p is
+     already the transport — announce/find over the DHT, no central registry), **self-forming swarms** (nodes
+     gossip capability + locally form a coverable low-RTT ring vs. a central planner call), **coordinator**
+     (per-swarm head or elected, not a central driver), **settlement** (peer-attested receipts / on-chain vs a
+     central settler). Decide what decentralizes cheaply for the PoC vs. what's genuinely hard; stage it.
+
+**OWED — a REGRESSION "does it still work" ring pass** (leyten flagged, rightly, that it's been days + many
+changes with no live validation). NOTE: this session's changes were placement/control-plane + docs, NOT the
+decode hot path (m25_pipe / m25_scatter_pipe untouched), so serving speed should be unmoved — but we still
+owe ONE warm ring pass confirming the loop serves at the expected ~10-12 tok/s before trusting the stack.
+Fold it into the first ring session for #1 or #2 (don't spin a ring just for it).
+
+**Shipped-and-parked (do NOT keep polishing):** the safety rails — boundary pinning (opt-in private tier),
+graded reputation, layer-block spot-check — are MERGED (shard #57, c0mpute #15) and the PoC runs fully open.
+Cheat-detection (receipts + auditor spot-check + reputation) stays on; privacy is a documented deferred gap.
+See the block below for detail; it is DONE, not the focus.
+
 ### ⇒ 2026-07-08 — PoC RUNS FULLY OPEN (privacy deferred); cheat-detection rails BUILT + PROVEN
 **leyten's call (2026-07-08):** for the PoC, **any machine joins any swarm and holds any slice.** Prompt
 privacy is a **known, accepted limitation** — mandatory boundary pinning would need trusted nodes in ~40%
