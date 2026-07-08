@@ -199,6 +199,8 @@ class ChainProvider(Provider):
     tried). fetch_block's own re-hash stays as the fail-closed backstop either way.
     Only when every provider failed does the fetch fail closed."""
 
+    verifies = True   # fetch_block_range skips its backstop re-hash: we already re-hash per source
+
     def __init__(self, providers: list[Provider]):
         if not providers:
             raise ValueError("ChainProvider needs at least one provider")
@@ -334,7 +336,8 @@ def fetch_block_range(manifest: dict, model_dir: str, lo: int, hi: int, *,
             continue
         _log(f"  fetch {s['path']} ({s['size'] / 1e9:.2f} GB)")
         provider.fetch(s, dest)
-        _verify(dest, s)
+        if not getattr(provider, "verifies", False):   # a self-verifying provider (ChainProvider)
+            _verify(dest, s)                            # already re-hashed; don't hash 100+ GB twice
         paths.append(dest)
     _log(f"block verified: {len(paths)} files in {model_dir}")
     return paths

@@ -198,6 +198,38 @@ def test_hostile_seeder_falls_back(net, tmp_path):
         for p in paths:                                      # pull SUCCEEDS despite the hostile peer
             rel = os.path.relpath(p, dest)
             assert open(p, "rb").read() == open(os.path.join(net["mirror"], rel), "rb").read()
+        # the hostile peer was actually CONTACTED and served its garbage (else this proves nothing) —
+        # the corrupted weight file was requested, so fallback, not a silent mirror-direct, saved us.
+        assert "SERVED" in open(evil.log).read(), "evil seeder was never contacted — test is vacuous"
+        # and no peer partial survives to poison a later run
+        leftover = [f for f in os.listdir(dest) if ".p2p." in f and f.endswith(".part")]
+        assert not leftover, f"peer partials left behind: {leftover}"
+    finally:
+        evil.stop()
+
+
+# ---- 6. hostile seeder cannot WEDGE a pull when an honest peer also holds the shard ----------------
+def test_hostile_and_honest_peer(net, tmp_path):
+    """The finding-#3 case: a hostile seeder serving size-correct garbage must not be able to
+    contaminate an HONEST peer's transfer (the old shared .p2p.part let it force every completion
+    to hash-fail). Empty mirror, so success proves the honest PEER delivered."""
+    bad_dir = str(tmp_path / "bad_ckpt")
+    shutil.copytree(net["ckpt"], bad_dir)
+    for name in ("model-00001.safetensors", "model-00002.safetensors"):
+        f = os.path.join(bad_dir, name)
+        blob = bytearray(open(f, "rb").read())
+        blob[100] ^= 0xFF
+        open(f, "wb").write(bytes(blob))
+    evil = Seeder(net["tmp"], "peerEvil2", net["man_path"], bad_dir, bootstrap=[net["seederA"].addr])
+    empty = str(tmp_path / "empty_mirror")
+    os.makedirs(empty)
+    try:
+        dest = str(tmp_path / "nodeB")
+        # both the honest seeder A and the hostile seeder are reachable; no mirror to fall back to
+        paths = _pull(net, dest, [net["seederA"].addr, evil.addr], empty)
+        for p in paths:
+            rel = os.path.relpath(p, dest)
+            assert open(p, "rb").read() == open(os.path.join(net["ckpt"], rel), "rb").read()
     finally:
         evil.stop()
 
