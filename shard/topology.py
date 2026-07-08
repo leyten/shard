@@ -88,6 +88,84 @@ def _held_karp(nodes, L, c_out, c_in):
     return order, best
 
 
+def _held_karp_ends(nodes, L, c_out, c_in, start, ends):
+    """exact min-latency loop with order[0] == `start` and order[-1] in `ends` (boundary pinning:
+    both ring ends must be trusted, so the order search is END-CONSTRAINED — rejecting the
+    unconstrained optimum's order after the fact would skip subsets that DO admit a valid ring,
+    the classic false-infeasible class). One dp run per start answers every end. O(k^2 2^k)."""
+    idx = list(nodes)
+    k = len(idx)
+    if k == 1:
+        n = idx[0]
+        return ([n], c_out[n] + c_in[n]) if n == start and n in ends else (None, INF)
+    pos = {n: i for i, n in enumerate(idx)}
+    s = pos[start]
+    dp = [[INF] * k for _ in range(1 << k)]
+    par = [[-1] * k for _ in range(1 << k)]
+    dp[1 << s][s] = c_out[start]
+    for mask in range(1 << k):
+        if not (mask >> s) & 1:
+            continue
+        for j in range(k):
+            if dp[mask][j] == INF or not (mask >> j) & 1:
+                continue
+            base = dp[mask][j]
+            for m in range(k):
+                if (mask >> m) & 1:
+                    continue
+                nmask = mask | (1 << m)
+                cand = base + L[idx[j]][idx[m]]
+                if cand < dp[nmask][m]:
+                    dp[nmask][m] = cand
+                    par[nmask][m] = j
+    full = (1 << k) - 1
+    best, bj = INF, -1
+    for j in range(k):
+        if idx[j] not in ends or j == s:
+            continue
+        c = dp[full][j] + c_in[idx[j]]
+        if c < best:
+            best, bj = c, j
+    if bj < 0:
+        return None, INF
+    order, mask, j = [], full, bj                               # reconstruct
+    while j != -1:
+        order.append(idx[j])
+        pj = par[mask][j]
+        mask ^= (1 << j)
+        j = pj
+    order.reverse()
+    return order, best
+
+
+def _pin_order_oversize(nodes, L, c_out, c_in, heads, ends):
+    """heuristic ends-constrained order for k>16 (outside Held-Karp reach; rings are ~5-8 so this
+    is a widen-fallback safety net, not a hot path): for each trusted (head, tail) pair, greedy
+    nearest-neighbor path head->...->tail over the middle, then 2-opt on the middle segment."""
+    best_o, best_c = None, INF
+    for h in heads:
+        for t in ends:
+            if t == h:
+                continue
+            mid, tour = set(nodes) - {h, t}, [h]
+            while mid:
+                nxt = min(mid, key=lambda n: L[tour[-1]][n])
+                tour.append(nxt); mid.discard(nxt)
+            tour.append(t)
+            improved = True
+            while improved:
+                improved = False
+                for i in range(1, len(tour) - 2):
+                    for j in range(i + 1, len(tour) - 1):
+                        cand = tour[:i] + tour[i:j + 1][::-1] + tour[j + 1:]
+                        if loop_cost(cand, L, c_out, c_in) + 1e-9 < loop_cost(tour, L, c_out, c_in):
+                            tour, improved = cand, True
+            c = loop_cost(tour, L, c_out, c_in)
+            if c < best_c:
+                best_o, best_c = tour, c
+    return best_o, best_c
+
+
 def _nn_2opt(nodes, L, c_out, c_in, rounds=4):
     """heuristic for large k: nearest-neighbor seed, then 2-opt segment reversals."""
     idx = list(nodes)
@@ -193,7 +271,24 @@ def predict_prefill_ms(order, layers, L, c_out, c_in, up_mbps, prefill_bytes, pr
     return lat + transport + compute
 
 
-def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms):
+def _boundary_nodes(order, alloc, n_layers, boundary_in, boundary_out):
+    """The stages whose contiguous block intersects a LEAKY range: [0, boundary_in) near the
+    embedding, [n_layers-boundary_out, n_layers) near the output — PLUS both ends of the ring
+    unconditionally, because the roles themselves leak regardless of which layers they hold: the
+    head is handed the raw prompt token ids to embed, and the tail computes logits and returns
+    argmax token ids (during prefill that's the greedy next-token at every prompt position — a
+    near-copy of the prompt). Middle stages see only the activation tensor."""
+    out, lo = {order[0], order[-1]}, 0
+    hi_cut = n_layers - max(0, boundary_out)
+    for n in order:
+        hi = lo + alloc[n]
+        if lo < boundary_in or hi > hi_cut:
+            out.add(n)
+        lo = hi
+    return out
+
+
+def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms, trusted=None, boundary_subnets=()):
     """Advisory off-critical-path role for every DROPPED node, derived from WHY the objective dropped
     it — NOT a fresh absolute threshold. This is the PLACEMENT half of the decided admission/placement
     framing: the "threshold" is per-role capability against the CHOSEN ring, never a velvet rope at the
@@ -206,7 +301,9 @@ def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms):
                            supernode (the research's top off-ring lever). Mechanism lives in c0mpute.
       hot-standby        : subnet-twin of a chosen stage — warm PASSIVE failover for that block (co-
                            location is fine for a spare; a twin is latency-close, so failover keeps the
-                           ring's step_ms — we never route a high-latency node here).
+                           ring's step_ms — we never route a high-latency node here). Trust-aware: an
+                           UNTRUSTED twin of a boundary stage is never a hot-standby (failover would
+                           hand the leaky block to a stranger — the exact hole pinning closes).
       decode-only-replica: compute ring-competitive but dropped for its slow UPLOAD — decode's tiny
                            activation survives its uplink; candidate member of a decode-only ring (ring
                            formation, which needs >=k subnet-distinct peers, lives in c0mpute).
@@ -223,7 +320,8 @@ def _relegate(order, dropped, caps, subnet, up_mbps, layer_ms):
             roles[n] = "weight-seeder"                          # can't hold a stage -> seed weights
         elif _up(up_mbps, n) >= ring_best_up and subnet[n] not in ring_subnets:
             roles[n] = "aggregator"                             # better-connected than the whole ring
-        elif subnet[n] in ring_subnets:
+        elif subnet[n] in ring_subnets and (trusted is None or n in trusted
+                                            or subnet[n] not in boundary_subnets):
             roles[n] = "hot-standby"                            # subnet-twin of a stage -> warm failover
         elif layer_ms[n] <= ring_worst_compute:
             roles[n] = "decode-only-replica"                    # compute-fine, dropped for upload -> decode is ok
@@ -256,22 +354,28 @@ def node_capacity(free_vram_mb, layer_vram_mb, kv_mb_per_layer=0):
     return int(free_vram_mb // per) if per > 0 else 0
 
 
-def assign_layers(order, n_layers, caps, layer_ms):
+def assign_layers(order, n_layers, caps, layer_ms, floors=None):
     """Size each node's contiguous block to MINIMIZE total decode-step compute — the SUM of per-stage
     times, which is exactly what predict_step_ms scores and the right model for single-traversal
     autoregressive decode (token t+1 can't enter the ring until t exits, so per-step latency is the
     sum, not a pipeline makespan). Every stage must hold >=1 layer (no empty hops), so: floor 1 per
     node, then pile the remaining layers onto the lowest-layer_ms nodes up to their VRAM `caps`.
-    Returns {node: cnt} (sums to n_layers, every value >=1) or None if the subset can't give each
-    stage a layer and still hold the model. (A PIPELINED throughput regime minimizes the max stage
-    instead; predict_step_ms would then switch to max — the two must stay in lockstep.)"""
-    k = len(order)
-    if n_layers <= 0 or n_layers < k:                           # need >=1 layer per stage
+    `floors` (optional {node: min_layers}) raises a node's floor above 1 — boundary pinning uses it
+    to make a trusted end-stage hold the whole leaky boundary range instead of letting layers spill
+    onto an untrusted neighbor. Returns {node: cnt} (sums to n_layers, every value >= its floor) or
+    None if the subset can't satisfy floors+caps and still hold the model. (A PIPELINED throughput
+    regime minimizes the max stage instead; predict_step_ms would then switch to max — the two must
+    stay in lockstep.)"""
+    base = {n: max(1, (floors or {}).get(n, 1)) for n in order}
+    need = sum(base.values())
+    if n_layers <= 0 or n_layers < need:                        # need >= floor layers per stage
+        return None
+    if any(base[n] > caps[n] for n in order):                   # a floor its node can't hold
         return None
     if sum(caps[n] for n in order) < n_layers:
         return None
-    alloc = {n: 1 for n in order}                               # every stage holds >=1 layer (no empty hops)
-    rem = n_layers - k
+    alloc = dict(base)
+    rem = n_layers - need
     for n in sorted(order, key=lambda n: layer_ms[n]):          # remaining layers -> cheapest-per-layer first (min sum)
         take = min(caps[n] - alloc[n], rem)
         if take > 0:
@@ -284,7 +388,8 @@ def assign_layers(order, n_layers, caps, layer_ms):
 def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 n_layers, layer_vram_mb, kv_mb_per_layer=0, slack=2, exclude=None, require=None,
                 up_mbps=None, prefill_bytes=0.0, decode_bytes=0.0, decode_steps=1,
-                prefill_chunks=1, prefill_layer_ms=None, relegate=True):
+                prefill_chunks=1, prefill_layer_ms=None, relegate=True,
+                trusted=None, boundary_in=0, boundary_out=0):
     """The self-optimizer's pure core. From a candidate POOL, choose the subset + ring order +
     per-node layer split that MINIMIZES predicted request time, subject to:
       * VRAM feasibility — the chosen nodes must hold the whole model (+ KV),
@@ -319,14 +424,37 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     headroom you rented (N+slack) — selection can only drop bad nodes when the pool exceeds what the
     model strictly needs. Assumes the pool is already pre-filtered to a tractable candidate set (the
     network layer funnels thousands -> ~16 via latency coordinates before calling this); if larger,
-    it pre-trims to the 14 lowest-RTT usable nodes (always keeping `require`)."""
+    it pre-trims to the 14 lowest-RTT usable nodes (always keeping `require`).
+
+    BOUNDARY-LAYER PINNING (opt-in via `trusted={node,...}`) — the open-admission privacy rail. An
+    untrusted stage can invert the activations it forwards back toward the prompt, and inversion is
+    strongest at the BOUNDARIES: near the embedding (early layers) and near the output (late layers
+    + the lm_head). When `trusted` is given, placement enforces:
+      * the HEAD and TAIL stages are trusted UNCONDITIONALLY — the head is handed raw prompt token
+        ids to embed, and the tail computes logits + returns argmax token ids (at prefill: the
+        greedy next-token at every prompt position, a near-copy of the prompt). Those roles leak
+        whatever layers they hold.
+      * every stage whose block intersects [0, boundary_in) or [n_layers-boundary_out, n_layers)
+        is trusted — strangers hold only deep-middle layers, where inversion decays.
+    assign_layers is floored so a trusted end-stage absorbs its whole boundary range when its VRAM
+    allows, instead of spilling leaky layers onto an untrusted neighbor. `trusted=None` (default)
+    is the exact legacy objective; an EMPTY trusted set with pinning on is honestly infeasible.
+    Trust is a CONSTRAINT, never a score: among trust-valid rings the objective is unchanged."""
     if require is not None and exclude and require in set(exclude):
         raise ValueError("`require` and `exclude` name the same node")
+    pin = trusted is not None
+    trust = set(trusted) if pin else set()
+    b_in, b_out = (max(0, int(boundary_in)), max(0, int(boundary_out))) if pin else (0, 0)
     nodes = [n for n in nodes if not exclude or n not in exclude]
     caps = {n: node_capacity(free_vram_mb[n], layer_vram_mb, kv_mb_per_layer) for n in nodes}
     usable = [n for n in nodes if caps[n] > 0]
     if require is not None and require not in usable:
         return None                                              # the pinned coord/head can't hold a block
+    if pin:
+        if require is not None and require not in trust:
+            return None                                          # the coord/head box sees raw tokens: must be trusted
+        if not any(n in trust for n in usable):
+            return None                                          # no trusted stage-capable node -> can't hold the ends
 
     def feasible_cap(pool):                                      # max layers coverable using DISTINCT subnets
         best = {}
@@ -363,6 +491,14 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                 seen.add(subnet[m]); must.add(m); acc += caps[m] # was false-"infeasible" bug #3)
                 if acc >= n_layers:
                     break
+        if pin:                                                  # ...and a TRUSTED cover: both ring ends (+ the
+            seen, kept_t = set(), 0                              # boundary layers) must sit on trusted nodes, and
+            for m in by_cap:                                     # the low-RTT `keep` may hold none -> keep the
+                if m not in trust or subnet[m] in seen:          # fattest trusted card per distinct subnet (+slack)
+                    continue                                     # so pinning can't be starved into false-infeasible
+                seen.add(subnet[m]); must.add(m); kept_t += 1
+                if kept_t >= 2 + slack:
+                    break
         usable = keep + [n for n in must if n not in keep]
 
     aware = up_mbps is not None
@@ -396,21 +532,52 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
                                 prefill_chunks, prefill_layer_ms)
         return pf + D * step, step, pf                          # rank by total request time
 
+    def _pin_order(subset, k):
+        """min-cost order with TRUSTED ends: order[0] a trusted head (require when pinned there),
+        order[-1] a trusted tail. Exact (ends-constrained Held-Karp) for k<=16."""
+        Lm, om, im = (EL, Eout, Ein) if aware else (L, c_out, c_in)
+        heads = [require] if require is not None else [n for n in subset if n in trust]
+        ends = {n for n in subset if n in trust}
+        if k > 16:
+            return _pin_order_oversize(subset, Lm, om, im, heads, ends)[0]
+        best_o, best_c = None, INF
+        for h in heads:
+            o, c = _held_karp_ends(subset, Lm, om, im, h, ends if k == 1 else ends - {h})
+            if o is not None and c < best_c:
+                best_o, best_c = o, c
+        return best_o
+
     def _search(k_lo, k_hi):
         found = None
         for k in range(k_lo, min(k_hi, len(usable)) + 1):
             for subset in combinations(usable, k):
                 if require is not None and require not in subset:        # coord/head must be in the ring
                     continue
+                if pin and sum(1 for n in subset if n in trust) < (1 if k == 1 else 2):
+                    continue                                             # both ends must be trusted (distinct if k>1)
                 if len(set(subnet[n] for n in subset)) < k:              # never co-locate (all distinct subnets)
                     continue
-                order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
-                if require is not None and order[0] != require:  # deployable orientation: coord box = stage 0
-                    order = (_head_first(order, require, EL, Eout, Ein) if aware
-                             else _head_first(order, require, L, c_out, c_in))
-                alloc = assign_layers(order, n_layers, {n: caps[n] for n in subset}, layer_ms)
+                if pin:
+                    order = _pin_order(subset, k)
+                    if order is None:
+                        continue
+                else:
+                    order, _ = optimal_loop(subset, EL, Eout, Ein) if aware else optimal_loop(subset, L, c_out, c_in)
+                    if require is not None and order[0] != require:  # deployable orientation: coord box = stage 0
+                        order = (_head_first(order, require, EL, Eout, Ein) if aware
+                                 else _head_first(order, require, L, c_out, c_in))
+                floors = None
+                if pin:                                                  # a trusted end absorbs its whole boundary
+                    floors = {}                                          # range when its VRAM allows, so leaky layers
+                    if b_in:                                             # don't spill onto an untrusted neighbor
+                        floors[order[0]] = min(b_in, caps[order[0]])
+                    if b_out:
+                        floors[order[-1]] = max(floors.get(order[-1], 0), min(b_out, caps[order[-1]]))
+                alloc = assign_layers(order, n_layers, {n: caps[n] for n in subset}, layer_ms, floors)
                 if alloc is None:
                     continue
+                if pin and not _boundary_nodes(order, alloc, n_layers, b_in, b_out) <= trust:
+                    continue                                             # boundary spilled past the trusted stages
                 rank, step, pf = _score(order, alloc)
                 if found is None or rank < found[0]:                     # ties: smaller k wins (k ascending, strict <)
                     found = (rank, order, alloc, k, step, pf)
@@ -429,11 +596,15 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     dropped = [n for n in nodes if n not in order]
     spec = {"order": order, "blocks": blocks, "layers": alloc, "step_ms": round(step, 1),
             "tok_s_per_g": round(1000.0 / step, 2) if step > 0 else INF, "dropped": dropped, "k": k}
+    b_nodes = _boundary_nodes(order, alloc, n_layers, b_in, b_out) if pin else set()
+    if pin:
+        spec["boundary"] = [n for n in order if n in b_nodes]    # trust-critical stages, ring order
     if aware:
         spec["prefill_ms"] = round(pf, 1)
         spec["request_ms"] = round(rank, 1)
         if relegate:
-            spec["roles"] = _relegate(order, dropped, caps, subnet, up_mbps, layer_ms)
+            spec["roles"] = _relegate(order, dropped, caps, subnet, up_mbps, layer_ms,
+                                      trust if pin else None, {subnet[n] for n in b_nodes})
     return spec
 
 
