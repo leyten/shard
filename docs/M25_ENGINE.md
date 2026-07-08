@@ -32,15 +32,40 @@ On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, n
   hit this pass and were hand-fixed. **RING TORN DOWN** (instances-v1==0 verified); ~$? of vast credit used.
 - **Publisher key was ephemeral/test** — the durable manifest-signing identity is still a c0mpute-catalog call (leyten's).
 
-**NEXT:** the loop is proven both in sim (control plane, PR #14) AND live (physical path). Remaining to make it a
-standing service: (1) **SAFETY RAILS = the OPEN-launch blocker** — leyten LOCKED admission=**open** + pay=**by
-layers** (c0mpute PR #14 MERGED), and open admission ≠ open traffic: boundary-layer pinning (leaky embed/final
-→ staked nodes, strangers hold deep-middle) + graded reputation + layer-block spot-check must be live before
-serving untrusted jobs; (2) the ring **watcher** (task #2) with the two fault-recoveries above; (3) the **socket
-node-agent** so nodes announce to the orchestrator over the wire (this pass drove assign→pull via SSH push);
-(4) **P2P shard propagation** (task #4). The loop MECHANISM works (sim + live); the rails gate the open service.
+**DECIDED + LOCKED (leyten):** admission = **OPEN** (proven VRAM floor; placement decides role — open supply is
+the endgame, avoids a curated bottleneck), pay = **by layers** (ungameable; boundary-role premium likely v2),
+coordinator = central (PoC). `DEFAULT_SWARM_CONFIG = {open, layers}`; `c0mpute/PERMISSIONLESS_LOOP.md` = the loop spec.
 
-### ⇒ 2026-07-07 (later) — PERMISSIONLESS LOOP DEMONSTRATED end-to-end (sim, REAL seams); #46 fixed; 2 FORKS to leyten
+**⇒ NEXT SESSION (in order) — turn the proven mechanism into a safe, self-running OPEN service. The loop MECHANISM
+works (sim + live); what remains is the trust rails + automation, NOT more mechanism:**
+1. **SAFETY RAILS = the OPEN-launch blocker (do FIRST).** Open ADMISSION ≠ open TRAFFIC — do not serve untrusted
+   jobs until: (a) **boundary-layer pinning** — placement keeps the leaky embedding/final layers (35–59% of a
+   prompt is reconstructable from their activations) on staked/trusted nodes; strangers hold only deep-middle. A
+   `select_ring` trust-pin input it doesn't take yet (a `require`-like constraint + a per-node trust flag). (b)
+   **graded reputation** — a per-node score gating roles, replacing c0mpute's binary ban ([[c0mpute-reputation-needs-upgrade]]).
+   (c) **layer-block spot-check** — seeded redundant recompute of a random block on a trusted node
+   (`shard/challenge.py` primitive + 13 tests EXIST; wire into c0mpute placement/verification). Until live, run
+   rings only over trusted/own boxes even though admission is open.
+2. **Ring watcher (task #2)** — detached, self-healing provisioning with the TWO fault-recoveries the live pass
+   exposed: (a) a box that never bootstraps (no `boot.log` → currently polled forever) → detect + re-bootstrap/swap;
+   (b) a CUDA-driver DUD (`Error 803`) that passes the VRAM health check but fails `torch.cuda.init()` → health
+   checks must probe CUDA init, not just free VRAM. Provisioning is SLOW (~10min) + flaky (2 of 5 boxes needed
+   swapping this pass). Prior art: detached `swarm_master.sh` style + this session's `scratchpad/ring_pass_*.sh`.
+3. **Socket node-agent** — a node ANNOUNCES to the orchestrator over the wire + runs `fetch_block_range` (verified
+   pull) + `m25_scatter_pipe` on `swarm:assign` (this pass drove assign→pull via SSH push; the c0mpute-worker is
+   whole-model today). Turns the loop from driver-script-orchestrated into truly node-driven.
+4. **RTT probe + auto-form trigger** (`formSwarm` needs a measured RTT matrix over the candidate pool + a trigger:
+   pool reaches a coverable set / demand) · **pay wiring** (map the verified per-shard split onto `recordEarning()`;
+   split is correct, only the $ mapping waits) · **token-attested pay** (receipts attest WHICH layers ran, not the
+   token COUNT — coordinator's number trusted up to a cap; bind it to the job before real open payout).
+5. **P2P shard propagation (task #4)** — swap `MirrorProvider`→`Libp2pProvider` so a joiner pulls its verified
+   range from PEERS not HF (the "torrent" half). Python seam READY; UNBUILT = the Go sidecar DHT transfer
+   (provide/find-providers/block-exchange) + peer→HF fallback. Sidecar source not in the repo (binary only) — may need it.
+
+**RING: none live** (vast instances-v1==0 verified). Vast credit ~$130 (real-ring pass used ~$5–8). Publisher key is
+ephemeral/test — the durable manifest-signing identity is a c0mpute-catalog call (leyten's).
+
+### ⇒ 2026-07-07 (later) — [SUPERSEDED by the current-state block above — kept for the PR/build trail] loop first demonstrated in sim; #46 fixed
 Acted on the PIVOT below. The loop now runs end-to-end — **announce → admit → PLACE → assign → (pull/form/serve
 sim) → SETTLE → pay per shard** — against the REAL shard decision code, and dishonest settlements pay NOBODY.
 
@@ -56,7 +81,7 @@ sim) → SETTLE → pay per shard** — against the REAL shard decision code, an
   `select_ring` + `receipt.verify_coverage` over stdio (deps still one way). The three shard pieces — plan, fetch
   (verified), verify — are contract-compatible and now callable from the network layer.
 
-**OPEN for leyten's review — c0mpute PR #14 (`net/permissionless-loop`), NOT merged (product/economics-fork-dependent):**
+**c0mpute PR #14 (`net/permissionless-loop`) — since MERGED (settlement hardened; open+layers locked):**
 The graduation into the orchestrator. `lib/orchestrator/swarm.ts` (`SwarmManager`: admit → candidate pool →
 `formSwarm` calls the plan seam + emits `swarm:assign` → `markReady` → `settleJob` calls the verify seam + splits
 pay per shard) + `swarm-seam.ts` (spawns the shard modules) + `swarm-loop.ts` wired into `orchestrator.ts` in ONE
@@ -66,7 +91,7 @@ ring (coordinator = most-central node, slow low-uplink 4090 relegated to verifie
 per shard (77+101+101+101+100=480), and replayed-nonce + coverage-gap settlements pay nobody. Full project tsc clean.
 Built in an isolated worktree; leyten's uncommitted c0mpute work (onchain-staking.ts) was left untouched.
 
-**⇒ 2 GENUINE FORKS surfaced to leyten (labelled in `SwarmConfig`, defaults reversible — see c0mpute/PERMISSIONLESS_LOOP.md §A/B):**
+**⇒ 2 FORKS — since DECIDED + LOCKED (open admission + pay by layers; details in the current-state block above):**
 - **A. Admission — curated vs open** (§10.3): curated allowlist (betanet-first, the default) vs open proven-VRAM
   floor (permissionless). Mechanism is identical; only *who may announce* differs. Recommend build-both (done),
   run first live rings curated, flip to open on his word.
@@ -74,7 +99,7 @@ Built in an isolated worktree; leyten's uncommitted c0mpute work (onchain-stakin
   boundary-role premium. Recommend `layers` for the PoC, revisit with the privacy stance.
 - (Decided for the PoC, not a fork: coordinator runs the planner centrally — §10.1, the likely A→B path.)
 
-**NEXT (after leyten weighs the forks / reviews #14):**
+**NEXT (this list is DONE/superseded — the real-ring pass RAN and forks are LOCKED; the current NEXT is in the block at the top):**
 1. **Real-ring pass** = the ultimate proof. Needs two things still owed: (a) the **watcher-based ring
    orchestration** (task below / the PIVOT's ask — still NOT built; needed before spinning a ring); (b) a
    **sharded node-agent** that listens for `swarm:assign` and runs `fetch_block_range` (verified pull) +
@@ -95,7 +120,7 @@ Built in an isolated worktree; leyten's uncommitted c0mpute work (onchain-stakin
    seeding lifecycle. NOTE: the sidecar source isn't in the shard repo (binary at `/tmp/sidecar`) — may need the
    sidecar codebase. Slots after/parallel to the real-ring pass. See task #4.
 
-### ⇒ 2026-07-07 (late) — PIVOT: build the permissionless loop, and use REAL orchestration for rings
+### ⇒ 2026-07-07 (late) — [DONE this session — see the current-state block at top] PIVOT: build the permissionless loop, use REAL orchestration for rings
 The engine-hardening + trust-primitive work is DONE and over-invested (a review found the day drifted into
 "safe CPU-testable" engine internals while the actual PoC gap — the permissionless network driving a sharded
 swarm — sat at zero). **NEXT SESSION'S JOB = the permissionless loop, NOT more engine hardening:** a minimal
