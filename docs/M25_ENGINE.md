@@ -74,14 +74,12 @@ economics decision that remains leyten's — WHO counts as a staked/trusted node
 private tier is turned on, NOT on the PoC critical path (`GradedReputation.isStaked` seam →
 `lib/onchain-staking.ts`).
 
-**⇒ NEXT: PUSH + open the two PRs, then MERGE** (branches ready, tested; not yet pushed — privacy stance
-now decided, so unblocked). shard `net/boundary-pinning` (6 commits), c0mpute `net/safety-rails` (4:
-rails + fork-doc + adversarial hardening + fully-open PoC). Then the remaining loop-integration items, NOT
-rails: RTT probe + auto-form trigger, pay wiring onto `recordEarning`, token-attested pay, P2P shard
-propagation (torrent half), and standing up the **spot-check auditor node(s)** (the we-run recompute box
-the open-PoC spot-check verifies against). A LIVE fully-open ring end-to-end (announce→place→pull→serve→
-settle with receipts + a live spot-check) is the next real-hardware milestone. **RING: none live.** Vast
-credit ~$130 (this session: $0).
+**⇒ MERGED to master (2026-07-08): shard PR #57 + c0mpute PR #15** (both squash-merged, branches deleted).
+The rails are live in the tree, PoC runs fully open. Next, NOT rails: RTT probe + auto-form trigger, pay
+wiring onto `recordEarning`, token-attested pay, P2P shard propagation (torrent half), and standing up the
+**spot-check auditor node(s)** (the we-run recompute box the open-PoC spot-check verifies against). A LIVE
+fully-open ring end-to-end (announce→place→pull→serve→settle with receipts + a live spot-check) is the
+next real-hardware milestone. **RING: none live.** Vast credit ~$130 (this session: $0).
 
 ### ⇒ 2026-07-07 (night) — REAL-RING PASS PASSED: the permissionless loop closed end-to-end on LIVE GPUs
 On a real scattered 5×5090 EU ring (NO→NO→LV→DE→DK, distinct subnets, no co-location), the whole loop ran:
