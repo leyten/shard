@@ -399,7 +399,14 @@ def select_ring(nodes, L, c_out, c_in, *, free_vram_mb, layer_ms, subnet,
     b_in = min(max(0, int(boundary_in)), n_layers) if pin else 0
     b_out = min(max(0, int(boundary_out)), n_layers) if pin else 0
     nodes = [n for n in nodes if not exclude or n not in exclude]
-    caps = {n: node_capacity(free_vram_mb[n], layer_vram_mb, kv_mb_per_layer) for n in nodes}
+    # layer_vram_mb is a scalar OR a per-node dict {node: mb}: a heterogeneous ring holds cards whose
+    # per-layer footprint differs by ARCH+backend (5090 cutlass NVFP4 ~1.7GB/layer; a 4090/3090 on the
+    # marlin dequant path ~4.1GB, so it holds far fewer layers). Per-node caps flow straight into every
+    # downstream cap[n] check, so the selector fills a small card with few layers automatically. A scalar
+    # is byte-identical to the legacy path (goldens unchanged).
+    def _lv(n):
+        return layer_vram_mb[n] if isinstance(layer_vram_mb, dict) else layer_vram_mb
+    caps = {n: node_capacity(free_vram_mb[n], _lv(n), kv_mb_per_layer) for n in nodes}
     usable = [n for n in nodes if caps[n] > 0]
     if require is not None and require not in usable:
         return None                                              # the pinned coord/head can't hold a block

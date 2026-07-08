@@ -38,7 +38,7 @@ is not.)
 
 Usable-speed frame: `tok/s = g / T_traversal`; a stage holding K layers adds `K × layer_ms` to the
 ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). Single-stream WITH
-graph-aux (`M25_GRAPH` + `M25_STATIC_KV`, PR #25) does **~24 decode-weighted / 30-32 reasoning-heavy**
+graph-aux (`M25_CUDA_GRAPH` + `M25_STATIC_KV`, PR #25) does **~24 decode-weighted / 30-32 reasoning-heavy**
 on a good EU ring; draftable-verbatim and batched-aggregate go higher still. So the 20 tok/s bar is
 comfortably above what a heterogeneous ring must protect — heterogeneity must not be what drops a
 ring below it, and every perf ring MUST launch with graph-aux on (a no-graph run under-measures ~2×). Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
@@ -70,9 +70,11 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
    empirically (a few forward passes) and feed `select_ring` (it already consumes them). Needed for
    NVIDIA heterogeneity too; the driver-API CUDA probe (`scratchpad/health_probe.py`) is the
    liveness half.
-2. **[S] Per-node backend + per-node `layer_vram_mb`** — `M25_MOE_BACKEND=auto` (shipped) picks
-   cutlass/marlin per arch; the planner's single global `layer_vram_mb` must become per-node so a
-   marlin 4090 (2.4× footprint) is placed with the right layer count.
+2. **[S] ✅ SHIPPED — per-node backend + per-node `layer_vram_mb`** — `M25_MOE_BACKEND=auto` picks
+   cutlass/marlin per arch; `select_ring`'s `layer_vram_mb` now accepts a per-node dict (scalar path
+   byte-identical, goldens green), and `ring_up` detects each node's GPU name → per-arch footprint
+   (5090 cutlass 1.7 GB, 4090/3090 marlin ~4.1 GB) + a marlin compute penalty, so a marlin card is
+   placed as a thin stage automatically.
 3. **[S] CPU-side fp8 wire unpack fallback** — for Mac/AMD safety on the fp8 codec path.
 4. **[M] `MlxRuntime`** — a `ModelRuntime` (`shard/node.py`) over `mlx_lm.models.minimax`: load only
    layers [lo,hi) from the MLX-4bit artifact, drive `layers[i](h, mask, cache)`, crop KV to

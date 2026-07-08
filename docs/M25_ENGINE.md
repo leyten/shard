@@ -70,7 +70,7 @@ Warm 5×5090 EU ring (BG→UK→NO→DE→BG, 0/10/13/13/13/13 split), verified 
 manifest, session publisher key). Novel-reasoning job: 200 coherent tokens, **2.90 tok/s** (g=2.24, n-gram
 mean_accept 1.24/8, transport 79% — a high-RTT ring, s4 hop ~51ms), **5 signed per-stage receipts ALL VALID +
 full [0:62) coverage + chain intact**. That novel number matches prior real-ring novel prompts (3.84 on
-2026-07-07, perf-not-the-point). Copy/draftable job: 220 tokens, **5.58 tok/s** (g=4.29, mean_accept 3.29/8, transport 78%). ⚠️ **This run UNDER-MEASURED — graph-aux was OFF** (launched `M25_EAGLE=1` but NOT `M25_GRAPH`/`M25_STATIC_KV`), so it ran the slow eager path (~157ms/traversal) on a high-RTT ring. With graph-aux this ring class does **~24 decode-weighted / 30-32 reasoning-heavy** (PR #25, proven). EVERY perf ring MUST launch `M25_GRAPH=1 M25_STATIC_KV=1 --kv-maxlen 16384`. Receipts ALL VALID regardless. The regression QUESTION — did the
+2026-07-07, perf-not-the-point). Copy/draftable job: 220 tokens, **5.58 tok/s** (g=4.29, mean_accept 3.29/8, transport 78%). ⚠️ **This run UNDER-MEASURED — graph-aux was OFF** (launched `M25_EAGLE=1` but NOT `M25_CUDA_GRAPH`/`M25_STATIC_KV`), so it ran the slow eager path (~157ms/traversal) on a high-RTT ring. With graph-aux this ring class does **~24 decode-weighted / 30-32 reasoning-heavy** (PR #25, proven). EVERY perf ring MUST launch `M25_CUDA_GRAPH=1 M25_STATIC_KV=1 --kv-maxlen 16384`. Receipts ALL VALID regardless. The regression QUESTION — did the
 session's control-plane/docs changes break serving? — is answered NO (it serves + verifies; the SPEED was mis-measured by omitting graph-aux, my error).
 
 **RING: TORN DOWN (instances-v1==0 verified) — all 5 ring + 4090 + 3090 probe boxes.** Vast credit ~$127 start (this session used ~$5.13). Live iids tracked in
@@ -108,7 +108,7 @@ this order of leyten's emphasis — all on-thesis "make it more torrent":**
      per-arch kernel selection in ModelRuntime (M25_MOE_BACKEND per node), mixed-precision-stage numeric
      compatibility on the wire/receipts, VRAM+compute admission floor per GPU class.
    - **DECIDED (leyten): the minimum usable-speed bar = 20 tok/s+.** The allow-list is "cards that keep a ring
-     at ≥20 tok/s." This is REACHABLE single-stream: graph-aux (PR #25, `M25_GRAPH`+`M25_STATIC_KV`) proved
+     at ≥20 tok/s." This is REACHABLE single-stream: graph-aux (PR #25, `M25_CUDA_GRAPH`+`M25_STATIC_KV`) proved
      **~24 decode-weighted / 30-32 reasoning-heavy** on a good scattered EU ring (reason-math 32, agentic 31) —
      20+ sits BELOW that, comfortably. (The old "~10-12 ceiling" is PRE-graph-aux and STALE — do not cite it;
      see line ~825 PROVEN + [[graph-aux-raised-single-stream-ceiling]].) Draftable-verbatim (50-80) and
@@ -149,7 +149,7 @@ this order of leyten's emphasis — all on-thesis "make it more torrent":**
 changes with no live validation). NOTE: this session's changes were placement/control-plane + docs, NOT the
 decode hot path (m25_pipe / m25_scatter_pipe untouched), so serving speed should be unmoved — but we still
 owe ONE warm ring pass confirming the loop serves at the expected **~24-32 tok/s single-stream WITH graph-aux**
-(`M25_GRAPH=1 M25_STATIC_KV=1`, PR #25 — NOT the ~10-12 that predates it) or the higher batched/draftable
+(`M25_CUDA_GRAPH=1 M25_STATIC_KV=1`, PR #25 — NOT the ~10-12 that predates it) or the higher batched/draftable
 numbers before trusting the stack. Do it early, and NEVER omit graph-aux on a perf ring.
 
 **RINGS — TEST ON FULL RINGS FREELY (leyten): the vast balance (~$130) is there to USE.** Don't be timid
