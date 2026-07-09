@@ -481,7 +481,10 @@ def measure_gpu(model_dir, layer=30, backend="auto", kv_tokens=1024):
     init_distributed_environment(world_size=1, rank=0, local_rank=0,
                                  distributed_init_method="env://", backend="nccl")
     vcfg = VllmConfig()
-    set_current_vllm_config(vcfg).__enter__()
+    # keep the CM referenced for the whole run: a dropped @contextmanager object is
+    # GC'd -> its generator closes -> the config context EXITS under us mid-probe
+    vcfg_ctx = set_current_vllm_config(vcfg)
+    vcfg_ctx.__enter__()
     initialize_model_parallel(1)
     try:
         from vllm.v1.worker.workspace import init_workspace_manager  # noqa: PLC0415
@@ -538,12 +541,16 @@ def measure_gpu(model_dir, layer=30, backend="auto", kv_tokens=1024):
     out["kernel"] = type(moe.quant_method).__name__
 
     # --- decode-shaped forward: GQA attention on the real weights + the MoE ---
-    gate_w = plain.get("block_sparse_moe.gate.weight")
+    # forward in bf16: the checkpoint stores e.g. gate.weight fp32 (footprint above
+    # measured the REAL stored dtypes; the cast copies here land in the run peak)
+    def bf16(w):
+        return w.to(torch.bfloat16) if w is not None else None
+    gate_w = bf16(plain.get("block_sparse_moe.gate.weight"))
     n_heads = cfg["num_attention_heads"]
     n_kv = cfg.get("num_key_value_heads", n_heads)
     hd = cfg.get("head_dim", H // n_heads)
-    wq, wk = plain.get("self_attn.q_proj.weight"), plain.get("self_attn.k_proj.weight")
-    wv, wo = plain.get("self_attn.v_proj.weight"), plain.get("self_attn.o_proj.weight")
+    wq, wk = bf16(plain.get("self_attn.q_proj.weight")), bf16(plain.get("self_attn.k_proj.weight"))
+    wv, wo = bf16(plain.get("self_attn.v_proj.weight")), bf16(plain.get("self_attn.o_proj.weight"))
     attn_ok = all(w is not None for w in (wq, wk, wv, wo))
     kc = torch.randn(1, n_kv, kv_tokens, hd, dtype=torch.bfloat16, device="cuda") * 0.1
     vc = torch.randn(1, n_kv, kv_tokens, hd, dtype=torch.bfloat16, device="cuda") * 0.1
