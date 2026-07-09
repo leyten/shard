@@ -27,6 +27,15 @@ The cost the choice creates: you now need a **trustless capability probe** — a
 spoof (self-reported specs are worthless; a liar just makes a slow ring). That probe is the real
 engineering the design choice buys decentralization with. It is not free, but it is right.
 
+**IMPLEMENTED: `shard/probe.py`** — the pure role function (`python3 -m shard.probe`, `{cap, model?,
+spec?}` JSON in → verdict out, the seam c0mpute drives), the `--measure` GPU one-block probe, the
+`--serve`/`--net-only` network probe (receiver-timed uplink, nonce dial-back, connect-time RTT in
+`topology`'s units). Honest v0 trust semantics: **trust-then-punish, not can't-lie** — the network half
+is measured by the other end (probe peers must be ASSIGNED by the control plane, never candidate-chosen:
+one colluding fast receiver would inflate max-over-peers uplink); the GPU half runs the real block but a
+lie is caught at placement/receipts/challenge, i.e. the ring eats one bad formation before reputation
+ejects. Signed probe transcripts + pool-run GPU spot-probes are the hardening that closes that window.
+
 ## The physics that sets the minimum
 
 Single decode token: `tok/s = g / T`, `T = N·RTT_eff + C`.
@@ -68,6 +77,15 @@ gate only bites the fallback paths: no CUDA-graph (3-10× launch overhead), no n
 
 Layers a card actually holds (peak-gated): 16 GB → 6 Blackwell / 3 marlin · 24 GB → 10 / **5** · 32 GB →
 **12** / 7 · 48 GB → ~21 / ~10 · 80 GB → ~40 / ~17. The `12` on a 32 GB 5090 is the load-tested cap.
+
+**KNOWN v0 TENSION — 12 vs 13 (adversarial review, 2026-07-09):** `plan.py`'s placement profile says
+`cap_layers=13` (warm-proven on live rings); this table says 12 (the 15-layer-OOM analysis). That ONE
+layer flips the marquee verdict: 13 → N=5 → a 32 GB 5090 gets ADMITTED interactive at 30 ms scatter
+(predicted 20.4), 12 → N=6 → denied (predicted 17.7, matching the 13-15 receipt). **Admission uses 12
+(the conservative number, `probe.ADMISSION_MODEL_V0`) until the probe's live peak measurement settles
+it**; placement may keep packing 13 where it's proven. Also: the cap is proven on 32 GB cards only, so
+the probe scales the proven DENSITY to card size (48 GB → 18 layers → N=4) instead of flat-clamping —
+a flat cap made a 48 GB card indistinguishable from a 32 GB one, erasing this spec's core distinction.
 
 ## The honest anchor verdict
 
