@@ -99,3 +99,23 @@ def test_cli_bad_request_reports_error():
                        capture_output=True, text=True, cwd=REPO, timeout=60)
     assert r.returncode == 2
     assert "error" in json.loads(r.stdout)
+
+
+def test_tail_reserve_shrinks_or_moves_the_tail():
+    """The tail stage also loads final norm + lm_head (measured 1.15 GiB on M2.5): a plan
+    that packs the tail to its VRAM brim OOMs at load (live, 2026-07-09). The landed tail's
+    block must leave tail_reserve_mb of headroom on top of its layers."""
+    from shard.plan import M25_PROFILE
+    nodes, rtt = _pool(6, free_gb=27.0)        # tight boxes: ~13 layers fills them to the brim
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    m = M25_PROFILE
+    per_layer = m["layer_vram_mb"] + m["kv_mb_per_layer"]
+    tail = next(s for s in plan["stages"] if s["tail"])
+    free = 27.0 * 1024 - m["reserve_mb"]       # the tail is never the head in this pool shape
+    assert tail["layers"] * per_layer + m["tail_reserve_mb"] <= free + 1e-6
+    # and the reserve is a MODEL knob: zeroing it restores the old packing behavior
+    plan0 = plan_ring(nodes, rtt, model={"tail_reserve_mb": 0.0})
+    tail0 = next(s for s in plan0["stages"] if s["tail"])
+    assert tail0["layers"] >= tail["layers"]
