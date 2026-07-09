@@ -1,0 +1,44 @@
+{
+  "what": "First live validation of the capability probe (shard/probe.py, PR #65/#66): full measured cap vector -> role on real hardware. GPU half on a rented 24GB 4090 (marlin path); network half cross-WAN against a 3x5090 EU pool (CH/NO/DK) with --serve peers on 29600 and dial-back through the vast port mapping (--dialback-advertise).",
+  "date": "2026-07-09",
+  "box": {"iid": 44342193, "gpu": "NVIDIA GeForce RTX 4090", "sm": "89", "geo_claimed": "NL (vast listing)"},
+  "measured_cap": {
+    "total_vram_mb": 24080.9,
+    "footprint_mb_per_layer": 4057.5,
+    "load_peak_extra_mb": 4824.0,
+    "run_peak_extra_mb": 4824.0,
+    "has_fast_kernel": true,
+    "kernel": "ModelOptNvFp4FusedMoE (marlin)",
+    "graph_cosine": 1.0,
+    "graph_max_abs_diff": 0.0,
+    "eager_layer_ms": 0.704,
+    "layer_ms_graph": 0.258,
+    "uplink_mbps_receiver_timed": 209.77,
+    "uplink_mbps_vast_listing": 1316.5,
+    "rtt_ms_to_pool": [69.37, 72.09, 73.51],
+    "rtt_to_pool_ms_median": 72.09,
+    "nat_dialable": true,
+    "disk_free_gb": 112.2
+  },
+  "verdict": {
+    "role": "verifier",
+    "layers": 4,
+    "n_single": 16,
+    "n_max_interactive": 2.14,
+    "n_max_batched": 10.46,
+    "predicted_tok_s": 3.33,
+    "predicted_agg_tok_s": 13.34,
+    "binding": [
+      {"role": "interactive-anchor", "failed": ["hops_vs_rtt"]},
+      {"role": "batched-filler", "failed": ["hops_vs_rtt"]}
+    ]
+  },
+  "spec_revisions_this_forces": [
+    "marlin load-peak-extra is MEASURED 4824 MB — bigger than the cutlass ~4300 assumption and far above the ~900 guess; a 24GB marlin card holds 4 layers, not the spec table's 5 (N=16 hops, not 13). The 'never anchors' verdict gets STRONGER.",
+    "marlin footprint 4057.5 MB/layer measured (spec said 4250; #61 measured 4080 MoE-only — consistent).",
+    "marlin under CUDA graph is BIT-EXACT vs eager on this box (max_abs_diff 0.0) — the fast-kernel gate could be tightened from cosine to bit-equality if this holds across arches.",
+    "rtt_to_pool is the binding constraint in practice: this 'NL' box is really ~72ms from the EU pool (geo claims are worthless, the probe catches it). At 72ms even batched B=4 misses the 20 agg bar (13.3) — batched viability is POOL-RELATIVE, the ~36 agg spec claim assumes ~19-30ms placement.",
+    "receiver-timed single-TCP-stream uplink (209.77) is ~6x below the vast listing (1316.5) — uplink thresholds should be read as single-stream receiver-timed numbers."
+  ],
+  "notes": "The dtype fix (fp32 gate.weight -> bf16 cast) and the vllm-config-context GC fix were found by this run — the probe's first two live wrinkles. Probe --serve DoS caps (slowloris wall-clock, 64-conn semaphore) untested under load; fine for pool-internal use."
+}
