@@ -96,6 +96,9 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
 
 ## Admission is a CAPABILITY FUNCTION, not an allowlist (leyten, 2026-07-08)
 
+> Full derived spec (min numbers per role, the physics, the honest anchor verdict, the probe
+> the function needs): **`docs/ADMISSION_SPEC.md`**. Summary below.
+
 **The table above is illustrative OUTPUT, not the mechanism.** Admission is NOT "5090 yes, 3060 no" —
 it is a GPU-model-independent function of *measured* capability, evaluated when a node joins. That is
 the most decentralized form of joining: anyone brings any hardware, and the function judges it. A
