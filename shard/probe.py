@@ -325,7 +325,7 @@ def _dialback_listener(port, ready_evt, stop_evt):
         srv.close()
 
 
-def measure_net(peers, upload_mb=16, dialback_port=None):
+def measure_net(peers, upload_mb=16, dialback_port=None, dialback_advertise=None):
     """The candidate-side network probe against pool peers ("host:port", running --serve).
 
     The peer list is ASSIGNED by the control plane (candidate-chosen peers let one
@@ -336,6 +336,11 @@ def measure_net(peers, upload_mb=16, dialback_port=None):
     mesh_rtt/plan_ring feed shard.topology as the per-hop cost, so admission and
     placement argue in one unit (~1 link RTT; do NOT "fix" this to a half-RTT one-way,
     that would double every hop budget and over-admit).
+
+    dialback_port is where the candidate's listener BINDS; dialback_advertise is the
+    port peers are told to dial (defaults to the bind port). They differ exactly when
+    the candidate sits behind a port-mapping NAT (a vast box maps container 29600 to a
+    random host port) — advertising the bind port there would fail every honest node.
 
     Returns {rtt_ms (per-peer), rtt_to_pool_ms (median), uplink_mbps (max of the
     receiver-reported rates), nat_dialable (any peer's dial-back succeeded)}.
@@ -378,7 +383,8 @@ def measure_net(peers, upload_mb=16, dialback_port=None):
             try:
                 s = socket.create_connection((host, port), timeout=6)
                 s.settimeout(20)
-                s.sendall((json.dumps({"op": "dialback", "port": dialback_port,
+                s.sendall((json.dumps({"op": "dialback",
+                                       "port": dialback_advertise or dialback_port,
                                        "nonce": os.urandom(8).hex()}) + "\n").encode())
                 dial = bool(json.loads(_readline(s).decode()).get("ok"))
                 s.close()
@@ -634,6 +640,8 @@ def _main() -> int:
     ap.add_argument("--backend", default="auto")
     ap.add_argument("--peers", default="", help="comma-separated host:port of --serve peers")
     ap.add_argument("--port", type=int, default=29655, help="--serve port / dial-back listen port")
+    ap.add_argument("--dialback-advertise", type=int, default=0,
+                    help="port peers dial back (behind a port-mapping NAT it differs from --port)")
     ap.add_argument("--upload-mb", type=int, default=16)
     a = ap.parse_args()
 
@@ -646,7 +654,8 @@ def _main() -> int:
             cap.update(measure_gpu(a.dir, a.layer, a.backend))
         if a.peers:
             cap.update(measure_net([p.strip() for p in a.peers.split(",") if p.strip()],
-                                   upload_mb=a.upload_mb, dialback_port=a.port))
+                                   upload_mb=a.upload_mb, dialback_port=a.port,
+                                   dialback_advertise=a.dialback_advertise or None))
         if "disk_free_gb" not in cap:                 # seeder gate input; CPU boxes need it too
             import shutil  # noqa: PLC0415
             root = a.dir if os.path.isdir(a.dir) else "/"

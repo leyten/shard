@@ -192,6 +192,19 @@ def test_net_probe_loopback_roundtrip():
     assert res["nat_dialable"] is True           # the peer dialed back and the nonce echoed
 
 
+def test_dialback_advertise_port_is_what_peers_dial():
+    # NAT case: the listener binds one port but peers must dial the mapped one. Advertising
+    # a port nothing maps to -> not dialable; advertising the real bind port -> dialable.
+    port = _start_peer()
+    bind = _free_port()
+    res = measure_net([f"127.0.0.1:{port}"], upload_mb=1,
+                      dialback_port=bind, dialback_advertise=_free_port())
+    assert res["nat_dialable"] is False          # peers dialed the advertised (dead) port
+    res = measure_net([f"127.0.0.1:{port}"], upload_mb=1,
+                      dialback_port=_free_port(), dialback_advertise=None)
+    assert res["nat_dialable"] is True           # default: advertise == bind
+
+
 def test_dialback_fails_closed_without_listener():
     port = _start_peer()
     s = socket.create_connection(("127.0.0.1", port), timeout=5)
