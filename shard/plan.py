@@ -27,6 +27,8 @@ M25_PROFILE = {
     "layer_ms_base": 0.65,       # per-layer decode compute on an idle fast-CPU 5090 box
     "reserve_mb": 1500.0,        # CUDA context + allocator slack per box
     "head_reserve_mb": 4096.0,   # coordinator process on the head: embed + EAGLE head + its context
+    "tail_reserve_mb": 1400.0,   # tail stage: final norm + lm_head (measured 1.15 GiB bf16 + slack —
+                                 # a 13-layer tail OOM'd on it live while 13-layer middles warmed fine)
     "cap_layers": 13,            # proven warm per-box ceiling (16/box is OOM-adjacent, unproven)
     "head_layer_ms_mult": 1.3,   # the head box also runs the coordinator
 }
@@ -124,12 +126,27 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         extra["boundary_in"] = int(privacy.get("boundary_in", 0))
         extra["boundary_out"] = int(privacy.get("boundary_out", 0))
 
-    spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
-                       subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=layer_vram,
-                       kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
-                       require=head, **extra)
-    if spec is None:
-        return None
+    # 6) the TAIL stage also holds the final norm + lm_head (measured 1.15 GiB bf16 on
+    #    M2.5 — a 13-layer tail OOM'd loading it on a 32 GB 5090, live 2026-07-09, while
+    #    the same 13 layers warmed fine as a middle). The reserve applies to WHICHEVER
+    #    node lands the tail, which select_ring decides — so plan, check the landed
+    #    tail's block against the reserve, and if it doesn't fit, bake the reserve into
+    #    that node's budget and re-plan (the tail may move; loop a few refinements).
+    tail_reserve = float(m.get("tail_reserve_mb", 0.0))
+    per_layer_mb_full = layer_vram + kv
+    spec = None
+    for _ in range(4):
+        spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
+                           subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=layer_vram,
+                           kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
+                           require=head, **extra)
+        if spec is None:
+            return None
+        tail_i = spec["order"][-1]
+        lo, hi = spec["blocks"][tail_i]
+        if tail_reserve == 0.0 or free[tail_i] >= (hi - lo) * per_layer_mb_full + tail_reserve:
+            break
+        free[tail_i] = max(free[tail_i] - tail_reserve, 0.0)
     assert spec["order"][0] == head, "select_ring must return a head-first (deployable) order"
 
     boundary = set(spec.get("boundary", []))
