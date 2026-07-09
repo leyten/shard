@@ -45,6 +45,9 @@ fast-kernel card (N≤4)**. M2.5's 140 GB makes interactive M2.5 Blackwell/pro-a
 The long tail is **ROUTED not rejected**: batched-fill (24 GB marlin = ~36 tok/s agg at B=4), verify, seed,
 and SMALLER MODELS (self-organizing multi-model = the real heterogeneity play). **The 20-bar is a ROLE TAG,
 not a binary gate.** Min-spec table + the trustless-probe design in the doc.
+**LIVING SPEC (leyten): the FRAMEWORK is settled, the NUMBERS are v0** — every threshold (uplink ≥200, the
+12-layer cap, RTT ≤25, layer minimums, g) is a derived estimate to VALIDATE + REVISE by testing; when live
+data diverges, CHANGE the number. The probe (#1 below) + batched test (#3) exist to correct it. Not a constant.
 
 **NEXT SESSION — build the admission MECHANISM the spec calls for + continue the torrent path (in order):**
 1. **The trustless capability PROBE** (the admission spec's core ask, CPU/one-box testable): a 1-block load
