@@ -1,0 +1,18 @@
+{
+  "what": "First ON-RING --seed-shards proof: a joiner pulled its verified layer range from RINGMATES over the shard DHT while the ring SERVED. Closes the torrent loop #61 left owed (WAN peer-fetch was proven point-to-point; this is the production shape: every stage's sidecar seeds its verified range from the same tunnel daemon, joiner pulls peers-first, mirror only as fallback).",
+  "date": "2026-07-09",
+  "ring": {
+    "stages": ["CH 44342127 [0:11] head", "NO 44342145 [11:24]", "HU 44342144 [24:37]", "DK 44342137 [37:50]", "IT 44343604 [50:62] tail"],
+    "launch": "m25_scatter_pipe --batch 4 --kv-maxlen 16384 --seed-shards --receipts --warm-only (M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_SDPA=1)",
+    "sidecar": "HEAD build incl. PR #68 same-peer offset-resume; -seed manifest=/root/m25 per stage, DHT bootstrap via predecessor"
+  },
+  "joiner": {
+    "box": "44342193 (24GB 4090, NL-listed, ~72ms real RTT to the pool)",
+    "command": "node_pull --source libp2p --stage 1 --nstages 5 (SHARD_DHT_BOOTSTRAP = 2 ring maddrs)",
+    "result": "rc=0, 9 files / 28.6 GB verified into /root/m25_join, 2394 s (~12 MB/s avg single-stream WAN)",
+    "sources": "6 of 7 weight shards + all config files from RINGMATES (NO alone SERVED 3 complete shards); 1 shard (model-00010) fell back to the mirror after progress-gated retries",
+    "trust": "every byte re-hashed vs the signed manifest per source, exactly as the mirror path"
+  },
+  "fix_this_run_forced": "First attempt (pre-resume sidecar): the seeder sent 4.27/5.0 GB, one 60 s WAN stall discarded the partial and forced mirror fallback on shard ONE. PR #68 (same-peer offset-resume, progress-gated retries) shipped mid-session and pushed to all boxes; the rerun sourced 6/7 shards P2P.",
+  "notes": "Serving and seeding co-existed: the batched driver ran its full pass on the SAME warm ring during seeding. Remaining known gap: the k=0 (head) sidecar's initial DHT provide fires before the mesh forms ('failed to find any peer in table') — direct-dial fallback covers joiners bootstrapped through it, but a periodic re-provide would make head-held ranges discoverable via the DHT proper."
+}
