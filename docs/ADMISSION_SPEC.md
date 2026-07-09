@@ -1,10 +1,20 @@
 # M2.5 Admission Spec — capability function, not an allowlist
 
+> **LIVING SPEC — v0 (2026-07-09). The FRAMEWORK is settled; the NUMBERS are not.** What's decided is the
+> *shape*: admission is a GPU-model-independent capability function over `{peak-VRAM, fast-kernel, layer_ms,
+> RTT-to-neighbors, uplink, dialable} → role`, and the physics `tok/s = g/(N·RTT + C)` with
+> `N = 62/layers-per-node`. Every THRESHOLD below (uplink ≥ 200 Mbps, the 12-layer/32 GB cap, RTT ≤ 25 ms,
+> the layer-count minimums, the g assumptions) is a **derived estimate to be VALIDATED and REVISED by
+> measurement** — the probe + the batched/live tests exist precisely to correct them. If testing shows
+> uplink must be stricter, or VRAM can be looser, or the g/RTT assumptions were off, **change the numbers.**
+> Treat this doc as a hypothesis to falsify, not a fixed law. Update it when a run says otherwise.
+
 The decision (leyten, 2026-07-08): a node is admitted to a swarm by a **GPU-model-independent capability
 function**, never a vendor/model allowlist. This doc turns that choice into a *derived, implementable*
 spec: the physics that sets the minimum, the numbers per role, and the honest verdict on what can
 actually anchor a fast M2.5 ring. Numbers are derived from live 5090+4090 EU rings and
-adversarially cross-checked against both the scatter receipt (13-15 tok/s) and the tight receipt (32).
+adversarially cross-checked against both the scatter receipt (13-15 tok/s) and the tight receipt (32) —
+they REPRODUCE both, which is why the framework is trusted; the exact thresholds still need live validation.
 
 ## Why capability > allowlist (and what it costs)
 
@@ -122,3 +132,9 @@ neighborhood, so a fast card in a bad region is correctly relegated, not admitte
 5. **Emit a ROLE**, feeding placement (`select_ring`, which already sizes by measured VRAM+layer_ms) and
    the market (each role priced). Per the boundary law: shard owns the probe + physics; c0mpute owns the
    role decision. See `HETERO_DEVICES.md` (physics/tier table) and MARKET_DECENTRALIZATION.md (pricing).
+6. **Feed measured values back to REVISE this spec (the numbers are v0).** The probe produces real
+   per-node `layer_ms`/uplink/RTT and every served ring produces real tok/s vs the predicted `g/T`. When
+   live data diverges from a threshold here — a role that clears the bar the spec said it wouldn't, or an
+   admitted node that stalls a ring — that is a signal to CHANGE the number, not to trust the doc. The
+   admission spec is a hypothesis the network's own telemetry falsifies and tunes; it is the self-optimizer's
+   input, not a constant. Keep it current the same way as the living-state doc.
