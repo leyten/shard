@@ -1,0 +1,16 @@
+{
+  "what": "Batched-aggregate LIVE confirmation on a 5-stage scattered EU ring (the inclusion half of the admission spec) — coordinate_pipe_batch driven by research/m25_batch_serve_driver.py on the head, ngram drafting, 48 new tokens/stream.",
+  "date": "2026-07-09",
+  "ring": "CH[0:11] NO[11:24] HU[24:37] DK[37:50] IT[50:62], B=4 KV @ 16384, graph-aux on, receipts on",
+  "gates": {
+    "coherence": "PASS (B=3 distinct prompts, sensible text each)",
+    "data_isolation": "PASS — stream A's output_ids IDENTICAL across different batch-mates; per-stream attention + row-independent MoE => batched serving stays per-stream verifiable",
+    "throughput": {"B1": 5.19, "B2": 8.63, "B4": 11.95, "scaling": "1.00x / 1.66x / 2.30x"}
+  },
+  "honest_reading": "The driver's counting prompt is n-gram-UNDRAFTABLE (every number novel) => g~1, the drafting floor. 11.95 agg at B=4/g~1 vs the 155-agg receipt (2026-06-29, draftable content @16k, g~4): batched viability is CONTENT-dependent. At the g=1 floor, clearing 20 agg needs ~B=8 or a tighter pool. SPEC REVISED: g_batched 4.0 -> 1.5 (content-mix estimate) in SPEC_V0 + ADMISSION_SPEC.md; the 24GB-marlin '~36 agg at B=4' claim is now qualified as draftable-content-only.",
+  "vram_reads_same_ring": {
+    "13-layer middle (HU)": "31545/32607 MiB — brim",
+    "12-layer tail (IT)": "30365/32607 MiB",
+    "13-layer tail (first launch)": "OOM loading lm_head 1.15 GiB -> plan.py tail_reserve_mb=1400 (PR #69)"
+  }
+}

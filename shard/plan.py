@@ -22,14 +22,18 @@ from .topology import select_ring
 # runnable for M2.5 without one.
 M25_PROFILE = {
     "n_layers": 62,
-    "layer_vram_mb": 1700.0,     # NVFP4 experts + bf16 attn, per decoder layer
-    "kv_mb_per_layer": 150.0,    # at the 40960 KV cap
+    "layer_vram_mb": 2330.0,     # NVFP4 experts + bf16 attn + norms, per decoder layer — MEASURED
+                                 # 2026-07-09 (capability probe, one real layer resident: 2329.5 MB;
+                                 # a warm 13-layer stage read 31.5/32.6 GiB — the old 1700 estimate
+                                 # under-modeled by ~35% and packed stages one allocation from OOM)
+    "kv_mb_per_layer": 150.0,    # at the 40960 KV cap (B=1; batched callers scale by B*maxlen/40960)
     "layer_ms_base": 0.65,       # per-layer decode compute on an idle fast-CPU 5090 box
     "reserve_mb": 1500.0,        # CUDA context + allocator slack per box
     "head_reserve_mb": 4096.0,   # coordinator process on the head: embed + EAGLE head + its context
     "tail_reserve_mb": 1400.0,   # tail stage: final norm + lm_head (measured 1.15 GiB bf16 + slack —
                                  # a 13-layer tail OOM'd on it live while 13-layer middles warmed fine)
-    "cap_layers": 13,            # proven warm per-box ceiling (16/box is OOM-adjacent, unproven)
+    "cap_layers": 12,            # 32 GB ceiling by MEASURED footprint ((32768-1500)/2480 = 12.6);
+                                 # 13 ran warm but at 31.5/32.6 GiB — brim-riding, not a plan target
     "head_layer_ms_mult": 1.3,   # the head box also runs the coordinator
 }
 

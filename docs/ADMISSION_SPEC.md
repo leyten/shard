@@ -49,17 +49,25 @@ The model reproduces both live receipts: 6-stage scatter @ g≈4 → predicted m
 5-stage tight @ g≈4.5 → predicted clear with margin → measured 32 ✓.
 
 **Three co-binding constraints — VRAM alone is the wrong function:**
-1. **VRAM → layers → hop FLOOR.** `layers = (VRAM − peak_overhead) / footprint`. Blackwell cutlass
-   1.85 GB/layer (1.7 weight + 0.15 KV); marlin (Ada/Ampere) **4.25 GB/layer — a 2.3× penalty** that is
-   fatal for a 140 GB model. Gate on the **load-time PEAK, not resident**: a 32 GB 5090 OOM'd at 15
-   layers (22 GB resident) on the NVFP4 weight-swizzle peak (~+4.3 GB); 12 layers is the safe cap.
+1. **VRAM → layers → hop FLOOR.** `layers = (VRAM − reserve − load_transient) / (footprint + kv)`.
+   **MEASURED 2026-07-09 (capability probe, one real layer + warm-stage reads):** Blackwell cutlass
+   **2.33 GB/layer full-layer resident** (NVFP4 experts + bf16 attn + norms — the earlier 1.7 GB was
+   experts-only and under-modeled by ~35%); marlin (Ada/Ampere) **4.06 GB/layer — still a ~1.75×
+   penalty** that is fatal for a 140 GB model. The load TRANSIENT is arch-dependent and the probe
+   measures it: **cutlass ~72 MB (tiny), marlin ~4.8 GB (the dequant/repack buffer — bigger than the
+   old "swizzle peak" guess).** The original "+4.3 GB swizzle" mechanism story was WRONG: the 15-layer
+   OOM was plain footprint arithmetic (15 × 2.33 ≈ 35 GB > 32). Direct warm-stage evidence: a
+   13-layer stage serves at **31.5/32.6 GiB — one allocation from OOM**; a 12-layer tail sits at
+   30.4 GiB. **12 layers is the 32 GB plan target** ((32768−1500)/2480 = 12.6), by measurement.
 2. **RTT → actual speed.** Same cards, RTT 30→19 ms doubled throughput (13-15 → 32) with zero VRAM
    change. A 48 GB node at 80 ms RTT tanks a ring that a 32 GB node at 20 ms carries. RTT-to-assigned-
    neighbors + NAT-dialability are part of the capability vector, not an afterthought.
 3. **Uplink → prefill TTFT.** Decode activation is trivial (~3 KB/token = 0.5 Mbps). But prefill at 16k
    is **50 MB/hop** (S×H×1B, fp8): 400 Mbps → 6 s TTFT over 6 hops; **15 Mbps residential → 160 s**.
    Uplink is a genuine second gate that VRAM-only admission misses; chunked prefill barely helps
-   (compute is ~1 ms/layer, it can't hide a 50 MB transfer).
+   (compute is ~1 ms/layer, it can't hide a 50 MB transfer). Thresholds are RECEIVER-TIMED
+   single-TCP-stream numbers — measured 2026-07-09: a vast box LISTED at 1316 Mbps up delivered
+   **210 Mbps** receiver-timed cross-WAN. Listings and speed-test numbers do not qualify a node.
 
 Compute is NOT a number — it's a **binary "has a graph-safe fast kernel."** No modern GPU is
 compute-bound at its VRAM-limited layer count (5090 0.75 ms/layer, 4090 marlin+graph 1.6 ms/layer). The
@@ -71,21 +79,21 @@ gate only bites the fallback paths: no CUDA-graph (3-10× launch overhead), no n
 | Role | min layers | min VRAM (by arch) | kernel | uplink | RTT |
 |---|---|---|---|---|---|
 | **Interactive anchor** (20-32 single-stream) | 13-16 scatter / 7-12 tight | **48 GB Blackwell** (~21 L); 32 GB 5090 (12 L) **tight-ring-only, marginal**; **24 GB marlin = NO** | native + CUDA-graph | ≥200 Mbps (16k TTFT) | ≤25 ms to neighbors |
-| **Batched filler** (aggregate 20+, per-stream ~8) | 3-5 | ~16 GB Blackwell / **24 GB marlin (5 L) ✓** | native + graph | ≥100 Mbps | relaxed (long N amortizes) |
+| **Batched filler** (aggregate 20+, per-stream ~8) | 3-5 | ~16 GB Blackwell / **24 GB marlin (4 L, measured)** | native + graph | ≥100 Mbps | relaxed but POOL-relative (measured: 72 ms kills even B=4) |
 | **Verifier** (spot-check 1 block) | 1+ | 2-8 GB any GPU; CPU ok (slow) | any | modest | n/a |
 | **Seeder** (weight propagation) | 0 | 0 — CPU / phone + disk | none | upload BW only | n/a |
 
-Layers a card actually holds (peak-gated): 16 GB → 6 Blackwell / 3 marlin · 24 GB → 10 / **5** · 32 GB →
-**12** / 7 · 48 GB → ~21 / ~10 · 80 GB → ~40 / ~17. The `12` on a 32 GB 5090 is the load-tested cap.
+Layers a card actually holds (measured footprint 2.33/4.06 GB + kv 0.15, reserve 1.5, arch transient):
+16 GB → **5** Blackwell / 2 marlin · 24 GB → **9** / **4** · 32 GB → **12** / 6 · 48 GB → ~19 / ~10 ·
+80 GB → ~32 / ~17 (the ≥48 GB column is density-extrapolated, unproven at size — probe on join decides).
 
-**KNOWN v0 TENSION — 12 vs 13 (adversarial review, 2026-07-09):** `plan.py`'s placement profile says
-`cap_layers=13` (warm-proven on live rings); this table says 12 (the 15-layer-OOM analysis). That ONE
-layer flips the marquee verdict: 13 → N=5 → a 32 GB 5090 gets ADMITTED interactive at 30 ms scatter
-(predicted 20.4), 12 → N=6 → denied (predicted 17.7, matching the 13-15 receipt). **Admission uses 12
-(the conservative number, `probe.ADMISSION_MODEL_V0`) until the probe's live peak measurement settles
-it**; placement may keep packing 13 where it's proven. Also: the cap is proven on 32 GB cards only, so
-the probe scales the proven DENSITY to card size (48 GB → 18 layers → N=4) instead of flat-clamping —
-a flat cap made a 48 GB card indistinguishable from a 32 GB one, erasing this spec's core distinction.
+**12-vs-13 — RESOLVED BY MEASUREMENT (2026-07-09).** The v0 tension (plan profile 13 vs spec 12) is
+settled: the full-layer footprint is 2.33 GB, so 12 is arithmetic, and the live reads prove it — a
+13-layer middle warmed but served at **31.5/32.6 GiB (brim)**, and a 13-layer TAIL **OOM'd loading the
+1.15 GiB lm_head** (middles ≠ tail: `plan.py` now models `tail_reserve_mb=1400`). `plan.py` and
+`probe.ADMISSION_MODEL_V0` both carry the measured numbers (layer_vram 2330, cap 12). The cap is
+proven on 32 GB cards only, so the probe scales the proven DENSITY to card size (48 GB → 18 → N=4)
+instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
 
 ## The honest anchor verdict
 
@@ -101,11 +109,18 @@ a flat cap made a 48 GB card indistinguishable from a 32 GB one, erasing this sp
 - **The comfortable fast-M2.5 anchor is a 48 GB fast-kernel card (N≤4)**, or a tight regional ring of
   32 GB 5090s. M2.5's 140 GB size makes interactive M2.5 **Blackwell/pro-anchored** — full stop.
 - **This does NOT reject the long tail — it ROUTES it.** Weak/consumer hardware earns its keep exactly as
-  the torrent thesis predicts: **batched-fill** (a 24 GB marlin card gives ~36 tok/s aggregate at B=4),
-  **verification**, **seeding**, and **anchoring SMALLER models** (a 30-40 B NVFP4 fits meaningfully in 5
-  layers). The capability function, parameterized per model, sends every card to where it adds value.
-  That is the self-organizing multi-model network — the real heterogeneity play, not "make every card
-  serve M2.5."
+  the torrent thesis predicts: **batched-fill**, **verification**, **seeding**, and **anchoring SMALLER
+  models** (a 30-40 B NVFP4 fits meaningfully in 4 layers). The capability function, parameterized per
+  model, sends every card to where it adds value. That is the self-organizing multi-model network — the
+  real heterogeneity play, not "make every card serve M2.5."
+- **Batched viability is g-DEPENDENT and pool-relative (measured 2026-07-09).** Live 5-stage EU ring,
+  B=1/2/4 = 5.19/8.63/**11.95 agg** with clean scaling (1.66×/2.30×) and the DATA-ISOLATION gate PASSING
+  (stream outputs independent of batch-mates — what makes batched serving verifiable). BUT that run was
+  n-gram-undraftable content (g≈1, the floor): the earlier ~36-155 agg numbers are DRAFTABLE-content
+  (g≈4) figures. At the g=1 floor, clearing 20 agg needs **B≈8 on a tight pool**, not B=4 — the
+  batched-filler bar must be evaluated at a content-mix g (v0.1 uses g_batched≈1.5, revisable), and the
+  live probe verdict for a 24 GB card 72 ms from its pool was VERIFIER, correctly: batched inclusion is
+  pool-relative, not a birthright.
 
 ## The bar is a ROLE TAG, not a binary gate
 
