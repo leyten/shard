@@ -36,11 +36,15 @@ is not.)
 
 ## Device tier table (against the ≥20 tok/s bar)
 
+> This table is **illustrative output of the capability admission function** (below) evaluated on
+> common cards today — NOT an allowlist. Admission is by measured VRAM/compute/bandwidth, not model name.
+
 Usable-speed frame: `tok/s = g / T_traversal`; a stage holding K layers adds `K × layer_ms` to the
-ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). The 20 tok/s bar
-lives in the **batched-aggregate / draftable-verbatim / topology-tightened** regimes (single-stream
-novel reasoning tops out ~10-12 on a good 5090 ring — WAN physics), so heterogeneity must not be
-what drops a ring below it. Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
+ring, and the ring is only as fast as its slowest stage + WAN hop (~15-40 ms). Single-stream WITH
+graph-aux (`M25_CUDA_GRAPH` + `M25_STATIC_KV`, PR #25) does **~24 decode-weighted / 30-32 reasoning-heavy**
+on a good EU ring; draftable-verbatim and batched-aggregate go higher still. So the 20 tok/s bar is
+comfortably above what a heterogeneous ring must protect — heterogeneity must not be what drops a
+ring below it, and every perf ring MUST launch with graph-aux on (a no-graph run under-measures ~2×). Layers-held ≈ (VRAM − reserve) / (per-layer weights + KV). NEVER
 co-locate to manufacture the number — every verdict below is for scattered WAN placement.
 
 | Device | BW GB/s | Mem GB | ~layers @ arch footprint | est layer_ms | Verdict |
@@ -69,9 +73,11 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
    empirically (a few forward passes) and feed `select_ring` (it already consumes them). Needed for
    NVIDIA heterogeneity too; the driver-API CUDA probe (`scratchpad/health_probe.py`) is the
    liveness half.
-2. **[S] Per-node backend + per-node `layer_vram_mb`** — `M25_MOE_BACKEND=auto` (shipped) picks
-   cutlass/marlin per arch; the planner's single global `layer_vram_mb` must become per-node so a
-   marlin 4090 (2.4× footprint) is placed with the right layer count.
+2. **[S] ✅ SHIPPED — per-node backend + per-node `layer_vram_mb`** — `M25_MOE_BACKEND=auto` picks
+   cutlass/marlin per arch; `select_ring`'s `layer_vram_mb` now accepts a per-node dict (scalar path
+   byte-identical, goldens green), and `ring_up` detects each node's GPU name → per-arch footprint
+   (5090 cutlass 1.7 GB, 4090/3090 marlin ~4.1 GB) + a marlin compute penalty, so a marlin card is
+   placed as a thin stage automatically.
 3. **[S] CPU-side fp8 wire unpack fallback** — for Mac/AMD safety on the fp8 codec path.
 4. **[M] `MlxRuntime`** — a `ModelRuntime` (`shard/node.py`) over `mlx_lm.models.minimax`: load only
    layers [lo,hi) from the MLX-4bit artifact, drive `layers[i](h, mask, cache)`, crop KV to
@@ -88,15 +94,34 @@ first-class **seeder** and a torch-free challenge judge (`shard/challenge.py` al
    hidden-states-in→layers→hidden-states-out API; a custom ggml graph over the loaded GGUF layers.
    After the Mac path proves mixed-quant rings live.
 
-## Admission floor per class (c0mpute side)
+## Admission is a CAPABILITY FUNCTION, not an allowlist (leyten, 2026-07-08)
 
-Per the boundary law the *runtime* (which backend, numeric compat) is shard; the *admission tiers*
-are c0mpute. The floor: **ring-worthy** = holds ≥ N layers at its arch footprint AND keeps the ring
-≥ 20 tok/s in the served regime (compute ≲ one WAN hop, uplink ≥ ~20 Mbps); **off-ring** = seeder /
-verifier / coordinator / standby (a wage via the off-ring markets, see MARKET_DECENTRALIZATION.md);
-**too-slow** = below both. The compute probe (build item 1) supplies the measured `layer_ms` the
-floor is evaluated against — self-reported specs are never trusted (a liar just makes a slow ring
-and gets relegated by the receipts).
+**The table above is illustrative OUTPUT, not the mechanism.** Admission is NOT "5090 yes, 3060 no" —
+it is a GPU-model-independent function of *measured* capability, evaluated when a node joins. That is
+the most decentralized form of joining: anyone brings any hardware, and the function judges it. A
+card is never on or off an allowlist by name; it is admitted or rejected by what it can measurably do.
+
+**Collected on join** (measured, never self-reported — a liar just makes a slow ring and gets
+relegated by the receipts): free VRAM, compute speed (`layer_ms` from a probe forward — captures the
+CPU kernel-launch factor too), uplink Mbps, region/RTT to existing pools.
+
+**The function** (`allow-ring` / `relegate-off-ring` / `reject`):
+1. **VRAM feasibility** — can it hold ≥1 layer at its per-arch footprint? (else seeder/verifier only.)
+2. **Usable-speed + hop viability** — would including this node in a *coverable* swarm keep that swarm
+   ≥ the bar (20 tok/s), or does accommodating its minimum contribution force too many hops? A node
+   that can hold only ~2 layers forces a 62-layer model into ~31 stages ≈ 31 WAN hops — far over the
+   traversal budget — so it is rejected *for the ring* even if its per-layer compute is fine. The
+   criterion is a property of the **swarm shape the node forces (coverage-per-hop)**, not the node's
+   speed alone. This is why a "bad" card is excluded: not because of its name, but because the minimal
+   swarm that could use it isn't viable.
+3. **Output**: ring-worthy / off-ring (seeder / verifier / coordinator / standby — a wage via the
+   market, see MARKET_DECENTRALIZATION.md) / reject.
+
+Boundary: shard owns the **probe + physics** (`select_ring` already sizes each node by measured
+VRAM + `layer_ms`; the per-node VRAM footprint shipped this session is the placement half). c0mpute
+owns the **admission decision** (the same measured inputs run through allow/relegate/reject *before*
+placement). The compute/uplink probe (build item 1) is the shared front door; see
+`admission-is-capability-function-not-allowlist` in memory.
 
 ## Prior art (why nobody has shipped a *verified* heterogeneous ring)
 
