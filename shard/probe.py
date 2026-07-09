@@ -57,7 +57,8 @@ SPEC_V0 = {
     "bar_batched_agg_tok_s": 20.0,   # aggregate bar for a batched ring
     "batch_B": 4,                    # proven batch width (the 155 tok/s agg receipt ran B=4)
     "g_interactive": 4.0,            # accepted tokens/traversal, EAGLE+n-gram (measured 3.3-4.5)
-    "g_batched": 4.0,                # same drafting; B changes the BAR, not g
+    "g_batched": 1.5,                # content-mix estimate: measured floor g≈1 on undraftable output
+                                     # (B=4 agg 11.95 live), ~4 on draftable — batched jobs skew novel
     "c_base_ms": 46.0,               # measured all-5090 total compute over 62 layers (mixed ~56)
     "uplink_interactive_mbps": 200.0,  # 16k prefill = 50 MB/hop; 15 Mbps residential -> 160 s TTFT
     "uplink_batched_mbps": 100.0,
@@ -68,14 +69,13 @@ SPEC_V0 = {
 
 ROLES = ("interactive-anchor", "batched-filler", "verifier", "seeder", "reject")
 
-# ADMISSION model defaults = plan.py's engine profile with a CONSERVATIVE layer cap.
-# plan.py says cap_layers=13 (warm-proven placement ceiling on 32 GB 5090s); the spec's
-# load-test analysis says 12 (15 layers OOM'd on the swizzle peak; "12 is the safe cap").
-# That one-layer disagreement FLIPS the marquee scatter verdict (13 -> N=5 -> admit
-# @30 ms; 12 -> N=6 -> deny, matching the 13-15 tok/s receipt), so ADMISSION takes the
-# conservative number until the probe's own peak measurements settle it — it is the
-# first v0 number live data must revise, in BOTH docs/ADMISSION_SPEC.md and here.
-ADMISSION_MODEL_V0 = {**M25_PROFILE, "cap_layers": 12}
+# ADMISSION model defaults = plan.py's engine profile. The 12-vs-13 cap tension this
+# module shipped with was RESOLVED BY MEASUREMENT (2026-07-09: live probe + warm-stage
+# VRAM reads): the full-layer cutlass footprint is ~2330 MB (the old 1700 was ~35%
+# light), so a 32 GB card holds 12 by arithmetic — and a 13-layer stage ran warm at
+# 31.5/32.6 GiB, brim-riding, never a plan target. plan.py now carries the measured
+# numbers (layer_vram_mb 2330, cap_layers 12); admission inherits them directly.
+ADMISSION_MODEL_V0 = dict(M25_PROFILE)
 _PROVEN_CAP_VRAM_MB = 32768.0    # the card size cap_layers was proven on; bigger cards
                                  # scale by density (a flat cap made 48 GB == 32 GB)
 

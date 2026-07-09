@@ -13,6 +13,63 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-09 (later) — ADMISSION MECHANISM BUILT+LIVE-PROVEN, on-ring TORRENT LOOP CLOSED, numbers v0→MEASURED
+All three live milestones landed in one session, and the measurements REVISED the spec (the LIVING-doc
+loop working as designed). Merged: shard **#65 #66 #67 #68 #69** + c0mpute **#19**. Ring torn down
+(instances-v1==0), **balance ~$21.3** (session ~$10.6).
+
+**1. CAPABILITY PROBE — built, adversarially reviewed, LIVE-VALIDATED (`shard/probe.py`, #65-67).**
+The full ADMISSION_SPEC mechanism: pure role function (`python3 -m shard.probe`, stdio like shard.plan;
+binding[] names the denying gate = the revise signal), `--measure` (one REAL layer: footprint,
+arch-dependent load transient, graph-replayed layer_ms, binary fast-kernel = native kernel + CUDA-graph
+capture+replay), `--serve/--net-only` (receiver-timed uplink, nonce dial-back w/ NAT advertise port,
+connect-time RTT in topology units). The 22-test suite pins the spec table AT the receipts' numbers.
+The ADVERSARIAL REVIEW flipped a marquee verdict pre-ship (cap 13 admitted a 32GB card at 30ms scatter
+that the 13-15 receipt denies) — model of the discipline. **LIVE: a rented 4090 measured
+{footprint 4057, marlin repack transient 4824(!), graph BIT-exact, uplink 210 receiver-timed vs 1316
+listed, real pool-RTT 72ms vs 'NL' geo} → role VERIFIER (hops_vs_rtt binds) — correct physics.**
+c0mpute #19: node-bind accepts a measured cap, server drives shard.probe (role NEVER self-reported),
+verdict+cap persisted in `node_role` (placement/pricing/telemetry). Trust framing honest:
+trust-then-punish v0; probe peers must be control-plane-ASSIGNED; signed transcripts = later hardening.
+
+**2. NUMBERS v0 → MEASURED (docs/ADMISSION_SPEC.md revised + `M25_PROFILE` corrected, receipts in
+docs/receipts/):** the real cutlass FULL-layer footprint is **2330 MB** (old 1700 was experts-only,
+~35% light) — the "swizzle peak" MECHANISM story was wrong (transient is arch-dependent: cutlass 72MB,
+marlin 4.8GB repack); the 15-layer OOM was footprint arithmetic. Direct warm reads: 13-layer middle =
+**31.5/32.6 GiB (brim)**; 12-layer tail = 30.4. **12 = the 32GB plan target — 12-vs-13 RESOLVED.**
+A 13-layer TAIL OOM'd loading lm_head (1.15GB) live → `plan.py` now models `tail_reserve_mb=1400`
+(#69) + `layer_vram_mb=2330`, `cap_layers=12`. 24GB marlin holds **4 layers not 5** (N=16). Uplink
+thresholds = receiver-timed single-stream (listings are ~6× optimistic). `g_batched` 4.0→**1.5**
+(content-mix; see #3). Consequence to own: **5-box 32GB rings are brim-riding — 62 layers wants 6.**
+
+**3. ON-RING TORRENT LOOP CLOSED (#68 + receipt onring-seed-shards-20260709).** The 5×5090 EU ring
+launched `--seed-shards --receipts --batch 4` (every stage's sidecar seeds its verified range, DHT via
+predecessors) and a JOINER (the 4090) pulled its full 28.6GB stage range **6/7 weight shards from
+RINGMATES** (NO alone SERVED 3), every byte re-hashed vs the signed manifest, WHILE the ring served.
+Attempt #1 exposed a real hole — one 60s WAN stall at 4.27/5GB discarded the partial → mirror — fixed
+as **same-peer offset-resume + progress-gated retries (#68)**; rerun sourced peers-first. Known gap:
+the head's initial DHT provide fires pre-mesh (direct-dial covers it; periodic re-provide = follow-up).
+
+**4. BATCHED B=4 LIVE (receipt batched-b4-live-20260709):** coherence PASS, **DATA-ISOLATION PASS**
+(stream outputs independent of batch-mates = batched stays verifiable), B=1/2/4 = 5.19/8.63/**11.95
+agg** (clean 1.66×/2.30× WAN amortization) — BUT on n-gram-undraftable content (g≈1 floor). The 155-agg
+receipt is the draftable-content (g≈4) regime. Batched viability is g-dependent + pool-relative; at
+g=1 clearing 20 agg needs ~B=8 or a tight pool. Spec + SPEC_V0 revised accordingly.
+
+**NEXT SESSION (in order):**
+1. **MlxRuntime** — the any-device flagship (Mac/MLX; model file + 4-bit artifact + per-layer
+   callability exist). CPU/local-first; the real "any device joins" proof.
+2. **Probe fidelity follow-ups:** align `--measure`'s per-layer tensor set with what m25_stage actually
+   keeps resident (probe loads the whole layer prefix — measured 2330 vs stage-implied ~2426 all-in at
+   B=4, close but unaudited); B=8 batched arm on draftable content (settles the batched bar for real);
+   periodic DHT re-provide in the sidecar; probe the >48GB tier when a box is cheap.
+3. **Market migration stage 1** IF leyten greenlights c0mpute #16 — the role verdict in `node_role` is
+   exactly the "asks in announce" input the cheapest-adequate formation needs.
+4. Wire warm per-stage `per_stage_ms` feedback into re-selection (ring_up's honest gap; the probe's
+   layer_ms is the admission-time half of it).
+
+**RING: none live** (verified 0). c0mpute WIP (`onchain-staking.ts`) untouched.
+
 ### ⇒ 2026-07-09 — HETEROGENEOUS swarm PROVEN live + CAPABILITY-ADMISSION spec DERIVED (the strategic capstone)
 Live-tested a mixed 5090+4090 ring end-to-end, then turned leyten's "capability function, not allowlist"
 admission decision into a derived, adversarially-verified minimum-spec. This is the on-thesis output; the
