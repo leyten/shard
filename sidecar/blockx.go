@@ -345,6 +345,13 @@ func runFetchCid(ctx context.Context, h host.Host, d *dht.IpfsDHT, known []peer.
 	seen := map[peer.ID]bool{h.ID(): true}
 	lastErr := fmt.Errorf("no providers for %s", cidStr)
 	tried := 0
+	partSize := func(p string) int64 {
+		st, err := os.Stat(p)
+		if err != nil {
+			return 0
+		}
+		return st.Size()
+	}
 	attempt := func(ai peer.AddrInfo) (done bool, err error) {
 		if seen[ai.ID] {
 			return false, nil
@@ -352,17 +359,32 @@ func runFetchCid(ctx context.Context, h host.Host, d *dht.IpfsDHT, known []peer.
 		seen[ai.ID] = true
 		tried++
 		part := prefix + shortPeer(ai.ID) + ".part" // this peer's own partial namespace
-		if err := fetchFromPeer(fctx, h, ai, cidStr, part, size); err != nil {
-			log.Printf("provider %s: %v", ai.ID, err)
-			os.Remove(part) // drop this peer's (possibly hostile) bytes; never reused
-			lastErr = err
-			return false, nil
+		// PROGRESS-GATED retries against the SAME peer, resuming at the partial's
+		// offset: a transient WAN stall (a 60 s idle mid-5 GB — observed live: a ring
+		// seeder sent 4.27 GB then stalled) must not cost the honest bytes already
+		// pulled. Each retry must GROW the partial or we stop — a hostile/refusing
+		// peer makes no progress and exits in one round; wrong bytes still die at the
+		// caller's manifest re-hash. Cross-peer resume stays impossible (peer-scoped
+		// partial file).
+		var ferr error
+		for try := 0; try < 3; try++ {
+			before := partSize(part)
+			if ferr = fetchFromPeer(fctx, h, ai, cidStr, part, size); ferr == nil {
+				if err := os.Rename(part, out); err != nil {
+					return true, err
+				}
+				fmt.Printf("FETCHED %s -> %s\n", cidStr, out)
+				return true, nil
+			}
+			if partSize(part) <= before {
+				break
+			}
+			log.Printf("provider %s: %v — retrying, resume at %d", ai.ID, ferr, partSize(part))
 		}
-		if err := os.Rename(part, out); err != nil {
-			return true, err
-		}
-		fmt.Printf("FETCHED %s -> %s\n", cidStr, out)
-		return true, nil
+		log.Printf("provider %s: %v", ai.ID, ferr)
+		os.Remove(part) // drop this peer's (possibly hostile) bytes; never reused
+		lastErr = ferr
+		return false, nil
 	}
 	for ai := range d.FindProvidersAsync(fctx, c, 8) {
 		if done, err := attempt(ai); done {
@@ -397,11 +419,16 @@ func shortPeer(p peer.ID) string {
 	return s
 }
 
-// fetchFromPeer pulls one shard from ONE peer into `part` — a fresh, peer-owned file, so
-// there is no cross-peer prefix to resume (each attempt starts clean). A short/stalled
-// body errors and the caller drops `part`. The bulk body streams under an idle deadline.
+// fetchFromPeer pulls one shard from ONE peer into `part` — a peer-owned file. If the
+// partial already exists (a prior attempt against THIS peer), the pull RESUMES at its
+// offset (blockxReq.Offset; the serve side seeks). Cross-peer partials never mix — the
+// file is namespaced by peer id, and the caller deletes it before moving on. A
+// short/stalled body errors; the bulk body streams under an idle deadline.
 func fetchFromPeer(ctx context.Context, h host.Host, ai peer.AddrInfo, cidStr, part string, size int64) error {
-	os.Remove(part) // this peer's partial is fresh each attempt — no inherited prefix
+	var start int64
+	if st, err := os.Stat(part); err == nil {
+		start = st.Size() // same-peer resume point
+	}
 	cctx, cancel := context.WithTimeout(ctx, 20*time.Second)
 	err := h.Connect(cctx, ai)
 	cancel()
@@ -414,7 +441,7 @@ func fetchFromPeer(ctx context.Context, h host.Host, ai peer.AddrInfo, cidStr, p
 	}
 	defer s.Close()
 	_ = s.SetWriteDeadline(time.Now().Add(idleTimeout))
-	req, _ := json.Marshal(blockxReq{Cid: cidStr, Offset: 0})
+	req, _ := json.Marshal(blockxReq{Cid: cidStr, Offset: start})
 	if err := writeFrame(s, req); err != nil {
 		return err
 	}
@@ -435,14 +462,17 @@ func fetchFromPeer(ctx context.Context, h host.Host, ai peer.AddrInfo, cidStr, p
 	if resp.Size < 0 {
 		return fmt.Errorf("peer declared negative size %d", resp.Size)
 	}
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, 0o644)
+	if start > resp.Size {
+		return fmt.Errorf("partial %d exceeds peer size %d", start, resp.Size)
+	}
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
 	if err != nil {
 		return err
 	}
-	n, err := copyIdle(s, f, s, resp.Size)
+	n, err := copyIdle(s, f, s, resp.Size-start)
 	f.Close()
 	if err != nil {
-		return fmt.Errorf("transfer stopped at %d/%d: %w", n, resp.Size, err)
+		return fmt.Errorf("transfer stopped at %d/%d: %w", start+n, resp.Size, err)
 	}
 	return nil
 }
