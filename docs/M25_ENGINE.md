@@ -13,6 +13,60 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-09 — HETEROGENEOUS swarm PROVEN live + CAPABILITY-ADMISSION spec DERIVED (the strategic capstone)
+Live-tested a mixed 5090+4090 ring end-to-end, then turned leyten's "capability function, not allowlist"
+admission decision into a derived, adversarially-verified minimum-spec. This is the on-thesis output; the
+ring re-measurement that preceded it was over-spend (see BALANCE).
+
+**SHIPPED — shard PR #62 MERGED (`eagle/hetero-swarm`):**
+- **Per-node VRAM footprint** in `select_ring` (`layer_vram_mb` accepts a dict): a marlin 4090
+  (4.25 GB/layer, ~2.3× the 5090's 1.85) is sized to ~5 layers automatically, no OOM; scalar path
+  byte-identical (goldens green). `ring_up` detects arch → footprint; head pinned to a 5090.
+- **Marlin is CUDA-graph-safe** (proven live: 4090 stage 32.65 ms → **8.02 ms**, receipts valid) → graph-aux
+  now default-ON for EVERY arch (`M25_EAGER_NONBLACKWELL=1` escape hatch). A non-Blackwell card is a
+  FULL-speed ring stage, not an eager drag.
+- **Live proof:** 6-box mixed ring (5×5090 cutlass + 1×4090 marlin) served coherently, all 6 per-stage
+  receipts VALID across reasoning/verbatim/copy. Mixed-arch numeric compat confirmed live.
+- **Docs:** stale "~10-12 single-stream" corrected to the graph-aux truth (see PROVEN); admission reframed
+  as a capability function.
+
+**DERIVED + VERIFIED — the capability-admission MINIMUM SPEC (`docs/ADMISSION_SPEC.md`, PR #63 OPEN for
+leyten):** admission is a GPU-model-independent function, but NOT VRAM-only. `tok/s = g/T`,
+`T = N·RTT + C`, `N_hops = ceil(62 / layers-the-weakest-node-holds)` — layers set hops, hops set speed.
+**THREE co-binding constraints:** (1) VRAM→layers→hop-floor (gate on load PEAK not resident — 32 GB 5090
+OOMs at 15 layers, cap 12; marlin's 4.25 GB/layer is fatal for 140 GB); (2) RTT (30→19 ms doubled tok/s
+13-15→32; a 48 GB node at 80 ms tanks a ring); (3) uplink (decode trivial, but 16k prefill 50 MB/hop → 15
+Mbps residential = 160 s TTFT). Compute is a BINARY graph-safe-fast-kernel check.
+**HONEST ANCHOR VERDICT:** a 24 GB non-Blackwell card (4090/3090) can **NEVER** anchor fast single-stream
+M2.5 (5 layers → 13 hops → needs g≥5.9, real g 3.3-4.5); a 32 GB 5090 is **marginal — clears 20 only on a
+tight ≤24 ms REGIONAL ring** (the reason-math-32 receipt is tight-ring-only; a 5-stage ring needs 12.4
+layers but 32 GB caps at 12 → a naive admitter OOMs); the comfortable fast-M2.5 anchor is a **48 GB
+fast-kernel card (N≤4)**. M2.5's 140 GB makes interactive M2.5 Blackwell/pro-anchored — physics, not policy.
+The long tail is **ROUTED not rejected**: batched-fill (24 GB marlin = ~36 tok/s agg at B=4), verify, seed,
+and SMALLER MODELS (self-organizing multi-model = the real heterogeneity play). **The 20-bar is a ROLE TAG,
+not a binary gate.** Min-spec table + the trustless-probe design in the doc.
+
+**NEXT SESSION — build the admission MECHANISM the spec calls for + continue the torrent path (in order):**
+1. **The trustless capability PROBE** (the admission spec's core ask, CPU/one-box testable): a 1-block load
+   probe measuring **peak-VRAM-at-load** (not free — else admit-then-OOM), `layer_ms`, the binary
+   fast-kernel check, **uplink**, and **RTT-to-assigned-neighbors + NAT-dialability**; output a ROLE
+   (interactive-anchor / batched-filler / verifier / seeder / reject) via the `ADMISSION_SPEC.md` function.
+   shard owns probe+physics, c0mpute owns the role decision — wire it into c0mpute admission (before
+   placement) and the market (price per role).
+2. **On-ring `--seed-shards` LIVE** — the torrent half owed: push `/tmp/sidecar_new` (the DHT-capable binary)
+   into the ring bootstrap so a joiner pulls its verified range from a RINGMATE, mirror only as fallback.
+   (WAN peer-fetch already proven: 4090 seeded → box pulled 5 GB @95 MB/s.)
+3. **Batched-aggregate LIVE confirmation** — the single measurement that validates the inclusion half of the
+   admission spec (a 24 GB card → ring-worthy in batched). Only genuine live spend left worth doing.
+4. **MlxRuntime** — the any-device flagship (Mac/MLX; model + 4-bit artifact + per-layer callability exist).
+5. **Market migration stage 1** IF leyten greenlights c0mpute PR #16 (asks in announce + cheapest-adequate).
+
+**BALANCE: ~$32** (this hetero session burned ~$90 re-measuring 13-15 tok/s — the physics already had the
+answer; next session is SPEND-CONSCIOUS: CPU/one-box first, ring only for #2/#3 where live is the point).
+**RING: none live** (instances-v1==0 verified). c0mpute WIP (`onchain-staking.ts`) untouched.
+
+---
+
 ### ⇒ 2026-07-08 (later) — TORRENT-FIRST session: P2P propagation BUILT+WAN-proven, heterogeneous 4090 PROVEN, market design panelled
 Acted on the three torrent tasks. All three moved; the loop still serves (regression pass ran live).
 
