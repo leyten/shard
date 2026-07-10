@@ -2,15 +2,20 @@
 
 Exposes /v1/chat/completions (messages + tools + tool_choice + streaming) and /v1/models over the
 scattered libp2p ring. This is the PROGRAMMATIC api c0mpute calls — distinct from gateway.py's shared
-public demo terminal. The shard engine is single-stream (one ring), so requests are serialized
-through a lock; concurrent callers queue.
+public demo terminal.
+
+CONTINUOUS BATCHING is the standard concurrency path: requests queue to a dispatcher; a burst that
+arrives within M25_GW_WINDOW_MS rides ONE coordinate_pipe_batch job (per-stream drafting = the full
+solo stack: n-gram -> EAGLE per stream; per-stream streaming; per-stream tools/reasoning/max_new).
+A lone request takes the tuned solo path (identical to the old behavior). M25_GW_BATCH caps the batch
+width and MUST be <= the ring's M25_BATCH (stage KV rows are allocated at launch) — it defaults to
+M25_BATCH so an un-batched ring never sees a batched op.
 
   SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_gateway.py --head H:P --tail H:P --port 29600
   M25_GATEWAY_MOCK=1 python m25_gateway.py --head x --tail x --port 29600   # local api/shape test, no GPU
 
-Beta notes: decoding is greedy (n-gram speculative verify); `temperature`/`top_p`/`top_k` are accepted
-but not yet applied (lossless sampling is a separate engine lever — the tail argmaxes today). One
-in-flight request at a time.
+Beta notes: decoding is greedy (speculative verify); `temperature`/`top_p`/`top_k` are accepted
+but not yet applied (lossless sampling is a separate engine lever — the tail argmaxes today).
 """
 import argparse, json, os, socket, sys, threading, time, itertools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -30,7 +35,9 @@ NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 # that stops reading is dropped in seconds, not up to the ring timeout (was ~30 min). Env-tunable.
 STREAM_WRITE_TIMEOUT = float(os.environ.get("M25_STREAM_WRITE_TIMEOUT", "30"))
 _ids = itertools.count(1)
-RING_LOCK = threading.Lock()   # the ring is single-stream: one generation at a time
+RING_LOCK = threading.Lock()   # one ring job at a time (a job may carry up to M25_GW_BATCH streams)
+GW_BATCH = int(os.environ.get("M25_GW_BATCH", os.environ.get("M25_BATCH", "1")))
+GW_WINDOW_MS = float(os.environ.get("M25_GW_WINDOW_MS", "40"))
 
 
 class ClientGone(Exception):
@@ -43,17 +50,20 @@ class ClientGone(Exception):
 A = None
 tok = None
 coordinate_pipe = None
+coordinate_pipe_batch = None
 make_drafter = None
+make_drafters_b = None
 SOCKS = {}
 
 
 def _engine_init():
     """Import the M2.5 engine + tokenizer and resolve head/tail endpoints (real mode only)."""
-    global tok, coordinate_pipe, make_drafter
+    global tok, coordinate_pipe, coordinate_pipe_batch, make_drafter, make_drafters_b
     import m25_stage as S
-    from m25_pipe import coordinate_pipe as cp, make_drafter as md
+    from m25_pipe import (coordinate_pipe as cp, coordinate_pipe_batch as cpb,
+                          make_drafter as md, make_drafters_b as mdb)
     from transformers import AutoTokenizer
-    coordinate_pipe = cp; make_drafter = md
+    coordinate_pipe = cp; coordinate_pipe_batch = cpb; make_drafter = md; make_drafters_b = mdb
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 
 
@@ -98,6 +108,124 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
             _drop_socks()
             if attempt == 2:
                 raise
+
+
+# ---------- batched dispatcher: concurrent requests ride ONE ring job ----------
+
+class _Req:
+    __slots__ = ("messages", "tools", "max_new", "reasoning", "on_commit", "event",
+                 "result", "error", "dead")
+
+    def __init__(self, messages, tools, max_new, reasoning, on_commit):
+        self.messages = messages; self.tools = tools; self.max_new = max_new
+        self.reasoning = reasoning; self.on_commit = on_commit
+        self.event = threading.Event(); self.result = None; self.error = None; self.dead = False
+
+
+_QUEUE = []
+_QCOND = threading.Condition()
+
+
+def run_request(messages, tools, max_new, reasoning, on_commit=None, timeout=1800):
+    """The handler-side entry: enqueue and wait. The dispatcher owns the ring; a burst becomes one
+    batched job, a lone request the solo path. MOCK short-circuits (no ring, no queue)."""
+    if MOCK:
+        return _mock_generate(messages, tools, max_new, on_commit, reasoning)
+    rq = _Req(messages, tools, max_new, reasoning, on_commit)
+    with _QCOND:
+        _QUEUE.append(rq); _QCOND.notify()
+    if not rq.event.wait(timeout + 120):
+        rq.dead = True                                  # dispatcher will drop this client's writes
+        raise TimeoutError("gateway dispatch timed out")
+    if rq.error:
+        raise rq.error
+    return rq.result
+
+
+def _stream_cb(rq):
+    """Per-stream commit callback: a dead/stalled CLIENT must never abort its batch-mates — mark the
+    stream dead and let the batch finish (solo keeps its abort-the-job behavior; there the client IS
+    the job)."""
+    if rq.on_commit is None:
+        return None
+    def cb(out, dt):
+        if rq.dead:
+            return
+        try:
+            rq.on_commit(out, dt)
+        except (ClientGone, OSError):
+            rq.dead = True
+    return cb
+
+
+def _run_solo(rq):
+    try:
+        rq.result = generate(rq.messages, rq.tools, rq.max_new, rq.on_commit, reasoning=rq.reasoning)
+    except Exception as e:  # noqa: BLE001 — hand the handler thread whatever happened
+        rq.error = e
+
+
+def _run_batch(reqs):
+    for attempt in (1, 2):
+        try:
+            if "pipe" not in SOCKS or attempt == 2:
+                _connect(1800)
+            drafters = make_drafters_b(len(reqs), A.ngram_n)
+            r = coordinate_pipe_batch(
+                SOCKS["pipe"], tok, [rq.messages for rq in reqs], A.K,
+                [rq.max_new for rq in reqs], 1800, SOCKS["ret"], drafters, depth=A.depth,
+                tools_b=[rq.tools for rq in reqs], prefill_chunk=4096, max_ctx=A.max_ctx,
+                reasoning=[rq.reasoning for rq in reqs], on_commits=[_stream_cb(rq) for rq in reqs])
+            dt = max(r["dt"], 1e-9)
+            for b, rq in enumerate(reqs):
+                s = r["streams"][b]
+                rq.result = {"ok": True, "text": s["text"], "n_tokens": s["n_tokens"],
+                             "prompt_tokens": s["prompt_tokens"], "tok_s": s["n_tokens"] / dt,
+                             "mean_accept": s["g"], "output_ids": s["output_ids"],
+                             "receipts": r.get("receipts"), "receipts_ok": r.get("receipts_ok"),
+                             "batched_B": r["B"]}
+                if rq.dead:
+                    rq.error = ClientGone("client left mid-stream (batch completed without it)")
+            return
+        except Exception as e:  # noqa: BLE001 — one retry with fresh sockets, then report to every caller
+            _drop_socks()
+            if attempt == 2:
+                for rq in reqs:
+                    rq.error = rq.error or e
+
+
+def _dispatcher():
+    """The one ring writer. Pop a burst (first request + whatever lands inside GW_WINDOW_MS, up to
+    GW_BATCH), run it as one job, wake every caller. GW_BATCH=1 (an un-batched ring) degenerates to
+    the exact old serialize-through-a-lock behavior."""
+    while True:
+        with _QCOND:
+            while not _QUEUE:
+                _QCOND.wait()
+        if GW_BATCH > 1:
+            time.sleep(GW_WINDOW_MS / 1000.0)           # let a burst gather
+        with _QCOND:
+            batch = _QUEUE[:GW_BATCH]
+            del _QUEUE[:GW_BATCH]
+        # a caller that timed out waiting marked itself dead — never run its job (solo would hand its
+        # raw callback to generate() and a write to the gone client would abort the ring pass)
+        for rq in [r for r in batch if r.dead]:
+            rq.event.set()
+        batch = [r for r in batch if not r.dead]
+        if not batch:
+            continue
+        try:
+            with RING_LOCK:
+                if len(batch) == 1:
+                    _run_solo(batch[0])
+                else:
+                    _run_batch(batch)
+        except Exception as e:  # noqa: BLE001 — the dispatcher must NEVER die (a dead dispatcher
+            for rq in batch:    # hangs every future request silently); report to the batch instead
+                rq.error = rq.error or e
+        finally:
+            for rq in batch:
+                rq.event.set()
 
 
 def _mock_generate(messages, tools, max_new, on_commit, reasoning=True):
@@ -195,11 +323,12 @@ class H(BaseHTTPRequestHandler):
             reasoning = DEFAULT_REASONING
         cid = f"chatcmpl-{next(_ids)}"; created = int(time.time())
         try:
-            with RING_LOCK:
-                if stream:
-                    self._stream(cid, created, messages, tools, max_new, reasoning)
-                else:
-                    self._complete(cid, created, messages, tools, max_new, reasoning)
+            # no ring lock here: the dispatcher owns the ring; handlers enqueue and wait, so a burst
+            # of concurrent requests rides ONE batched job instead of serializing.
+            if stream:
+                self._stream(cid, created, messages, tools, max_new, reasoning)
+            else:
+                self._complete(cid, created, messages, tools, max_new, reasoning)
         except (BrokenPipeError, ClientGone):
             pass                                          # client is gone — nothing to send, ring already released
         except Exception as e:
@@ -208,7 +337,7 @@ class H(BaseHTTPRequestHandler):
             except Exception: pass
 
     def _complete(self, cid, created, messages, tools, max_new, reasoning=True):
-        r = generate(messages, tools, max_new, on_commit=None, reasoning=reasoning)
+        r = run_request(messages, tools, max_new, reasoning, on_commit=None)
         parsed = parse_completion(r["text"])
         msg, finish = to_openai_message(parsed)
         if not (tools and parsed["tool_calls"]) and finish == "tool_calls":
@@ -248,7 +377,7 @@ class H(BaseHTTPRequestHandler):
             if len(content) > state["c"]:
                 chunk({"content": content[state["c"]:]}); state["c"] = len(content)
 
-        r = generate(messages, tools, max_new, on_commit=on_commit, reasoning=reasoning)
+        r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
         parsed = parse_completion(r["text"])
         # flush any tail not yet streamed (final trimmed text), then tool calls
         _, fcontent = _split_stream(r["text"], reasoning)
@@ -276,6 +405,7 @@ if __name__ == "__main__":
     A = ap.parse_args()
     if not MOCK:
         _engine_init()
+        threading.Thread(target=_dispatcher, daemon=True).start()
     print(f"[m25-gateway] :{A.port}  model={MODEL_ID}  engine={'MOCK' if MOCK else f'head={A.head} tail={A.tail}'}  "
-          f"(OpenAI /v1/chat/completions, single-stream)", flush=True)
+          f"(OpenAI /v1/chat/completions, batch<= {GW_BATCH} window={GW_WINDOW_MS:.0f}ms)", flush=True)
     ThreadingHTTPServer(("0.0.0.0", A.port), H).serve_forever()
