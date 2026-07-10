@@ -1,0 +1,324 @@
+{
+ "what": "Apples-to-apples re-run of the 12-arm batched sweep AFTER the two throughput levers landed (PR #74: batched drafter forward + BatchGraphRunner batched-decode CUDA graphs). Three passes on one 6x5090 EU ring (same shape as batched-sweep-eagle-20260710: light head [0:2] + 5x12L): v1-off = levers-1-only (fp8 wire, batched graphs off), v1-on = full new build (fp8 wire, graphs on), v2-on = the OLD receipt's numerics env (NO fp8 wire, graphs on, kv 4096). Every arm receipt-attested; per-arm graph route ack-verified (the reset_batch graph-arm stamping from the adversarial review).",
+ "date": "2026-07-10",
+ "ring_v1": "6 stages CZ->BG HU IT NO SE-shaped: DK(head,[0:2]) BG[2:14] HU[14:26] IT[26:38] NO[38:50] SE[50:62], M25_EAGLE=1 M25_BATCH=8 kv 8192, M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_FP8_WIRE=1, K=8, max_new 96, receipts ON, SWEEP_GRAPH_ARMS=off,on with untimed per-B graph warmups",
+ "ring_v2": "same ring, head replaced (DK host CUDA/uvm died mid-session -> destroyed; CZ[0:2] replacement), NO fp8 wire (the old receipt's env), kv-maxlen 4096 (frees the tail brim: B=8 graphs then capture cleanly; runtime attention identical - reads are bucket-clamped either way), graphs on",
+ "headline_bcurve": {
+  "old_baseline_20260710": [
+   2.96,
+   3.65,
+   7.7,
+   9.72
+  ],
+  "v2_on_old_env": [
+   7.5,
+   5.67,
+   7.81,
+   11.9
+  ],
+  "v1_on_fp8_build": [
+   18.11,
+   9.64,
+   14.54,
+   15.48
+  ],
+  "note": "B=1/2/4/8 mixed-content agg tok/s. v2-on is the honest old-receipt comparison; v1-on adds fp8 wire (2x payload cut) on top of the levers."
+ },
+ "findings": [
+  "1. CONTENT-g REPRODUCES THE OLD RECEIPT EXACTLY at the old numerics env (v2: summarize 5.80==5.80, tools 3.73==3.73, qa 2.38==2.38, prose 2.16==2.16, mix-B1 2.46==2.46, mix-B8 2.97~=2.95): the model's greedy outputs byte-match the old run, live-validating that the batched drafter forward changed NOTHING about drafting quality or committed content - the pure-wall-clock claim, proven on the ring.",
+  "2. THE DRAFTING TAX IS DEAD. Old mix-B1 round 1158ms -> v2-on 458ms (same env, levers only). v1 lever split at B=4: off 1398ms/round -> on 787ms/round (graphs), and the serial ~0.25s/stream drafting term is gone at every B (B=1 round 212ms on the fp8 build INCLUDING drafting).",
+  "3. WHAT BINDS NOW: WAN PAYLOAD, linear in B. At the old env (bf16 wire) mix-B4 rounds are 1607ms ~= the old 1630ms - the round is transport-payload-bound (EAGLE aux = 3 layers x [B,K+1,H] dominates; levers can't move it). fp8 wire halves it: mix-B4 787ms -> agg 14.54. The 20-agg bar moved from DRAFTING-bound to TRANSPORT-bound.",
+  "4. fp8 WIRE IS A ~2x THROUGHPUT LEVER *AND* A NUMERICS ENV: it shifts greedy content and the measured content-g band (mix 3.55 bf16 -> 2.48 fp8; summarize 5.80 -> 2.03). g_batched must be quoted per wire mode. The operative admission number 2.5 now rests on the fp8 measurement directly (2.48) instead of a drafter-tax discount.",
+  "5. Brim behavior worked as designed: v1 (kv 8192) tail free-VRAM guard refused B=8 capture (1.3GB free < 1.5GB estimate) -> 5/6-graphed arm, honestly counted in graph_arm; v2 (kv 4096) zero capture failures, B=8 fully graphed.",
+  "6. qa-B4 in v2 stalled (4.9s/round, receipts still valid) - a WAN-leg outlier on big bf16 frames, footnoted NOT averaged; the same content ran 18.05 agg on the fp8 build. mix-B4-hybrid v1-on row lost with the dead DK box (duplicate-content arm of mix-B4).",
+  "7. All arms across all three passes: receipts_ok true (6 stages signed, nonce-fresh, fail-closed)."
+ ],
+ "bar_verdict": "mix-B4 >= 25 / mix-B8 >= 50 NOT met. Best measured: B4 14.54, B8 15.48 (fp8 build). Honest decomposition: at B=4 fp8 the 787ms round is ~200ms ring floor + ~450ms payload+coordinator + <150ms drafting; the remaining lever class is transport (aux slimming, depth>1 overlap), not compute.",
+ "next_levers_quantified": [
+  "1. AUX SLIMMING (lossless, biggest): the tail computes the argmax rows, so it can slice the returned aux to each stream's ACCEPTED prefix +1 instead of all K+1 positions (the coordinator only extend()s committed positions) -> ~2-3x cut of the dominant payload at typical g.",
+  "2. fp8 wire as the standard batched env (2x payload) - already built; quote g_batched per wire mode.",
+  "3. Depth>1 stale-context EAGLE: drafting is now cheap enough that pipelining rounds again hides WAN (was pointless when drafting serialized).",
+  "4. B=8 full graphs need kv<=4096 on 32GB tails (or 48GB tails)."
+ ],
+ "spec_impact": "Operative g_batched stays 2.5 but re-derived: measured fp8-wire content-mix g = 2.48 (band 1.9-3.5); bf16-wire g = 3.55 (band 2.2-5.8, == old receipt). The drafter-serialization discount no longer applies (tax removed).",
+ "rows_v1": "see rows_v1 array; passes tagged by graph_arm.graph (false=lever-1-only, true=full build)",
+ "rows_v1_data_file": "recovered from the session monitor (23/24 rows); raw JSON rows follow",
+ "rows": {
+  "v1": [
+   {
+    "arm": "mix-B1",
+    "pass": "off",
+    "agg": 5.7,
+    "g": 3.0,
+    "rounds": 25,
+    "dt": 16.83
+   },
+   {
+    "arm": "mix-B2",
+    "pass": "off",
+    "agg": 5.68,
+    "g": 2.37,
+    "rounds": 31,
+    "dt": 33.98
+   },
+   {
+    "arm": "mix-B4",
+    "pass": "off",
+    "agg": 8.18,
+    "g": 2.48,
+    "rounds": 34,
+    "dt": 47.54
+   },
+   {
+    "arm": "mix-B8",
+    "pass": "off",
+    "agg": 9.13,
+    "g": 2.68,
+    "rounds": 35,
+    "dt": 84.91
+   },
+   {
+    "arm": "code-B4",
+    "pass": "off",
+    "agg": 11.8,
+    "g": 3.48,
+    "rounds": 23,
+    "dt": 33.55
+   },
+   {
+    "arm": "prose-B4",
+    "pass": "off",
+    "agg": 7.02,
+    "g": 1.94,
+    "rounds": 33,
+    "dt": 54.74
+   },
+   {
+    "arm": "reasoning-B4",
+    "pass": "off",
+    "agg": 8.54,
+    "g": 2.38,
+    "rounds": 29,
+    "dt": 46.38
+   },
+   {
+    "arm": "summarize-B4",
+    "pass": "off",
+    "agg": 7.16,
+    "g": 2.03,
+    "rounds": 33,
+    "dt": 55.87
+   },
+   {
+    "arm": "tools-B4",
+    "pass": "off",
+    "agg": 10.37,
+    "g": 3.54,
+    "rounds": 22,
+    "dt": 37.03
+   },
+   {
+    "arm": "qa-B4",
+    "pass": "off",
+    "agg": 9.55,
+    "g": 2.81,
+    "rounds": 26,
+    "dt": 40.61
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "pass": "off",
+    "agg": 3.35,
+    "g": 0.03,
+    "rounds": 380,
+    "dt": 114.63
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "pass": "off",
+    "agg": 7.42,
+    "g": 2.48,
+    "rounds": 34,
+    "dt": 52.45
+   },
+   {
+    "arm": "mix-B1",
+    "pass": "on",
+    "agg": 18.11,
+    "g": 3.0,
+    "rounds": 25,
+    "dt": 5.3
+   },
+   {
+    "arm": "mix-B2",
+    "pass": "on",
+    "agg": 9.64,
+    "g": 2.37,
+    "rounds": 31,
+    "dt": 20.02
+   },
+   {
+    "arm": "mix-B4",
+    "pass": "on",
+    "agg": 14.54,
+    "g": 2.48,
+    "rounds": 34,
+    "dt": 26.76
+   },
+   {
+    "arm": "mix-B8",
+    "pass": "on",
+    "agg": 15.48,
+    "g": 2.68,
+    "rounds": 35,
+    "dt": 50.07,
+    "note": "tail eager (B8 capture refused by VRAM guard at kv 8192): 5/6-graphed"
+   },
+   {
+    "arm": "code-B4",
+    "pass": "on",
+    "agg": 16.1,
+    "g": 3.48,
+    "rounds": 23,
+    "dt": 24.6
+   },
+   {
+    "arm": "prose-B4",
+    "pass": "on",
+    "agg": 12.3,
+    "g": 1.94,
+    "rounds": 33,
+    "dt": 31.21
+   },
+   {
+    "arm": "reasoning-B4",
+    "pass": "on",
+    "agg": 8.74,
+    "g": 2.38,
+    "rounds": 29,
+    "dt": 45.29
+   },
+   {
+    "arm": "summarize-B4",
+    "pass": "on",
+    "agg": 9.42,
+    "g": 2.03,
+    "rounds": 33,
+    "dt": 42.46
+   },
+   {
+    "arm": "tools-B4",
+    "pass": "on",
+    "agg": 18.62,
+    "g": 3.54,
+    "rounds": 22,
+    "dt": 20.62
+   },
+   {
+    "arm": "qa-B4",
+    "pass": "on",
+    "agg": 18.05,
+    "g": 2.81,
+    "rounds": 26,
+    "dt": 21.49
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "pass": "on",
+    "agg": 4.18,
+    "g": 0.03,
+    "rounds": 380,
+    "dt": 91.93
+   }
+  ],
+  "v2_on_old_env": [
+   {
+    "arm": "mix-B1",
+    "agg": 7.5,
+    "g": 2.46,
+    "rounds": 28,
+    "dt": 12.81
+   },
+   {
+    "arm": "mix-B2",
+    "agg": 5.67,
+    "g": 2.32,
+    "rounds": 34,
+    "dt": 35.07
+   },
+   {
+    "arm": "mix-B4",
+    "agg": 7.81,
+    "g": 3.55,
+    "rounds": 31,
+    "dt": 49.83
+   },
+   {
+    "arm": "mix-B8",
+    "agg": 11.9,
+    "g": 2.97,
+    "rounds": 36,
+    "dt": 66.48
+   },
+   {
+    "arm": "code-B4",
+    "agg": 13.09,
+    "g": 2.81,
+    "rounds": 26,
+    "dt": 29.63
+   },
+   {
+    "arm": "prose-B4",
+    "agg": 10.11,
+    "g": 2.16,
+    "rounds": 31,
+    "dt": 37.98
+   },
+   {
+    "arm": "reasoning-B4",
+    "agg": 12.15,
+    "g": 3.44,
+    "rounds": 23,
+    "dt": 32.58
+   },
+   {
+    "arm": "summarize-B4",
+    "agg": 16.86,
+    "g": 5.8,
+    "rounds": 15,
+    "dt": 23.02
+   },
+   {
+    "arm": "tools-B4",
+    "agg": 13.51,
+    "g": 3.73,
+    "rounds": 22,
+    "dt": 29.91
+   },
+   {
+    "arm": "qa-B4",
+    "agg": 2.69,
+    "g": 2.38,
+    "rounds": 29,
+    "dt": 144.12,
+    "note": "WAN-leg stall outlier (4.9s/round), receipts valid; footnoted not averaged"
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "agg": 6.42,
+    "g": 0.22,
+    "rounds": 380,
+    "dt": 60.25,
+    "note": "133ms/round graphed floor vs old 220ms eager floor"
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "agg": 9.42,
+    "g": 3.55,
+    "rounds": 31,
+    "dt": 41.28
+   }
+  ]
+ },
+ "ops_notes": "Session ops: 3 HF pull stalls (xet hang) fixed by kill+resume kick cycles; DK head host CUDA/uvm died on stage relaunch (reboot + stop/start did not recover -> destroyed, CZ replacement head bootstrapped in ~6min); one zombie instance from rent_pool caught at teardown. instances-v1==0 verified at session end."
+}
