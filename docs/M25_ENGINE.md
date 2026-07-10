@@ -13,6 +13,55 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-10 (later) — THE DRAFTING TAX IS DEAD (PR #74): batched drafter forward + batched-stage CUDA graphs, live-proven
+The two ranked levers landed, adversarially reviewed pre-ring, and re-swept apples-to-apples
+(receipt **batched-levers-sweep-20260710**). Merged **#74 #75 #76**. Ring up+down same session
+(6×5090 EU, one head replaced mid-session); leyten topped the vast balance +$100.
+
+**1. BATCHED DRAFTER FORWARD (the big lever, coordinator-side).** `eagle_draft.draft_batch` runs the
+B EAGLE fork chains as ONE [B,...] forward per chain step (linears/norms/argmax batch rowwise;
+attention stays per-fork over its own ragged context; 2 host syncs × K × B collapse to one
+`.tolist()`); `fetch_b` = the batched HybridDrafter fetch (n-gram per stream, misses in one chain),
+driven from `coordinate_pipe_batch`'s fill loop. **Byte-identical to serial per row** — CPU gate
+(research/m25_draft_batch_test.py), e2e fake-ring gate (research/m25_batch_eagle_test.py), and
+LIVE-validated: at the old numerics env the re-sweep reproduced the prior receipt's content-g
+token-exact (summarize 5.80==5.80, tools 3.73==3.73...). Solo path untouched.
+
+**2. BATCHED-STAGE CUDA GRAPHS.** `BatchGraphRunner` (m25_stage.py) captures `run_block_decode_b` at
+the job-fixed [B,K+1] shape, one graph per context bucket — solo's _GraphState design batched (static
+cp/RoPE/per-stream-mask buffers refreshed per replay; aux copy captured in-graph, [B,s,H] statics).
+Routed via `_block_b`; `M25_BATCH_GRAPH=0` = per-lever hatch (in scatter_pipe ENG_ENV). The
+adversarial review (3 skeptics; no wrong-output path found) flipped two MAJORs pre-ring: (a) batched
+jobs silently inherited the last SOLO job's runtime graph arm → `reset_batch` now applies
+`_reset_flags`, tail acks the APPLIED route+counters when stamped (M25_GRAPH_JOB), coordinator raises
+on refusal + surfaces `graph_arm` per job; (b) capture-at-zero-headroom could pin a pool that OOMs
+the next eager prefill (dead stage) → free-VRAM pre-check, short → LOUD permanent-eager. Live: the
+guard refused B=8 capture on the kv-8192 brim tail exactly as designed; at kv 4096 all captures clean.
+
+**3. THE RE-SWEEP (3 passes, same 12 arms/prompts/K/max_new, all receipts valid).** B-curve
+2.96/3.65/7.70/9.72 → **7.50/5.67/7.81/11.90** at the old env (bf16 wire) → **18.11/9.64/14.54/15.48**
+on the fp8-wire build. B=1 rounds 1158→458ms at equal env (the tax gone); v1 off→on isolates graphs
+(B4 1398→787ms rounds). **THE BAR (mix-B4 ≥25 / B8 ≥50) NOT met — the round is now TRANSPORT-bound:**
+EAGLE aux (3 × [B,K+1,H]) ∝ B dominates; at bf16 wire B4 rounds stay ~1600ms (payload), fp8 halves it.
+**fp8 wire = 2× lever AND a numerics env** — it shifts greedy content: g_mix 3.55 bf16 vs 2.48 fp8
+(quote g per wire mode). qa-B4 v2 arm = WAN-stall outlier (footnoted, receipts valid).
+
+**4. Spec:** ADMISSION_SPEC g_batched operative stays **2.5** but re-derived (= the direct fp8-wire
+measurement, no drafter-tax discount). Ops lessons: HF xet pulls stall (kill+resume kick-cycle);
+`pkill -f` self-match struck AGAIN via a heredoc body carrying the pattern (split kill/launch into
+separate ssh calls); a vast host with wedged nvidia-uvm survives reboot+stop/start → destroy+replace.
+
+**NEXT SESSION (ranked, transport-bound era):**
+1. **AUX SLIMMING (lossless, biggest):** the tail knows each stream's accepted prefix — return aux
+   sliced to accepted+1 positions instead of all K+1 → ~2-3× cut of the dominant batched payload.
+2. **fp8 wire as the standard batched env** (already built; 2× payload) + bank the g-per-wire-mode
+   bands in SPEC_V0.
+3. **Depth>1 stale-context EAGLE A/B:** drafting is cheap now, so round pipelining hides WAN again
+   (was pointless while drafting serialized). Quality-not-correctness tradeoff — A/B on-ring.
+4. Then: MlxRuntime → probe fidelity leftovers → market iff c0mpute #16.
+
+**RING: none live** (instances-v1==0 verified). c0mpute WIP untouched.
+
 ### ⇒ 2026-07-10 — FULL DRAFTER IN THE BATCHED PATH (PR #72) + batching = the STANDARD path + the 12-arm use-case sweep
 leyten's call executed end-to-end: wire the full drafting stack into the batcher, make batching the
 engine standard, sweep B × real AI use cases. Merged **#71 #72**. Ring up+down same session
