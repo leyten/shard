@@ -901,7 +901,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     t_recv = 0.0; t_pf = time.time(); receipts = []
     eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
     if eagle_on:
-        from eagle_draft import prefill_pair_tokens
+        from eagle_draft import prefill_pair_tokens, fetch_b
         for d in drafters:
             d.reset()                                    # fresh per-stream EAGLE context per job
     job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
@@ -943,10 +943,17 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         while not all(done) or inflight:
             while len(inflight) < cur_depth and not all(done):  # fill the in-flight window (speculative per stream)
                 tids = []; row = []; sb = []
+                # ONE batched drafter pass per fill (eagle_draft.fetch_b): n-gram per stream (free), all
+                # EAGLE misses as a single [n,...] chain forward. The per-b serial fetch() loop was the
+                # measured drafting tax (~0.25s/stream/round at B=4 — the round went DRAFTING-bound);
+                # each row stays byte-identical to drafters[b].fetch() (research/m25_draft_batch_test.py).
+                if eagle_on:
+                    act = [b for b in range(B) if not done[b]]
+                    ds_act = dict(zip(act, fetch_b([drafters[b] for b in act])))
                 for b in range(B):
                     if done[b]:
                         tids.append([cur[b]] * (K + 1)); row.append(None); sb.append(pos[b]); continue
-                    ds = drafters[b].fetch()
+                    ds = ds_act[b] if eagle_on else drafters[b].fetch()
                     tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
                     dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
                 kw.send({"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
