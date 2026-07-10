@@ -69,6 +69,11 @@ M25_FP8_AUX = bool(int(os.environ.get("M25_FP8_AUX", "1" if M25_FP8_WIRE else "0
 M25_GRAPH_JOB = os.environ.get("M25_GRAPH_JOB")
 if M25_GRAPH_JOB is not None:
     M25_GRAPH_JOB = M25_GRAPH_JOB.strip().lower() in ("1", "true", "yes", "on")   # explicit truthy set: "no"/"off"/"0" = False
+# Batched-decode graph route (M25_BATCH_GRAPH=0 = escape hatch): with graphs ACTIVE, verify_batch
+# blocks go through a BatchGraphRunner (batched stages ran EAGER — the measured ~220ms B=4 ring+eager
+# round floor). 0 pins batched decode eager WITHOUT touching the solo graph route, so a batched-graph
+# regression can be isolated per-launch on a warm ring (the M25_EAGER-style per-lever hatch).
+M25_BATCH_GRAPH = os.environ.get("M25_BATCH_GRAPH", "1") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -1076,6 +1081,29 @@ def _block(grs, layers, start, x, vcfg):
     return S.run_block(layers, start, x, vcfg)
 
 
+def _block_b(grs_b, layers, starts, x, vcfg):
+    """run_block_decode_b's analog of _block: route the fixed-shape [B,K+1] verify_batch block through
+    a lazily captured BatchGraphRunner when the graph route is ACTIVE (same runtime toggle as solo,
+    plus the M25_BATCH_GRAPH escape hatch). `starts` is the HOST list off the wire — the runner's
+    bounds check + static-buffer refresh must never touch a device tensor (sync). One runner per
+    (B, s) shape; each of its buckets is ONE captured graph against the process-wide S.M25_GRAPH_MAX
+    budget, with the same over-budget/failed-capture eager fallback semantics as _block."""
+    if S.M25_CUDA_GRAPH_ACTIVE and M25_BATCH_GRAPH and x.shape[1] <= 64 and S.M25_BATCH > 1:
+        B, s = x.shape[0], x.shape[1]
+        gr = grs_b.get((B, s))
+        if gr is None:
+            grs_b[(B, s)] = gr = S.BatchGraphRunner(layers, vcfg, B, s)
+        alen = gr._bucket(max(starts) + s)
+        if alen in gr.graphs or S._GRAPH_COUNT < S.M25_GRAPH_MAX:
+            return gr.run(starts, x)                # replay, or capture within budget (OOM-safe in run())
+        S._GRAPH_SKIPPED += 1                       # budget spent: new (B,s,bucket) shapes run eager
+        if (B, s, alen) not in _GRAPH_CAP_LOGGED:
+            _GRAPH_CAP_LOGGED.add((B, s, alen))
+            print(f"[graph] cap: B={B} s={s} bucket={alen} -> eager "
+                  f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
+    return S.run_block_decode_b(layers, torch.as_tensor(starts, dtype=torch.long, device=dev), x, vcfg)
+
+
 def _reset_flags(msg):
     """Stage-side per-job flags off a reset frame, applied BEFORE the reset is ack'd/propagated:
     'graph' flips the runtime CUDA-graph route (S.set_graph — refused loudly, 'GRAPH REFUSED' in the
@@ -1199,6 +1227,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     layers = parts["layers"]
     vcfg = S._CTX[1]
     graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
+    graph_runners_b = {}                              # batched-decode graph cache, keyed (B, s) — same lifetime
     def _dial_fwd():
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
@@ -1365,7 +1394,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             _ret_send("ok"); continue
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             x = msg["h"].to(dev)
-                            h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), x, vcfg)
+                            h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
                             if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                 signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                             toks = _tail_logits(h, parts).argmax(-1).tolist()
@@ -1474,7 +1503,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         else:
                             h = msg["h"].to(dev)
                         x = h
-                        h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
+                        h = _block_b(graph_runners_b, layers, msg["start_b"], h, vcfg)
                         if RECEIPTS and signer is not None:     # attest batched rounds like solo
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
