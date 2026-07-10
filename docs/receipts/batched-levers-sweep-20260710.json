@@ -35,7 +35,7 @@
  ],
  "bar_verdict": "mix-B4 >= 25 / mix-B8 >= 50 NOT met. Best measured: B4 14.54, B8 15.48 (fp8 build). Honest decomposition: at B=4 fp8 the 787ms round is ~200ms ring floor + ~450ms payload+coordinator + <150ms drafting; the remaining lever class is transport (aux slimming, depth>1 overlap), not compute.",
  "next_levers_quantified": [
-  "1. AUX SLIMMING (lossless, biggest): the tail computes the argmax rows, so it can slice the returned aux to each stream's ACCEPTED prefix +1 instead of all K+1 positions (the coordinator only extend()s committed positions) -> ~2-3x cut of the dominant payload at typical g.",
+  "1. AUX SLIMMING (lossless): the head forwards the drafted rows ('tids') so the TAIL can slice the returned aux to each stream's ACCEPTED prefix +1 (the coordinator only extend()s committed positions). HONEST leg math: this trims the RETURN leg's 3 aux layers (~60% cut at typical g) ~= 10-15% of round bytes, NOT the 2-3x first estimated. The BIGGER prize in the same analysis: L1's aux is produced by the head stage ON THE COORDINATOR'S OWN BOX yet rides 6 WAN legs (aux-layer-legs at this shape: L1=6, L30=3, L58=1 vs activations=6) - delivering it head-locally would cut ~60% of aux bytes-on-wire (~35-40% of round bytes at B=4 bf16). Design-panelled; the protocol seam is the follow-up.",
   "2. fp8 wire as the standard batched env (2x payload) - already built; quote g_batched per wire mode.",
   "3. Depth>1 stale-context EAGLE: drafting is now cheap enough that pipelining rounds again hides WAN (was pointless when drafting serialized).",
   "4. B=8 full graphs need kv<=4096 on 32GB tails (or 48GB tails)."
