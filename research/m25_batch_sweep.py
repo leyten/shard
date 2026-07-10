@@ -101,6 +101,7 @@ def run_arm(name, prompts, kind):
         "receipts": len(r.get("receipts") or []), "receipts_ok": r.get("receipts_ok"),
         "graph_arm": r.get("graph_arm"),                # the tail's APPLIED route + counters (M25_GRAPH_JOB
                                                         # stamped jobs) — an arm must never lie about its route
+        "aux_local": r.get("aux_local"),                # armed head-local lane vs ridden-ring aux (never conflate)
         "per_stream": [{"tok_s": round(s["n_tokens"] / max(r["dt"], 1e-9), 2), "g": s["g"],
                         "n": s["n_tokens"]} for s in r["streams"]],
         "g_mean": round(sum(s["g"] for s in r["streams"]) / len(r["streams"]), 3),
