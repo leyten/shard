@@ -57,8 +57,11 @@ SPEC_V0 = {
     "bar_batched_agg_tok_s": 20.0,   # aggregate bar for a batched ring
     "batch_B": 4,                    # proven batch width (the 155 tok/s agg receipt ran B=4)
     "g_interactive": 4.0,            # accepted tokens/traversal, EAGLE+n-gram (measured 3.3-4.5)
-    "g_batched": 1.5,                # content-mix estimate: measured floor g≈1 on undraftable output
-                                     # (B=4 agg 11.95 live), ~4 on draftable — batched jobs skew novel
+    "g_batched": 2.5,                # MEASURED 2026-07-10 (full drafting stack in batch, 12-arm sweep):
+                                     # content-mix g = 3.6 (band 2.2 prose .. 5.8 summarize), discounted
+                                     # to 2.5 operative for the current drafter-serialization tax
+                                     # (B EAGLE chains run serially coordinator-side; revise up when the
+                                     # batched drafter forward lands — receipt batched-sweep-eagle)
     "c_base_ms": 46.0,               # measured all-5090 total compute over 62 layers (mixed ~56)
     "uplink_interactive_mbps": 200.0,  # 16k prefill = 50 MB/hop; 15 Mbps residential -> 160 s TTFT
     "uplink_batched_mbps": 100.0,

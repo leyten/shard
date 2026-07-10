@@ -1,0 +1,32 @@
+{
+  "what": "Full batched sweep with the COMPLETE drafting stack (hybrid n-gram->EAGLE per stream, PR #72): B x AI-use-case x drafting-arm on a live 6x5090 EU ring. Sets g_batched from measurement (replaces the counting-prompt floor) and quantifies the batched throughput levers.",
+  "date": "2026-07-10",
+  "ring": "6 stages HU(head,[0:2]) HU[2:14] IT[14:26] DE[26:38] DK[38:50] HR[50:62], measured-footprint plan (12L/box cap), M25_EAGLE=1 M25_BATCH=8 kv 8192, graph-aux on (solo path), batched decode EAGER (no graph on run_block_decode_b yet), K=8, max_new 96, receipts ON",
+  "results": [
+    {"arm": "mix-B1",        "B": 1, "drafting": "hybrid", "agg": 2.96,  "g": 2.46, "ms_round": 1158},
+    {"arm": "mix-B2",        "B": 2, "drafting": "hybrid", "agg": 3.65,  "g": 2.27, "ms_round": 1557},
+    {"arm": "mix-B4",        "B": 4, "drafting": "hybrid", "agg": 7.70,  "g": 3.62, "ms_round": 1630},
+    {"arm": "mix-B8",        "B": 8, "drafting": "hybrid", "agg": 9.72,  "g": 2.95, "ms_round": 2261},
+    {"arm": "code-B4",       "B": 4, "drafting": "hybrid", "agg": 8.46,  "g": 2.85, "ms_round": 1764},
+    {"arm": "prose-B4",      "B": 4, "drafting": "hybrid", "agg": 7.42,  "g": 2.16, "ms_round": 1670},
+    {"arm": "reasoning-B4",  "B": 4, "drafting": "hybrid", "agg": 10.75, "g": 3.68, "ms_round": 1674},
+    {"arm": "summarize-B4",  "B": 4, "drafting": "hybrid", "agg": 16.07, "g": 5.80, "ms_round": 1609},
+    {"arm": "tools-B4",      "B": 4, "drafting": "hybrid", "agg": 11.28, "g": 3.73, "ms_round": 1629},
+    {"arm": "qa-B4",         "B": 4, "drafting": "hybrid", "agg": 6.63,  "g": 2.38, "ms_round": 2019},
+    {"arm": "mix-B4-ngram",  "B": 4, "drafting": "ngram",  "agg": 4.62,  "g": 0.22, "ms_round": 220, "note": "depth-4 pipelined; the equal-transport A/B baseline"},
+    {"arm": "mix-B4-hybrid", "B": 4, "drafting": "hybrid", "agg": 7.41,  "g": 3.62, "ms_round": 1693}
+  ],
+  "headlines": {
+    "eagle_g_transfers_to_batch": "mixed-content g = 3.6 at B=4 (solo EAGLE band is 3.3-4.5). The A/B at equal transport: n-gram g=0.22 vs hybrid g=3.62 — a 16x drafting-quality lift; aggregate 4.62 -> 7.41 (1.6x).",
+    "g_by_use_case": "summarize 5.8 (verbatim-quote content: n-gram+EAGLE stack) > tools-JSON 3.7 ~ reasoning 3.7 > code 2.9 > qa 2.4 > prose 2.2. The real-workload band is 2.2-5.8, mix ~3.6.",
+    "the_cost_that_caps_it": "hybrid rounds run ~1.6-2.3s vs the ring's 220ms (the ngram arm at equal transport): the coordinator drafts B EAGLE chains SERIALLY (~250-360ms/stream on the shared head GPU) and EAGLE pins the in-flight window to 1. Batching amortizes the ring but re-pays the drafter: B-scaling 2.96 -> 9.72 (3.3x at B=8, not 8x).",
+    "receipts": "72/72 per-stage signatures VALID across all 12 batched jobs (the PR #72 attestation fix live-proven); coherent output on every sampled stream."
+  },
+  "next_levers_quantified": [
+    "1. BATCH the B drafter chains into one [B,...] forward (same weights, per-stream KV — embarrassingly batchable): removes the ~250ms x B serial term; projected mixed B=8 agg ~3x today's.",
+    "2. CUDA-graph the drafter chain steps (8 serial launch-bound micro-steps/stream today).",
+    "3. Graph-capture run_block_decode_b (batched stages run eager; the ngram arm's 220ms round shows ring+eager floor).",
+    "4. Investigate depth>1 with stale-context EAGLE (quality-vs-pipelining tradeoff; today mirrors solo's depth-1 rule)."
+  ],
+  "spec_impact": "g_batched(content, hybrid) = 3.6 measured (band 2.2-5.8). OPERATIVE admission number set to 2.5: the measured content g discounted for the current drafter-serialization tax; revise up as levers 1-3 land. The 20-agg bar on THIS engine build is drafting-bound, not WAN-bound — an engine-lever problem, not an admission-physics one."
+}

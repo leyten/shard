@@ -113,14 +113,19 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
   models** (a 30-40 B NVFP4 fits meaningfully in 4 layers). The capability function, parameterized per
   model, sends every card to where it adds value. That is the self-organizing multi-model network — the
   real heterogeneity play, not "make every card serve M2.5."
-- **Batched viability is g-DEPENDENT and pool-relative (measured 2026-07-09).** Live 5-stage EU ring,
-  B=1/2/4 = 5.19/8.63/**11.95 agg** with clean scaling (1.66×/2.30×) and the DATA-ISOLATION gate PASSING
-  (stream outputs independent of batch-mates — what makes batched serving verifiable). BUT that run was
-  n-gram-undraftable content (g≈1, the floor): the earlier ~36-155 agg numbers are DRAFTABLE-content
-  (g≈4) figures. At the g=1 floor, clearing 20 agg needs **B≈8 on a tight pool**, not B=4 — the
-  batched-filler bar must be evaluated at a content-mix g (v0.1 uses g_batched≈1.5, revisable), and the
-  live probe verdict for a 24 GB card 72 ms from its pool was VERIFIER, correctly: batched inclusion is
-  pool-relative, not a birthright.
+- **Batched viability is g-DEPENDENT and pool-relative (measured 2026-07-09, REVISED 2026-07-10 with
+  the full drafting stack in the batched path).** The 12-arm live sweep (6×5090 ring, hybrid
+  n-gram→EAGLE per stream, receipt batched-sweep-eagle-20260710): **content-mix g = 3.6** (band: prose
+  2.2, qa 2.4, code 2.9, reasoning 3.7, tools-JSON 3.7, summarize/verbatim 5.8) — the 16× lift over the
+  n-gram-only floor (g 0.22 at equal transport) proves drafting quality transfers to batch. The
+  DATA-ISOLATION gate passes and every batched round is receipt-attested (72/72 sigs valid).
+  **Operative g_batched = 2.5**: the measured 3.6 discounted for the CURRENT engine's
+  drafter-serialization tax (B EAGLE chains run serially coordinator-side, ~0.25 s/stream/round, and
+  EAGLE pins the in-flight window to 1 — B-scaling measured 3.3× at B=8, not 8×). On this engine build
+  the 20-agg bar is DRAFTING-bound, not WAN-bound: the unlock is engine work (batch the drafter
+  forward, graph the drafter chain, graph the batched stage path), not admission policy. Revise
+  g_batched up as those land. Pool-relativity stands: the live probe verdict for a 24 GB card 72 ms
+  from its pool was VERIFIER, correctly.
 
 ## The bar is a ROLE TAG, not a binary gate
 

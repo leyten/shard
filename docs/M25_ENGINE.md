@@ -13,6 +13,48 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-10 — FULL DRAFTER IN THE BATCHED PATH (PR #72) + batching = the STANDARD path + the 12-arm use-case sweep
+leyten's call executed end-to-end: wire the full drafting stack into the batcher, make batching the
+engine standard, sweep B × real AI use cases. Merged **#71 #72**. Ring up+down same session
+(6×5090, measured-footprint 12L plan, ~$4.4); **balance ~$16.9**.
+
+**1. EAGLE-IN-BATCH BUILT (PR #72, adversarially reviewed pre-ring).** `coordinate_pipe_batch` now runs
+the solo stack PER STREAM: hybrid n-gram→EAGLE via `EagleDrafter.fork()` (shared read-only head, own
+context), per-stream aux `[B,s,H]` w/ per-STREAM fp8 scales, solo's depth rule + bonus-commit,
+per-stream g/streaming/tools/reasoning/max_new, receipt sweep + verify (fail-closed). Stages attest
+batched rounds (they did NOT before — and `reset_batch` now makes a FRESH nonce'd signer; the review
+caught a stale SOLO signer bleeding valid-looking receipts into batched jobs). Also from the review:
+batched coordinator no longer inherits solo's 20s rx deadline on a reused socket; EAGLE-with-no-aux
+fails LOUD (was: silent worse-than-ngram paid measurement); B > ring M25_BATCH nacks cleanly (was:
+stage-process death). Offline batched==solo byte-identity gate REVIVED (stubs dead since da9f11d) and
+green. Gateway: batching is the STANDARD concurrency path — dispatcher collects a burst
+(M25_GW_WINDOW_MS, cap M25_GW_BATCH ≤ ring M25_BATCH) into ONE ring job; lone request = unchanged solo
+path; dead client never aborts batch-mates. `--serve` hands the ring's batch width to the gateway.
+
+**2. THE SWEEP (12 arms live, receipt batched-sweep-eagle-20260710): drafting quality TRANSFERS;
+throughput is now DRAFTER-bound.** Content-mix **g = 3.6 at B=4** (solo band!), per use case:
+summarize/verbatim **5.8** > tools-JSON 3.7 ≈ reasoning 3.7 > code 2.9 > qa 2.4 > prose 2.2. The
+equal-transport A/B: n-gram g=0.22 @220ms rounds vs hybrid g=3.62 @1.7s rounds — a **16× drafting
+lift** but only 1.6× aggregate (4.62→7.41), because the coordinator drafts B EAGLE chains SERIALLY
+(~0.25s/stream/round) and EAGLE pins depth to 1. B-curve: 2.96/3.65/7.70/**9.72** (B=1/2/4/8; 3.3× at
+B=8). Best arm: summarize-B4 **16.07 agg**. 72/72 receipt sigs valid across all batched jobs; coherent
+output everywhere. **The 20-agg bar on this build is DRAFTING-bound, not WAN-bound.**
+
+**3. Spec revised from measurement:** `g_batched` 1.5 → **2.5 operative** (measured content 3.6
+discounted for the drafter tax; ADMISSION_SPEC.md updated with the full content band + the engine-not-
+policy framing).
+
+**NEXT SESSION (the quantified throughput levers, in order):**
+1. **Batch the drafter forward**: run the B EAGLE chains as ONE [B,...] forward (same weights,
+   per-stream KV rows — embarrassingly batchable). Kills the ~0.25s×B serial term; projected mixed
+   B=8 agg ~3× today's. The single biggest lever, coordinator-side only.
+2. **CUDA-graph the drafter chain** (8 launch-bound micro-steps/stream today) and/or
+   **graph-capture `run_block_decode_b`** (batched stages run eager; ring+eager floor measured 220ms).
+3. **Depth>1 with stale-context EAGLE** A/B (pipelining vs draft-quality tradeoff).
+4. Then the deferred: MlxRuntime → probe fidelity leftovers → market iff c0mpute #16.
+
+**RING: none live** (verified 0). c0mpute WIP untouched.
+
 ### ⇒ 2026-07-09 (later) — ADMISSION MECHANISM BUILT+LIVE-PROVEN, on-ring TORRENT LOOP CLOSED, numbers v0→MEASURED
 All three live milestones landed in one session, and the measurements REVISED the spec (the LIVING-doc
 loop working as designed). Merged: shard **#65 #66 #67 #68 #69** + c0mpute **#19**. Ring torn down
