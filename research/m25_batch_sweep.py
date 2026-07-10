@@ -75,6 +75,20 @@ def make_drafters(B, kind):
     return P.make_drafters_b(B)                        # honors M25_EAGLE (must be 1 for hybrid arms)
 
 
+def warmup():
+    """Untimed job per B shape BEFORE the timed arms: the first verify_batch of each (B, s) lazily
+    CAPTURES the batched CUDA graphs on every stage (seconds, serialized along the ring) — inside a
+    timed arm that pollutes the B-curve, worst at B=1. Runners persist across jobs on the warm
+    stages, so one throwaway job per B pays the whole capture bill off the clock. SWEEP_WARMUP=0
+    skips (e.g. a deliberately-eager M25_BATCH_GRAPH=0 pass has nothing to capture)."""
+    for B in (1, 2, 4, 8):
+        prompts = list(itertools.islice(itertools.cycle(MIX), B))
+        msgs = [[{"role": "user", "content": p}] for p in prompts]
+        r = P.coordinate_pipe_batch(pipe, tok, msgs, K, 8, 600, ret, make_drafters(B, "hybrid"),
+                                    prefill_chunk=512, max_ctx=8192)
+        print(f"[warmup] B={B} rounds={r['rounds']} graph_arm={r.get('graph_arm')}", flush=True)
+
+
 def run_arm(name, prompts, kind):
     drafters = make_drafters(len(prompts), kind)
     msgs = [[{"role": "user", "content": p}] for p in prompts]
@@ -84,7 +98,9 @@ def run_arm(name, prompts, kind):
         "arm": name, "B": len(prompts), "drafting": kind, "eagle": r["eagle"],
         "agg_tok_s": round(r["agg_tok_s"], 2), "rounds": r["rounds"], "depth": r["depth"],
         "wasted": r["wasted"], "dt": round(r["dt"], 2), "prefill_s": round(r["prefill_s"], 2),
-        "receipts": len(r.get("receipts") or []),
+        "receipts": len(r.get("receipts") or []), "receipts_ok": r.get("receipts_ok"),
+        "graph_arm": r.get("graph_arm"),                # the tail's APPLIED route + counters (M25_GRAPH_JOB
+                                                        # stamped jobs) — an arm must never lie about its route
         "per_stream": [{"tok_s": round(s["n_tokens"] / max(r["dt"], 1e-9), 2), "g": s["g"],
                         "n": s["n_tokens"]} for s in r["streams"]],
         "g_mean": round(sum(s["g"] for s in r["streams"]) / len(r["streams"]), 3),
@@ -96,6 +112,8 @@ def run_arm(name, prompts, kind):
 
 
 print(f"=== SWEEP: K={K} max_new={MAX_NEW} eagle_dir={EAGLE_DIR} M25_EAGLE={S.M25_EAGLE} ===", flush=True)
+if os.environ.get("SWEEP_WARMUP", "1") != "0":
+    warmup()
 results = []
 
 # 1. mixed-content B sweep, full drafting

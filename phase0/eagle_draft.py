@@ -324,6 +324,117 @@ class EagleDrafter:
         self._pending = None                    # drop a stale request without running the K-step chain
 
 
+@torch.no_grad()
+def draft_batch(eagles, k):
+    """Draft k tokens for EACH of n EagleDrafter forks in ONE [n,...] forward per chain step. The batched
+    coordinator's B serial _draft() calls were the measured drafting tax (~0.25s/stream/round at B=4 —
+    aggregate went DRAFTING-bound, not WAN-bound): the forks share one head, so every linear/norm/argmax
+    of the chain batches to [n,...] (rowwise bit-exact — same math, same reduction per row), and each
+    micro-step's 2 host syncs (int(argmax), int(d2t[i])) collapse to ONE .tolist() after the whole chain.
+    Only ATTENTION stays per-fork: each fork attends its OWN ragged committed context (kbuf[:T]), the
+    exact serial op — which is what keeps row j byte-identical to eagles[j]._draft(k). Scratch-tail
+    semantics mirror _draft: chain k/v go to slots [ctx_len, ctx_len+k), committed state never mutates."""
+    n = len(eagles)
+    if n == 0:
+        return []
+    if n == 1:
+        return [eagles[0]._draft(k)]                           # nothing to batch: the proven serial path
+    E0 = eagles[0]
+    assert all(e.fc is E0.fc and e.lm is E0.lm and e.next_hidden == E0.next_hidden for e in eagles), \
+        "draft_batch needs forks of ONE head (shared weights, same carry rule)"
+    out = [None] * n
+    live = []; slots = []
+    for j, e in enumerate(eagles):
+        if e.ctx_len == 0 or e._last_h is None:                # _draft's degenerate row, verbatim
+            out[j] = [int(e._last_tok) if e._last_tok is not None else 0] * k
+        else:
+            live.append(e); slots.append(j)
+    if not live:
+        return out
+    if len(live) == 1:
+        out[slots[0]] = live[0]._draft(k)
+        return out
+    m = len(live)
+    lin = torch.nn.functional.linear
+    HD = E0.HD; maxp = E0.cos.shape[0] - 1
+    for e in live:
+        e._ensure_cap(e.ctx_len + k)                           # per-fork chain scratch tail, like _draft
+    T = [e.ctx_len for e in live]
+    P = torch.tensor([[min(e._last_pos + i, maxp) for e in live] for i in range(k)],
+                     dtype=torch.long, device=E0.dev)          # [k,m] RoPE positions, one H2D copy
+    h = torch.cat([e._last_h for e in live], 0)                # [m,H] per-fork carry
+    tok = torch.tensor([int(e._last_tok) for e in live], dtype=torch.long, device=E0.dev)
+    steps = []
+    for i in range(k):
+        en = _rms(E0.embed[tok], E0.in_ln, E0.eps)             # [m,H]
+        hn = _rms(h, E0.h_ln, E0.eps)
+        x = torch.cat([en, hn], -1)                            # [m,2H]
+        res = h
+        q = lin(x, E0.qp).view(m, E0.NH, HD)
+        cos = E0.cos[P[i]].unsqueeze(1); sin = E0.sin[P[i]].unsqueeze(1)   # [m,1,HD] per-fork RoPE row
+        q = q * cos + _rotate_half(q) * sin
+        if i > 0:                                              # new chain slot per fork, at ITS scratch tail
+            kk = lin(x, E0.kp).view(m, E0.NKV, HD)
+            vv = lin(x, E0.vp).view(m, E0.NKV, HD)
+            kk = kk * cos + _rotate_half(kk) * sin
+            for j, e in enumerate(live):
+                e.kbuf[T[j]] = kk[j]; e.vbuf[T[j]] = vv[j]; T[j] += 1
+        os_ = []
+        for j, e in enumerate(live):                           # per-fork GQA attention over its own context
+            qg = q[j].view(E0.NKV, E0.GRP, 1, HD)              # (ragged T — the serial op, byte-identical)
+            Kt = e.kbuf[:T[j]].permute(1, 2, 0).unsqueeze(1)
+            att = torch.softmax((qg @ Kt).float() / (HD ** 0.5), -1).to(q.dtype)
+            Vt = e.vbuf[:T[j]].permute(1, 0, 2).unsqueeze(1)
+            os_.append((att @ Vt).reshape(1, E0.NH * HD))
+        o = torch.cat(os_, 0)                                  # [m, NH*HD]
+        res = lin(o, E0.op) + res
+        hn2 = _rms(res, E0.post_ln, E0.eps)
+        res = lin(torch.nn.functional.silu(lin(hn2, E0.gp)) * lin(hn2, E0.upp), E0.dp) + res
+        hf = _rms(res, E0.norm, E0.eps)
+        did = lin(hf, E0.lm).argmax(-1)                        # [m] — stays on device, no per-step sync
+        tok = did + E0.d2t[did]
+        steps.append(tok)
+        h = hf if E0.next_hidden == "final" else res
+    rows = torch.stack(steps, 0).t().tolist()                  # ONE host sync for the whole batched chain
+    for j, r in zip(slots, rows):
+        out[j] = [int(t) for t in r]
+    return out
+
+
+def fetch_b(drafters):
+    """Batched drop-in for [d.fetch() for d in drafters] across B streams: the n-gram half runs per
+    stream first (CPU dict lookups, free), then ALL EAGLE misses draft in ONE draft_batch chain instead
+    of B serial ones. Accepts any mix of HybridDrafter / EagleDrafter / other drafters (anything else
+    just fetch()es serially — n-gram-only streams cost nothing either way). Row b is byte-identical to
+    drafters[b].fetch() — same math, same argmax — so committed streams are unchanged; only the
+    coordinator's drafting wall-clock moves. Consumes pendings exactly like fetch() (sets .matched)."""
+    out = [None] * len(drafters)
+    batch = {}                                                 # k -> [(slot, eagle)] (k is uniform in
+    for j, d in enumerate(drafters):                           # practice; grouping keeps it correct anyway)
+        if isinstance(d, HybridDrafter):
+            ids, k = d._pending
+            ng = d.ngram.fetch()
+            if getattr(d.ngram, "matched", False):             # n-gram hit: draftable, use it (fetch()'s rule)
+                d.matched = True; out[j] = ng
+                continue
+            d.matched = False
+            e = d.eagle
+        elif isinstance(d, EagleDrafter):
+            ids, k = d._pending
+            e = d
+        else:
+            out[j] = d.fetch()
+            continue
+        if e.ctx_len > 0 and e._last_h is not None:
+            batch.setdefault(k, []).append((j, e))
+        else:                                                  # no context: propose()'s seed/degrade path, serial
+            out[j] = e.propose(ids, k)
+    for k, grp in batch.items():
+        for (j, _), r in zip(grp, draft_batch([e for _, e in grp], k)):
+            out[j] = r
+    return out
+
+
 def prefill_pair_tokens(gen_ids, start, toks):
     """The extend() pairing for ONE prefill chunk (pure; the EAGLE left-shift): the chunk's aux positions
     [start, start+len(toks)) each predicted the NEXT prompt token, so tokens[i] = gen_ids[start+1+i]; the
