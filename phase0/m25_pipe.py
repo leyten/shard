@@ -903,7 +903,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     acc = [0] * B; vrounds = [0] * B                     # per-stream accepted tokens / verify rounds (g telemetry)
-    t_recv = 0.0; t_pf = time.time(); receipts = []
+    t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None
     eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
     if eagle_on:
         from eagle_draft import prefill_pair_tokens, fetch_b
@@ -914,10 +914,14 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         rb_op = {"op": "reset_batch", "B": B, "swarm_id": swarm_id, "job_id": job_id}
         if job_nonce is not None:
             rb_op["nonce"] = job_nonce
+        if M25_GRAPH_JOB is not None:                        # per-job graph arm, exactly solo's stamp: a batched
+            rb_op["graph"] = M25_GRAPH_JOB                   # job must never SILENTLY inherit a prior solo job's
+                                                             # runtime route (the review's poisoned-arm scenario)
         kw.send(rb_op); ack = recv_data(rx)
         if isinstance(ack, dict) and ack.get("error"):       # e.g. B wider than the ring's launch-time KV rows:
             raise TransportError(f"reset_batch refused: {ack['error']}")   # abort BEFORE any batched
                                                                            # op can kill a warm stage
+        _check_reset_ack(rb_op, ack)                         # graph-stamped job + refused/old-stage toggle = fail LOUD
         for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
             gen = prompts[b]
             starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
@@ -1003,7 +1007,8 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             getattr(drafters[b], "cancel", lambda: None)()      # drop any standing request at drain
         if RECEIPTS:                                            # PROVE: sweep the ring once, like solo
             kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
-            if isinstance(receipts, dict):
+            if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
+                graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
                 receipts = receipts.get("receipts", [])
     finally:
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
@@ -1022,6 +1027,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     return {"streams": res, "B": B, "rounds": rounds, "depth": cur_depth,
             "wasted": wasted, "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
             "receipts_ok": receipts_ok, "eagle": eagle_on,
+            "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
@@ -1386,12 +1392,16 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
                             if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
                                 _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
-                            for L in layers: L.reset()
+                            job_graph = _reset_flags(msg)   # per-job graph arm, like solo's reset (also CLEARS a
+                            for L in layers: L.reset()      # stale solo job_graph when the field is absent)
                             if RECEIPTS:                    # batched jobs get a FRESH signer (a solo job's
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # stale signer
                                                        msg.get("job_id", "job"), lo, hi,        # must never
                                                        nonce=msg.get("nonce"))                  # bleed in)
-                            _ret_send("ok"); continue
+                            _ret_send("ok" if job_graph is None else    # graph-stamped batched jobs ack the APPLIED
+                                      {"ok": 1, "graph": job_graph,     # route + counters (_check_reset_ack's food);
+                                       "graph_captured": S._GRAPH_COUNT,   # plain jobs keep the bare ok (compat)
+                                       "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             x = msg["h"].to(dev)
                             h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
@@ -1491,6 +1501,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
+                        _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
                         for L in layers: L.reset()
                         if RECEIPTS:                            # fresh per-job signer, same as tail (never let a
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # solo job's signer

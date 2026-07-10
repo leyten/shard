@@ -777,6 +777,17 @@ class BatchGraphRunner:
     def _capture(self, alen):
         from vllm.forward_context import set_forward_context
         global _GR, _GRAPH_COUNT
+        # Free-VRAM pre-check: a capture that SUCCEEDS with ~zero headroom is WORSE than no capture —
+        # the pool pins multi-GB-scale transients forever and the NEXT eager prefill's transients OOM
+        # uncaught (dead stage, wedged warm ring). Demand the pool estimate (kk/vv GQA-repeat dominates)
+        # + a prefill-sized margin up front; short -> RuntimeError -> run()'s handler marks the bucket
+        # permanently eager, LOUDLY. Batched pools are 5-30x solo-sized; brim stages must degrade to
+        # eager predictably, never die.
+        need = 2 * self.B * NH * alen * HD * 2 + 2 * self.B * NH * self.s * alen * 4 + (1 << 30)
+        free = torch.cuda.mem_get_info()[0]
+        if free < need:
+            raise RuntimeError(f"free VRAM {free / 1e9:.1f}GB < capture estimate {need / 1e9:.1f}GB "
+                               f"(pool + prefill margin)")
         h = (torch.randn(self.B, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)   # static input buffer
         st = _BGraphState(self.B, self.s, alen, self.rd, self.dv, self.aux_ids)
         st.set([alen - self.s] * self.B, self.cos, self.sin)          # capture-time starts (total == alen)
