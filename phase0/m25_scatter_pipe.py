@@ -213,7 +213,8 @@ def main():
     if a.serve:                                   # DEPLOY: start the OpenAI /v1 gateway on the head over the warm ring
         GW = 18000
         rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
-        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
+        bt = f"M25_BATCH={a.batch} " if a.batch > 1 else ""   # gateway micro-batches up to the ring's KV rows
+        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
               f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
         sh(head["host"], head["port"], gw, 30); time.sleep(4)

@@ -328,6 +328,31 @@ def _eagle_aux_range(aux, lo, hi):
     return _t.stack([aux[str(li)][lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
 
 
+def _eagle_aux_range_b(aux, b, lo, hi):
+    """Batched _eagle_aux_range: stack the 3 aux hidden states for STREAM b's chunk positions [lo,hi)
+    -> [hi-lo,3,H]. verify_batch aux entries are [B,s,H] (every row kept); the coordinator slices its
+    stream's row for that stream's drafter."""
+    import torch as _t
+    return _t.stack([aux[str(li)][b, lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
+
+
+def _unpack_b(resp):
+    """verify_batch reply: bare [B][K+1] rows (plain), or {"toks": rows, "aux": {li: [B,s,H]}} under
+    M25_EAGLE — fp8-packed aux entries dequantized once, mirroring _unpack. Batched entries carry a
+    PER-STREAM scale list ([q, [s0..sB-1]]); solo-shaped entries keep the [q, float] pair."""
+    if isinstance(resp, dict):
+        aux = resp.get("aux")
+        if aux:
+            for k, v in aux.items():
+                if isinstance(v, list):
+                    if isinstance(v[1], list):          # per-row scales for [B,s,H]
+                        aux[k] = v[0].to(torch.bfloat16) * torch.tensor(v[1], dtype=torch.bfloat16).view(-1, 1, 1)
+                    else:
+                        aux[k] = _unpack_h(v[0], v[1])
+        return resp.get("toks"), aux
+    return resp, None
+
+
 def _eagle_aux_nodes(aux, node_indices):
     """Gather the 3 aux hidden states at arbitrary FLAT verify-node indices -> [len,3,H]. The tree walk
     indexes the verify's nodes (anchor + accepted path), not contiguous chunk positions, so EagleDrafter.extend()
@@ -384,6 +409,19 @@ def make_drafter(ngram_n=3):
         return ng
     from eagle_draft import HybridDrafter
     return HybridDrafter(ng, _eagle_singleton())
+
+
+def make_drafters_b(B, ngram_n=3):
+    """Per-stream drafter factory for the batched coordinator — the SAME env logic as make_drafter,
+    B times. Each stream gets a fresh n-gram index; under M25_EAGLE each also gets a fork() of the
+    shared EAGLE head (shared read-only weights/RoPE, own committed-context state)."""
+    from ngram_draft import NgramDrafter
+    mm = int(os.environ.get("M25_NGRAM_MINMATCH", "1"))
+    if not S.M25_EAGLE:
+        return [NgramDrafter(ng=ngram_n, min_match=mm) for _ in range(B)]
+    from eagle_draft import HybridDrafter
+    base = _eagle_singleton()
+    return [HybridDrafter(NgramDrafter(ng=ngram_n, min_match=mm), base.fork()) for _ in range(B)]
 
 
 def _reset_op(swarm_id, job_id, nonce=None):
@@ -821,55 +859,89 @@ def _sdpa_backend_probe(stage):
 
 
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
-                          depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True):
+                          depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
+                          on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
-    round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). SYNCHRONOUS
-    (one batched verify per round — no per-stream depth pipelining; the batching itself provides the
-    win). Each stream's output is byte-identical to a solo coordinate_pipe run (per-stream KV row +
-    per-stream causal mask + per-stream MoE on the stage side guarantee it). Prefill is PER-STREAM
-    (variable length) into batch-row b; only the fixed-shape K+1 decode is batched. Greedy.
+    round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). Each stream's
+    output is byte-identical to a solo coordinate_pipe run (per-stream KV row + per-stream causal mask +
+    per-stream MoE on the stage side guarantee it). Prefill is PER-STREAM (variable length) into
+    batch-row b; only the fixed-shape K+1 decode is batched. Greedy.
+
+    DRAFTING = the FULL solo stack per stream: `drafters[b]` may be n-gram, EAGLE, or Hybrid — when the
+    drafter has extend() and stages run M25_EAGLE, verify_batch returns per-stream aux rows ([B,s,H] per
+    aux layer) and each stream's committed positions grow ITS drafter's context, exactly like solo. The
+    depth rule mirrors solo too: EAGLE needs the verified hidden before the next draft, so the in-flight
+    window is 1 under M25_EAGLE (batching itself is the amortizer); n-gram-only keeps depth pipelining.
 
     Protocol: reset_batch -> prefill each stream (op=verify, stream=b) -> per round, op=verify_batch
-    with token_ids_b/start_b for the ACTIVE streams; the ring returns B argmax rows."""
+    with token_ids_b/start_b for the ACTIVE streams; the ring returns B argmax rows (+ aux under EAGLE).
+    RECEIPTS (SHARD_RECEIPTS=1) sweep at job end like solo — batched rounds are attested on-stage."""
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
     pipe_sock.settimeout(timeout)
+    rx.settimeout(timeout)                               # NEVER inherit a prior solo job's tightened 20s decode
+                                                         # deadline (gateway reuses the ret socket across jobs;
+                                                         # a 4096-token batched prefill hop can exceed 20s)
     kw_job = os.environ.get("M25_KEEPWARM_JOB")          # cwnd keep-warm, same design as coordinate_pipe;
     kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)   # NOTE: reset_batch
     _eos = tok.eos_token_id                              # carries no keepwarm_ms — stage toggling is reset-only
     eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
-    prompts = [render_ids(tok, m, tools=tools, reasoning=reasoning) for m in messages_list]
-    mx = [max(16, min(max_new, max_ctx - len(p) - 16)) if max_ctx else max_new for p in prompts]
+    # reasoning/max_new accept a scalar (every stream alike — the bench shape) or a per-stream list;
+    # per-stream tool specs go in `tools_b` (a toolspec is itself a list, so `tools` stays scalar-only).
+    # on_commits: per-stream streaming callbacks, called with (out[b], dt) after each commit — solo's
+    # on_commit, per row (the gateway shape: independent requests riding one batch).
+    tb = tools_b if tools_b is not None else [tools] * B
+    reas_b = reasoning if isinstance(reasoning, list) else [reasoning] * B
+    mxnew_b = max_new if isinstance(max_new, list) else [max_new] * B
+    prompts = [render_ids(tok, m, tools=tb[b], reasoning=reas_b[b]) for b, m in enumerate(messages_list)]
+    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - 16)) if max_ctx else mxnew_b[b]
+          for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
-    t_recv = 0.0; t_pf = time.time()
+    acc = [0] * B; vrounds = [0] * B                     # per-stream accepted tokens / verify rounds (g telemetry)
+    t_recv = 0.0; t_pf = time.time(); receipts = []
+    eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
+    if eagle_on:
+        from eagle_draft import prefill_pair_tokens
+        for d in drafters:
+            d.reset()                                    # fresh per-stream EAGLE context per job
+    job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
     try:
-        kw.send({"op": "reset_batch", "B": B}); recv_data(rx)
+        rb_op = {"op": "reset_batch", "B": B, "swarm_id": swarm_id, "job_id": job_id}
+        if job_nonce is not None:
+            rb_op["nonce"] = job_nonce
+        kw.send(rb_op); ack = recv_data(rx)
+        if isinstance(ack, dict) and ack.get("error"):       # e.g. B wider than the ring's launch-time KV rows:
+            raise TransportError(f"reset_batch refused: {ack['error']}")   # abort BEFORE any batched
+                                                                           # op can kill a warm stage
         for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
             gen = prompts[b]
-            if prefill_chunk and len(gen) > prefill_chunk:
-                rr = None
-                for i in range(0, len(gen), prefill_chunk):
-                    kw.send({"op": "verify", "stream": b, "token_ids": gen[i:i + prefill_chunk], "start": i, "prefill": True})
-                    rr = recv_data(rx)
-                cur[b] = rr[-1]
-            else:
-                kw.send({"op": "verify", "stream": b, "token_ids": gen, "start": 0, "prefill": True}); cur[b] = recv_data(rx)[-1]
+            starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
+            for i in starts_b:
+                chunk = gen[i:i + prefill_chunk] if prefill_chunk else gen
+                kw.send({"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True})
+                rr, aux = _unpack(recv_data(rx))         # stream-b prefill reply is solo-shaped ({toks, aux})
+                if eagle_on and aux is not None:         # whole-prompt drafter context, chunk by chunk
+                    drafters[b].extend(prefill_pair_tokens(gen, i, rr),
+                                       _eagle_aux_range(aux, 0, len(rr)), base_pos=i)
+            cur[b] = rr[-1]
             pos[b] = len(gen); out[b] = [cur[b]]
             if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
             drafters[b].request(prompts[b] + [cur[b]], K)
+            if on_commits and on_commits[b]: on_commits[b](out[b], 0.0)   # stream: first token from prefill
         prefill_s = time.time() - t_pf; t0 = time.time()        # start the DECODE-rate timer after prefill (matches coordinate_pipe; agg_tok_s is steady-state decode, not TTFT-polluted)
         # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
         # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
         # Each round speculatively advances ALL B streams; on a stream's divergence we drop that stream's stale
         # in-flight chunks (per-row discard) and re-draft. Each stream stays data-isolated (output depends on B, not
         # on batch-mates) and byte-faithful to solo up to the batched-matmul tiling. Mirrors coordinate_pipe per row.
+        cur_depth = 1 if eagle_on else depth                    # solo's rule: EAGLE drafts from the verified hidden
         rounds = 0; wasted = 0
         dprefix = [prompts[b] + [cur[b]] for b in range(B)]     # speculative continuation per stream (prefill already requested)
         spos = list(pos)                                        # send position per stream (advances K per drafted chunk)
         discard = [0] * B                                       # stale-chunk skip counter per stream after a divergence
         inflight = []                                           # FIFO of rounds; each = [(spos_b, ds_b) | None] over b
         while not all(done) or inflight:
-            while len(inflight) < depth and not all(done):      # fill the in-flight window (speculative per stream)
+            while len(inflight) < cur_depth and not all(done):  # fill the in-flight window (speculative per stream)
                 tids = []; row = []; sb = []
                 for b in range(B):
                     if done[b]:
@@ -881,27 +953,51 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                 inflight.append(row)
             if not inflight:
                 break
-            tr = time.time(); rb = recv_data(rx); t_recv += time.time() - tr   # rb: [B][K+1] per-stream argmax
+            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            rb, aux_b = _unpack_b(resp)                         # rb: [B][K+1] per-stream argmax; aux rows under EAGLE
+            if eagle_on and aux_b is None and rounds == 0:      # fail LOUD, not a silently-poisoned measurement:
+                raise TransportError("EAGLE drafters but the ring returned no aux — launch stages "
+                                     "with M25_EAGLE=1 (a depth-1 no-context run measures WORSE than n-gram)")
             row = inflight.pop(0); rounds += 1
             for b in range(B):
                 if row[b] is None or done[b]:
                     continue
                 if discard[b] > 0:                              # stale chunk from before this stream's last divergence
                     discard[b] -= 1; wasted += 1; continue
-                _, ds = row[b]; r = rb[b]; n = 0
+                sp_b, ds = row[b]; r = rb[b]; n = 0
                 for j in range(K):
                     if ds[j] == r[j]: n += 1
                     else: break
+                vrounds[b] += 1; acc[b] += n
                 if n == K:
                     out[b].extend(ds); pos[b] += K; cur[b] = ds[-1]; committed = ds
+                    # FULL-ACCEPT BONUS, exactly solo's rule: only when nothing is in flight (depth 1 —
+                    # the EAGLE regime) is r[K]'s position uncovered; commit it to advance K+1 per round.
+                    if not inflight and len(r) > K:
+                        out[b].append(r[K]); committed = ds + [r[K]]; cur[b] = r[K]
+                        pos[b] += 1; spos[b] += 1; dprefix[b] = dprefix[b] + [r[K]]
+                        acc[b] += 1
                 else:                                           # divergence: commit prefix, drop this stream's stale in-flight, re-draft
                     committed = ds[:n] + [r[n]]; out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
                     discard[b] = sum(1 for rr in inflight if rr[b] is not None)
-                    drafters[b].fetch(); dprefix[b] = prompts[b] + out[b]; spos[b] = pos[b]; drafters[b].request(dprefix[b], K)
+                    getattr(drafters[b], "cancel", drafters[b].fetch)()   # drop the stale pending draft WITHOUT computing it
+                    dprefix[b] = prompts[b] + out[b]; spos[b] = pos[b]; drafters[b].request(dprefix[b], K)
+                if eagle_on and aux_b is not None:              # grow stream b's EAGLE context with its commit
+                    drafters[b].extend(committed, _eagle_aux_range_b(aux_b, b, 0, len(committed)), base_pos=sp_b)
+                if on_commits and on_commits[b]: on_commits[b](out[b], time.time() - t0)   # stream this commit
                 if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
                     done[b] = True
+        for b in range(B):
+            getattr(drafters[b], "cancel", lambda: None)()      # drop any standing request at drain
+        if RECEIPTS:                                            # PROVE: sweep the ring once, like solo
+            kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
+            if isinstance(receipts, dict):
+                receipts = receipts.get("receipts", [])
     finally:
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    check_chain=not M25_FP8_WIRE) if receipts   # fp8 wire is intentionally lossy
+                   else (False if RECEIPTS else None))                          # fail closed, like solo
     dt = time.time() - t0
     res = []
     for b in range(B):                                  # trim at first eos, per stream
@@ -909,9 +1005,12 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         for ee in eos_set:
             if ee in o: o = o[:o.index(ee)]; break
         res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
+                    "g": round(acc[b] / max(vrounds[b], 1), 3),   # accepted/verify-round — the drafting telemetry
                     "text": tok.decode(o, skip_special_tokens=True)})
-    return {"streams": res, "B": B, "rounds": rounds, "depth": depth, "wasted": wasted, "dt": dt,
-            "prefill_s": prefill_s, "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
+    return {"streams": res, "B": B, "rounds": rounds, "depth": cur_depth,
+            "wasted": wasted, "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
+            "receipts_ok": receipts_ok, "eagle": eagle_on,
+            "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
 def _load(stage, nstages, lo, hi):
@@ -993,8 +1092,13 @@ def _merge_aux(upstream):
     if S.M25_EAGLE:
         for li, h in S._AUX.items():
             if M25_FP8_AUX:
-                q, sc = _pack_h(h)
-                acc[str(li)] = [q, sc]
+                if h.dim() == 3:                       # batched [B,s,H]: per-STREAM scale — one stream's
+                    sc = (h.detach().abs().amax(dim=(1, 2)) / 448.0).clamp(min=1e-8)   # outlier must not
+                    q = (h / sc.view(-1, 1, 1)).to(torch.float8_e4m3fn).cpu()          # degrade its batch-
+                    acc[str(li)] = [q, [float(x) for x in sc]]                         # mates' drafter aux
+                else:
+                    q, sc = _pack_h(h)
+                    acc[str(li)] = [q, sc]
             else:
                 acc[str(li)] = h.cpu()
     return acc
@@ -1244,14 +1348,28 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                        "graph_captured": S._GRAPH_COUNT,
                                        "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
+                            if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
+                                _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
                             for L in layers: L.reset()
+                            if RECEIPTS:                    # batched jobs get a FRESH signer (a solo job's
+                                signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # stale signer
+                                                       msg.get("job_id", "job"), lo, hi,        # must never
+                                                       nonce=msg.get("nonce"))                  # bleed in)
                             _ret_send("ok"); continue
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
-                            h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), msg["h"].to(dev), vcfg)
-                            _ret_send(_tail_logits(h, parts).argmax(-1).tolist()); continue
+                            x = msg["h"].to(dev)
+                            h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), x, vcfg)
+                            if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
+                                signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
+                            toks = _tail_logits(h, parts).argmax(-1).tolist()
+                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
                         if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
-                            h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], msg["h"].to(dev), vcfg)
-                            _ret_send(_tail_logits(h, parts).argmax(-1)[0].tolist()); continue
+                            x = msg["h"].to(dev)
+                            h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], x, vcfg)
+                            if RECEIPTS and signer is not None:
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
                         if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
                             x = msg["h"].to(dev)
                             h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
@@ -1338,21 +1456,37 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
                         for L in layers: L.reset()
+                        if RECEIPTS:                            # fresh per-job signer, same as tail (never let a
+                            signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # solo job's signer
+                                                   msg.get("job_id", "job"), lo, hi,         # bleed into batched)
+                                                   nonce=msg.get("nonce"))
                         nxt_kw.send(msg); continue
                     if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor(msg["token_ids_b"], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
+                        x = h
                         h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
-                        nxt_kw.send(_hsend({"op": "verify_batch", "h": h, "start_b": msg["start_b"]})); continue
+                        if RECEIPTS and signer is not None:     # attest batched rounds like solo
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
+                        if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
+                            fwd["aux"] = _merge_aux(msg.get("aux"))
+                        nxt_kw.send(_hsend(fwd)); continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
+                        x = h
                         h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
-                        nxt_kw.send(_hsend({"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True})); continue
+                        if RECEIPTS and signer is not None:
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
+                        if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
+                            fwd["aux"] = _merge_aux(msg.get("aux"))
+                        nxt_kw.send(_hsend(fwd)); continue
                     if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])

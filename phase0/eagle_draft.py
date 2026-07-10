@@ -93,6 +93,16 @@ class EagleDrafter:
         self._aux = None; self._pending = None
         self.matched = True                             # EAGLE always "produces" a draft (for HybridDrafter symmetry)
 
+    def fork(self):
+        """A per-stream sibling: SHARES every read-only tensor (head weights, d2t, embed, RoPE tables —
+        ~GBs across B streams if copied) but owns FRESH context state (kbuf/vbuf/ctx_len/last_*). This is
+        how continuous batching gets B independent EAGLE contexts from one loaded head."""
+        d = object.__new__(EagleDrafter)
+        d.__dict__.update(self.__dict__)                # references only: weights/rope/embed are read-only
+        d.reset()                                       # own kbuf/vbuf/ctx state (reset() rebinds, never mutates shared)
+        d._aux = None; d._pending = None; d.matched = True
+        return d
+
     # ---- persistent committed-context cache -------------------------------------
     def reset(self):
         """Clear the committed context (start of a new generation)."""

@@ -565,6 +565,8 @@ def run_block_prefill_b(layers, b, start, h, vcfg):     # continuous batching: p
     with torch.no_grad(), set_forward_context(None, vcfg):
         for L in layers:
             h = L.forward_prefill_b(h, b, start, pe)
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # per-stream prefill aux ([s,H], row b) — same
+                _AUX[L.li] = h[0].detach().to(torch.bfloat16)   # contract as run_block (h is [1,s,H])
     return h
 
 
@@ -574,6 +576,8 @@ def run_block_decode_b(layers, starts, h, vcfg):        # continuous batching: b
     with torch.no_grad(), set_forward_context(None, vcfg):
         for L in layers:
             h = L.forward_decode_b(h, starts, pe)
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # batched aux: keep EVERY row — [B,s,H] (the
+                _AUX[L.li] = h.detach().to(torch.bfloat16)  # coordinator slices per stream for its drafter)
     return h
 
 
