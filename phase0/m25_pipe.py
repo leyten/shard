@@ -69,6 +69,11 @@ M25_FP8_AUX = bool(int(os.environ.get("M25_FP8_AUX", "1" if M25_FP8_WIRE else "0
 M25_GRAPH_JOB = os.environ.get("M25_GRAPH_JOB")
 if M25_GRAPH_JOB is not None:
     M25_GRAPH_JOB = M25_GRAPH_JOB.strip().lower() in ("1", "true", "yes", "on")   # explicit truthy set: "no"/"off"/"0" = False
+# Batched-decode graph route (M25_BATCH_GRAPH=0 = escape hatch): with graphs ACTIVE, verify_batch
+# blocks go through a BatchGraphRunner (batched stages ran EAGER — the measured ~220ms B=4 ring+eager
+# round floor). 0 pins batched decode eager WITHOUT touching the solo graph route, so a batched-graph
+# regression can be isolated per-launch on a warm ring (the M25_EAGER-style per-lever hatch).
+M25_BATCH_GRAPH = os.environ.get("M25_BATCH_GRAPH", "1") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -898,10 +903,10 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     acc = [0] * B; vrounds = [0] * B                     # per-stream accepted tokens / verify rounds (g telemetry)
-    t_recv = 0.0; t_pf = time.time(); receipts = []
+    t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None
     eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
     if eagle_on:
-        from eagle_draft import prefill_pair_tokens
+        from eagle_draft import prefill_pair_tokens, fetch_b
         for d in drafters:
             d.reset()                                    # fresh per-stream EAGLE context per job
     job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
@@ -909,10 +914,14 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         rb_op = {"op": "reset_batch", "B": B, "swarm_id": swarm_id, "job_id": job_id}
         if job_nonce is not None:
             rb_op["nonce"] = job_nonce
+        if M25_GRAPH_JOB is not None:                        # per-job graph arm, exactly solo's stamp: a batched
+            rb_op["graph"] = M25_GRAPH_JOB                   # job must never SILENTLY inherit a prior solo job's
+                                                             # runtime route (the review's poisoned-arm scenario)
         kw.send(rb_op); ack = recv_data(rx)
         if isinstance(ack, dict) and ack.get("error"):       # e.g. B wider than the ring's launch-time KV rows:
             raise TransportError(f"reset_batch refused: {ack['error']}")   # abort BEFORE any batched
                                                                            # op can kill a warm stage
+        _check_reset_ack(rb_op, ack)                         # graph-stamped job + refused/old-stage toggle = fail LOUD
         for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
             gen = prompts[b]
             starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
@@ -943,10 +952,17 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         while not all(done) or inflight:
             while len(inflight) < cur_depth and not all(done):  # fill the in-flight window (speculative per stream)
                 tids = []; row = []; sb = []
+                # ONE batched drafter pass per fill (eagle_draft.fetch_b): n-gram per stream (free), all
+                # EAGLE misses as a single [n,...] chain forward. The per-b serial fetch() loop was the
+                # measured drafting tax (~0.25s/stream/round at B=4 — the round went DRAFTING-bound);
+                # each row stays byte-identical to drafters[b].fetch() (research/m25_draft_batch_test.py).
+                if eagle_on:
+                    act = [b for b in range(B) if not done[b]]
+                    ds_act = dict(zip(act, fetch_b([drafters[b] for b in act])))
                 for b in range(B):
                     if done[b]:
                         tids.append([cur[b]] * (K + 1)); row.append(None); sb.append(pos[b]); continue
-                    ds = drafters[b].fetch()
+                    ds = ds_act[b] if eagle_on else drafters[b].fetch()
                     tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
                     dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
                 kw.send({"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
@@ -991,7 +1007,8 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             getattr(drafters[b], "cancel", lambda: None)()      # drop any standing request at drain
         if RECEIPTS:                                            # PROVE: sweep the ring once, like solo
             kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
-            if isinstance(receipts, dict):
+            if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
+                graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
                 receipts = receipts.get("receipts", [])
     finally:
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
@@ -1010,6 +1027,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     return {"streams": res, "B": B, "rounds": rounds, "depth": cur_depth,
             "wasted": wasted, "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
             "receipts_ok": receipts_ok, "eagle": eagle_on,
+            "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
@@ -1067,6 +1085,29 @@ def _block(grs, layers, start, x, vcfg):
             print(f"[graph] cap: s={s} bucket={alen} -> eager "
                   f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
     return S.run_block(layers, start, x, vcfg)
+
+
+def _block_b(grs_b, layers, starts, x, vcfg):
+    """run_block_decode_b's analog of _block: route the fixed-shape [B,K+1] verify_batch block through
+    a lazily captured BatchGraphRunner when the graph route is ACTIVE (same runtime toggle as solo,
+    plus the M25_BATCH_GRAPH escape hatch). `starts` is the HOST list off the wire — the runner's
+    bounds check + static-buffer refresh must never touch a device tensor (sync). One runner per
+    (B, s) shape; each of its buckets is ONE captured graph against the process-wide S.M25_GRAPH_MAX
+    budget, with the same over-budget/failed-capture eager fallback semantics as _block."""
+    if S.M25_CUDA_GRAPH_ACTIVE and M25_BATCH_GRAPH and x.shape[1] <= 64 and S.M25_BATCH > 1:
+        B, s = x.shape[0], x.shape[1]
+        gr = grs_b.get((B, s))
+        if gr is None:
+            grs_b[(B, s)] = gr = S.BatchGraphRunner(layers, vcfg, B, s)
+        alen = gr._bucket(max(starts) + s)
+        if alen in gr.graphs or S._GRAPH_COUNT < S.M25_GRAPH_MAX:
+            return gr.run(starts, x)                # replay, or capture within budget (OOM-safe in run())
+        S._GRAPH_SKIPPED += 1                       # budget spent: new (B,s,bucket) shapes run eager
+        if (B, s, alen) not in _GRAPH_CAP_LOGGED:
+            _GRAPH_CAP_LOGGED.add((B, s, alen))
+            print(f"[graph] cap: B={B} s={s} bucket={alen} -> eager "
+                  f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
+    return S.run_block_decode_b(layers, torch.as_tensor(starts, dtype=torch.long, device=dev), x, vcfg)
 
 
 def _reset_flags(msg):
@@ -1192,6 +1233,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     layers = parts["layers"]
     vcfg = S._CTX[1]
     graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
+    graph_runners_b = {}                              # batched-decode graph cache, keyed (B, s) — same lifetime
     def _dial_fwd():
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
@@ -1350,15 +1392,19 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
                             if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
                                 _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
-                            for L in layers: L.reset()
+                            job_graph = _reset_flags(msg)   # per-job graph arm, like solo's reset (also CLEARS a
+                            for L in layers: L.reset()      # stale solo job_graph when the field is absent)
                             if RECEIPTS:                    # batched jobs get a FRESH signer (a solo job's
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # stale signer
                                                        msg.get("job_id", "job"), lo, hi,        # must never
                                                        nonce=msg.get("nonce"))                  # bleed in)
-                            _ret_send("ok"); continue
+                            _ret_send("ok" if job_graph is None else    # graph-stamped batched jobs ack the APPLIED
+                                      {"ok": 1, "graph": job_graph,     # route + counters (_check_reset_ack's food);
+                                       "graph_captured": S._GRAPH_COUNT,   # plain jobs keep the bare ok (compat)
+                                       "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             x = msg["h"].to(dev)
-                            h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), x, vcfg)
+                            h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
                             if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                 signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                             toks = _tail_logits(h, parts).argmax(-1).tolist()
@@ -1455,6 +1501,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
+                        _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
                         for L in layers: L.reset()
                         if RECEIPTS:                            # fresh per-job signer, same as tail (never let a
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # solo job's signer
@@ -1467,7 +1514,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         else:
                             h = msg["h"].to(dev)
                         x = h
-                        h = S.run_block_decode_b(layers, torch.tensor(msg["start_b"], device=dev), h, vcfg)
+                        h = _block_b(graph_runners_b, layers, msg["start_b"], h, vcfg)
                         if RECEIPTS and signer is not None:     # attest batched rounds like solo
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}

@@ -446,27 +446,43 @@ class Layer:
     def attn_decode_b(self, x, starts, cos, sin):
         """BATCHED decode (x: [B, s, H], starts: [B] long). Per-stream RoPE/scatter/mask (batchverify
         pattern, proven bit-exact vs solo). Manual matmul over a shared bucket; per-stream mask isolates
-        each stream + zeros its unwritten tail."""
+        each stream + zeros its unwritten tail. Under a BatchGraphRunner capture (_GR set, batched
+        state) the varying starts come in through STATIC buffers (cp/cos/sin/mask, refreshed by set()
+        before every replay) — the same design as attn()'s solo graph branch."""
         B, s, _ = x.shape
         lin = torch.nn.functional.linear
         q = self._rms(lin(x, self.q_proj), self.q_norm).view(B, s, NH, HD).transpose(1, 2)
         k = self._rms(lin(x, self.k_proj), self.k_norm).view(B, s, NKV, HD).transpose(1, 2)
         v = lin(x, self.v_proj).view(B, s, NKV, HD).transpose(1, 2)
         rd = cos.shape[-1]
-        cp = starts.view(B, 1) + torch.arange(s, device=dev).view(1, s)           # [B,s] abs positions
-        cu = cos[cp].unsqueeze(1); su = sin[cp].unsqueeze(1)                       # [B,1,s,rd] per-stream RoPE
+        gr = _GR                                     # batched-graph capture state (None = eager)
+        if gr is not None:                           # graph: statics carry the varying starts (attn() pattern)
+            cp = gr.cp                               # [B,s] abs positions
+            cu, su = gr.cos, gr.sin                  # [B,1,s,rd] per-stream RoPE, pre-gathered by set()
+        else:
+            cp = starts.view(B, 1) + torch.arange(s, device=dev).view(1, s)           # [B,s] abs positions
+            cu = cos[cp].unsqueeze(1); su = sin[cp].unsqueeze(1)                       # [B,1,s,rd] per-stream RoPE
         def ap(t):
             tr, tp = t[..., :rd], t[..., rd:]
             return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
         q, k = ap(q), ap(k)
         idx = cp.view(B, 1, s, 1).expand(B, NKV, s, HD)
-        mx = _decode_kv_check(int(starts.max().item()), s)   # clean error, not an OOB scatter CUDA-assert that kills the stage
+        if gr is None:
+            mx = _decode_kv_check(int(starts.max().item()), s)   # clean error, not an OOB scatter CUDA-assert that kills the stage
+            alen = _bucket(mx)
+        else:
+            alen = gr.alen                           # bounds-checked by the runner BEFORE replay (a host
+                                                     # sync is illegal inside capture)
         self.bkc[:B].scatter_(2, idx, _kv_enc(k)); self.bvc[:B].scatter_(2, idx, _kv_enc(v))   # write all rows (fp8 bytes if M25_KV_FP8)
-        alen = _bucket(mx)
         # HYBRID: small/medium context -> ONE batched manual matmul (fast, ~3x batched throughput); big context ->
         # per-stream flash SDPA (the GQA-repeat [B,48,alen,HD] would OOM at big alen, and a batched dense mask
         # forces SDPA->MATH which also OOMs). Threshold on the GQA-repeat size (kk+vv bf16 bytes).
-        if B * NH * alen * HD * 4 <= 1_400_000_000:                                # batched manual matmul path
+        if gr is not None:                           # graphed: manual matmul + STATIC additive mask — the
+            kk = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)   # same kernel
+            vv = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)   # class as the
+            a = torch.matmul(q, kk.transpose(-1, -2)) * SCALING + gr.mask                        # eager manual
+            o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)                      # path below
+        elif B * NH * alen * HD * 4 <= 1_400_000_000:                              # batched manual matmul path
             kk = _kv_view(self.bkc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)
             vv = _kv_view(self.bvc)[:B, :, :alen].to(torch.bfloat16).repeat_interleave(GRP, 1)
             cols = torch.arange(alen, device=dev).view(1, 1, alen)
@@ -691,6 +707,134 @@ class GraphRunner:
         # (immediate .cpu()/fp8-pack) before the next replay can overwrite it.
         for li in self.aux_ids:
             _AUX[li] = st.aux[li]
+        return out
+
+
+class _BGraphState:
+    """_GraphState's batched-decode analog: static per-block buffers that carry the varying PER-STREAM
+    starts INTO a captured run_block_decode_b graph — abs positions cp [B,s] (drives the RoPE gather,
+    the KV scatter index and the per-stream mask), pre-gathered RoPE rows cos/sin [B,1,s,rd], and the
+    per-stream additive causal mask [B,1,s,alen] (isolates each stream + zeros its unwritten bucket
+    tail, exactly the eager math). set() refreshes them IN PLACE before every replay. `aux_ids`
+    (M25_EAGLE) adds one static [B,s,H] OUTPUT buffer per aux layer, copy_()d inside the capture so
+    every replay publishes fresh per-stream aux — the solo aux-in-graph design, batched."""
+    def __init__(self, B, s, alen, rd, dv, aux_ids=()):
+        self.B, self.s, self.alen = B, s, alen
+        self.cp = torch.zeros(B, s, dtype=torch.long, device=dv)
+        self.cos = torch.zeros(B, 1, s, rd, dtype=torch.bfloat16, device=dv)
+        self.sin = torch.zeros(B, 1, s, rd, dtype=torch.bfloat16, device=dv)
+        self.mask = torch.zeros(B, 1, s, alen, dtype=torch.bfloat16, device=dv)
+        self.aux = {li: torch.zeros(B, s, H, dtype=torch.bfloat16, device=dv) for li in aux_ids}
+        self._ar = torch.arange(s, device=dv)
+        self._cols = torch.arange(alen, device=dv).view(1, 1, alen)
+
+    def set(self, starts, full_cos, full_sin):
+        """starts: per-stream absolute start positions (host list/sequence — never a device sync)."""
+        cp = torch.as_tensor(starts, dtype=torch.long, device=self.cp.device).view(self.B, 1) \
+            + self._ar.view(1, self.s)
+        self.cp.copy_(cp)
+        self.cos.copy_(full_cos[cp].unsqueeze(1)); self.sin.copy_(full_sin[cp].unsqueeze(1))
+        self.mask.copy_(torch.where(self._cols <= cp[:, :, None], 0.0,
+                                    float("-inf")).to(torch.bfloat16)[:, None])
+
+
+class BatchGraphRunner:
+    """Capture + replay a CUDA graph of run_block_decode_b at a FIXED [B, s=K+1] batched-decode shape,
+    one graph per context bucket — GraphRunner's continuous-batching analog (batched stages ran EAGER;
+    the measured B=4 ring+eager round floor was ~220ms of mostly launch overhead). B is the JOB's row
+    count (<= launch M25_BATCH), fixed for the job, so the shape is graph-friendly. The graphed
+    attention is the batched manual matmul + static additive mask (the eager small-ctx path's own
+    kernels — same class); buckets past the manual-path threshold run eager (per-stream flash SDPA is
+    not graphable and the GQA-repeat would OOM). Capture failure -> permanent-eager bucket, never a
+    dead stage (solo's OOM-safety + side-stream drain). Counts against the process-wide M25_GRAPH_MAX
+    budget like every other graph."""
+    def __init__(self, layers, vcfg, B, s, dv=dev):
+        assert M25_BATCH > 1 and B <= M25_BATCH, "batched graph needs the launch-time [B,...] KV rows"
+        self.layers, self.vcfg, self.B, self.s, self.dv = layers, vcfg, B, s, dv
+        self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
+        self.graphs = {}                                              # bucket alen -> (graph, h_static, state, out_static)
+        self.eager = set()                                            # buckets whose capture FAILED -> permanently eager
+        self.aux_ids = [L.li for L in layers if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS]
+
+    def _bucket(self, total):
+        for b in DECODE_BUCKETS:
+            if b >= total:
+                return min(b, M25_KV_MAXLEN)
+        return M25_KV_MAXLEN
+
+    def _manual_ok(self, alen):                                       # the eager hybrid's threshold: only the
+        return self.B * NH * alen * HD * 4 <= 1_400_000_000           # manual-matmul path is graphable
+
+    def _layers(self, h):
+        st = _GR                                                      # the _BGraphState being captured
+        starts = st.cp[:, 0]                                          # shape-correct; the graphed attn reads _GR, not this
+        for L in self.layers:
+            h = L.forward_decode_b(h, starts, (self.cos, self.sin))
+            if L.li in st.aux:                                        # EAGLE aux: device-side copy into the static
+                st.aux[L.li].copy_(h)                                 # buffer, CAPTURED -> every replay refreshes it
+        return h
+
+    def _capture(self, alen):
+        from vllm.forward_context import set_forward_context
+        global _GR, _GRAPH_COUNT
+        # Free-VRAM pre-check: a capture that SUCCEEDS with ~zero headroom is WORSE than no capture —
+        # the pool pins multi-GB-scale transients forever and the NEXT eager prefill's transients OOM
+        # uncaught (dead stage, wedged warm ring). Demand the pool estimate (kk/vv GQA-repeat dominates)
+        # + a prefill-sized margin up front; short -> RuntimeError -> run()'s handler marks the bucket
+        # permanently eager, LOUDLY. Batched pools are 5-30x solo-sized; brim stages must degrade to
+        # eager predictably, never die.
+        need = 2 * self.B * NH * alen * HD * 2 + 2 * self.B * NH * self.s * alen * 4 + (1 << 30)
+        free = torch.cuda.mem_get_info()[0]
+        if free < need:
+            raise RuntimeError(f"free VRAM {free / 1e9:.1f}GB < capture estimate {need / 1e9:.1f}GB "
+                               f"(pool + prefill margin)")
+        h = (torch.randn(self.B, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)   # static input buffer
+        st = _BGraphState(self.B, self.s, alen, self.rd, self.dv, self.aux_ids)
+        st.set([alen - self.s] * self.B, self.cos, self.sin)          # capture-time starts (total == alen)
+        _GR = st
+        try:
+            side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad(), set_forward_context(None, self.vcfg):
+                for _ in range(3):
+                    self._layers(h)                                   # warm-up before capture
+            torch.cuda.current_stream().wait_stream(side); torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g), torch.no_grad(), set_forward_context(None, self.vcfg):
+                out = self._layers(h)
+        finally:
+            _GR = None                                                # capture done; back to eager for prefill etc.
+        self.graphs[alen] = (g, h, st, out)
+        _GRAPH_COUNT += 1                                             # counts against the process-wide M25_GRAPH_MAX
+
+    def run(self, starts, x):
+        """One batched verify block. `starts` is the HOST list off the wire (the bounds check must not
+        sync, and set() re-uploads it into the static buffers). Returns the STATIC output buffer — the
+        caller consumes it before the next run, like GraphRunner. OOM-SAFE: capture failure drains the
+        side stream then marks the bucket permanently eager (see GraphRunner.run for why the drain
+        must precede any eager KV write)."""
+        global _GRAPH_SKIPPED
+        mx = _decode_kv_check(max(starts), self.s)                    # same clean bound as the eager path
+        alen = self._bucket(mx)
+        if alen in self.eager or not self._manual_ok(alen):
+            _GRAPH_SKIPPED += 1
+            return run_block_decode_b(self.layers,
+                                      torch.as_tensor(starts, dtype=torch.long, device=self.dv), x, self.vcfg)
+        if alen not in self.graphs:
+            try:
+                self._capture(alen)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()                              # drain in-flight side-stream garbage FIRST
+                self.eager.add(alen); _GRAPH_SKIPPED += 1
+                print(f"[graph] batched capture failed (B={self.B}, s={self.s}, alen={alen}): "
+                      f"{type(e).__name__}: {e} -> bucket marked permanently eager", flush=True)
+                return run_block_decode_b(self.layers,
+                                          torch.as_tensor(starts, dtype=torch.long, device=self.dv), x, self.vcfg)
+        g, h, st, out = self.graphs[alen]
+        st.set(starts, self.cos, self.sin)                            # varying per-stream starts, IN PLACE
+        h.copy_(x)
+        g.replay(); torch.cuda.synchronize()
+        for li in self.aux_ids:                                       # publish this replay's [B,s,H] aux — ALIASES the
+            _AUX[li] = st.aux[li]                                     # static buffer; _merge_aux consumes it synchronously
         return out
 
 
