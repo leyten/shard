@@ -56,16 +56,30 @@ agg** (clean 1.66×/2.30× WAN amortization) — BUT on n-gram-undraftable conte
 receipt is the draftable-content (g≈4) regime. Batched viability is g-dependent + pool-relative; at
 g=1 clearing 20 agg needs ~B=8 or a tight pool. Spec + SPEC_V0 revised accordingly.
 
-**NEXT SESSION (in order):**
-1. **MlxRuntime** — the any-device flagship (Mac/MLX; model file + 4-bit artifact + per-layer
+**NEXT SESSION (in order — reprioritized 2026-07-10, leyten's call: batched becomes the engine
+standard once the drafter is in):**
+1. **EAGLE-in-batch, then batched-as-standard.** Wire the FULL drafting stack into
+   `coordinate_pipe_batch`: per-stream aux buffers ([B,s,H] in the graph capture, mirroring the solo
+   aux-in-graph design) + B drafter states at the coordinator (hybrid n-gram→EAGLE per stream; tree
+   second). The batched path drafting n-gram-only is why B=4 measured 11.95 at the g≈1 floor while
+   single-stream does 20-30 with EAGLE — same physics, missing drafter. THEN re-measure the batched
+   bar honestly: REALISTIC prompt mix + B=4/8 arms (the counting prompt was n-gram-ADVERSARIAL, below
+   any real floor — don't set g_batched from it; set it from the mix measurement). Direction once it
+   holds: the batched CODE PATH becomes the default for every ring — B=1 reduces to solo (batchverify
+   proven bit-exact at B=1) so one code path serves all roles and every benchmark runs B-parameterized
+   on one warm ring. B stays a per-role SERVING-POLICY knob, not a constant: interactive anchors keep
+   single-stream priority (per-stream latency at B>1 is strictly worse; batched fills idle capacity),
+   and batched KV VRAM (B×MAXLEN per layer) keeps feeding plan/admission as modeled. The isolation
+   gate (PASS, receipt) is what makes the unification safe: per-stream receipts/verification unchanged.
+2. **MlxRuntime** — the any-device flagship (Mac/MLX; model file + 4-bit artifact + per-layer
    callability exist). CPU/local-first; the real "any device joins" proof.
-2. **Probe fidelity follow-ups:** align `--measure`'s per-layer tensor set with what m25_stage actually
+3. **Probe fidelity follow-ups:** align `--measure`'s per-layer tensor set with what m25_stage actually
    keeps resident (probe loads the whole layer prefix — measured 2330 vs stage-implied ~2426 all-in at
-   B=4, close but unaudited); B=8 batched arm on draftable content (settles the batched bar for real);
-   periodic DHT re-provide in the sidecar; probe the >48GB tier when a box is cheap.
-3. **Market migration stage 1** IF leyten greenlights c0mpute #16 — the role verdict in `node_role` is
+   B=4, close but unaudited); periodic DHT re-provide in the sidecar; probe the >48GB tier when a box
+   is cheap.
+4. **Market migration stage 1** IF leyten greenlights c0mpute #16 — the role verdict in `node_role` is
    exactly the "asks in announce" input the cheapest-adequate formation needs.
-4. Wire warm per-stage `per_stage_ms` feedback into re-selection (ring_up's honest gap; the probe's
+5. Wire warm per-stage `per_stage_ms` feedback into re-selection (ring_up's honest gap; the probe's
    layer_ms is the admission-time half of it).
 
 **RING: none live** (verified 0). c0mpute WIP (`onchain-staking.ts`) untouched.
