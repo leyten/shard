@@ -74,6 +74,14 @@ if M25_GRAPH_JOB is not None:
 # round floor). 0 pins batched decode eager WITHOUT touching the solo graph route, so a batched-graph
 # regression can be isolated per-launch on a warm ring (the M25_EAGER-style per-lever hatch).
 M25_BATCH_GRAPH = os.environ.get("M25_BATCH_GRAPH", "1") != "0"
+# Accepted-prefix aux slimming (M25_AUX_SLIM=0 = escape hatch): batched rounds are TRANSPORT-bound
+# (batched-levers-sweep-20260710) and the EAGLE aux return is a big slice of the round's bytes. The
+# tail recomputes the coordinator's accept rule from the drafted rows (the head forwards them as
+# 'tids') and returns aux SLICED to each stream's committed prefix — lossless (unsent rows were never
+# read) and compat-gated (no tids on the frame -> full aux, so old/new builds mix cleanly). This
+# trims the RETURN leg only (~the tail's 3 aux layers); the forward-leg aux is the head-local-aux
+# follow-up. Solo path untouched.
+M25_AUX_SLIM = os.environ.get("M25_AUX_SLIM", "1") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -341,16 +349,71 @@ def _eagle_aux_range_b(aux, b, lo, hi):
     return _t.stack([aux[str(li)][b, lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
 
 
+def _aux_keep_lens(tids, rows):
+    """Per-stream count of aux rows the coordinator will CONSUME this round — EXACTLY its accept rule
+    (the batch loop): n = longest prefix where draft ds[j] == argmax r[j]; it commits n+1 rows on a
+    divergence (accepted prefix + the correction) or the full K+1 on a full accept (bonus token
+    possible at depth 1). tids rows are [anchor]+ds (length K+1); rows are the tail's argmax [B][K+1].
+    The TAIL runs this so it can slice the returned aux to what will actually be consumed — the aux
+    payload is the dominant batched-round transport term. Lossless: rows past the commit are never
+    read by the coordinator (an extra unsent row could only ever have sat unread)."""
+    lens = []
+    for b, row in enumerate(rows):
+        ds = tids[b][1:]
+        K = len(ds)
+        n = 0
+        for j in range(K):
+            if ds[j] == row[j]:
+                n += 1
+            else:
+                break
+        lens.append(n + 1 if n < K else K + 1)
+    return lens
+
+
+def _slim_aux_b(aux, lens):
+    """Slice each merged aux entry ([B,s,H] bf16 tensor, or fp8 [q, [scales]]) to per-stream
+    accepted-prefix lengths, ragged-packed as ["slim", cat, lens, scales|None] (cat = kept rows
+    concatenated over streams; fp8 rides as a uint8 byte view — slice/cat-safe on every torch build).
+    Unknown entry shapes pass through FULL (fail-open: worst case is the old payload, never a broken
+    drafter)."""
+    out = {}
+    for k, v in aux.items():
+        if torch.is_tensor(v) and v.dim() == 3:                        # bf16 [B,s,H]
+            out[k] = ["slim", torch.cat([v[b, :l] for b, l in enumerate(lens)], 0), list(lens), None]
+        elif (isinstance(v, list) and len(v) == 2 and torch.is_tensor(v[0]) and v[0].dim() == 3
+              and isinstance(v[1], list)):                             # fp8 [q [B,s,H], per-stream scales]
+            q = v[0].view(torch.uint8)
+            out[k] = ["slim", torch.cat([q[b, :l] for b, l in enumerate(lens)], 0), list(lens), v[1]]
+        else:
+            out[k] = v
+    return out
+
+
 def _unpack_b(resp):
     """verify_batch reply: bare [B][K+1] rows (plain), or {"toks": rows, "aux": {li: [B,s,H]}} under
     M25_EAGLE — fp8-packed aux entries dequantized once, mirroring _unpack. Batched entries carry a
-    PER-STREAM scale list ([q, [s0..sB-1]]); solo-shaped entries keep the [q, float] pair."""
+    PER-STREAM scale list ([q, [s0..sB-1]]); solo-shaped entries keep the [q, float] pair. SLIM
+    entries (["slim", cat, lens, scales|None] — the tail sliced aux to accepted prefixes) reconstruct
+    to a zero-PADDED [B, max_len, H]: the coordinator only ever reads [b, :len(committed)) with
+    len(committed) <= lens[b], so padding is never consumed. Dequant matches the unslimmed path
+    bit-for-bit (bf16 q times bf16 per-stream scale)."""
     if isinstance(resp, dict):
         aux = resp.get("aux")
         if aux:
             for k, v in aux.items():
                 if isinstance(v, list):
-                    if isinstance(v[1], list):          # per-row scales for [B,s,H]
+                    if v and v[0] == "slim":            # ragged accepted-prefix aux -> padded [B,max,H]
+                        _, cat, lens, scales = v
+                        mx = max(lens) if lens else 0
+                        if scales is not None:
+                            cat = cat.view(torch.float8_e4m3fn).to(torch.bfloat16)
+                            sc = torch.tensor(scales, dtype=torch.bfloat16)
+                        o = torch.zeros(len(lens), mx, cat.shape[-1], dtype=torch.bfloat16)
+                        for b, p in enumerate(torch.split(cat, lens, 0)):
+                            o[b, :lens[b]] = p * sc[b] if scales is not None else p
+                        aux[k] = o
+                    elif isinstance(v[1], list):        # per-row scales for [B,s,H]
                         aux[k] = v[0].to(torch.bfloat16) * torch.tensor(v[1], dtype=torch.bfloat16).view(-1, 1, 1)
                     else:
                         aux[k] = _unpack_h(v[0], v[1])
@@ -1408,7 +1471,14 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                 signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                             toks = _tail_logits(h, parts).argmax(-1).tolist()
-                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                            if S.M25_EAGLE:
+                                aux = _merge_aux(msg.get("aux"))
+                                if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
+                                    aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
+                                _ret_send({"toks": toks, "aux": aux})
+                            else:
+                                _ret_send(toks)
+                            continue
                         if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                             x = msg["h"].to(dev)
                             h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], x, vcfg)
@@ -1520,6 +1590,9 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
                         if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
                             fwd["aux"] = _merge_aux(msg.get("aux"))
+                            tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
+                            if tb is not None:                               # ints) so it can slice the return-leg
+                                fwd["tids"] = tb                             # aux to accepted prefixes (M25_AUX_SLIM)
                         nxt_kw.send(_hsend(fwd)); continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:

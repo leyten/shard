@@ -51,14 +51,24 @@ measurement, no drafter-tax discount). Ops lessons: HF xet pulls stall (kill+res
 `pkill -f` self-match struck AGAIN via a heredoc body carrying the pattern (split kill/launch into
 separate ssh calls); a vast host with wedged nvidia-uvm survives reboot+stop/start → destroy+replace.
 
-**NEXT SESSION (ranked, transport-bound era):**
-1. **AUX SLIMMING (lossless, biggest):** the tail knows each stream's accepted prefix — return aux
-   sliced to accepted+1 positions instead of all K+1 → ~2-3× cut of the dominant batched payload.
-2. **fp8 wire as the standard batched env** (already built; 2× payload) + bank the g-per-wire-mode
+**NEXT SESSION (ranked, transport-bound era — leg math CORRECTED from the first estimate):**
+1. **HEAD-LOCAL AUX (the real transport prize — design-panelled, plan in
+   `.claude/plans/head-local-aux.md`):** L1's aux is produced on the coordinator's OWN box yet rides
+   6 WAN legs (aux-layer-legs at this shape: L1=6, L30=3, L58=1; activations=6 → **40% of round
+   bytes**, same % at every B and wire mode). Panel verdict: bidirectional head pipe socket, per-job
+   opt-in (`aux_local` reset field + head ok), forward-first send order (localhost-buffer deadlock
+   proof), seq-paired frames (mispair = LOUD abort), shared-fate failure semantics (no new wedge
+   class), 6 offline gates specified. Projected fp8-B4 round 787→~610ms (agg ~18), bf16 1607→~1000ms.
+2. **AUX SLIMMING — BUILT (this session, follow-up commit):** head forwards drafted rows (`tids`),
+   tail slices returned aux to each stream's accepted prefix +1 (`_aux_keep_lens`/`_slim_aux_b`,
+   `M25_AUX_SLIM` hatch, compat-gated on tids; lossless + offline-gated bit-exact). HONEST math: the
+   return leg's 3 aux layers only ≈ 10-15% of round bytes at typical g — NOT the 2-3× first written.
+   Composes with head-local aux (~48% together).
+3. **fp8 wire as the standard batched env** (already built; 2× payload) + bank the g-per-wire-mode
    bands in SPEC_V0.
-3. **Depth>1 stale-context EAGLE A/B:** drafting is cheap now, so round pipelining hides WAN again
+4. **Depth>1 stale-context EAGLE A/B:** drafting is cheap now, so round pipelining hides WAN again
    (was pointless while drafting serialized). Quality-not-correctness tradeoff — A/B on-ring.
-4. Then: MlxRuntime → probe fidelity leftovers → market iff c0mpute #16.
+5. Then: MlxRuntime → probe fidelity leftovers → market iff c0mpute #16.
 
 **RING: none live** (instances-v1==0 verified). c0mpute WIP untouched.
 
