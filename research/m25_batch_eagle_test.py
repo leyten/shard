@@ -97,7 +97,7 @@ def _aux_block(b, start, s):
     return {str(li): torch.stack([aux_at(b, start + j, li) for j in range(s)], 0) for li in AUX_IDS}
 
 
-def _batch_ring(pipe_in, ret_out, stop):
+def _batch_ring(pipe_in, ret_out, stop, slim=False):
     while not stop.is_set():
         try:
             m = pipe_in.q.get(timeout=0.25)
@@ -116,18 +116,21 @@ def _batch_ring(pipe_in, ret_out, stop):
             aux = {str(li): torch.stack([torch.stack([aux_at(b, sb[b] + j, li)
                                                       for j in range(len(tb[b]))], 0)
                                          for b in range(B)], 0) for li in AUX_IDS}
+            if slim:                                           # the tail's accepted-prefix slicing, via the
+                lens = m25_pipe._aux_keep_lens(tb, toks)       # REAL helpers (round-trips _unpack_b's padded
+                aux = m25_pipe._slim_aux_b(aux, lens)          # reconstruction end-to-end)
             ret_out.q.put({"toks": toks, "aux": aux})
         elif op == "receipt":
             ret_out.q.put([])
 
 
-def run_batch(head_dir, tag):
+def run_batch(head_dir, tag, slim=False):
     gen = torch.Generator().manual_seed(5)
     embed = (torch.randn(VOCAB, H, generator=gen) * 0.3).to(torch.bfloat16)
     base = EagleDrafter(head_dir, embed, device="cpu", max_pos=2048, next_hidden="prenorm")
     drafters = [HybridDrafter(NgramDrafter(ng=3, margin=8), base.fork()) for _ in range(3)]
     pipe = _Chan(); ret = _Chan(); stop = threading.Event()
-    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop), daemon=True); t.start()
+    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop, slim), daemon=True); t.start()
     try:
         msgs = [[{"role": "user", "content": str(b)}] for b in range(3)]
         r = m25_pipe.coordinate_pipe_batch(pipe, _FakeTok(), msgs, K, 40, 15, ret, drafters,
@@ -157,6 +160,15 @@ assert len(o_new[EOS_STREAM]) < len(o_new[0]), "EOS stream must finish mid-batch
 assert any(g > 3 for g in g_new), "need a high-g (n-gram lock / full-accept+bonus) stream in the mix"
 assert any(g < 2 for g in g_new), "need a divergence-heavy stream in the mix"
 print("[adv-e2e] PASS — new fill-loop wiring == old serial wiring: committed outputs, g, rounds all equal")
+
+# ---- accepted-prefix aux slimming: a SLIM-serving ring must be a pure payload change ----------------
+# The ring slices aux to each stream's committed prefix via the REAL tail helpers (_aux_keep_lens +
+# _slim_aux_b) and the coordinator reconstructs via _unpack_b — committed outputs, g and rounds must
+# be EXACTLY the full-aux run's (the drafter consumed identical aux rows).
+o_slim, g_slim, r_slim = run_batch(tmp, "SLIM-aux ring", slim=True)
+assert o_slim == o_new, f"SLIM AUX CHANGED COMMITTED OUTPUT\n slim={o_slim}\n full={o_new}"
+assert g_slim == g_new and r_slim == r_new, f"slim telemetry diverged: g {g_slim} vs {g_new}"
+print("[adv-e2e] PASS — slim-aux ring == full-aux ring: outputs, g, rounds identical (payload-only change)")
 
 
 # ---- graph-arm plumbing on reset_batch (the poisoned-arm guard, adversarial-review MAJOR) ----------
