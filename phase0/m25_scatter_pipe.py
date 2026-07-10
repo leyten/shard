@@ -26,6 +26,7 @@ ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAG
            "M25_GRAPH_JOB",                                               # per-job graph A/B: stages need the cap, the coordinator the reset stamp
            "M25_BATCH_GRAPH",                                             # batched-decode graph hatch: read STAGE-side (a hatch that doesn't reach the stages is dead)
            "M25_AUX_SLIM",                                                # accepted-prefix aux slimming hatch: read TAIL-side
+           "M25_AUX_LOCAL",                                               # head-local aux lane: coordinator stamps the job, the HEAD stage arms
            "M25_MOE_BACKEND",
            "M25_DEFAULT_REASONING", "M25_MAX_POS",
            "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH",   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four

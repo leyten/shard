@@ -44,6 +44,17 @@ def _stub(name, **a):
 class _Chan:
     def __init__(self): self.q = queue.Queue()
     def settimeout(self, t): pass
+    def gettimeout(self): return None
+
+
+class _Pipe:
+    """Duplex coordinator<->head pipe: ops go coordinator->ring (ring_q), the head-local aux lane
+    comes back on local_q (what the REAL pipe socket does bidirectionally under M25_AUX_LOCAL)."""
+    def __init__(self):
+        self.ring_q = queue.Queue()                    # coordinator -> ring ops
+        self.local_q = queue.Queue()                   # head -> coordinator aux_local frames
+    def settimeout(self, t): pass
+    def gettimeout(self): return None
 
 
 AUX_IDS = [1, 30, 58]
@@ -53,7 +64,9 @@ _stub("m25_stage", H=3072, DIR="/tmp/none", EPS=1e-6, raw=lambda *a, **k: None,
       vllm_ctx=lambda *a, **k: None, Layer=object, run_block=lambda *a, **k: None, _CTX=(None, None))
 _stub("m25_tools", render_ids=lambda tok, messages, tools=None, reasoning=True: list(PROMPTS[int(messages[0]["content"])]),
       parse_completion=lambda t: {"content": t, "reasoning_content": "", "tool_calls": []})
-_stub("node_kv", send_msg=lambda s, o: s.q.put(o), recv_msg=lambda s: s.q.get(timeout=15),
+_stub("node_kv",
+      send_msg=lambda s, o: (s.ring_q if hasattr(s, "ring_q") else s.q).put(o),
+      recv_msg=lambda s: (s.local_q if hasattr(s, "local_q") else s.q).get(timeout=15),
       EDGE_ERRORS=(Exception,), TransportError=RuntimeError)
 _stub("receipt", ReceiptSigner=None, load_or_make_node_key=lambda *a, **k: None,
       verify_receipt=lambda *a, **k: None, verify_coverage=lambda *a, **k: None)
@@ -97,25 +110,42 @@ def _aux_block(b, start, s):
     return {str(li): torch.stack([aux_at(b, start + j, li) for j in range(s)], 0) for li in AUX_IDS}
 
 
-def _batch_ring(pipe_in, ret_out, stop, slim=False):
+def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=False):
+    """aux_local: play an ARMED head too — ack the reset on the local lane, then per aux-producing
+    frame ship layer "1" on local_q (echoing job+seq) and keep it OFF the ring path, exactly the
+    armed head's contract. skew_seq: echo seq+1 on every local frame (the pairing-torture arm — a
+    DROPPED frame just times the job out loudly; a PRESENT-but-mispaired frame is the guard's case)."""
+    job = "job"
     while not stop.is_set():
         try:
-            m = pipe_in.q.get(timeout=0.25)
+            m = (pipe_in.ring_q if hasattr(pipe_in, "ring_q") else pipe_in.q).get(timeout=0.25)
         except queue.Empty:
             continue
         op = m.get("op")
+
+        def local_send(aux1, seq):
+            pipe_in.local_q.put({"op": "aux_local", "job": job,
+                                 "seq": (seq + 1) if skew_seq else seq, "aux": {"1": aux1}})
+
         if op == "reset_batch":
+            job = m.get("aux_local") or m.get("job_id", "job")   # echo the lane TOKEN (per-job nonce)
+            if aux_local and m.get("aux_local"):
+                pipe_in.local_q.put({"op": "aux_local_ok", "job": job})
             ret_out.q.put("ok")
         elif op == "verify":                                  # per-stream prefill: solo-shaped {toks, aux}
             b = m["stream"]; st = m["start"]; s = len(m["token_ids"])
-            ret_out.q.put({"toks": [truth(b, st + j + 1) for j in range(s)],
-                           "aux": _aux_block(b, st, s)})
+            aux = _aux_block(b, st, s)
+            if aux_local:
+                local_send(aux.pop("1"), m.get("seq"))         # "1" goes local-only, like the armed head
+            ret_out.q.put({"toks": [truth(b, st + j + 1) for j in range(s)], "aux": aux})
         elif op == "verify_batch":
             sb = m["start_b"]; tb = m["token_ids_b"]; B = len(tb)
             toks = [[truth(b, sb[b] + j + 1) for j in range(len(tb[b]))] for b in range(B)]
             aux = {str(li): torch.stack([torch.stack([aux_at(b, sb[b] + j, li)
                                                       for j in range(len(tb[b]))], 0)
                                          for b in range(B)], 0) for li in AUX_IDS}
+            if aux_local:
+                local_send(aux.pop("1"), m.get("seq"))
             if slim:                                           # the tail's accepted-prefix slicing, via the
                 lens = m25_pipe._aux_keep_lens(tb, toks)       # REAL helpers (round-trips _unpack_b's padded
                 aux = m25_pipe._slim_aux_b(aux, lens)          # reconstruction end-to-end)
@@ -124,18 +154,25 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False):
             ret_out.q.put([])
 
 
-def run_batch(head_dir, tag, slim=False):
+def run_batch(head_dir, tag, slim=False, aux_local=False, skew_seq=False, prestuff=False):
     gen = torch.Generator().manual_seed(5)
     embed = (torch.randn(VOCAB, H, generator=gen) * 0.3).to(torch.bfloat16)
     base = EagleDrafter(head_dir, embed, device="cpu", max_pos=2048, next_hidden="prenorm")
     drafters = [HybridDrafter(NgramDrafter(ng=3, margin=8), base.fork()) for _ in range(3)]
-    pipe = _Chan(); ret = _Chan(); stop = threading.Event()
-    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop, slim), daemon=True); t.start()
+    pipe = _Pipe() if aux_local else _Chan(); ret = _Chan(); stop = threading.Event()
+    if prestuff:                                       # a dead job's leftovers on the reused socket: the
+        pipe.local_q.put({"op": "aux_local", "job": "dead", "seq": 7, "aux": {}})   # handshake must
+        pipe.local_q.put({"op": "aux_local_ok", "job": "dead"})                     # drain them all
+    old_flag = m25_pipe.M25_AUX_LOCAL
+    m25_pipe.M25_AUX_LOCAL = aux_local
+    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop, slim, aux_local, skew_seq),
+                         daemon=True); t.start()
     try:
         msgs = [[{"role": "user", "content": str(b)}] for b in range(3)]
         r = m25_pipe.coordinate_pipe_batch(pipe, _FakeTok(), msgs, K, 40, 15, ret, drafters,
                                            prefill_chunk=0, max_ctx=0)
     finally:
+        m25_pipe.M25_AUX_LOCAL = old_flag
         stop.set(); t.join(timeout=2)
     assert r["eagle"], "eagle_on must be True in this gate"
     outs = [s["output_ids"] for s in r["streams"]]
@@ -169,6 +206,24 @@ o_slim, g_slim, r_slim = run_batch(tmp, "SLIM-aux ring", slim=True)
 assert o_slim == o_new, f"SLIM AUX CHANGED COMMITTED OUTPUT\n slim={o_slim}\n full={o_new}"
 assert g_slim == g_new and r_slim == r_new, f"slim telemetry diverged: g {g_slim} vs {g_new}"
 print("[adv-e2e] PASS — slim-aux ring == full-aux ring: outputs, g, rounds identical (payload-only change)")
+
+# ---- head-local aux (M25_AUX_LOCAL): layer "1" arrives on the LOCAL lane, never the ring ------------
+# The armed ring acks the handshake, strips "1" from every ring-path aux and ships it on local_q with
+# (job, seq) — the coordinator must merge it seamlessly: outputs, g, rounds EXACTLY the full run's.
+# Stale frames from a dead job are pre-stuffed on the lane: the handshake must drain them.
+o_loc, g_loc, r_loc = run_batch(tmp, "HEAD-LOCAL aux ring", aux_local=True, prestuff=True)
+assert o_loc == o_new, f"HEAD-LOCAL AUX CHANGED COMMITTED OUTPUT\n local={o_loc}\n full={o_new}"
+assert g_loc == g_new and r_loc == r_new, f"aux_local telemetry diverged: g {g_loc} vs {g_new}"
+print("[adv-e2e] PASS — head-local aux ring == full ring (incl. stale-frame drain): pure transport change")
+
+# pairing torture: a PRESENT-but-mispaired local frame must abort LOUD (a silent mispair would
+# degrade g invisibly); a DROPPED frame times the job out loudly via the socket deadline instead
+try:
+    run_batch(tmp, "SEQ-SKEW ring", aux_local=True, skew_seq=True)
+    raise AssertionError("a mispaired aux_local frame was accepted — the (job,seq) guard is MISSING")
+except RuntimeError as e:                                     # TransportError is stubbed to RuntimeError here
+    assert "aux_local pairing broken" in str(e), e
+print("[adv-e2e] PASS — mispaired local frame aborts LOUD on the (job,seq) pairing guard")
 
 
 # ---- graph-arm plumbing on reset_batch (the poisoned-arm guard, adversarial-review MAJOR) ----------
