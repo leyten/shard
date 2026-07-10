@@ -113,19 +113,22 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
   models** (a 30-40 B NVFP4 fits meaningfully in 4 layers). The capability function, parameterized per
   model, sends every card to where it adds value. That is the self-organizing multi-model network — the
   real heterogeneity play, not "make every card serve M2.5."
-- **Batched viability is g-DEPENDENT and pool-relative (measured 2026-07-09, REVISED 2026-07-10 with
-  the full drafting stack in the batched path).** The 12-arm live sweep (6×5090 ring, hybrid
-  n-gram→EAGLE per stream, receipt batched-sweep-eagle-20260710): **content-mix g = 3.6** (band: prose
-  2.2, qa 2.4, code 2.9, reasoning 3.7, tools-JSON 3.7, summarize/verbatim 5.8) — the 16× lift over the
-  n-gram-only floor (g 0.22 at equal transport) proves drafting quality transfers to batch. The
-  DATA-ISOLATION gate passes and every batched round is receipt-attested (72/72 sigs valid).
-  **Operative g_batched = 2.5**: the measured 3.6 discounted for the CURRENT engine's
-  drafter-serialization tax (B EAGLE chains run serially coordinator-side, ~0.25 s/stream/round, and
-  EAGLE pins the in-flight window to 1 — B-scaling measured 3.3× at B=8, not 8×). On this engine build
-  the 20-agg bar is DRAFTING-bound, not WAN-bound: the unlock is engine work (batch the drafter
-  forward, graph the drafter chain, graph the batched stage path), not admission policy. Revise
-  g_batched up as those land. Pool-relativity stands: the live probe verdict for a 24 GB card 72 ms
-  from its pool was VERIFIER, correctly.
+- **Batched viability is g-DEPENDENT, WIRE-MODE-dependent, and pool-relative (measured 2026-07-09,
+  REVISED 2026-07-10 twice: full drafting stack, then the drafter-batching + batched-graph levers —
+  receipts batched-sweep-eagle-20260710 + batched-levers-sweep-20260710).** Content-mix g at bf16 wire
+  = **3.55** (band: prose 2.2, qa 2.4, code 2.8, reasoning 3.4, tools-JSON 3.7, summarize/verbatim 5.8
+  — reproduced the prior receipt token-exact); at **fp8 wire g = 2.48** (band 1.9–3.5; fp8 shifts the
+  greedy content itself, and it halves the payload → ~2× rounds, so it is BOTH a lever and a numerics
+  env — quote g per wire mode). The 16× drafting lift over the n-gram floor stands; every batched
+  round is receipt-attested across all passes.
+  **Operative g_batched = 2.5**, now resting directly on the fp8-wire measurement (2.48), no longer on
+  a drafter-tax discount: the levers KILLED the serialization tax (B chains draft as one [B,...]
+  forward; batched stages replay CUDA graphs — B=1 rounds 1158→458 ms at equal env, B-curve
+  2.96/3.65/7.70/9.72 → 18.1/9.6/14.5/15.5 agg on the fp8 build). On this build the 20-agg bar is
+  **TRANSPORT-bound** (EAGLE aux payload ∝ B dominates the round): the next unlocks are aux slimming
+  (return accepted-prefix aux only) and depth>1 stale-context overlap — engine work, not admission
+  policy. Pool-relativity stands: the live probe verdict for a 24 GB card 72 ms from its pool was
+  VERIFIER, correctly.
 
 ## The bar is a ROLE TAG, not a binary gate
 
