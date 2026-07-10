@@ -82,6 +82,18 @@ M25_BATCH_GRAPH = os.environ.get("M25_BATCH_GRAPH", "1") != "0"
 # trims the RETURN leg only (~the tail's 3 aux layers); the forward-leg aux is the head-local-aux
 # follow-up. Solo path untouched.
 M25_AUX_SLIM = os.environ.get("M25_AUX_SLIM", "1") != "0"
+# Head-local aux (M25_AUX_LOCAL=1, BATCHED jobs, default OFF until live-validated): the head stage's
+# own aux layers (L1 at the standard shape) are produced ON THE COORDINATOR'S BOX yet ride every WAN
+# leg — ~40% of a batched round's bytes (aux-layer-legs L1=6/L30=3/L58=1 vs 6 activation legs; same %
+# at every B and wire mode). With the flag, a batched job opts in per job (reset_batch 'aux_local' ->
+# the head acks 'aux_local_ok' on the pipe socket BEFORE forwarding the reset), then the head sends
+# {op:aux_local, job, seq, aux} on the pipe AFTER each ring forward (forward-first: a big local frame
+# must never block the ring send) and OMITS its own aux from the forward frames. The coordinator
+# pulls exactly one local frame per aux-producing frame it sent, paired by (job, seq): any skew
+# aborts LOUD — a silently mispaired aux row would degrade g invisibly, the worst drafter bug class.
+# Old head (no ack) -> degrade to the ridden-ring path. Solo jobs never stamp the field.
+# Design + failure matrix: .claude/plans/head-local-aux.md.
+M25_AUX_LOCAL = os.environ.get("M25_AUX_LOCAL", "0") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -347,6 +359,67 @@ def _eagle_aux_range_b(aux, b, lo, hi):
     stream's row for that stream's drafter."""
     import torch as _t
     return _t.stack([aux[str(li)][b, lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
+
+
+def _aux_local_handshake(sock, token, wait_s=2.0):
+    """Confirm the head's per-job aux_local opt-in on the (localhost) pipe socket. `token` is the
+    job's UNIQUE nonce (minted per job — job_id defaults to "job" everywhere, so it can NOT
+    disambiguate a dead job's residue from this job's; the review's F2): the head echoes it in the
+    ok and every frame. The head sends aux_local_ok BEFORE forwarding the reset, and the tail's
+    reset ack only arrives after the full ring traversal — so an armed head's ok is already buffered
+    when this runs and the read returns instantly. The wait only elapses against an OLD head that
+    never acks: return False and run the job on the ridden-ring path. (NOTE that degrade is sound
+    only for genuinely OLD heads — a NEW armed head whose ok was somehow lost would omit its aux
+    from the ring and the job would crash LOUD on the missing layer; acceptable: loud, and
+    near-unreachable on a loopback lane.) Also DRAINS a dead job's stale frames off the reused
+    gateway socket — foreign-token oks and frames are dropped, never terminate the handshake."""
+    old = sock.gettimeout()
+    try:
+        sock.settimeout(wait_s)
+        while True:
+            try:
+                m = recv_data(sock)
+            except (socket.timeout, TransportError, OSError):   # old head / nothing buffered
+                return False
+            if isinstance(m, dict) and m.get("op") == "aux_local_ok" and m.get("job") == token:
+                return True
+            # a dead job's ok or stale aux frame: drop and keep draining
+    finally:
+        sock.settimeout(old)
+
+
+def _pull_aux_local(sock, token, want_seq):
+    """Pull the head's aux_local frame for the round the coordinator JUST received the ring reply
+    for. Causality guarantees it is already buffered (the head sent it right after forwarding the
+    frame whose reply completed the traversal), so this is a local read, not a wait. The (token,
+    seq) pair MUST match: two FIFOs driven 1:1 by the same single-threaded sender can only skew if
+    a frame was lost or a build is mixed wrong — and a silently mispaired aux row would degrade g
+    invisibly, so any mismatch aborts the job LOUDLY instead."""
+    m = recv_data(sock)
+    if not (isinstance(m, dict) and m.get("op") == "aux_local"
+            and m.get("job") == token and m.get("seq") == want_seq):
+        raise TransportError(f"aux_local pairing broken: wanted token={token} seq={want_seq}, got "
+                             f"{str(m)[:100]} — aborting (a mispaired aux would silently degrade g)")
+    return m.get("aux") or {}
+
+
+def _drain_aux_local(sock, n, wait_s=1.0):
+    """Best-effort post-ABORT drain: consume up to the n outstanding local frames an aborted armed
+    job left in flight. Without this the single-threaded head can sit BLOCKED mid-send_msg on a full
+    localhost buffer (a prefill chunk's aux is tens of MB) — it then can't read the NEXT job's
+    reset, and the only other drain point (the next handshake) sits BEHIND that reset's tail ack:
+    a full-ring wedge on any reused pipe socket (the review's F1). A quiet lane (frame not yet
+    sent / head gone) stops the drain early; errors are absorbed — the caller is already aborting."""
+    try:
+        old = sock.gettimeout()
+        sock.settimeout(wait_s)
+        try:
+            for _ in range(n):
+                recv_data(sock)
+        finally:
+            sock.settimeout(old)
+    except Exception:
+        pass
 
 
 def _aux_keep_lens(tids, rows):
@@ -973,6 +1046,11 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         for d in drafters:
             d.reset()                                    # fresh per-stream EAGLE context per job
     job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+    # aux_local token = a per-job NONCE, not job_id: job_id defaults to "job" for every sweep/gateway
+    # job, so it cannot disambiguate a dead job's lane residue from this job's (review F2). Counters
+    # live OUTSIDE the try so the finally-drain (review F1) is always well-defined.
+    aux_token = os.urandom(8).hex() if (M25_AUX_LOCAL and eagle_on) else None
+    aux_local = False; lseq_tx = lseq_rx = 0
     try:
         rb_op = {"op": "reset_batch", "B": B, "swarm_id": swarm_id, "job_id": job_id}
         if job_nonce is not None:
@@ -980,18 +1058,31 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         if M25_GRAPH_JOB is not None:                        # per-job graph arm, exactly solo's stamp: a batched
             rb_op["graph"] = M25_GRAPH_JOB                   # job must never SILENTLY inherit a prior solo job's
                                                              # runtime route (the review's poisoned-arm scenario)
+        if aux_token:
+            rb_op["aux_local"] = aux_token                   # per-job opt-in; the head echoes the token on the lane
         kw.send(rb_op); ack = recv_data(rx)
         if isinstance(ack, dict) and ack.get("error"):       # e.g. B wider than the ring's launch-time KV rows:
             raise TransportError(f"reset_batch refused: {ack['error']}")   # abort BEFORE any batched
                                                                            # op can kill a warm stage
         _check_reset_ack(rb_op, ack)                         # graph-stamped job + refused/old-stage toggle = fail LOUD
+        if aux_token:
+            aux_local = _aux_local_handshake(pipe_sock, aux_token)   # also drains a dead job's stale frames
+            if not aux_local:
+                print("[batch] aux_local asked but the head never acked — ridden-ring aux (old head?)", flush=True)
         for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
             gen = prompts[b]
             starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
             for i in starts_b:
                 chunk = gen[i:i + prefill_chunk] if prefill_chunk else gen
-                kw.send({"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True})
+                pf = {"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True}
+                if aux_local:
+                    pf["seq"] = lseq_tx; lseq_tx += 1
+                kw.send(pf)
                 rr, aux = _unpack(recv_data(rx))         # stream-b prefill reply is solo-shaped ({toks, aux})
+                if aux_local:                            # the head's own aux layers arrive on the local lane
+                    loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
+                    if loc:
+                        aux = {**(aux or {}), **loc}     # all-empty stays None -> the no-aux path fails loud
                 if eagle_on and aux is not None:         # whole-prompt drafter context, chunk by chunk
                     drafters[b].extend(prefill_pair_tokens(gen, i, rr),
                                        _eagle_aux_range(aux, 0, len(rr)), base_pos=i)
@@ -1028,12 +1119,19 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                     ds = ds_act[b] if eagle_on else drafters[b].fetch()
                     tids.append([dprefix[b][-1]] + ds); row.append((spos[b], ds)); sb.append(spos[b])
                     dprefix[b] = dprefix[b] + ds; spos[b] += K; drafters[b].request(dprefix[b], K)
-                kw.send({"op": "verify_batch", "token_ids_b": tids, "start_b": sb})
+                vb = {"op": "verify_batch", "token_ids_b": tids, "start_b": sb}
+                if aux_local:
+                    vb["seq"] = lseq_tx; lseq_tx += 1
+                kw.send(vb)
                 inflight.append(row)
             if not inflight:
                 break
             tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
             rb, aux_b = _unpack_b(resp)                         # rb: [B][K+1] per-stream argmax; aux rows under EAGLE
+            if aux_local:                                       # one local frame per round, ALWAYS consumed (even for
+                loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1   # rounds a divergence will discard —
+                if loc:                                                           # the FIFO pairing must never skew)
+                    aux_b = {**(aux_b or {}), **loc}
             if eagle_on and aux_b is None and rounds == 0:      # fail LOUD, not a silently-poisoned measurement:
                 raise TransportError("EAGLE drafters but the ring returned no aux — launch stages "
                                      "with M25_EAGLE=1 (a depth-1 no-context run measures WORSE than n-gram)")
@@ -1074,6 +1172,8 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                 graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
                 receipts = receipts.get("receipts", [])
     finally:
+        if aux_local and lseq_rx < lseq_tx:                 # an ABORTED armed job must never leave the head blocked
+            _drain_aux_local(pipe_sock, lseq_tx - lseq_rx)  # mid-send on a full lane / the lane dirty (review F1)
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
                                     check_chain=not M25_FP8_WIRE) if receipts   # fp8 wire is intentionally lossy
@@ -1091,6 +1191,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             "wasted": wasted, "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
             "receipts_ok": receipts_ok, "eagle": eagle_on,
             "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
+            "aux_local": bool(aux_local),   # armed lane vs ridden-ring aux — arms must never be conflated
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
@@ -1547,7 +1648,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 time.sleep(0.5)
         conn, _ = srv.accept(); conn.setsockopt(*NODELAY); _keepalive(conn)
         print(f"[s{stage}] predecessor connected", flush=True)
-        signer = None
+        signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
         with torch.no_grad():
             try:
                 while True:
@@ -1557,6 +1658,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg["op"] == "reset":
                         _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
+                        aux_local_job = None                    # a solo job takes over: the local lane closes
                         for L in layers:
                             L.reset()
                         if "keepwarm_ms" in msg:                # coordinator toggle rode the reset (interleaved A/B)
@@ -1572,6 +1674,11 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
                         _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
+                        aux_local_job = (msg["aux_local"]   # the lane TOKEN: a per-job nonce (job_id is "job"
+                                         if parts["head"] and msg.get("aux_local") and S.M25_EAGLE else None)   # everywhere — it can't disambiguate residue)
+                        if aux_local_job is not None:           # ack the local lane on the pipe BEFORE forwarding the
+                            send_msg(conn, {"op": "aux_local_ok", "job": aux_local_job})   # reset — the coordinator's
+                                                                # handshake read is then causally satisfied
                         for L in layers: L.reset()
                         if RECEIPTS:                            # fresh per-job signer, same as tail (never let a
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # solo job's signer
@@ -1589,11 +1696,18 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
                         if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
-                            fwd["aux"] = _merge_aux(msg.get("aux"))
+                            if aux_local_job is None:            # armed head: its own aux goes on the LOCAL lane
+                                fwd["aux"] = _merge_aux(msg.get("aux"))   # (below), never onto the WAN legs
                             tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
                             if tb is not None:                               # ints) so it can slice the return-leg
                                 fwd["tids"] = tb                             # aux to accepted prefixes (M25_AUX_SLIM)
-                        nxt_kw.send(_hsend(fwd)); continue
+                        nxt_kw.send(_hsend(fwd))
+                        if aux_local_job is not None:            # forward-FIRST, then the local lane: a big local
+                            send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
+                                            "seq": msg.get("seq"),                      # the ring send (localhost
+                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()   # buffer deadlock)
+                                                    for li, v in S._AUX.items()}})
+                        continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
@@ -1605,8 +1719,14 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
                         if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
-                            fwd["aux"] = _merge_aux(msg.get("aux"))
-                        nxt_kw.send(_hsend(fwd)); continue
+                            if aux_local_job is None:            # armed head: own aux on the local lane (below)
+                                fwd["aux"] = _merge_aux(msg.get("aux"))
+                        nxt_kw.send(_hsend(fwd))
+                        if aux_local_job is not None:            # forward-first, exactly like verify_batch
+                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
+                                                    for li, v in S._AUX.items()}})
+                        continue
                     if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
                         if parts["head"]:
                             h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
