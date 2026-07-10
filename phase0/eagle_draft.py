@@ -333,7 +333,10 @@ def draft_batch(eagles, k):
     micro-step's 2 host syncs (int(argmax), int(d2t[i])) collapse to ONE .tolist() after the whole chain.
     Only ATTENTION stays per-fork: each fork attends its OWN ragged committed context (kbuf[:T]), the
     exact serial op — which is what keeps row j byte-identical to eagles[j]._draft(k). Scratch-tail
-    semantics mirror _draft: chain k/v go to slots [ctx_len, ctx_len+k), committed state never mutates."""
+    semantics mirror _draft: chain k/v go to slots [ctx_len, ctx_len+k), committed state never mutates.
+    Byte-identity is CPU-PROVEN (research/m25_draft_batch_test.py); on CUDA the batched GEMMs may pick
+    different kernel schedules than M=1 (bit-drift possible) — harmless BY CONSTRUCTION: these are
+    PROPOSALS, the ring greedy-verifies every token, so only g can move (judge it on the live A/B)."""
     n = len(eagles)
     if n == 0:
         return []
@@ -406,8 +409,9 @@ def fetch_b(drafters):
     stream first (CPU dict lookups, free), then ALL EAGLE misses draft in ONE draft_batch chain instead
     of B serial ones. Accepts any mix of HybridDrafter / EagleDrafter / other drafters (anything else
     just fetch()es serially — n-gram-only streams cost nothing either way). Row b is byte-identical to
-    drafters[b].fetch() — same math, same argmax — so committed streams are unchanged; only the
-    coordinator's drafting wall-clock moves. Consumes pendings exactly like fetch() (sets .matched)."""
+    drafters[b].fetch() — same math, same argmax (CPU-proven; see draft_batch's CUDA caveat) — so
+    committed streams are unchanged; only the coordinator's drafting wall-clock moves. Consumes
+    pendings exactly like fetch() (sets .matched)."""
     out = [None] * len(drafters)
     batch = {}                                                 # k -> [(slot, eagle)] (k is uniform in
     for j, d in enumerate(drafters):                           # practice; grouping keeps it correct anyway)
