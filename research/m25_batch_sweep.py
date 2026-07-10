@@ -111,27 +111,46 @@ def run_arm(name, prompts, kind):
     return row
 
 
+def run_all():
+    """The 12 arms, names/prompts/K/max_new UNCHANGED (apples-to-apples vs batched-sweep-eagle-20260710)."""
+    rows = []
+    # 1. mixed-content B sweep, full drafting
+    for B in (1, 2, 4, 8):
+        prompts = list(itertools.islice(itertools.cycle(MIX), B))
+        rows.append(run_arm(f"mix-B{B}", prompts, "hybrid"))
+    # 2. per-use-case pure batches at B=4, full drafting
+    for case, prompt in CASES.items():
+        rows.append(run_arm(f"{case}-B4", [prompt] * 4, "hybrid"))
+    # 3. drafting A/B at B=4 mixed: EAGLE's isolated lift over the old n-gram-only floor
+    rows.append(run_arm("mix-B4-ngram", MIX[:4], "ngram"))
+    rows.append(run_arm("mix-B4-hybrid", MIX[:4], "hybrid"))
+    return rows
+
+
 print(f"=== SWEEP: K={K} max_new={MAX_NEW} eagle_dir={EAGLE_DIR} M25_EAGLE={S.M25_EAGLE} ===", flush=True)
-if os.environ.get("SWEEP_WARMUP", "1") != "0":
-    warmup()
 results = []
-
-# 1. mixed-content B sweep, full drafting
-for B in (1, 2, 4, 8):
-    prompts = list(itertools.islice(itertools.cycle(MIX), B))
-    results.append(run_arm(f"mix-B{B}", prompts, "hybrid"))
-
-# 2. per-use-case pure batches at B=4, full drafting
-for case, prompt in CASES.items():
-    results.append(run_arm(f"{case}-B4", [prompt] * 4, "hybrid"))
-
-# 3. drafting A/B at B=4 mixed: EAGLE's isolated lift over the old n-gram-only floor
-results.append(run_arm("mix-B4-ngram", MIX[:4], "ngram"))
-results.append(run_arm("mix-B4-hybrid", MIX[:4], "hybrid"))
+# SWEEP_GRAPH_ARMS="off,on": run the WHOLE arm set once per batched-graph arm on ONE warm ring —
+# per-job stamped via M25_GRAPH_JOB -> reset_batch (ack-verified on every job, so a silently-eager
+# "on" pass is impossible). off = the old build's decode path (lever-1 isolation + ring-parity anchor
+# vs the old receipt's 220ms ngram floor); on = the full new build. Unset = plain single pass
+# (whatever the launch env routes).
+GRAPH_PASSES = [p.strip() for p in os.environ.get("SWEEP_GRAPH_ARMS", "").split(",") if p.strip()]
+if not GRAPH_PASSES:
+    if os.environ.get("SWEEP_WARMUP", "1") != "0":
+        warmup()
+    results = run_all()
+else:
+    for p in GRAPH_PASSES:
+        P.M25_GRAPH_JOB = (p == "on")
+        print(f"=== PASS graph={p} ===", flush=True)
+        if p == "on" and os.environ.get("SWEEP_WARMUP", "1") != "0":
+            warmup()                                   # captures happen off the clock, once per (B,s)
+        results += [{**row, "graph_pass": p} for row in run_all()]
 
 print("=== SUMMARY ===", flush=True)
 for row in results:
-    print(f"  {row['arm']:>16} B={row['B']} {row['drafting']:>6}: agg={row['agg_tok_s']:7.2f} "
-          f"g={row['g_mean']:.2f} per-stream~{row['per_stream'][0]['tok_s']:.1f} "
-          f"rounds={row['rounds']} receipts={row['receipts']}", flush=True)
+    print(f"  {row.get('graph_pass', '-'):>4} {row['arm']:>16} B={row['B']} {row['drafting']:>6}: "
+          f"agg={row['agg_tok_s']:7.2f} g={row['g_mean']:.2f} "
+          f"per-stream~{row['per_stream'][0]['tok_s']:.1f} rounds={row['rounds']} "
+          f"receipts={row['receipts']} ok={row.get('receipts_ok')}", flush=True)
 print("[sweep] done", flush=True)
