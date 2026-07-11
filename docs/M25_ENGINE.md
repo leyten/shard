@@ -13,6 +13,25 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ PoC DEFINITION-OF-DONE (agreed with leyten 2026-07-11) — the legs, status + owner
+The betanet PoC = a permissionless network where any GPU joins, gets measured, gets a role, serves
+real inference verifiably, and gets paid. Leg status:
+1. **Interactive speed** — ✅ BANKED (20-30 tok/s solo receipts, graph-aux).
+2. **Permissionless join + measured admission** — ✅ BANKED (probe live-proven, role-at-node-bind).
+3. **Torrent weight propagation** — ✅ BANKED (ringmate pulls, DHT, same-peer resume).
+4. **Verifiable serving** — ✅ BANKED (per-stage receipts everywhere, batched attested, fail-closed).
+5. **Batched viability number** — ⏳ ONE RING AWAY: both aux transport levers built+gated (#78 slim,
+   #79 head-local); the A/B + re-sweep either banks mix-B4 ≥ 25 agg (the "batching is a product"
+   bar feeding spec/economics/paper) or names what binds. THE current next action.
+6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
+   must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
+   CPU/local-first, multi-day, no leyten decisions needed. THE next build after leg 5.
+7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
+   verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
+   engine work**. Paper publish also on leyten (refresh the headline with the new B-curve first).
+Sequence: leg-5 ring → leg-6 MlxRuntime (depth>1 stale-context EAGLE folds into a ring A/B only if
+the leg-5 decomposition says rounds went ring-latency-bound; K<8 same rule).
+
 ### ⇒ 2026-07-10 (later) — THE DRAFTING TAX IS DEAD (PR #74): batched drafter forward + batched-stage CUDA graphs, live-proven
 The two ranked levers landed, adversarially reviewed pre-ring, and re-swept apples-to-apples
 (receipt **batched-levers-sweep-20260710**). Merged **#74 #75 #76**. Ring up+down same session
