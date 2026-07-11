@@ -20,8 +20,15 @@ real inference verifiably, and gets paid. Leg status:
 2. **Permissionless join + measured admission** — ✅ BANKED (probe live-proven, role-at-node-bind).
 3. **Torrent weight propagation** — ✅ BANKED (ringmate pulls, DHT, same-peer resume).
 4. **Verifiable serving** — ✅ BANKED (per-stage receipts everywhere, batched attested, fail-closed).
-5. **Batched viability** — RE-SCOPED by leyten 2026-07-11: the DONE condition is **20-30 tok/s PER
-   STREAM at B≥2** (solo-grade UX under batch), not aggregate. Aggregate milestone banked (receipt
+5. **Batched viability** — RE-SCOPED by leyten 2026-07-11 to **20-30 tok/s PER STREAM at B≥2**;
+   **LARGELY MET same day (receipt perstream-delockstep-20260711)**: DE-LOCKSTEP (PR #84) live —
+   B=4 per-stream medians (3 reps, receipts valid): reasoning **26.9**, tools **26.8**, code
+   **23.9**, qa 19.4 ✓; prose 17.2 / summarize 13.8 / mix 13.6 (g-bound content). B-curve agg
+   2.96/3.65/7.70/9.72 → **23.0/30.9/54.3/111.5** (B=8 = 11.5×). De-lockstep = 1.6-2.7× per-stream
+   over lockstep same-ring; per-frame cadence ~44ms at B=4 (the research model held). Remaining to
+   the FULL bar: per-stream TREES (activation condition — latency-floor rounds — now MET), gateway
+   content routing (bar-content users get it today), B=2 tier 15.4 → ~19 w/ trees. bf16-aux
+   recovered only +8% g (the fp8-wire drop is content-shift, not aux fidelity). Aggregate milestone banked (receipt
    batched-viability-20260711: mix-B4 agg 25.68 median, per-stream 5.4-7.3; B-curve journey
    2.96/3.65/7.70/9.72 → 21.8/27.0/25.7/31.2). THE PATH (3-agent research synthesis, full plan
    `.claude/plans/per-stream-20-plan.md`): (0) **every batched receipt ran with TCP cwnd keep-warm
