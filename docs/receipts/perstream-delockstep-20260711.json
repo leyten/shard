@@ -1,0 +1,27 @@
+{
+  "what": "THE PER-STREAM BAR VERDICT: de-lockstep (PR #84, M25_DELOCKSTEP) live A/B vs lockstep on one 6x5090 EU ring + 3 on-pass repetitions of the 12-arm sweep. leyten's re-scoped leg-5 requirement = 20-30 tok/s PER STREAM under batch: MET at B=4 for tools/reasoning/code (23.9-26.9/stream median) and qa at the line (19.4); mixed/prose/summarize 13.6-17.2 (g-bound content -> the tree lever's regime, now latency-floor-bound as predicted).",
+  "date": "2026-07-11",
+  "ring": "6 stages RS(head,[0:10]) BG[10:14] DK[14:26] FR[26:38] HU[38:50] HU[50:62], M25_EAGLE=1 M25_BATCH=8 kv 4096, graphs on (M25_GRAPH_MAX=32), fp8 wire + BF16 AUX (M25_FP8_AUX=0), aux_local ON, aux slim ON, cwnd keep-warm ON (launcher default for batched since #83), M25_STAGE_TIMING=1, K=8 max_new 96, receipts ON",
+  "verdict_perstream_B4_median_3reps": {
+    "reasoning": 26.91, "tools": 26.78, "code": 23.92, "qa": 19.37,
+    "prose": 17.15, "summarize": 13.77, "mix": 13.58,
+    "note": "per-stream = mean over the 4 streams' tok_s; min/max across reps within ~5% except summarize (9.9-14.2, its g collapsed to 1.34 under the fp8-wire content shift — same phenomenon as the 07-10 finding, content-not-engine)"
+  },
+  "bcurve_agg_median": {
+    "delockstep_on": [23.0, 30.9, 54.3, 111.5],
+    "lockstep_same_ring": [25.2, 28.3, 34.9, 40.6],
+    "pre_lever_baseline_20260710": [2.96, 3.65, 7.70, 9.72],
+    "note": "B=1/2/4/8 mixed-content agg tok/s. B=8 delockstep = 11.5x the 4-day-old baseline. B=1: delockstep ~= lockstep ~= solo (as designed)."
+  },
+  "delockstep_ab_same_ring": "per-stream at B=4: lockstep 8.7-13.8 -> delockstep 13.6-26.9 by content (~1.6-2.7x). Per-frame cadence at B=4 ~44ms (4 interleaved streams -> ~176ms per-stream rounds) — the queueing model from the research synthesis held almost exactly (projected 190-230ms).",
+  "keepwarm_effect_visible": "lockstep mix-B4 rounds 297ms on this ring vs 530ms on the 07-11 morning ring (fp8-aux, keep-warm OFF) — the cwnd fix + bf16-aux ring; the ngram anchor arm ran 116-121ms (depth-4 pipelined floor).",
+  "bf16_aux_hypothesis_result": "mix g 2.68 vs 2.48 with fp8 aux (07-11 morning): +8% — MODEST. The fp8-wire g drop is mostly the CONTENT shift (what the model generates), not drafter-input fidelity. bf16 aux kept (cheap with slim+local).",
+  "ops": "zero pairing/skew/anchor faults across 4 armed passes; row graphs captured clean (5 graphs, 0 skipped, incl. the shared row graph); fp8 advanced-index probe passed on-GPU pre-sweep; all receipts valid on every arm (48 arm-jobs).",
+  "remaining_to_full_bar": [
+    "1. Low-g content (prose 1.97 / summarize 1.34 / mix 2.68): per-stream = g/round and rounds are now LATENCY-FLOOR-bound (~176ms at B=4) — the batched per-stream TREE lever's activation condition is met (parked spec in the per-stream-20 plan; projected +15-25% -> prose ~20, mix ~16-17).",
+    "2. Content routing at the gateway (batch like-with-like; tools/code/reasoning/qa users get the bar TODAY).",
+    "3. B=2 as the guaranteed tier: 15.4/stream mixed; with trees ~18-19; a fat-stage (48GB, N=3-4) ring pushes any of these ~1.3-1.8x.",
+    "4. summarize g anomaly under fp8 wire: investigate (bf16-wire arm or drafter-side) — its 5.8-at-bf16-wire content is the best case elsewhere."
+  ],
+  "spend": "~$5 ring session; credit $101.86; instances-v1 == 0 verified."
+}
