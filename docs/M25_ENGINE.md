@@ -20,15 +20,23 @@ real inference verifiably, and gets paid. Leg status:
 2. **Permissionless join + measured admission** — ✅ BANKED (probe live-proven, role-at-node-bind).
 3. **Torrent weight propagation** — ✅ BANKED (ringmate pulls, DHT, same-peer resume).
 4. **Verifiable serving** — ✅ BANKED (per-stage receipts everywhere, batched attested, fail-closed).
-5. **Batched viability number** — ✅ BANKED 2026-07-11 (receipt batched-viability-20260711):
-   mix-B4 ≥ 25 agg MET at the median (25.68 over 6 same-content reps, band 12.9-29.2; per-stream
-   ~5.4-7.3; use-case B4 medians 26.9-45.4). B-curve journey 2.96/3.65/7.70/9.72 →
-   21.8/27.0/25.7/31.2 (3.2-7.4×). aux_local live-proven (3 armed passes, zero aborts) → default
-   ON. Residual: the B8 ≥ 50 bar (payload ∝ B still binds; depth>1 overlap / aux compression /
-   B8 transport tuning are the candidates — engine work, not blocking the PoC story).
+5. **Batched viability** — RE-SCOPED by leyten 2026-07-11: the DONE condition is **20-30 tok/s PER
+   STREAM at B≥2** (solo-grade UX under batch), not aggregate. Aggregate milestone banked (receipt
+   batched-viability-20260711: mix-B4 agg 25.68 median, per-stream 5.4-7.3; B-curve journey
+   2.96/3.65/7.70/9.72 → 21.8/27.0/25.7/31.2). THE PATH (3-agent research synthesis, full plan
+   `.claude/plans/per-stream-20-plan.md`): (0) **every batched receipt ran with TCP cwnd keep-warm
+   OFF** — B≥4 rounds idle legs past RTO_min → cwnd collapse EVERY round, +180-500ms; launcher now
+   defaults it ON for batched launches (projection alone: 6.4 → ~9-11/stream); (1) **DE-LOCKSTEP**
+   the streams (per-stream async solo frames — the next build; 11-14 mix, 15-25 draftable);
+   (2) g-at-fp8 recovery A/B (bf16 aux over fp8 wire; g 2.48→~3.5 candidate); (3) content routing
+   + per-content K; (4) batch-invariant grouped MoE (the B8 lever); (5) 48GB fat-stage rings
+   (N=3-4). Depth>1 stale-context EAGLE: **KILLED by arithmetic** (useful-frame rate α^K ≈ 2-5% at
+   mix-g, doubles wire). verify_batch now stamps per-stage timing (M25_STAGE_TIMING) — the
+   decomposition experiment is ready for the next ring.
 6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
    must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
-   CPU/local-first, multi-day, no leyten decisions needed. **THE current next build.**
+   CPU/local-first, multi-day, no leyten decisions needed. Queued BEHIND the per-stream-20 work
+   (leg 5 re-scoped above).
 7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
    verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
    engine work**. Paper publish also on leyten (refresh the headline with the new B-curve first).
