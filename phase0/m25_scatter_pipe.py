@@ -149,9 +149,14 @@ def main():
     # Interactive deploy (--serve = the OpenAI gateway) defaults cwnd keep-warm ON: single-stream legs
     # idle between tokens long enough to trip TCP slow-start-after-idle (cwnd collapse -> the next frame
     # eats 2-4 extra RTTs), so tiny noops keep every leg hot. eng_env() forwards it to the stages AND the
-    # gateway. Neutral on busy/batched rings (legs never idle); override via the env, set =0 to disable.
-    # The measurement paths (one-shot coord / --warm-only) stay OFF for A/B purity.
-    if a.serve and "M25_CWND_KEEPWARM_MS" not in os.environ:
+    # gateway. Override via the env, set =0 to disable.
+    # The "neutral on batched rings (legs never idle)" note above was WRONG for B>=4 (2026-07-11
+    # research): B=1 rounds (~165ms) sit UNDER Linux RTO_min (200ms) so cwnd survives, but B>=4
+    # lockstep rounds (450-900ms) idle every leg PAST the RTO -> cwnd collapses to IW10 EVERY round
+    # -> +2-3.5 RTTs/leg = +180-500ms/round. Every batched receipt through 2026-07-11 carries that
+    # handicap. Default keep-warm ON for --serve AND any batched launch; --warm-only solo measurement
+    # stays OFF for A/B purity unless the operator sets it.
+    if (a.serve or a.batch > 1) and "M25_CWND_KEEPWARM_MS" not in os.environ:
         os.environ["M25_CWND_KEEPWARM_MS"] = "150"
     nodes = []
     for spec in a.order:
