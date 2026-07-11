@@ -264,14 +264,15 @@ def _graph_job(graph_job, ack_graph, receipts=False):
     drafters = [HybridDrafter(NgramDrafter(ng=3, margin=8), base.fork()) for _ in range(2)]
     pipe = _Chan(); ret = _Chan(); stop = threading.Event()
     t = threading.Thread(target=_graph_ring, args=(pipe, ret, stop, ack_graph), daemon=True); t.start()
-    old_gj, old_rc = m25_pipe.M25_GRAPH_JOB, m25_pipe.RECEIPTS
+    old_gj, old_rc, old_al = m25_pipe.M25_GRAPH_JOB, m25_pipe.RECEIPTS, m25_pipe.M25_AUX_LOCAL
     m25_pipe.M25_GRAPH_JOB = graph_job; m25_pipe.RECEIPTS = receipts
+    m25_pipe.M25_AUX_LOCAL = False          # these scenarios test the graph-arm plumbing, not the lane
     try:
         msgs = [[{"role": "user", "content": str(b)}] for b in range(2)]
         return m25_pipe.coordinate_pipe_batch(pipe, _FakeTok(), msgs, K, 16, 15, ret, drafters,
                                               prefill_chunk=0, max_ctx=0)
     finally:
-        m25_pipe.M25_GRAPH_JOB = old_gj; m25_pipe.RECEIPTS = old_rc
+        m25_pipe.M25_GRAPH_JOB = old_gj; m25_pipe.RECEIPTS = old_rc; m25_pipe.M25_AUX_LOCAL = old_al
         stop.set(); t.join(timeout=2)
 
 
