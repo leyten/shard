@@ -1041,7 +1041,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     acc = [0] * B; vrounds = [0] * B                     # per-stream accepted tokens / verify rounds (g telemetry)
-    t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None
+    t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None; per_stage = {}
     eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
     if eagle_on:
         from eagle_draft import prefill_pair_tokens, fetch_b
@@ -1129,6 +1129,8 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             if not inflight:
                 break
             tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            if isinstance(resp, dict) and resp.get("stage_dt"):   # per-stage [span, compute] stamps (M25_STAGE_TIMING)
+                _acc_stage_dt(resp, per_stage)
             rb, aux_b = _unpack_b(resp)                         # rb: [B][K+1] per-stream argmax; aux rows under EAGLE
             if aux_local:                                       # one local frame per round, ALWAYS consumed (even for
                 loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1   # rounds a divergence will discard —
@@ -1194,6 +1196,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             "receipts_ok": receipts_ok, "eagle": eagle_on,
             "graph_arm": graph_arm,   # graph-A/B jobs: tail's {graph, graph_captured, graph_skipped} at job end
             "aux_local": bool(aux_local),   # armed lane vs ridden-ring aux — arms must never be conflated
+            "per_stage": {k: [round(v[0], 1), round(v[1], 1), v[2]] for k, v in per_stage.items()},   # stage -> [span_ms_sum, compute_ms_sum, n] under M25_STAGE_TIMING
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
@@ -1571,6 +1574,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
                             x = msg["h"].to(dev)
                             h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                             if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                 signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                             toks = _tail_logits(h, parts).argmax(-1).tolist()
@@ -1578,9 +1582,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 aux = _merge_aux(msg.get("aux"))
                                 if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
                                     aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
-                                _ret_send({"toks": toks, "aux": aux})
+                                o = {"toks": toks, "aux": aux}
                             else:
-                                _ret_send(toks)
+                                o = {"toks": toks}                # timing promotes bare rows to a dict (like solo)
+                            if S.M25_STAGE_TIMING:                # batched rounds get the same per-stage [span,
+                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)   # compute] stamps as solo — the
+                                                                  # round-decomposition experiment's food
+                            _ret_send(o if (S.M25_EAGLE or S.M25_STAGE_TIMING) else toks)
                             continue
                         if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                             x = msg["h"].to(dev)
@@ -1703,6 +1711,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
                             if tb is not None:                               # ints) so it can slice the return-leg
                                 fwd["tids"] = tb                             # aux to accepted prefixes (M25_AUX_SLIM)
+                        if S.M25_STAGE_TIMING:
+                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
                         nxt_kw.send(_hsend(fwd))
                         if aux_local_job is not None:            # forward-FIRST, then the local lane: a big local
                             send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
