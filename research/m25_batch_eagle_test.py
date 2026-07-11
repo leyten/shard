@@ -110,11 +110,12 @@ def _aux_block(b, start, s):
     return {str(li): torch.stack([aux_at(b, start + j, li) for j in range(s)], 0) for li in AUX_IDS}
 
 
-def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=False):
+def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=False, counts=None):
     """aux_local: play an ARMED head too — ack the reset on the local lane, then per aux-producing
     frame ship layer "1" on local_q (echoing job+seq) and keep it OFF the ring path, exactly the
     armed head's contract. skew_seq: echo seq+1 on every local frame (the pairing-torture arm — a
-    DROPPED frame just times the job out loudly; a PRESENT-but-mispaired frame is the guard's case)."""
+    DROPPED frame just times the job out loudly; a PRESENT-but-mispaired frame is the guard's case).
+    counts: optional dict accumulating {"tree": n, "chain": n} decode-frame counts (vacuity guard)."""
     job = "job"
     while not stop.is_set():
         try:
@@ -138,10 +139,17 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
                 assert m["token_ids"][0] == truth(b, st), (    # token_ids[0] at position `start`; a wrong
                     f"anchor violated: stream {b} start={st} fed {m['token_ids'][0]}, committed "
                     f"token there is {truth(b, st)}")          # anchor = corrupted KV w/ valid receipts)
-            aux = _aux_block(b, st, s)
+            if counts is not None and not m.get("prefill"):
+                counts["tree" if m.get("tree") else "chain"] = counts.get("tree" if m.get("tree") else "chain", 0) + 1
+            if m.get("tree"):                                  # de-lockstep TREE frame: per-node oracle at
+                pos = [int(p) for p in m["pos_ids"]]           # each node's RoPE position (run_block_tree_row
+                aux = {str(li): torch.stack([aux_at(b, p, li) for p in pos], 0) for li in AUX_IDS}   # returns
+            else:                                              # solo-shaped [N,H] aux, node-indexed)
+                pos = [st + j for j in range(s)]
+                aux = _aux_block(b, st, s)
             if aux_local:
                 local_send(aux.pop("1"), m.get("seq"))         # "1" goes local-only, like the armed head
-            o = {"toks": [truth(b, st + j + 1) for j in range(s)], "aux": aux}
+            o = {"toks": [truth(b, p + 1) for p in pos], "aux": aux}
             if not m.get("prefill"):
                 o["stream"] = b                                # row replies carry the FIFO-pairing tag
             ret_out.q.put(o)
@@ -166,7 +174,7 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
             ret_out.q.put([])
 
 
-def run_batch(head_dir, tag, slim=False, aux_local=False, skew_seq=False, prestuff=False):
+def run_batch(head_dir, tag, slim=False, aux_local=False, skew_seq=False, prestuff=False, counts=None):
     gen = torch.Generator().manual_seed(5)
     embed = (torch.randn(VOCAB, H, generator=gen) * 0.3).to(torch.bfloat16)
     base = EagleDrafter(head_dir, embed, device="cpu", max_pos=2048, next_hidden="prenorm")
@@ -177,7 +185,7 @@ def run_batch(head_dir, tag, slim=False, aux_local=False, skew_seq=False, prestu
         pipe.local_q.put({"op": "aux_local_ok", "job": "dead"})                     # drain them all
     old_flag = m25_pipe.M25_AUX_LOCAL
     m25_pipe.M25_AUX_LOCAL = aux_local
-    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop, slim, aux_local, skew_seq),
+    t = threading.Thread(target=_batch_ring, args=(pipe, ret, stop, slim, aux_local, skew_seq, counts),
                          daemon=True); t.start()
     try:
         msgs = [[{"role": "user", "content": str(b)}] for b in range(3)]
@@ -267,6 +275,34 @@ try:
 except RuntimeError as e:                                     # TransportError is stubbed to RuntimeError here
     assert "aux_local pairing broken" in str(e), e
 print("[adv-e2e] PASS — mispaired local frame aborts LOUD on the (job,seq) pairing guard")
+
+# ---- PER-STREAM TREES (M25_TREE under de-lockstep): the aux_local lane + seq pairing must hold ------
+# across MIXED chain/tree row frames (tree frames also produce exactly one local aux frame each).
+# Equivalence vs the unarmed tree run pins the lane as a pure transport change on the tree path too;
+# the rows-vs-solo-tree BYTE equivalence itself lives in tests/test_fake_ring_rows.py.
+import m25_stage as _S                                        # the stub module (S inside m25_pipe)
+m25_pipe.M25_DELOCKSTEP = True
+_S.M25_TREE = True
+os.environ["M25_TREE_M"], os.environ["M25_TREE_TOPB"], os.environ["M25_TREE_DEPTH"] = "10", "2", "4"
+try:
+    tree_counts = {}
+    o_tr, g_tr, _ = run_batch(tmp, "DE-LOCKSTEP + trees", counts=tree_counts)
+    assert tree_counts.get("tree", 0) > 5 and tree_counts.get("chain", 0) > 0, (
+        f"tree arm vacuous: decode frames {tree_counts} — need mixed tree (novel) + chain (n-gram) rows")
+    o_trl, g_trl, _ = run_batch(tmp, "DE-LOCKSTEP + trees + aux_local", aux_local=True, prestuff=True)
+    assert o_trl == o_tr and g_trl == g_tr, "trees + aux_local diverged from trees alone"
+    for b in range(len(o_tr)):                                # trees are lossless: same oracle prefix
+        nmin = min(len(o_tr[b]), len(o_rows[b]))
+        assert o_tr[b][:nmin] == o_rows[b][:nmin], f"stream {b} tree-arm PREFIX diverged from chain rows"
+    try:
+        run_batch(tmp, "SEQ-SKEW + trees", aux_local=True, skew_seq=True)
+        raise AssertionError("a mispaired aux_local frame was accepted on the TREE path")
+    except RuntimeError as e:
+        assert "aux_local pairing broken" in str(e), e
+finally:
+    m25_pipe.M25_DELOCKSTEP = old_dl
+    _S.M25_TREE = False
+print("[adv-e2e] PASS — per-stream trees: aux_local lane pure-transport + seq guard LOUD across tree frames")
 
 
 # ---- graph-arm plumbing on reset_batch (the poisoned-arm guard, adversarial-review MAJOR) ----------

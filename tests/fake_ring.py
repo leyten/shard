@@ -246,6 +246,164 @@ class FakeRing(threading.Thread):
                     pass
 
 
+class FakeRingB(threading.Thread):
+    """Batched (de-lockstep) head+tail oracle for coordinate_pipe_rows: per-STREAM target sequences
+    Ts, the solo FakeRing's KV dirty-frontier model held PER STREAM (each stream owns a KV row —
+    frames must never assume KV their row never got), and decode replies tagged with the stream (the
+    rows coordinator's LOUD FIFO-pairing guard requires it; prefill replies stay untagged, mirroring
+    serve()'s batched-prefill branch). Chain/prefill row frames write causally and advance that
+    stream's clean frontier; TREE frames advance it by their causal trunk only (tree nodes stay
+    dirty until re-fed — the per-stream pending_path contract). aux = position-encoded fp32 exactly
+    like FakeRing, so a rows stream and a solo reference run against FakeRing(T=Ts[b]) see
+    BYTE-IDENTICAL aux -> byte-identical drafter evolution -> the equivalence gate is exact."""
+
+    def __init__(self, pipe_sock, ret_sock, Ts, aux_h=32, aux_layer_ids=None):
+        super().__init__(daemon=True)
+        self.pipe = pipe_sock
+        self.ret = ret_sock
+        self.Ts = [[int(t) for t in T] for T in Ts]
+        self.aux_h = aux_h
+        self.aux_ids = list(aux_layer_ids if aux_layer_ids is not None else S.EAGLE_AUX_LAYER_IDS)
+        self.st = [{"clean": 0, "written": {}, "viol": [], "starts": []} for _ in Ts]
+        self.log = []
+        self.error = None
+
+    def _tok_at(self, b, p):
+        T = self.Ts[b]
+        return T[p + 1] if p + 1 < len(T) else T[-1]
+
+    def _aux(self, positions):
+        n = len(positions)
+        col = torch.tensor([float(p) for p in positions], dtype=torch.float32).unsqueeze(1)
+        a = col.expand(n, self.aux_h).contiguous()
+        return {str(li): a.clone() for li in self.aux_ids}
+
+    def run(self):
+        try:
+            while True:
+                msg = recv_msg(self.pipe)
+                op = msg.get("op")
+                if op == "reset_batch":
+                    self.log.append({"op": "reset_batch", "B": msg.get("B")})
+                    send_msg(self.ret, "ok")
+                elif op == "noop":
+                    self.log.append({"op": "noop"})
+                elif op == "receipt":
+                    self.log.append({"op": "receipt"})
+                    send_msg(self.ret, msg.get("receipts", []))
+                elif op == "verify":
+                    b = msg["stream"]                   # rows frames ALWAYS tag (untagged = solo-path bug)
+                    s = int(msg["start"])
+                    st = self.st[b]
+                    if s > st["clean"]:
+                        raise AssertionError(
+                            f"KV GAP stream {b}: frame start={s} past clean frontier {st['clean']} — "
+                            f"the rows coordinator assumed row KV the ring never wrote "
+                            f"(dirty pending_path not re-fed?)")
+                    idx = len(st["starts"]); st["starts"].append(s)
+                    for sl in range(min(s, len(self.Ts[b]))):
+                        w = st["written"].get(sl)
+                        if w is not None and w != self.Ts[b][sl]:
+                            st["viol"].append((idx, sl))
+                    for i, t in enumerate(msg["token_ids"]):
+                        st["written"][s + i] = int(t)
+                    if msg.get("tree"):
+                        pos = [int(p) for p in msg["pos_ids"]]
+                        trunk = 0                       # leading causal run = the re-fed trunk (see FakeRing)
+                        while trunk < len(msg["parents"]) and msg["parents"][trunk] == trunk - 1:
+                            trunk += 1
+                        st["clean"] = max(st["clean"], s + trunk)
+                    else:
+                        pos = [s + i for i in range(len(msg["token_ids"]))]
+                        st["clean"] = max(st["clean"], s + len(pos))
+                    self.log.append({"op": "verify", "stream": b, "start": s,
+                                     "n": len(msg["token_ids"]), "tree": bool(msg.get("tree")),
+                                     "prefill": bool(msg.get("prefill")),
+                                     "token_ids": [int(t) for t in msg["token_ids"]], "pos": pos})
+                    toks = [self._tok_at(b, p) for p in pos]
+                    o = {"toks": toks, "aux": self._aux(pos)}
+                    if not msg.get("prefill"):
+                        o["stream"] = b                 # decode replies carry the FIFO-pairing tag
+                    send_msg(self.ret, o)
+                else:
+                    raise ValueError(f"fake rows ring got unexpected op {op!r}")
+        except (OSError, EOFError):                     # coordinator closed its ends — normal shutdown
+            for b, st in enumerate(self.st):            # POST-HOC healing per stream (FakeRing's rule);
+                cutoff = len(st["starts"]) - 1          # rows is depth-1 per stream -> slack of 1 frame
+                for idx, sl in st["viol"]:
+                    if idx >= cutoff:
+                        continue
+                    if not any(s2 <= sl for s2 in st["starts"][idx + 1:]):
+                        self.error = AssertionError(
+                            f"KV CONTENT stream {b}: frame #{idx} read stale slot {sl} "
+                            f"(held {st['written'].get(sl)} vs committed {self.Ts[b][sl]}) and no "
+                            f"later frame re-wrote it")
+                        return
+            return
+        except Exception as e:
+            self.error = e
+            for s_ in (self.pipe, self.ret):
+                try:
+                    s_.close()
+                except OSError:
+                    pass
+
+
+class FakeTokB:
+    """FakeTok for the rows coordinator: ONE tokenizer, per-stream prompts — a message's content is
+    the stream index and apply_chat_template returns that stream's prompt prefix."""
+
+    def __init__(self, prompts, eos_id=10 ** 6):
+        self._prompts = [list(map(int, p)) for p in prompts]
+        self.eos_token_id = eos_id
+
+    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, return_dict=True, **kw):
+        return {"input_ids": list(self._prompts[int(messages[-1]["content"])])}
+
+    def decode(self, ids, skip_special_tokens=True):
+        return " ".join(str(int(i)) for i in ids)
+
+    def __call__(self, text, add_special_tokens=False):
+        return {"input_ids": []}
+
+
+def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill_chunk=24, timeout=30):
+    """One coordinate_pipe_rows job against a fresh FakeRingB. S.M25_TREE (monkeypatched by the
+    caller) arms the per-stream tree route, same as production. Returns (result, ring)."""
+    c_pipe, r_pipe = socket.socketpair()
+    c_ret, r_ret = socket.socketpair()
+    c_ret.settimeout(timeout)
+    ring = FakeRingB(r_pipe, r_ret, Ts)
+    ring.start()
+    tok = FakeTokB([T[:pl] for T, pl in zip(Ts, prompt_lens)])
+    msgs = [[{"role": "user", "content": str(b)}] for b in range(len(Ts))]
+    try:
+        try:
+            res = MP.coordinate_pipe_rows(c_pipe, tok, msgs, K, max_new, timeout, c_ret, drafters,
+                                          prefill_chunk=prefill_chunk)
+        except Exception:
+            ring.join(2)
+            if ring.error is not None:
+                raise AssertionError(
+                    f"fake rows ring crashed: {type(ring.error).__name__}: {ring.error}") from None
+            raise
+    finally:
+        for s_ in (c_pipe, c_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+        ring.join(10)
+        for s_ in (r_pipe, r_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+    if ring.error is not None:
+        raise AssertionError(f"fake rows ring crashed: {type(ring.error).__name__}: {ring.error}")
+    return res, ring
+
+
 # ---- target-sequence builders ------------------------------------------------------------------
 # Token ids stay < 100 (the synthetic EAGLE head's target vocab) so the real EagleDrafter's embed
 # lookups are always in range on every path.
