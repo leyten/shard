@@ -134,6 +134,10 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
             ret_out.q.put("ok")
         elif op == "verify":                                  # per-stream prefill OR de-lockstep row decode
             b = m["stream"]; st = m["start"]; s = len(m["token_ids"])
+            if not m.get("prefill"):                           # ANCHOR INVARIANT (a real ring embeds
+                assert m["token_ids"][0] == truth(b, st), (    # token_ids[0] at position `start`; a wrong
+                    f"anchor violated: stream {b} start={st} fed {m['token_ids'][0]}, committed "
+                    f"token there is {truth(b, st)}")          # anchor = corrupted KV w/ valid receipts)
             aux = _aux_block(b, st, s)
             if aux_local:
                 local_send(aux.pop("1"), m.get("seq"))         # "1" goes local-only, like the armed head
@@ -143,6 +147,11 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
             ret_out.q.put(o)
         elif op == "verify_batch":
             sb = m["start_b"]; tb = m["token_ids_b"]; B = len(tb)
+            for b in range(B):
+                if not all(t == tb[b][0] for t in tb[b]):      # skip done-stream pad rows ([cur]*(K+1))
+                    assert tb[b][0] == truth(b, sb[b]), (
+                        f"anchor violated: stream {b} start={sb[b]} fed {tb[b][0]}, "
+                        f"committed token there is {truth(b, sb[b])}")
             toks = [[truth(b, sb[b] + j + 1) for j in range(len(tb[b]))] for b in range(B)]
             aux = {str(li): torch.stack([torch.stack([aux_at(b, sb[b] + j, li)
                                                       for j in range(len(tb[b]))], 0)
@@ -220,9 +229,17 @@ try:
     o_rows, g_rows, _ = run_batch(tmp, "DE-LOCKSTEP rows")
 finally:
     m25_pipe.M25_DELOCKSTEP = old_dl
-assert o_rows == o_new, f"DE-LOCKSTEP CHANGED COMMITTED OUTPUT\n rows={o_rows}\n lock={o_new}"
-assert g_rows == g_new, f"de-lockstep g diverged: {g_rows} vs {g_new}"
-print("[adv-e2e] PASS — de-lockstep rows == lockstep: committed outputs and per-stream g identical")
+# rows drafts WITH the bonus in the prefix (lockstep requests pre-bonus and stutters after full
+# accepts), so rows may commit MORE per round: prefix must be EXACT, length may overshoot the
+# max_new stop by up to one chunk+bonus (the original m25_batch_test tolerance); EOS stream exact.
+for b in range(len(o_rows)):
+    nmin = min(len(o_rows[b]), len(o_new[b]))
+    assert o_rows[b][:nmin] == o_new[b][:nmin], f"stream {b} PREFIX diverged"
+    assert abs(len(o_rows[b]) - len(o_new[b])) <= K + 1, f"stream {b} length gap beyond one chunk+bonus"
+assert len(o_rows[EOS_STREAM]) == len(o_new[EOS_STREAM]), "EOS stream must stop identically"
+assert all(gr >= gl for gr, gl in zip(g_rows, g_new)), f"de-lockstep g regressed: {g_rows} vs {g_new}"
+print(f"[adv-e2e] PASS — de-lockstep prefix == lockstep, len tol one chunk, g >= lockstep "
+      f"(rows {g_rows} vs lock {g_new})")
 
 # de-lockstep + head-local aux lane together (seq pairing across interleaved row frames)
 m25_pipe.M25_DELOCKSTEP = True
@@ -230,7 +247,7 @@ try:
     o_rl, g_rl, _ = run_batch(tmp, "DE-LOCKSTEP + aux_local", aux_local=True, prestuff=True)
 finally:
     m25_pipe.M25_DELOCKSTEP = old_dl
-assert o_rl == o_new and g_rl == g_new, "de-lockstep + aux_local diverged"
+assert o_rl == o_rows and g_rl == g_rows, "de-lockstep + aux_local diverged"
 print("[adv-e2e] PASS — de-lockstep + head-local lane: identical (seq pairing holds across row frames)")
 
 # ---- head-local aux (M25_AUX_LOCAL): layer "1" arrives on the LOCAL lane, never the ring ------------

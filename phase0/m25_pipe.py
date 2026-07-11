@@ -1309,9 +1309,10 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
             if isinstance(resp, dict) and resp.get("stage_dt"):
                 _acc_stage_dt(resp, per_stage)
             b = pend.popleft()
-            if isinstance(resp, dict) and resp.get("stream") is not None and resp["stream"] != b:
-                raise TransportError(f"row reply skewed: expected stream {b}, got {resp['stream']} "
-                                     f"— aborting (FIFO pairing broken)")
+            if not (isinstance(resp, dict) and resp.get("stream") == b):
+                raise TransportError(f"row reply skewed or UNTAGGED: expected stream {b}, got "
+                                     f"{str(resp)[:80]} — aborting (an old stage routing row frames "
+                                     f"down the solo path replies untagged = wrong KV)")
             r, aux = _unpack(resp)
             if aux_local:
                 loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
@@ -1329,6 +1330,9 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
             if n == K:                                   # full accept + bonus (nothing else in flight
                 committed = ds + [r[K]]                  # for THIS stream, ever — solo depth-1 rule)
                 out[b].extend(committed); cur[b] = r[K]; pos[b] += K + 1; acc[b] += 1
+                dprefix[b] = dprefix[b] + [r[K]]         # the NEXT frame's anchor IS the bonus (review
+                                                         # MAJOR-1: omitting this fed ds[-1] at the
+                                                         # bonus's position -> corrupted KV, valid receipts)
             else:
                 committed = ds[:n] + [r[n]]
                 out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1

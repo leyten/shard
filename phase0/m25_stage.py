@@ -554,8 +554,9 @@ class Layer:
         q, k = ap(q), ap(k)
         kf = self.bkc.view(-1, M25_KV_MAXLEN, HD)      # [B*NKV, MAXLEN, HD] flat views (dtype-preserving)
         vf = self.bvc.view(-1, M25_KV_MAXLEN, HD)
-        kf[rows_i[:, None], cp[None, :]] = _kv_enc(k[0].transpose(0, 1))   # [NKV,s,HD] into row b's slots
-        vf[rows_i[:, None], cp[None, :]] = _kv_enc(v[0].transpose(0, 1))
+        kf[rows_i[:, None], cp[None, :]] = _kv_enc(k[0])   # k[0] is [NKV,s,HD] already (review MAJOR-2:
+        vf[rows_i[:, None], cp[None, :]] = _kv_enc(v[0])   # a transpose here crashes at s!=NKV and writes
+                                                           # TRANSPOSED KV at the s==NKV coincidence)
         if gr is not None:                             # graphed: static cols gather + static additive mask
             kk = _kv_view(kf)[rows_i[:, None], gr.cols[None, :]].to(torch.bfloat16)   # [NKV, alen, HD]
             vv = _kv_view(vf)[rows_i[:, None], gr.cols[None, :]].to(torch.bfloat16)
@@ -840,6 +841,13 @@ class RowGraphRunner:
         h = (torch.randn(1, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)
         st = _RGraphState(self.s, alen, self.rd, self.dv, self.aux_ids)
         st.set(0, alen - self.s, self.cos, self.sin)
+        # Capture writes garbage k/v into LIVE row 0 at [alen-s, alen) — and unlike Batch/GraphRunner,
+        # the trigger is ONE stream's frontier, so row 0's committed KV may sit at/above those slots
+        # (review MAJOR-3: a short stream's capture destroyed a long stream's prompt KV — corrupted
+        # output, valid receipts). Save row 0's slots per layer and restore AFTER the device is
+        # drained (a restore before the sync could be overwritten by in-flight side-stream garbage).
+        lo = alen - self.s
+        saved = [(L, L.bkc[0, :, lo:alen].clone(), L.bvc[0, :, lo:alen].clone()) for L in self.layers]
         _GR = st
         try:
             side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
@@ -852,6 +860,9 @@ class RowGraphRunner:
                 out = self._layers(h)
         finally:
             _GR = None
+            torch.cuda.synchronize()                 # drain BEFORE restoring live KV (both paths)
+            for L, kb, vb in saved:
+                L.bkc[0, :, lo:alen] = kb; L.bvc[0, :, lo:alen] = vb
         self.graphs[alen] = (g, h, st, out)
         _GRAPH_COUNT += 1
 
