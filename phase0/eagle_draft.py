@@ -340,8 +340,6 @@ def draft_batch(eagles, k):
     n = len(eagles)
     if n == 0:
         return []
-    if n == 1:
-        return [eagles[0]._draft(k)]                           # nothing to batch: the proven serial path
     E0 = eagles[0]
     assert all(e.fc is E0.fc and e.lm is E0.lm and e.next_hidden == E0.next_hidden for e in eagles), \
         "draft_batch needs forks of ONE head (shared weights, same carry rule)"
@@ -354,10 +352,10 @@ def draft_batch(eagles, k):
             live.append(e); slots.append(j)
     if not live:
         return out
-    if len(live) == 1:
-        out[slots[0]] = live[0]._draft(k)
-        return out
-    m = len(live)
+    m = len(live)                                              # m==1 runs the batched path too (sync-free:
+                                                               # the de-lockstep per-reply draws need it; the
+                                                               # CPU gate pins byte-identity at every m)
+
     lin = torch.nn.functional.linear
     HD = E0.HD; maxp = E0.cos.shape[0] - 1
     for e in live:

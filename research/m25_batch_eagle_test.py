@@ -132,14 +132,26 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
             if aux_local and m.get("aux_local"):
                 pipe_in.local_q.put({"op": "aux_local_ok", "job": job})
             ret_out.q.put("ok")
-        elif op == "verify":                                  # per-stream prefill: solo-shaped {toks, aux}
+        elif op == "verify":                                  # per-stream prefill OR de-lockstep row decode
             b = m["stream"]; st = m["start"]; s = len(m["token_ids"])
+            if not m.get("prefill"):                           # ANCHOR INVARIANT (a real ring embeds
+                assert m["token_ids"][0] == truth(b, st), (    # token_ids[0] at position `start`; a wrong
+                    f"anchor violated: stream {b} start={st} fed {m['token_ids'][0]}, committed "
+                    f"token there is {truth(b, st)}")          # anchor = corrupted KV w/ valid receipts)
             aux = _aux_block(b, st, s)
             if aux_local:
                 local_send(aux.pop("1"), m.get("seq"))         # "1" goes local-only, like the armed head
-            ret_out.q.put({"toks": [truth(b, st + j + 1) for j in range(s)], "aux": aux})
+            o = {"toks": [truth(b, st + j + 1) for j in range(s)], "aux": aux}
+            if not m.get("prefill"):
+                o["stream"] = b                                # row replies carry the FIFO-pairing tag
+            ret_out.q.put(o)
         elif op == "verify_batch":
             sb = m["start_b"]; tb = m["token_ids_b"]; B = len(tb)
+            for b in range(B):
+                if not all(t == tb[b][0] for t in tb[b]):      # skip done-stream pad rows ([cur]*(K+1))
+                    assert tb[b][0] == truth(b, sb[b]), (
+                        f"anchor violated: stream {b} start={sb[b]} fed {tb[b][0]}, "
+                        f"committed token there is {truth(b, sb[b])}")
             toks = [[truth(b, sb[b] + j + 1) for j in range(len(tb[b]))] for b in range(B)]
             aux = {str(li): torch.stack([torch.stack([aux_at(b, sb[b] + j, li)
                                                       for j in range(len(tb[b]))], 0)
@@ -206,6 +218,37 @@ o_slim, g_slim, r_slim = run_batch(tmp, "SLIM-aux ring", slim=True)
 assert o_slim == o_new, f"SLIM AUX CHANGED COMMITTED OUTPUT\n slim={o_slim}\n full={o_new}"
 assert g_slim == g_new and r_slim == r_new, f"slim telemetry diverged: g {g_slim} vs {g_new}"
 print("[adv-e2e] PASS — slim-aux ring == full-aux ring: outputs, g, rounds identical (payload-only change)")
+
+# ---- DE-LOCKSTEP (M25_DELOCKSTEP): per-stream async frames must commit EXACTLY the lockstep streams -
+# Same drafters, same truth oracle, solo depth-1 semantics per stream on both paths => committed
+# outputs AND per-stream g must be equal token-for-token; the ring sees interleaved [1,K+1] row
+# frames instead of [B,K+1] lockstep frames.
+old_dl = m25_pipe.M25_DELOCKSTEP
+m25_pipe.M25_DELOCKSTEP = True
+try:
+    o_rows, g_rows, _ = run_batch(tmp, "DE-LOCKSTEP rows")
+finally:
+    m25_pipe.M25_DELOCKSTEP = old_dl
+# rows drafts WITH the bonus in the prefix (lockstep requests pre-bonus and stutters after full
+# accepts), so rows may commit MORE per round: prefix must be EXACT, length may overshoot the
+# max_new stop by up to one chunk+bonus (the original m25_batch_test tolerance); EOS stream exact.
+for b in range(len(o_rows)):
+    nmin = min(len(o_rows[b]), len(o_new[b]))
+    assert o_rows[b][:nmin] == o_new[b][:nmin], f"stream {b} PREFIX diverged"
+    assert abs(len(o_rows[b]) - len(o_new[b])) <= K + 1, f"stream {b} length gap beyond one chunk+bonus"
+assert len(o_rows[EOS_STREAM]) == len(o_new[EOS_STREAM]), "EOS stream must stop identically"
+assert all(gr >= gl for gr, gl in zip(g_rows, g_new)), f"de-lockstep g regressed: {g_rows} vs {g_new}"
+print(f"[adv-e2e] PASS — de-lockstep prefix == lockstep, len tol one chunk, g >= lockstep "
+      f"(rows {g_rows} vs lock {g_new})")
+
+# de-lockstep + head-local aux lane together (seq pairing across interleaved row frames)
+m25_pipe.M25_DELOCKSTEP = True
+try:
+    o_rl, g_rl, _ = run_batch(tmp, "DE-LOCKSTEP + aux_local", aux_local=True, prestuff=True)
+finally:
+    m25_pipe.M25_DELOCKSTEP = old_dl
+assert o_rl == o_rows and g_rl == g_rows, "de-lockstep + aux_local diverged"
+print("[adv-e2e] PASS — de-lockstep + head-local lane: identical (seq pairing holds across row frames)")
 
 # ---- head-local aux (M25_AUX_LOCAL): layer "1" arrives on the LOCAL lane, never the ring ------------
 # The armed ring acks the handshake, strips "1" from every ring-path aux and ships it on local_q with
