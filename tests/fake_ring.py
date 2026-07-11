@@ -324,6 +324,8 @@ class FakeRingB(threading.Thread):
                     o = {"toks": toks, "aux": self._aux(pos)}
                     if not msg.get("prefill"):
                         o["stream"] = b                 # decode replies carry the FIFO-pairing tag
+                    if msg.get("tree"):
+                        o["tree"] = True                # tree echo (the coordinator's version-mix guard)
                     send_msg(self.ret, o)
                 else:
                     raise ValueError(f"fake rows ring got unexpected op {op!r}")

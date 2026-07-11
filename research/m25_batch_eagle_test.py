@@ -152,6 +152,8 @@ def _batch_ring(pipe_in, ret_out, stop, slim=False, aux_local=False, skew_seq=Fa
             o = {"toks": [truth(b, p + 1) for p in pos], "aux": aux}
             if not m.get("prefill"):
                 o["stream"] = b                                # row replies carry the FIFO-pairing tag
+            if m.get("tree"):
+                o["tree"] = True                               # tree echo (the coordinator's version-mix guard)
             ret_out.q.put(o)
         elif op == "verify_batch":
             sb = m["start_b"]; tb = m["token_ids_b"]; B = len(tb)

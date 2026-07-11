@@ -1361,6 +1361,11 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                                      "with M25_EAGLE=1")
             kind, sp, payload, ext = inflight_b.pop(b)
             if kind == "tree":
+                if not resp.get("tree"):                 # version-mix guard: an OLD stage (no tree-row
+                    raise TransportError(                # branch) runs a tree frame as CHAIN math and
+                        f"tree frame for stream {b} came back without the tree echo — an old stage "
+                        f"ran it down the chain row path (corrupted row KV w/ valid receipts); "
+                        f"relaunch the ring on current code")
                 tree, L = payload, ext                   # trunk of L re-fed dirty tokens + M tree nodes
                 path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
                 vrounds[b] += 1; acc[b] += len(committed) - 1; rounds += 1   # solo tree's accept metric
@@ -1858,10 +1863,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            o = {"toks": toks, "stream": b}              # stream tag = the FIFO-pairing guard
-                            if S.M25_EAGLE:
-                                o["aux"] = _merge_aux(msg.get("aux"))
-                            if S.M25_STAGE_TIMING:
+                            o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
+                            if S.M25_EAGLE:                              # this frame as chain math replies
+                                o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
+                            if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
                                 o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
                             _ret_send(o); continue
                         if "stream" in msg and msg["op"] == "verify":   # DE-LOCKSTEP row decode: one stream's
