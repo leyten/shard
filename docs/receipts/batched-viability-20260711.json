@@ -1,0 +1,31 @@
+{
+  "what": "PoC leg-5 verdict ring: the aux transport levers (#78 accepted-prefix slimming, #79 head-local aux lane) live-validated on a 6x5090 EU ring, aux_local OFF/ON A/B + the 12-arm sweep x3 on-pass repetitions. THE BAR (mix-B4 >= 25 agg): MET AT THE MEDIAN.",
+  "date": "2026-07-11",
+  "ring": "6 stages HU2(head,[0:2]) CH[2:14] ES[14:26] ES[26:38] CZ[38:50] HU[50:62], measured-footprint plan, M25_EAGLE=1 M25_BATCH=8 kv 4096, M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_FP8_WIRE=1 (deployment build), K=8 max_new=96, receipts ON, SWEEP_AUX_ARMS=off,on + 2 extra on-pass reps. NOTE: this ring's WAN is ~1.75x faster than the 07-10 receipt ring (ngram depth-4 floor 76ms/round vs 133) - cross-ring comparisons carry that; within-ring A/B is clean.",
+  "bar_verdict": "mix-B4 >= 25 agg: MET at the median - pooled same-content mix-B4 arms (6 reps across 3 on-passes): median 25.68, mean 23.78, band 12.92-29.24 (WAN leg variance is real and reported, not averaged away). Per-stream ~5.4-7.3 tok/s at B=4. Per-use-case B4 medians: tools 45.4, code 38.8, qa 35.0, prose 30.5, reasoning 27.7, summarize 26.9. mix-B8 median 31.2 -> the 50-agg B8 bar NOT met (payload ~ B still binds at 8). Batching is a real product on a decent EU ring: 20-45 agg at B=4 by content.",
+  "bcurve_trail": {
+    "note": "mixed-content agg tok/s at B=1/2/4/8, the full journey",
+    "pre-levers_20260710": [2.96, 3.65, 7.70, 9.72],
+    "drafter+graphs_fp8_20260710": [18.11, 9.64, 14.54, 15.48],
+    "aux-levers_on_20260711_median": [21.76, 27.02, 25.68, 31.24],
+    "gain_vs_start": "7.3x / 7.4x / 3.3x / 3.2x"
+  },
+  "aux_local_ab": {
+    "note": "same ring, off-pass (1 run) vs on-pass (3 runs) round times, ms/round",
+    "rows": {
+      "mix-B1": [171, 165], "mix-B2": [386, 222], "mix-B4": [610, 530],
+      "mix-B8": [895, 788], "code-B4": [634, 444], "prose-B4": [692, 365],
+      "reasoning-B4": [629, 443], "summarize-B4": [557, 488],
+      "tools-B4": [553, 646], "qa-B4": [445, 653]
+    },
+    "reading": "median cut ~20-30% of round time at fp8 (aux is fp8 too, so its share is below the bf16 ~40%); two arms reversed (tools/qa) = per-arm WAN leg noise, same class as the 07-10 qa stall. No pairing aborts, no handshake degrades, no wedges across 3 armed passes - the lane's failure machinery never fired in anger.",
+    "isolated_slim_note": "the off-pass already includes #78 slimming (build default) - its isolated effect vs the 07-10 receipt is confounded by the faster ring; not separately claimed."
+  },
+  "ops_evidence": "warmup graph_arm: 4 captured / 0 skipped (kv-4096 B=8 tail capture fix CONFIRMED live - yesterday's guard refusal gone). All 72 arm-receipts across 3 passes: receipts_ok true. First sweep attempt timed out - the ring mesh wasn't up when the first reset_batch flowed (head sidecar dial still refused); the proven cascade re-handshake recovered it and the restarted sweep ran clean: NOT an aux_local fault. One dud DE head replaced pre-launch (pathological pip, 45min+; replacement HU box bootstrapped in <5min - race-the-replacement is the play).",
+  "next": [
+    "Flip M25_AUX_LOCAL default ON (this receipt is the live validation).",
+    "B=8 bar (>=50 agg) is the remaining batched target: payload ~ B still binds; candidates = depth>1 stale-context overlap, further aux compression, B=8-specific transport tuning.",
+    "PoC leg 6: MlxRuntime (the any-device flagship) - the next build.",
+    "g values unchanged (fp8 band 1.9-3.5, mix ~2.5-2.7) -> ADMISSION_SPEC operative g_batched 2.5 stands."
+  ]
+}
