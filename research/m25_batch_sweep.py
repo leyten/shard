@@ -136,7 +136,22 @@ results = []
 # vs the old receipt's 220ms ngram floor); on = the full new build. Unset = plain single pass
 # (whatever the launch env routes).
 GRAPH_PASSES = [p.strip() for p in os.environ.get("SWEEP_GRAPH_ARMS", "").split(",") if p.strip()]
-if not GRAPH_PASSES:
+# SWEEP_AUX_ARMS="off,on": the head-local-aux A/B on ONE warm ring — both passes run the full
+# graphed build (M25_GRAPH_JOB stamped + ack'd); only the coordinator-side M25_AUX_LOCAL flips per
+# pass (the head arms purely off the reset_batch field, so no stage relaunch). off = ridden-ring
+# aux (with #78 slimming, the build default); on = + the head-local lane (#79). Rows tagged
+# aux_pass; the per-job result also carries r["aux_local"] (the ARMED truth, never assumed).
+AUX_PASSES = [p.strip() for p in os.environ.get("SWEEP_AUX_ARMS", "").split(",") if p.strip()]
+if AUX_PASSES:
+    P.M25_GRAPH_JOB = True
+    P.M25_AUX_LOCAL = False
+    if os.environ.get("SWEEP_WARMUP", "1") != "0":
+        warmup()                                       # graph captures off the clock, once
+    for p in AUX_PASSES:
+        P.M25_AUX_LOCAL = (p == "on")
+        print(f"=== PASS aux_local={p} ===", flush=True)
+        results += [{**row, "aux_pass": p} for row in run_all()]
+elif not GRAPH_PASSES:
     if os.environ.get("SWEEP_WARMUP", "1") != "0":
         warmup()
     results = run_all()
