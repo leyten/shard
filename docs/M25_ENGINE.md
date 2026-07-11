@@ -20,12 +20,15 @@ real inference verifiably, and gets paid. Leg status:
 2. **Permissionless join + measured admission** — ✅ BANKED (probe live-proven, role-at-node-bind).
 3. **Torrent weight propagation** — ✅ BANKED (ringmate pulls, DHT, same-peer resume).
 4. **Verifiable serving** — ✅ BANKED (per-stage receipts everywhere, batched attested, fail-closed).
-5. **Batched viability number** — ⏳ ONE RING AWAY: both aux transport levers built+gated (#78 slim,
-   #79 head-local); the A/B + re-sweep either banks mix-B4 ≥ 25 agg (the "batching is a product"
-   bar feeding spec/economics/paper) or names what binds. THE current next action.
+5. **Batched viability number** — ✅ BANKED 2026-07-11 (receipt batched-viability-20260711):
+   mix-B4 ≥ 25 agg MET at the median (25.68 over 6 same-content reps, band 12.9-29.2; per-stream
+   ~5.4-7.3; use-case B4 medians 26.9-45.4). B-curve journey 2.96/3.65/7.70/9.72 →
+   21.8/27.0/25.7/31.2 (3.2-7.4×). aux_local live-proven (3 armed passes, zero aborts) → default
+   ON. Residual: the B8 ≥ 50 bar (payload ∝ B still binds; depth>1 overlap / aux compression /
+   B8 transport tuning are the candidates — engine work, not blocking the PoC story).
 6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
    must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
-   CPU/local-first, multi-day, no leyten decisions needed. THE next build after leg 5.
+   CPU/local-first, multi-day, no leyten decisions needed. **THE current next build.**
 7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
    verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
    engine work**. Paper publish also on leyten (refresh the headline with the new B-curve first).

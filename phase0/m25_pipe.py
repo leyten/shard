@@ -92,8 +92,10 @@ M25_AUX_SLIM = os.environ.get("M25_AUX_SLIM", "1") != "0"
 # pulls exactly one local frame per aux-producing frame it sent, paired by (job, seq): any skew
 # aborts LOUD — a silently mispaired aux row would degrade g invisibly, the worst drafter bug class.
 # Old head (no ack) -> degrade to the ridden-ring path. Solo jobs never stamp the field.
-# Design + failure matrix: .claude/plans/head-local-aux.md.
-M25_AUX_LOCAL = os.environ.get("M25_AUX_LOCAL", "0") != "0"
+# Design + failure matrix: .claude/plans/head-local-aux.md. Default ON since 2026-07-11: live-proven
+# (receipt batched-viability-20260711 - 3 armed passes, all receipts valid, zero pairing aborts,
+# ~20-30% round-time cut at fp8; the A/B knob remains for measurement).
+M25_AUX_LOCAL = os.environ.get("M25_AUX_LOCAL", "1") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the

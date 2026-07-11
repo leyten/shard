@@ -128,7 +128,10 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
   **TRANSPORT-bound** (EAGLE aux payload ∝ B dominates the round): the next unlocks are aux slimming
   (return accepted-prefix aux only) and depth>1 stale-context overlap — engine work, not admission
   policy. Pool-relativity stands: the live probe verdict for a 24 GB card 72 ms from its pool was
-  VERIFIER, correctly.
+  VERIFIER, correctly. LEG-5 VERDICT (2026-07-11, receipt batched-viability-20260711): with the aux
+  transport levers live (head-local lane + accepted-prefix slimming), a decent EU 6×5090 ring clears
+  **mix-B4 ≈ 25 agg median (band 12.9-29.2), use-case B4 medians 26.9-45.4, B8 ≈ 31** — batched
+  serving is a real product; per-stream ~5.4-7.3 at B=4. g bands unchanged (operative 2.5 stands).
 
 ## The bar is a ROLE TAG, not a binary gate
 
