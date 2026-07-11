@@ -142,7 +142,21 @@ GRAPH_PASSES = [p.strip() for p in os.environ.get("SWEEP_GRAPH_ARMS", "").split(
 # aux (with #78 slimming, the build default); on = + the head-local lane (#79). Rows tagged
 # aux_pass; the per-job result also carries r["aux_local"] (the ARMED truth, never assumed).
 AUX_PASSES = [p.strip() for p in os.environ.get("SWEEP_AUX_ARMS", "").split(",") if p.strip()]
-if AUX_PASSES:
+# SWEEP_DELOCK_ARMS="off,on": the de-lockstep A/B on ONE warm ring — graph-stamped, aux_local per
+# build default; only the coordinator-side dispatch flips per pass (rows vs lockstep frames).
+DELOCK_PASSES = [p.strip() for p in os.environ.get("SWEEP_DELOCK_ARMS", "").split(",") if p.strip()]
+if DELOCK_PASSES:
+    P.M25_GRAPH_JOB = True
+    if os.environ.get("SWEEP_WARMUP", "1") != "0":
+        P.M25_DELOCKSTEP = True                        # warm BOTH graph shapes (row + batched)
+        warmup()
+        P.M25_DELOCKSTEP = False
+        warmup()
+    for p in DELOCK_PASSES:
+        P.M25_DELOCKSTEP = (p == "on")
+        print(f"=== PASS delockstep={p} ===", flush=True)
+        results += [{**row, "delock_pass": p} for row in run_all()]
+elif AUX_PASSES:
     P.M25_GRAPH_JOB = True
     P.M25_AUX_LOCAL = False
     if os.environ.get("SWEEP_WARMUP", "1") != "0":

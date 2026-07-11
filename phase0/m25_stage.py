@@ -521,6 +521,62 @@ class Layer:
         x = x + self.mlp_b(self._rms(x, self.post_ln))                            # per-stream MoE
         return x
 
+    # ---- de-lockstep (M25_DELOCKSTEP): ONE stream's solo-style decode frame against KV ROW b ----
+    def attn_decode_row(self, x, row, start, cos, sin):
+        """DE-LOCKSTEP decode: x [1,s,H] for ONE stream against batched-KV ROW `row`. Math mirrors
+        attn_decode_b's manual-matmul branch at B=1 (bit-equal target), but the row is addressed
+        DYNAMICALLY through a flattened [B*NKV, MAXLEN, HD] view with index tensors — eager builds
+        them from ints; a graph capture (_GR = _RGraphState) reads STATIC buffers refreshed per
+        replay, so ONE captured graph serves EVERY row (a per-row graph set would pin B x the pool
+        memory). Writes land only in row b (advanced-index put); reads gather [NKV, alen, HD] via
+        static row+col indices."""
+        _, s, _ = x.shape
+        lin = torch.nn.functional.linear
+        q = self._rms(lin(x, self.q_proj), self.q_norm).view(1, s, NH, HD).transpose(1, 2)
+        k = self._rms(lin(x, self.k_proj), self.k_norm).view(1, s, NKV, HD).transpose(1, 2)
+        v = lin(x, self.v_proj).view(1, s, NKV, HD).transpose(1, 2)
+        rd = cos.shape[-1]
+        gr = _GR
+        if gr is not None and hasattr(gr, "rows"):     # row-graph capture/replay: statics carry row+start
+            rows_i, cp, cu, su, alen = gr.rows, gr.cp, gr.cos, gr.sin, gr.alen
+        else:
+            gr = None                                  # a foreign capture state never routes this path
+            cp = start + torch.arange(s, device=dev)                       # [s] abs positions
+            rows_i = row * NKV + torch.arange(NKV, device=dev)             # [NKV] flat kv-head rows
+            cu = cos[cp].unsqueeze(0).unsqueeze(0); su = sin[cp].unsqueeze(0).unsqueeze(0)   # [1,1,s,rd]
+            total = start + s
+            if total > M25_KV_MAXLEN:                  # clean error, never an OOB put that kills the stage
+                raise RuntimeError(f"row decode context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN}")
+            alen = _bucket(total)
+        def ap(t):
+            tr, tp = t[..., :rd], t[..., rd:]
+            return torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
+        q, k = ap(q), ap(k)
+        kf = self.bkc.view(-1, M25_KV_MAXLEN, HD)      # [B*NKV, MAXLEN, HD] flat views (dtype-preserving)
+        vf = self.bvc.view(-1, M25_KV_MAXLEN, HD)
+        kf[rows_i[:, None], cp[None, :]] = _kv_enc(k[0].transpose(0, 1))   # [NKV,s,HD] into row b's slots
+        vf[rows_i[:, None], cp[None, :]] = _kv_enc(v[0].transpose(0, 1))
+        if gr is not None:                             # graphed: static cols gather + static additive mask
+            kk = _kv_view(kf)[rows_i[:, None], gr.cols[None, :]].to(torch.bfloat16)   # [NKV, alen, HD]
+            vv = _kv_view(vf)[rows_i[:, None], gr.cols[None, :]].to(torch.bfloat16)
+            amask = gr.mask                            # [1,1,s,alen] additive
+        else:
+            cols = torch.arange(alen, device=dev)
+            kk = _kv_view(kf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16)
+            vv = _kv_view(vf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16)
+            amask = torch.where(cols.view(1, alen) <= cp.view(s, 1), 0.0,
+                                float("-inf")).to(torch.bfloat16)[None, None]
+        kk = kk.repeat_interleave(GRP, 0); vv = vv.repeat_interleave(GRP, 0)          # [NH, alen, HD]
+        a = torch.matmul(q[0], kk.transpose(-1, -2)) * SCALING + amask[0]             # [NH, s, alen]
+        o = torch.matmul(torch.softmax(a.float(), -1).to(vv.dtype), vv)               # [NH, s, HD]
+        return lin(o.transpose(0, 1).reshape(1, s, NH * HD), self.o_proj)
+
+    def forward_decode_row(self, x, row, start, pe):
+        cos, sin = pe
+        x = x + self.attn_decode_row(self._rms(x, self.in_ln), row, start, cos, sin)
+        x = x + self.mlp(self._rms(x, self.post_ln))   # ONE stream, s tokens — the solo MoE path
+        return x
+
 
 _PE = None
 # Rotary table length. MUST cover the full context: attn() indexes cos[start_pos:start_pos+s],
@@ -706,6 +762,122 @@ class GraphRunner:
         # the static buffer (no clone): the serve loop consumes _AUX synchronously via _merge_aux
         # (immediate .cpu()/fp8-pack) before the next replay can overwrite it.
         for li in self.aux_ids:
+            _AUX[li] = st.aux[li]
+        return out
+
+
+def run_block_decode_row(layers, row, start, h, vcfg):    # de-lockstep: ONE stream's [1,s,H] decode frame
+    from vllm.forward_context import set_forward_context
+    pe = get_pe()
+    with torch.no_grad(), set_forward_context(None, vcfg):
+        for L in layers:
+            h = L.forward_decode_row(h, row, start, pe)
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # SOLO-shaped aux ([s,H]) — the coordinator's
+                _AUX[L.li] = h[0].detach().to(torch.bfloat16)   # per-stream drafter consumes it like solo
+    return h
+
+
+class _RGraphState:
+    """Static buffers for the de-lockstep ROW graph: the row index (rows = row*NKV + arange(NKV)),
+    abs positions cp [s], RoPE rows cos/sin [1,1,s,rd], additive mask [1,1,s,alen], and the fixed
+    column index cols [alen] the KV gather reads through. set(row, start) refreshes row+start IN
+    PLACE — ONE captured graph serves every KV row and every start within the bucket."""
+    def __init__(self, s, alen, rd, dv, aux_ids=()):
+        self.s, self.alen = s, alen
+        self.rows = torch.zeros(NKV, dtype=torch.long, device=dv)
+        self.cp = torch.zeros(s, dtype=torch.long, device=dv)
+        self.cos = torch.zeros(1, 1, s, rd, dtype=torch.bfloat16, device=dv)
+        self.sin = torch.zeros(1, 1, s, rd, dtype=torch.bfloat16, device=dv)
+        self.mask = torch.zeros(1, 1, s, alen, dtype=torch.bfloat16, device=dv)
+        self.cols = torch.arange(alen, device=dv)
+        self.aux = {li: torch.zeros(s, H, dtype=torch.bfloat16, device=dv) for li in aux_ids}
+        self._ar = torch.arange(s, device=dv)
+        self._nkv = torch.arange(NKV, device=dv)
+
+    def set(self, row, start, full_cos, full_sin):
+        self.rows.copy_(row * NKV + self._nkv)
+        cp = start + self._ar
+        self.cp.copy_(cp)
+        self.cos.copy_(full_cos[cp][None, None]); self.sin.copy_(full_sin[cp][None, None])
+        self.mask.copy_(torch.where(self.cols.view(1, self.alen) <= cp.view(self.s, 1), 0.0,
+                                    float("-inf")).to(torch.bfloat16)[None, None])
+
+
+class RowGraphRunner:
+    """Capture + replay the de-lockstep row-decode block at fixed [1, s=K+1], one graph per context
+    bucket, serving EVERY KV row through _RGraphState's static row/start buffers. Same safety
+    contract as Batch/GraphRunner: host-side bounds check, free-VRAM pre-check, capture failure ->
+    LOUD permanent-eager, counts against M25_GRAPH_MAX."""
+    def __init__(self, layers, vcfg, s, dv=dev):
+        assert M25_BATCH > 1, "row graphs need the launch-time [B,...] KV rows"
+        self.layers, self.vcfg, self.s, self.dv = layers, vcfg, s, dv
+        self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
+        self.graphs = {}
+        self.eager = set()
+        self.aux_ids = [L.li for L in layers if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS]
+
+    def _bucket(self, total):
+        for b in DECODE_BUCKETS:
+            if b >= total:
+                return min(b, M25_KV_MAXLEN)
+        return M25_KV_MAXLEN
+
+    def _layers(self, h):
+        st = _GR
+        for L in self.layers:
+            h = L.forward_decode_row(h, 0, 0, (self.cos, self.sin))   # row/start unused: attn reads _GR
+            if L.li in st.aux:
+                st.aux[L.li].copy_(h[0])
+        return h
+
+    def _capture(self, alen):
+        from vllm.forward_context import set_forward_context
+        global _GR, _GRAPH_COUNT
+        need = 2 * NH * alen * HD * 2 + 2 * NH * self.s * alen * 4 + (1 << 30)   # kk/vv repeat + scores + margin
+        free = torch.cuda.mem_get_info()[0]
+        if free < need:
+            raise RuntimeError(f"free VRAM {free / 1e9:.1f}GB < row-capture estimate {need / 1e9:.1f}GB")
+        h = (torch.randn(1, self.s, H, device=self.dv) * 0.1).to(torch.bfloat16)
+        st = _RGraphState(self.s, alen, self.rd, self.dv, self.aux_ids)
+        st.set(0, alen - self.s, self.cos, self.sin)
+        _GR = st
+        try:
+            side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad(), set_forward_context(None, self.vcfg):
+                for _ in range(3):
+                    self._layers(h)
+            torch.cuda.current_stream().wait_stream(side); torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g), torch.no_grad(), set_forward_context(None, self.vcfg):
+                out = self._layers(h)
+        finally:
+            _GR = None
+        self.graphs[alen] = (g, h, st, out)
+        _GRAPH_COUNT += 1
+
+    def run(self, row, start, x):
+        global _GRAPH_SKIPPED
+        total = start + self.s
+        if total > M25_KV_MAXLEN:
+            raise RuntimeError(f"row decode context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN}")
+        alen = self._bucket(total)
+        if alen in self.eager or NH * alen * HD * 4 > 1_400_000_000:
+            _GRAPH_SKIPPED += 1
+            return run_block_decode_row(self.layers, row, start, x, self.vcfg)
+        if alen not in self.graphs:
+            try:
+                self._capture(alen)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()
+                self.eager.add(alen); _GRAPH_SKIPPED += 1
+                print(f"[graph] row capture failed (s={self.s}, alen={alen}): {type(e).__name__}: {e} "
+                      f"-> bucket marked permanently eager", flush=True)
+                return run_block_decode_row(self.layers, row, start, x, self.vcfg)
+        g, h, st, out = self.graphs[alen]
+        st.set(row, start, self.cos, self.sin)
+        h.copy_(x)
+        g.replay(); torch.cuda.synchronize()
+        for li in self.aux_ids:                        # solo-shaped [s,H] aux, consumed synchronously
             _AUX[li] = st.aux[li]
         return out
 

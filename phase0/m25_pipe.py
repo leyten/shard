@@ -96,6 +96,12 @@ M25_AUX_SLIM = os.environ.get("M25_AUX_SLIM", "1") != "0"
 # (receipt batched-viability-20260711 - 3 armed passes, all receipts valid, zero pairing aborts,
 # ~20-30% round-time cut at fp8; the A/B knob remains for measurement).
 M25_AUX_LOCAL = os.environ.get("M25_AUX_LOCAL", "1") != "0"
+# De-lockstep (M25_DELOCKSTEP=1, default OFF until live-proven): batched EAGLE jobs run per-stream
+# ASYNC solo-style frames that interleave on the ring instead of one lockstep [B,...] frame per
+# round — the streams ARE the pipeline (each stream's WAN wait hides the others' compute+drafting;
+# zero staleness, per-stream commit cadence, done streams stop sending, decode MoE back on the solo
+# token-count-invariant path). The per-stream-20 plan's build #1 (.claude/plans/per-stream-20-plan.md).
+M25_DELOCKSTEP = os.environ.get("M25_DELOCKSTEP", "0") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
@@ -1004,6 +1010,11 @@ def _sdpa_backend_probe(stage):
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
                           depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
                           on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+    if M25_DELOCKSTEP and S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters):
+        return coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock,
+                                    drafters, tools=tools, prefill_chunk=prefill_chunk,
+                                    max_ctx=max_ctx, reasoning=reasoning, on_commits=on_commits,
+                                    tools_b=tools_b, swarm_id=swarm_id, job_id=job_id)
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
     round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). Each stream's
     output is byte-identical to a solo coordinate_pipe run (per-stream KV row + per-stream causal mask +
@@ -1200,6 +1211,168 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
 
 
+def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
+                         tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
+                         on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+    """DE-LOCKSTEP coordinator (M25_DELOCKSTEP): B independent per-stream spec-decode chains whose
+    [1,K+1] solo-style frames INTERLEAVE on the ring — no shared round, no lockstep barrier. Each
+    stream is exactly solo depth-1 EAGLE (draft from the verified hidden -> send -> commit on reply,
+    full-accept bonus always available since a stream never has a second frame in flight); the WAN
+    time of one stream hides the compute/drafting of the others, which is where the per-stream
+    speedup over lockstep comes from (the streams ARE the pipeline). Replies arrive in global FIFO
+    order (one pipe path, single-threaded stages); each carries a 'stream' tag the coordinator
+    asserts against its own FIFO — any skew aborts LOUD. Job opening, prefill, receipts, graph-arm
+    stamping and the aux_local lane are the lockstep path's, verbatim."""
+    from eagle_draft import prefill_pair_tokens, fetch_b
+    from collections import deque
+    B = len(messages_list)
+    rx = ret_sock if ret_sock is not None else pipe_sock
+    pipe_sock.settimeout(timeout)
+    rx.settimeout(timeout)
+    kw_job = os.environ.get("M25_KEEPWARM_JOB")
+    kw = _KeepWarm(pipe_sock, interval_ms=kw_job if kw_job not in (None, "") else None)
+    _eos = tok.eos_token_id
+    eos_set = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}
+    tb = tools_b if tools_b is not None else [tools] * B
+    reas_b = reasoning if isinstance(reasoning, list) else [reasoning] * B
+    mxnew_b = max_new if isinstance(max_new, list) else [max_new] * B
+    prompts = [render_ids(tok, m, tools=tb[b], reasoning=reas_b[b]) for b, m in enumerate(messages_list)]
+    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - 16)) if max_ctx else mxnew_b[b]
+          for b, p in enumerate(prompts)]
+    out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
+    acc = [0] * B; vrounds = [0] * B
+    t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None; per_stage = {}
+    for d in drafters:
+        d.reset()                                        # fresh per-stream EAGLE context per job
+    job_nonce = os.urandom(16).hex() if RECEIPTS else None
+    aux_token = os.urandom(8).hex() if M25_AUX_LOCAL else None
+    aux_local = False; lseq_tx = lseq_rx = 0
+    rounds = 0
+    try:
+        rb_op = {"op": "reset_batch", "B": B, "swarm_id": swarm_id, "job_id": job_id}
+        if job_nonce is not None:
+            rb_op["nonce"] = job_nonce
+        if M25_GRAPH_JOB is not None:
+            rb_op["graph"] = M25_GRAPH_JOB
+        if aux_token:
+            rb_op["aux_local"] = aux_token
+        kw.send(rb_op); ack = recv_data(rx)
+        if isinstance(ack, dict) and ack.get("error"):
+            raise TransportError(f"reset_batch refused: {ack['error']}")
+        _check_reset_ack(rb_op, ack)
+        if aux_token:
+            aux_local = _aux_local_handshake(pipe_sock, aux_token)
+            if not aux_local:
+                print("[rows] aux_local asked but the head never acked — ridden-ring aux (old head?)", flush=True)
+        for b in range(B):                               # per-stream prefill, exactly the lockstep path
+            gen = prompts[b]
+            starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
+            for i in starts_b:
+                chunk = gen[i:i + prefill_chunk] if prefill_chunk else gen
+                pf = {"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True}
+                if aux_local:
+                    pf["seq"] = lseq_tx; lseq_tx += 1
+                kw.send(pf)
+                rr, aux = _unpack(recv_data(rx))
+                if aux_local:
+                    loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
+                    if loc:
+                        aux = {**(aux or {}), **loc}
+                if aux is not None:
+                    drafters[b].extend(prefill_pair_tokens(gen, i, rr),
+                                       _eagle_aux_range(aux, 0, len(rr)), base_pos=i)
+            cur[b] = rr[-1]
+            pos[b] = len(gen); out[b] = [cur[b]]
+            if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
+            drafters[b].request(prompts[b] + [cur[b]], K)
+            if on_commits and on_commits[b]: on_commits[b](out[b], 0.0)
+        prefill_s = time.time() - t_pf; t0 = time.time()
+        rx.settimeout(_reply_timeout(timeout))           # decode replies fail over in seconds, like solo
+        dprefix = [prompts[b] + [cur[b]] for b in range(B)]
+        inflight_b = {}                                  # stream -> (send_pos, ds) — at most ONE per stream
+        pend = deque()                                   # global FIFO of streams with a frame in flight
+
+        def _fire(b, ds):
+            nonlocal lseq_tx
+            fr = {"op": "verify", "stream": b, "token_ids": [dprefix[b][-1]] + ds, "start": pos[b]}
+            if aux_local:
+                fr["seq"] = lseq_tx; lseq_tx += 1
+            inflight_b[b] = (pos[b], ds)
+            dprefix[b] = dprefix[b] + ds
+            kw.send(fr); pend.append(b)
+
+        act = [b for b in range(B) if not done[b]]
+        for b, ds in zip(act, fetch_b([drafters[b] for b in act])):   # first draws batched in ONE pass
+            _fire(b, ds)
+        while pend:
+            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            if isinstance(resp, dict) and resp.get("stage_dt"):
+                _acc_stage_dt(resp, per_stage)
+            b = pend.popleft()
+            if isinstance(resp, dict) and resp.get("stream") is not None and resp["stream"] != b:
+                raise TransportError(f"row reply skewed: expected stream {b}, got {resp['stream']} "
+                                     f"— aborting (FIFO pairing broken)")
+            r, aux = _unpack(resp)
+            if aux_local:
+                loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
+                if loc:
+                    aux = {**(aux or {}), **loc}
+            if aux is None and rounds == 0:              # fail LOUD, like lockstep: no aux = a poisoned run
+                raise TransportError("EAGLE drafters but the ring returned no aux — launch stages "
+                                     "with M25_EAGLE=1")
+            sp, ds = inflight_b.pop(b)
+            n = 0
+            for j in range(K):
+                if ds[j] == r[j]: n += 1
+                else: break
+            vrounds[b] += 1; acc[b] += n; rounds += 1
+            if n == K:                                   # full accept + bonus (nothing else in flight
+                committed = ds + [r[K]]                  # for THIS stream, ever — solo depth-1 rule)
+                out[b].extend(committed); cur[b] = r[K]; pos[b] += K + 1; acc[b] += 1
+            else:
+                committed = ds[:n] + [r[n]]
+                out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
+                dprefix[b] = prompts[b] + out[b]         # divergence: rebase the prefix (no stale frames exist)
+            if aux is not None:
+                drafters[b].extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)
+            if on_commits and on_commits[b]: on_commits[b](out[b], time.time() - t0)
+            if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
+                done[b] = True
+            else:
+                drafters[b].request(dprefix[b], K)
+                ds2 = fetch_b([drafters[b]])[0]          # one-stream draw runs the sync-free batched path;
+                _fire(b, ds2)                            # other streams' frames are on the WAN meanwhile
+        for b in range(B):
+            getattr(drafters[b], "cancel", lambda: None)()
+        if RECEIPTS:
+            kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)
+            if isinstance(receipts, dict):
+                graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
+                receipts = receipts.get("receipts", [])
+    finally:
+        if aux_local and lseq_rx < lseq_tx:
+            _drain_aux_local(pipe_sock, lseq_tx - lseq_rx)
+        kw.stop()
+    receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    check_chain=not M25_FP8_WIRE) if receipts
+                   else (False if RECEIPTS else None))
+    dt = time.time() - t0
+    res = []
+    for b in range(B):
+        o = out[b]
+        for ee in eos_set:
+            if ee in o: o = o[:o.index(ee)]; break
+        res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
+                    "g": round(acc[b] / max(vrounds[b], 1), 3),
+                    "text": tok.decode(o, skip_special_tokens=True)})
+    return {"streams": res, "B": B, "rounds": rounds, "depth": 1, "wasted": 0,
+            "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
+            "receipts_ok": receipts_ok, "eagle": True, "delockstep": True,
+            "graph_arm": graph_arm, "aux_local": bool(aux_local),
+            "per_stage": {k: [round(v[0], 1), round(v[1], 1), v[2]] for k, v in per_stage.items()},
+            "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
+
+
 def _load(stage, nstages, lo, hi):
     S.vllm_ctx()
     layers = [S.Layer(i) for i in range(lo, hi)]
@@ -1277,6 +1450,25 @@ def _block_b(grs_b, layers, starts, x, vcfg):
             print(f"[graph] cap: B={B} s={s} bucket={alen} -> eager "
                   f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
     return S.run_block_decode_b(layers, torch.as_tensor(starts, dtype=torch.long, device=dev), x, vcfg)
+
+
+def _block_row(grs_r, layers, row, start, x, vcfg):
+    """De-lockstep row-decode router (mirrors _block/_block_b): route the fixed-shape [1,K+1] row
+    frame through the shared RowGraphRunner (ONE graph serves every KV row) when graphs are active."""
+    if S.M25_CUDA_GRAPH_ACTIVE and M25_BATCH_GRAPH and x.shape[1] <= 64 and S.M25_BATCH > 1:
+        s_ = x.shape[1]
+        gr = grs_r.get(s_)
+        if gr is None:
+            grs_r[s_] = gr = S.RowGraphRunner(layers, vcfg, s_)
+        alen = gr._bucket(start + s_)
+        if alen in gr.graphs or S._GRAPH_COUNT < S.M25_GRAPH_MAX:
+            return gr.run(row, start, x)
+        S._GRAPH_SKIPPED += 1
+        if ("row", s_, alen) not in _GRAPH_CAP_LOGGED:
+            _GRAPH_CAP_LOGGED.add(("row", s_, alen))
+            print(f"[graph] cap: row s={s_} bucket={alen} -> eager "
+                  f"({S._GRAPH_COUNT}/{S.M25_GRAPH_MAX} graphs captured)", flush=True)
+    return S.run_block_decode_row(layers, row, start, x, vcfg)
 
 
 def _reset_flags(msg):
@@ -1403,6 +1595,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     vcfg = S._CTX[1]
     graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
     graph_runners_b = {}                              # batched-decode graph cache, keyed (B, s) — same lifetime
+    graph_runners_r = {}                              # de-lockstep row-decode graph cache, keyed s
     def _dial_fwd():
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
@@ -1597,6 +1790,20 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                             _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                        if "stream" in msg and msg["op"] == "verify":   # DE-LOCKSTEP row decode: one stream's
+                            b = msg["stream"]                            # solo-style frame against KV row b
+                            x = msg["h"].to(dev)
+                            h = _block_row(graph_runners_r, layers, b, msg["start"], x, vcfg)
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                            if RECEIPTS and signer is not None:          # row frames are attested like every op
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                            o = {"toks": toks, "stream": b}              # stream tag = the coordinator's LOUD
+                            if S.M25_EAGLE:                              # FIFO-pairing guard
+                                o["aux"] = _merge_aux(msg.get("aux"))
+                            if S.M25_STAGE_TIMING:
+                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
+                            _ret_send(o); continue
                         if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
                             x = msg["h"].to(dev)
                             h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
@@ -1718,6 +1925,28 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
                                             "seq": msg.get("seq"),                      # the ring send (localhost
                                             "aux": {str(li): v.detach().to(torch.bfloat16).cpu()   # buffer deadlock)
+                                                    for li, v in S._AUX.items()}})
+                        continue
+                    if "stream" in msg and msg["op"] == "verify" and not msg.get("prefill"):   # DE-LOCKSTEP row decode
+                        b = msg["stream"]
+                        if parts["head"]:
+                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                        else:
+                            h = msg["h"].to(dev)
+                        x = h
+                        h = _block_row(graph_runners_r, layers, b, msg["start"], h, vcfg)
+                        if RECEIPTS and signer is not None:
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        fwd = {"op": "verify", "stream": b, "h": h, "start": msg["start"]}
+                        if S.M25_EAGLE:
+                            if aux_local_job is None:                    # armed head: own aux on the local lane
+                                fwd["aux"] = _merge_aux(msg.get("aux"))
+                        if S.M25_STAGE_TIMING:
+                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
+                        nxt_kw.send(_hsend(fwd))
+                        if aux_local_job is not None:                    # forward-first, like every armed op
+                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
                                                     for li, v in S._AUX.items()}})
                         continue
                     if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
