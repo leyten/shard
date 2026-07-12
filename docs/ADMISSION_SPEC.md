@@ -85,7 +85,16 @@ gate only bites the fallback paths: no CUDA-graph (3-10× launch overhead), no n
 
 Layers a card actually holds (measured footprint 2.33/4.06 GB + kv 0.15, reserve 1.5, arch transient):
 16 GB → **5** Blackwell / 2 marlin · 24 GB → **9** / **4** · 32 GB → **12** / 6 · 48 GB → ~19 / ~10 ·
-80 GB → ~32 / ~17 (the ≥48 GB column is density-extrapolated, unproven at size — probe on join decides).
+80 GB → ~32 / ~17 · **96 GB → 35 (MEASURED 2026-07-12)** (the ≥48 GB column below 96 is
+density-extrapolated — probe on join decides).
+
+**The 96 GB tier is now MEASURED, not extrapolated (2026-07-12, two rented RTX PRO 6000 WS):**
+full-layer cutlass footprint **2329.5 MB** (== the 5090's — the footprint is the QUANT's, not the
+card's), load transient 72 MB, density cap 35 layers, graph-replayed layer_ms 0.241 (Max-Q!). Live:
+the c0mpute loop placed one as a **31-layer head+coordinator in a 4-hop hetero ring** (vs 6 hops
+all-5090). The SECOND Pro 6000 probed fast_kernel=FALSE (graph replay cosine 0.0, deterministic —
+same model name, opposite verdict) and was relegated off-ring by its own measurement: the
+capability function catching a silent-corruption stage that any model-name allowlist admits.
 
 **12-vs-13 — RESOLVED BY MEASUREMENT (2026-07-09).** The v0 tension (plan profile 13 vs spec 12) is
 settled: the full-layer footprint is 2.33 GB, so 12 is arithmetic, and the live reads prove it — a
@@ -108,6 +117,9 @@ instead of flat-clamping — a flat cap made 48 GB indistinguishable from 32 GB.
   20-32 claim is **tight-regional-ring-only**.
 - **The comfortable fast-M2.5 anchor is a 48 GB fast-kernel card (N≤4)**, or a tight regional ring of
   32 GB 5090s. M2.5's 140 GB size makes interactive M2.5 **Blackwell/pro-anchored** — full stop.
+- **A 96 GB fast-kernel card is the PROVEN anchor class (2026-07-12):** 35-layer capacity → a 4-hop
+  ring with three 32 GB fillers (wire ×0.67 vs all-5090), placed by the loop itself. Fat cards
+  joining doesn't just add supply — it removes hops from everyone else's ring.
 - **This does NOT reject the long tail — it ROUTES it.** Weak/consumer hardware earns its keep exactly as
   the torrent thesis predicts: **batched-fill**, **verification**, **seeding**, and **anchoring SMALLER
   models** (a 30-40 B NVFP4 fits meaningfully in 4 layers). The capability function, parameterized per
