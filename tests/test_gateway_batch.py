@@ -140,20 +140,27 @@ def _fake_batch_recorder(calls):
 
 def test_content_class_and_k_policy(monkeypatch):
     monkeypatch.setattr(gw, "CONTENT_K", True)
-    assert gw._content_class([{"content": "hi"}], TOOL, False) == "draftable"
-    assert gw._content_class([{"content": "hi"}], None, True) == "draftable"
+    assert gw._content_class([{"content": "hi"}], TOOL, False) == "tools"
+    assert gw._content_class([{"content": "hi"}], None, True) == "reasoning"
     assert gw._content_class([{"content": "x" * 7000}], None, False) == "context"
     assert gw._content_class([{"content": "hi"}], None, False) == "novel"
-    assert gw._class_k("draftable") == 8                # args.K (fixture)
-    assert gw._class_k("context") == gw.K_CTX
-    assert gw._class_k("novel") == gw.K_NOVEL
+    # K keys on (class, B): narrow batches ride full K (g dominates, payload amortized); wide
+    # batches drop to the class K (dead-slot payload binds — receipt perstream-trees-ab-20260712);
+    # tools' g~5 earns full K at every width
+    for cls in ("tools", "reasoning", "context", "novel"):
+        assert gw._class_k(cls, B=1) == 8 and gw._class_k(cls, B=2) == 8
+    assert gw._class_k("tools", B=4) == 8
+    assert gw._class_k("reasoning", B=4) == gw.K_CTX
+    assert gw._class_k("context", B=4) == gw.K_CTX
+    assert gw._class_k("novel", B=8) == gw.K_NOVEL
     monkeypatch.setattr(gw, "CONTENT_K", False)         # kill switch: every class rides args.K
-    assert gw._class_k("novel") == 8
+    assert gw._class_k("novel", B=8) == 8
 
 
 def test_dispatcher_batches_like_with_like(monkeypatch):
-    """A mixed burst (2 tool-calling + 2 reasoning-off novel) must split into TWO single-class jobs
-    with the class's K — never one mixed job — and every caller still gets its own stream."""
+    """A mixed burst (4 tool-calling + 4 reasoning-off novel) must split into TWO single-class jobs
+    with the (class, B) K — never one mixed job — and every caller still gets its own stream. At
+    B=4 the tools job keeps full K while the novel job drops to K_NOVEL."""
     calls = []
     monkeypatch.setattr(gw, "coordinate_pipe_batch", _fake_batch_recorder(calls))
     monkeypatch.setattr(gw, "make_drafters_b", lambda B, n=3: [object()] * B)
@@ -162,21 +169,20 @@ def test_dispatcher_batches_like_with_like(monkeypatch):
     results = {}
 
     def one(i):
-        tools = TOOL if i < 2 else None
-        reasoning = i < 2
+        tools = TOOL if i < 4 else None
         try:
             results[i] = gw.run_request([{"role": "user", "content": f"p{i}"}], tools, 32,
-                                        reasoning, timeout=10)
+                                        False, timeout=10)
         except Exception as e:  # noqa: BLE001
             results[i] = e
-    ths = [threading.Thread(target=one, args=(i,)) for i in range(4)]
+    ths = [threading.Thread(target=one, args=(i,)) for i in range(8)]
     for t in ths: t.start()
     for t in ths: t.join(20)
-    assert all(results[i]["ok"] for i in range(4)), results
+    assert all(results[i]["ok"] for i in range(8)), results
     assert len(calls) == 2, f"mixed burst must split into two single-class jobs: {calls}"
     by_k = {c["K"]: c for c in calls}
-    assert 8 in by_k and gw.K_NOVEL in by_k, f"per-class K missing: {calls}"
-    assert all(t is not None for t in by_k[8]["tools_b"]), "draftable job must carry the tool streams"
+    assert 8 in by_k and gw.K_NOVEL in by_k, f"per-(class,B) K missing: {calls}"
+    assert all(t is not None for t in by_k[8]["tools_b"]), "tools job must carry the tool streams"
     assert all(t is None for t in by_k[gw.K_NOVEL]["tools_b"]), "novel job must carry the bare streams"
 
 
