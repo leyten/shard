@@ -1,0 +1,76 @@
+{
+ "checks": {
+  "range_load_middle": {
+   "ok": true,
+   "detail": "layers [29:32) loaded, active_mem=5.77GiB",
+   "s": 1.4
+  },
+  "forward_f32_finite_deterministic": {
+   "ok": true,
+   "detail": "[1,8,3072] f32 finite + run-to-run byte-equal, |y|~1.3032",
+   "s": 1.13
+  },
+  "forward_bf16_bits_representation": {
+   "ok": true,
+   "detail": "uint16 in/out; max|\u0394| vs f32 path 0.0000 (bf16-boundary rounding class)",
+   "s": 0.03
+  },
+  "kv_rollback_crop": {
+   "ok": true,
+   "detail": "trim-to-start_pos == fresh cache, byte-equal",
+   "s": 0.05
+  },
+  "kv_gap_refused": {
+   "ok": true,
+   "detail": "gap start_pos AHEAD of cache -> ValueError (refused)",
+   "s": 0.01
+  },
+  "aux_capture": {
+   "ok": true,
+   "detail": "aux[30] [8,3072] uint16 (always-bf16 contract)",
+   "s": 0.01
+  },
+  "audit_selection_on_real_index": {
+   "ok": true,
+   "detail": "partial-layer index -> o_proj absent from selection (audit would refuse at load)",
+   "s": 0.0
+  },
+  "tail_norm_lm_head": {
+   "ok": true,
+   "detail": "logits [1,8,200064] finite, argmax(last)=8361",
+   "s": 11.11
+  },
+  "head_embed": {
+   "ok": true,
+   "detail": "embed [1,4,3072] finite",
+   "s": 2.83
+  },
+  "wrapper_vs_mlxlm_loop_parity": {
+   "ok": true,
+   "detail": "byte-identical to a hand-driven mlx-lm layer loop",
+   "s": 2.95
+  },
+  "decode_ms_per_layer": {
+   "ok": true,
+   "detail": "2.8 ms / 3-layer block = 0.94 ms/layer decode (M2 Pro, B=1)",
+   "s": 0.15
+  }
+ },
+ "measured": {
+  "load_mem_gib": 5.77,
+  "decode_ms_per_layer": 0.94,
+  "decode_ms_3layer_block": 2.82,
+  "active_mem_gib": 5.77
+ },
+ "env": {
+  "mlx": "0.32.0",
+  "mlx_lm": "0.31.3",
+  "python": "3.13.13",
+  "model_type": "minimax_m2",
+  "quant": {
+   "bits": 4,
+   "group_size": 64,
+   "mode": "affine"
+  }
+ }
+}

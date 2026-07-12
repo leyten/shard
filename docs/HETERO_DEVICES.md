@@ -67,6 +67,7 @@ co-locate to manufacture the number — every verdict below is for scattered WAN
 | M2 Ultra | 800 | 64-192 | 25-62 | ~0.3 | **ring** (MLX build needed) |
 | M4 Max | 546 | 36-128 | ~14-40 | 0.45-0.8 | **ring** (watch uplink/prefill) |
 | M4 Pro | 273 | 24-64 | ~7-20 | 0.9-1.9 | ring-marginal — residential uplink is the gate |
+| **M2 Pro (MEASURED)** | 200 | 16 | 3-5 (1.9 GB/L @ MLX 4-bit, measured) | **0.94 (measured, B=1, mlx 0.32)** | **MLX GATE box** — 11/11 real-weights checks green 2026-07-12 (receipt mlx-mac-gate) |
 | base M-series | 100-150 | 16-32 | ~4-9 | 2-4.5 | off-ring: seeder / light verifier |
 | AMD 7900 XTX | 960 | 24 | ~9 | 0.45-0.65 (Vulkan) | **ring-worthy silicon** — gated on a llama.cpp backend |
 | CPU box (DDR5) | ~90 | 64-192 | many (host RAM) | ~2-6 (unproven) | off-ring: **seeder** (`-seed`), torch-free sketch judge, coordinator/gateway |
