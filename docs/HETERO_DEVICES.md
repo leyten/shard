@@ -58,8 +58,9 @@ co-locate to manufacture the number — every verdict below is for scattered WAN
 | Device | BW GB/s | Mem GB | ~layers @ arch footprint | est layer_ms | Verdict |
 |---|---|---|---|---|---|
 | **RTX PRO 6000 (WS/S)** | 1792 | 96 | **35** (2.33 GB, density-scaled cap; MEASURED 2026-07-12) | **0.24 (measured, graph)** | **ring ANCHOR — proven live**: held 31 L + coordinator in a 4-hop hetero ring the c0mpute loop placed |
-| RTX 5090 | 1792 | 32 | ~13 (1.7 GB) | 0.65-1.5 | **ring — proven** |
-| RTX 4090 | 1008 | 24 | ~4-5 (4.08 GB marlin) | 1.2-2.5 | **ring** — fewer layers, marlin |
+| RTX 5090 | 1792 | 32 | ~13 (1.7 GB) | 0.65-1.5 · **0.20 (measured, graph)** | **ring — proven** |
+| **H100 NVL (MEASURED)** | 3900 | 93 | ~20 (4057 MB/L marlin) | **0.184 (measured, graph)** | **ring — proven live 2026-07-12** (fleet sw2 tail [42:62]); the 80-95GB marlin tier now measured, transient +4824 |
+| RTX 4090 | 1008 | 24 | ~4-5 (4.08 GB marlin) | 1.2-2.5 · **0.263 (measured, graph)** | **ring** — fewer layers, marlin (fleet-measured) |
 | RTX 3090 | 936 | 24 | ~4-5 | 1.3-2.9 | **ring** (probe pending) |
 | 4070 Ti (S) | 504-672 | 12-16 | ~2-3 | 2-4 | ring-marginal (small block) |
 | RTX 3060 | 360 | 12 | ~2 | 3-7 | edge — batched regime only / prefer off-ring |

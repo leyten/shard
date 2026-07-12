@@ -161,13 +161,17 @@ def main():
         os.environ["M25_CWND_KEEPWARM_MS"] = "150"
     nodes = []
     for spec in a.order:
-        region, iid, lo, hi = spec.split(":")
+        parts = spec.split(":")
+        region, iid, lo, hi = parts[:4]
+        # optional 5th field "eager": launch this stage graph-OFF (a probe-measured
+        # graph-corrupt card serving at its eager speed — eager IS its reference numerics)
+        forced_eager = len(parts) > 4 and parts[4] == "eager"
         j = vinst(iid)
         ports = j.get("ports") or {}
         m = ports.get(f"{LIBP2P}/tcp")
         nodes.append(dict(region=region, iid=iid, host=j["ssh_host"], port=int(j["ssh_port"]),
                           pip=(j.get("public_ipaddr") or "").strip(), pport=m[0]["HostPort"] if m else None,
-                          lo=int(lo), hi=int(hi)))
+                          lo=int(lo), hi=int(hi), forced_eager=forced_eager))
     n = len(nodes)
     print("[pipe] push code + PeerIds ...", flush=True)
     for nd in nodes:
@@ -181,7 +185,8 @@ def main():
         # FULL-speed ring stage, not an eager drag. M25_EAGER_NONBLACKWELL=1 restores eager for a card
         # whose backend turns out not to be graph-safe (the warm check would otherwise catch a crash).
         eager_nb = os.environ.get("M25_EAGER_NONBLACKWELL", "0") != "0"
-        nd["graph_off"] = eager_nb and not any(b in nd["gpu"] for b in ("5090", "5080", "5070"))
+        nd["graph_off"] = nd.get("forced_eager", False) or \
+            (eager_nb and not any(b in nd["gpu"] for b in ("5090", "5080", "5070")))
         print(f"  {nd['region']} {nd['gpu']} {nd['pip']}:{nd['pport']} [{nd['lo']},{nd['hi']}) "
               f"{'eager' if nd['graph_off'] else 'graph'} {nd['pid'][:14]}..", flush=True)
 
