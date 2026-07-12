@@ -21,25 +21,26 @@ real inference verifiably, and gets paid. Leg status:
 3. **Torrent weight propagation** — ✅ BANKED (ringmate pulls, DHT, same-peer resume).
 4. **Verifiable serving** — ✅ BANKED (per-stage receipts everywhere, batched attested, fail-closed).
 5. **Batched viability** — RE-SCOPED by leyten 2026-07-11 to **20-30 tok/s PER STREAM at B≥2**;
-   **LARGELY MET same day (receipt perstream-delockstep-20260711)**: DE-LOCKSTEP (PR #84) live —
-   B=4 per-stream medians (3 reps, receipts valid): reasoning **26.9**, tools **26.8**, code
-   **23.9**, qa 19.4 ✓; prose 17.2 / summarize 13.8 / mix 13.6 (g-bound content). B-curve agg
-   2.96/3.65/7.70/9.72 → **23.0/30.9/54.3/111.5** (B=8 = 11.5×). De-lockstep = 1.6-2.7× per-stream
-   over lockstep same-ring; per-frame cadence ~44ms at B=4 (the research model held). Remaining to
-   the FULL bar: per-stream TREES (activation condition — latency-floor rounds — now MET), gateway
-   content routing (bar-content users get it today), B=2 tier 15.4 → ~19 w/ trees. bf16-aux
-   recovered only +8% g (the fp8-wire drop is content-shift, not aux fidelity). Aggregate milestone banked (receipt
-   batched-viability-20260711: mix-B4 agg 25.68 median, per-stream 5.4-7.3; B-curve journey
-   2.96/3.65/7.70/9.72 → 21.8/27.0/25.7/31.2). THE PATH (3-agent research synthesis, full plan
-   `.claude/plans/per-stream-20-plan.md`): (0) **every batched receipt ran with TCP cwnd keep-warm
-   OFF** — B≥4 rounds idle legs past RTO_min → cwnd collapse EVERY round, +180-500ms; launcher now
-   defaults it ON for batched launches (projection alone: 6.4 → ~9-11/stream); (1) **DE-LOCKSTEP**
-   the streams (per-stream async solo frames — the next build; 11-14 mix, 15-25 draftable);
-   (2) g-at-fp8 recovery A/B (bf16 aux over fp8 wire; g 2.48→~3.5 candidate); (3) content routing
-   + per-content K; (4) batch-invariant grouped MoE (the B8 lever); (5) 48GB fat-stage rings
-   (N=3-4). Depth>1 stale-context EAGLE: **KILLED by arithmetic** (useful-frame rate α^K ≈ 2-5% at
-   mix-g, doubles wire). verify_batch now stamps per-stage timing (M25_STAGE_TIMING) — the
-   decomposition experiment is ready for the next ring.
+   LARGELY MET 2026-07-11 (receipt perstream-delockstep-20260711: DE-LOCKSTEP #84 live, B=4
+   per-stream medians reasoning 26.9 / tools 26.8 / code 23.9 / qa 19.4 ✓, prose/sum/mix 13.6-17.2
+   g-bound; agg B-curve → 23.0/30.9/54.3/111.5). **2026-07-12 (receipt perstream-trees-ab-20260712,
+   3 reps + K-reference, all receipts valid):** the two follow-up levers MERGED and MEASURED —
+   * **Per-stream trees (#86, M25_TREE + rows)**: the g lever WORKS (+15-70% committed/round,
+     reasoning 2.31→3.92) but **HIT THE KILL CRITERION** live: −29..−63%/stream vs K-tuned chains
+     on every arm. Decomposition (M25_STAGE_TIMING): tree frames run EAGER stage-side — 154ms
+     summed stage compute vs 45ms graph-replayed chains (3.4×), rounds 328 vs 169ms. **What binds
+     = missing CUDA graphs on the tree kernel**, not g/wire. Trees stay env-armed only; the unlock
+     is designed in `.claude/plans/tree-graph-capture.md` (padded-N capture; mind the dummy-KV
+     trash-slot hazard documented there). NOTE #86 changed rows g to COMMITTED/round (uniform
+     chain+tree) — pre-#86 receipts quote accept-only g, ~1 lower on divergence-heavy content.
+   * **Content routing + per-(class,B) K (#87 + #88)**: THE surprise win — **K=6 chains lift every
+     g-bound B4 arm 20-100%**: reasoning 14→**29.0**, mix 14.2→**17.9 (≥16 bar MET)**, prose →18.5,
+     summarize →**18.2 (07-11 fp8-collapse did NOT reproduce — content-shift noise, closed)**,
+     qa →21.1, code →19.8; tools keeps K=8 (g~5, 29.7). K=8 still wins at B≤2 (22.5/21.7/stream).
+     Gateway now routes K by (content class, batch width); M25_DELOCKSTEP default ON.
+   * **FULL-bar scorecard at B=4 (K-tuned chains)**: reasoning 29.0 ✓ tools 29.7 ✓ qa 21.1 ✓
+     mix 17.9 ✓(≥16) code 19.8 ≈ summarize 18.2, prose 18.5 (target 20 — 1.5 short; remaining
+     levers: tree-frame graphs + K=5 novel tier). B=2 tier: 21.7/stream ✓.
 6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
    must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
    CPU/local-first, multi-day, no leyten decisions needed. Queued BEHIND the per-stream-20 work
@@ -88,23 +89,21 @@ measurement, no drafter-tax discount). Ops lessons: HF xet pulls stall (kill+res
 `pkill -f` self-match struck AGAIN via a heredoc body carrying the pattern (split kill/launch into
 separate ssh calls); a vast host with wedged nvidia-uvm survives reboot+stop/start → destroy+replace.
 
-**NEXT SESSION (transport-bound era; BOTH transport levers BUILT this session, ring-validation owed):**
-1. **RING: validate the two new transport levers + re-sweep.** Both landed offline-gated:
-   **head-local aux (#79, `M25_AUX_LOCAL`, default OFF)** — the head's aux (L1) goes to the
-   coordinator over localhost instead of 6 WAN legs (~40% of round bytes; per-job nonce'd lane,
-   forward-first, LOUD on mispair; two review MAJORs fixed: nonce token + abort drain — plan +
-   status `.claude/plans/head-local-aux.md`) — and **accepted-prefix aux slimming (#78,
-   `M25_AUX_SLIM`, default ON)** — tail slices return-leg aux to each stream's committed prefix
-   (~10-15%). Together ≈ half the batched round's bytes. Next ring: A/B aux_local ON-vs-OFF at equal
-   env (expect fp8-B4 787→~610ms round, agg ~18; bf16 1607→~1000ms), then the 12-arm sweep on the
-   full stack — the 25-agg B4 bar is in reach if the leg math holds. Flip aux_local default ON once
-   live-proven.
-2. **fp8 wire as the standard batched env** (2× payload) + bank the g-per-wire-mode bands in SPEC_V0.
-3. **Depth>1 stale-context EAGLE A/B:** drafting is cheap now, so round pipelining hides WAN again
-   (was pointless while drafting serialized). Quality-not-correctness tradeoff — A/B on-ring.
-4. Then: MlxRuntime → probe fidelity leftovers → market iff c0mpute #16.
+**NEXT SESSION (per-stream era, post trees-A/B):**
+1. **Tree-frame CUDA graphs** — the ONE lever the 07-12 decomposition points at (tree stage
+   compute 154→~50-70ms candidate → tree rounds ~200-240ms → the g lift nets +20-40%/stream
+   instead of −13%). Full design + the dummy-KV trash-slot hazard: `.claude/plans/tree-graph-capture.md`.
+   Offline gates first (graph-vs-eager bit-equality, no-poison row test, fake-ring equivalence
+   unchanged), adversarial review, THEN one ring for the re-A/B (same kill criterion).
+2. **MlxRuntime (leg 6)** — the biggest unbuilt thesis piece; CPU/local-first, multi-day, no
+   leyten decisions needed. Now unblocked as THE next build if trees-graphs is deprioritized.
+3. prose's last 1.5 tok/s to the 20 bar: K=5 novel tier is live (gateway), measure with tree
+   graphs; also consider per-(class,B) K tuning from real gateway traffic.
+4. Then: probe fidelity leftovers → market iff c0mpute #16 (leyten's fork). Paper headline refresh
+   (B-curve + per-stream scorecard) also awaits leyten's publish call.
 
-**RING: none live** (instances-v1==0 verified). c0mpute WIP untouched.
+**RING: none live** (instances-v1==0 verified 2026-07-12 post-teardown; ~$6 spent of the ~$102
+balance). c0mpute WIP untouched.
 
 ### ⇒ 2026-07-10 — FULL DRAFTER IN THE BATCHED PATH (PR #72) + batching = the STANDARD path + the 12-arm use-case sweep
 leyten's call executed end-to-end: wire the full drafting stack into the batcher, make batching the

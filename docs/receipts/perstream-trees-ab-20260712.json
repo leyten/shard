@@ -1,0 +1,3882 @@
+{
+ "what": "PER-STREAM TREES LIVE A/B (PR #86) + K-TUNED CHAIN REFERENCE on one 6x5090 EU ring, 3 reps. VERDICT: trees-as-built HIT THE KILL CRITERION (-29..-63%/stream vs K-tuned chains on every arm) \u2014 the g lever WORKS (+15-70% committed/round, receipts valid, zero pairing/echo aborts) but tree frames run EAGER stage-side: round decomposition (M25_STAGE_TIMING, reasoning-B4) = tree frame 154ms summed stage compute vs 45ms graph-replayed chains (3.4x), rounds 328ms vs 169ms. WHAT BINDS = missing CUDA graphs on the tree kernel (plan .claude/plans/tree-graph-capture.md), not g/wire. THE SURPRISE: K=6 chains lift every g-bound B4 arm massively (reasoning 14->29, mix 14.2->17.9 which clears the >=16 bar, prose ->18.5, summarize ->18.2 RECOVERED, qa ->21.1) while K=8 wins at B<=2 (22.5/21.7) \u2014 per-content K must be per-(content, B): dead-slot payload binds at B>=4 only. Summarize's 07-11 fp8 g-collapse did NOT reproduce (content-shift noise, closed).",
+ "date": "2026-07-12",
+ "ring": "6 stages BG(head,[0:2]) PL[2:14] SE[14:26] HU[26:38] RS[38:50] BG[50:62], iids 44558734/44558723/44558716/44558714/44558715/44558718, M25_EAGLE=1 M25_BATCH=8 kv 4096, graphs on (M25_GRAPH_MAX=32, zero refusals/capture-fails all stages), fp8 wire + bf16 aux (M25_FP8_AUX=0), aux_local ON, aux slim ON, cwnd keep-warm 150ms, M25_STAGE_TIMING=1, K=8 max_new 96, receipts ON, tree knobs M=12 topb=3 depth=8, M25_DELOCKSTEP default-ON build (#87)",
+ "method": "SWEEP_TREE_ARMS=off,on x 3 reps (rows dispatch both passes, S.M25_TREE per pass, armed truth recorded per job) + SWEEP_K=6 tree=off chain-reference pass. g = COMMITTED/round (uniform chain+tree since #86 \u2014 pre-#86 receipts quote accept-only g, ~1 lower on divergence-heavy content; never compare raw). rep1 tree=off reasoning (2.7/stream) and prose (6.3) were transient stall outliers \u2014 reruns and reps 2/3 sit at 14.0/21.4; medians quoted.",
+ "perstream_B4_medians": {
+  "mix-B1": {
+   "off_perstream_med": 22.5,
+   "on_perstream_med": 12.4,
+   "k6_chain_perstream": 17.1,
+   "g_off_med": 3.8,
+   "g_on_med": 4.75
+  },
+  "mix-B2": {
+   "off_perstream_med": 21.7,
+   "on_perstream_med": 10.1,
+   "k6_chain_perstream": 18.48,
+   "g_off_med": 3.66,
+   "g_on_med": 4.24
+  },
+  "mix-B4": {
+   "off_perstream_med": 14.2,
+   "on_perstream_med": 11.6,
+   "k6_chain_perstream": 17.85,
+   "g_off_med": 3.13,
+   "g_on_med": 4.27
+  },
+  "mix-B8": {
+   "off_perstream_med": 14.1,
+   "on_perstream_med": 11.3,
+   "k6_chain_perstream": 16.88,
+   "g_off_med": 3.52,
+   "g_on_med": 4.44
+  },
+  "code-B4": {
+   "off_perstream_med": 23.2,
+   "on_perstream_med": 13.4,
+   "k6_chain_perstream": 19.84,
+   "g_off_med": 3.8,
+   "g_on_med": 4.75
+  },
+  "prose-B4": {
+   "off_perstream_med": 21.4,
+   "on_perstream_med": 10.9,
+   "k6_chain_perstream": 18.47,
+   "g_off_med": 3.52,
+   "g_on_med": 3.73
+  },
+  "reasoning-B4": {
+   "off_perstream_med": 14.0,
+   "on_perstream_med": 10.8,
+   "k6_chain_perstream": 28.99,
+   "g_off_med": 2.31,
+   "g_on_med": 3.92
+  },
+  "summarize-B4": {
+   "off_perstream_med": 17.9,
+   "on_perstream_med": 12.9,
+   "k6_chain_perstream": 18.18,
+   "g_off_med": 2.91,
+   "g_on_med": 4.67
+  },
+  "tools-B4": {
+   "off_perstream_med": 29.7,
+   "on_perstream_med": 15.7,
+   "k6_chain_perstream": 24.18,
+   "g_off_med": 5.0,
+   "g_on_med": 5.44
+  },
+  "qa-B4": {
+   "off_perstream_med": 20.1,
+   "on_perstream_med": 13.6,
+   "k6_chain_perstream": 21.05,
+   "g_off_med": 3.3,
+   "g_on_med": 4.52
+  },
+  "mix-B4-ngram": {
+   "off_perstream_med": 2.8,
+   "on_perstream_med": 2.9,
+   "k6_chain_perstream": 3.15,
+   "g_off_med": 0.03,
+   "g_on_med": 0.03
+  },
+  "mix-B4-hybrid": {
+   "off_perstream_med": 14.3,
+   "on_perstream_med": 11.4,
+   "k6_chain_perstream": 17.24,
+   "g_off_med": 3.13,
+   "g_on_med": 4.27
+  }
+ },
+ "bcurve_agg_median": {
+  "tree_off": [
+   22.5,
+   43.5,
+   56.8,
+   112.4
+  ],
+  "tree_on": [
+   12.4,
+   20.2,
+   46.3,
+   90.7
+  ],
+  "note": "B=1/2/4/8 mixed-content agg tok/s; off-curve consistent w/ perstream-delockstep-20260711 (23.0/30.9/54.3/111.5)"
+ },
+ "decomposition_reasoning_B4": {
+  "chain_round": {
+   "stage_span_ms_sum6": 44.6,
+   "stage_compute_ms_sum6": 43.1,
+   "round_ms": 169,
+   "g": 2.31
+  },
+  "tree_round_mix": {
+   "stage_span_ms_sum6": 154.3,
+   "stage_compute_ms_sum6": 151.4,
+   "round_ms": 328,
+   "g": 3.92
+  },
+  "note": "per-stage [span,compute] stamps; tree pass = mostly tree frames on novel content; eager 62-layer tree blocks vs RowGraphRunner replays"
+ },
+ "verdicts": {
+  "kill_criterion": "HIT: tree-on < K-tuned chains everywhere (-29..-63%). Trees stay env-armed only (M25_TREE default off); graph-capture lever is the unlock (planned).",
+  "full_bar_with_k_tuned_chains_B4": "mix 17.9 (>=16 MET), qa 21.1, reasoning 29.0, tools 24.2 (K8: 29.7), code 19.8, summarize 18.2, prose 18.5 (target 20: 1.5 short \u2014 K=5 + tree-graphs are the remaining levers)",
+  "content_routing_action": "route K by (class, B): B<=2 -> K=8; B>=4 -> K=6 (tools stays 8: g=5 earns it; reasoning moves OFF the K8 list). Gateway change, offline-testable."
+ },
+ "rows": {
+  "rep1": [
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 22.09,
+    "rounds": 25,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.35,
+    "prefill_s": 0.58,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 22.09,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 42.81,
+    "rounds": 52,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.49,
+    "prefill_s": 1.09,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.4,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 21.4,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.659
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 55.31,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.05,
+    "prefill_s": 2.58,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 13.62,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.62,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 13.9,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.18,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 101.6,
+    "rounds": 229,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.66,
+    "prefill_s": 4.67,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 12.54,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 12.54,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 12.8,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 13.06,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 12.54,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 13.06,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 12.54,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 12.54,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.52
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 62.37,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.16,
+    "prefill_s": 3.24,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 15.59,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 15.59,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 15.59,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 15.59,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 25.17,
+    "rounds": 108,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 15.25,
+    "prefill_s": 4.62,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 6.29,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 6.29,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 6.29,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 6.29,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.519
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 10.83,
+    "rounds": 168,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 36.19,
+    "prefill_s": 5.06,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.71,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 2.71,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 2.71,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 2.71,
+      "g": 2.31,
+      "n": 98
+     }
+    ],
+    "g_mean": 2.31
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 60.28,
+    "rounds": 136,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.64,
+    "prefill_s": 14.57,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 15.07,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 15.07,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 15.07,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 15.07,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 2.912
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 114.73,
+    "rounds": 76,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 3.35,
+    "prefill_s": 2.35,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 28.68,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 28.68,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 28.68,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 28.68,
+      "g": 5.0,
+      "n": 96
+     }
+    ],
+    "g_mean": 5.0
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 78.55,
+    "rounds": 120,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.09,
+    "prefill_s": 2.09,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 1,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 19.64,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 19.64,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 19.64,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 19.64,
+      "g": 3.3,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.3
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 10.99,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 34.95,
+    "prefill_s": 4.72,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 2,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.75,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.75,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.75,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.75,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 57.17,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.82,
+    "prefill_s": 2.1,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 2,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 14.07,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 14.07,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.37,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.66,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 12.42,
+    "rounds": 20,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.73,
+    "prefill_s": 0.51,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 2,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 12.42,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 21.61,
+    "rounds": 46,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.98,
+    "prefill_s": 0.89,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 2,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.69,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 10.92,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.24
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 45.31,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.65,
+    "prefill_s": 2.13,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.1,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.33,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.44,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.44,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 90.68,
+    "rounds": 177,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.61,
+    "prefill_s": 3.81,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.15,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.38,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.5,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.5,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 11.5,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 11.15,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 11.15,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.38,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.44
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 53.31,
+    "rounds": 80,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.2,
+    "prefill_s": 2.02,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.33,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.33,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.33,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.33,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.94,
+    "rounds": 104,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.92,
+    "prefill_s": 1.71,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.99,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.99,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.99,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.99,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.731
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 47.89,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.27,
+    "prefill_s": 2.03,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.97,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.97,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.97,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.97,
+      "g": 3.92,
+      "n": 99
+     }
+    ],
+    "g_mean": 3.92
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 60.36,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.56,
+    "prefill_s": 3.51,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 15.09,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 15.09,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 15.09,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 15.09,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.667
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 64.86,
+    "rounds": 72,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.11,
+    "prefill_s": 1.87,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 16.22,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 16.22,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 16.22,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 16.22,
+      "g": 5.444,
+      "n": 99
+     }
+    ],
+    "g_mean": 5.444
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 52.72,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.28,
+    "prefill_s": 1.65,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.18,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.18,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.18,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.18,
+      "g": 4.524,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.524
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 11.44,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 33.57,
+    "prefill_s": 2.82,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.86,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.86,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.86,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.86,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 45.81,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.56,
+    "prefill_s": 2.11,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.22,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.45,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.57,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.57,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   }
+  ],
+  "rep2": [
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 22.5,
+    "rounds": 25,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.27,
+    "prefill_s": 0.93,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 22.5,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.54,
+    "rounds": 52,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.41,
+    "prefill_s": 1.17,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.77,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 21.77,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.659
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 57.25,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.81,
+    "prefill_s": 2.72,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 14.09,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 14.09,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.39,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.68,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 113.13,
+    "rounds": 229,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.88,
+    "prefill_s": 4.46,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 13.96,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.96,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.25,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.54,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 13.96,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 14.54,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 13.96,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.96,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.52
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 94.59,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.06,
+    "prefill_s": 1.93,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 23.65,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.65,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.65,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.65,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 85.88,
+    "rounds": 108,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.47,
+    "prefill_s": 1.72,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.47,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.47,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.47,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.47,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.519
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 57.29,
+    "rounds": 168,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.84,
+    "prefill_s": 2.0,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 14.32,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.32,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.32,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.32,
+      "g": 2.31,
+      "n": 98
+     }
+    ],
+    "g_mean": 2.31
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 71.66,
+    "rounds": 136,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.58,
+    "prefill_s": 3.79,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 17.92,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.92,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.92,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.92,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 2.912
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 119.1,
+    "rounds": 76,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 3.22,
+    "prefill_s": 1.8,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 29.78,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.78,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.78,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.78,
+      "g": 5.0,
+      "n": 96
+     }
+    ],
+    "g_mean": 5.0
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 80.55,
+    "rounds": 120,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.97,
+    "prefill_s": 1.76,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 20.14,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.14,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.14,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.14,
+      "g": 3.3,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.3
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 11.31,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 33.94,
+    "prefill_s": 3.37,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.83,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.83,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.83,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.83,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 57.33,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.8,
+    "prefill_s": 2.4,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 14.11,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 14.11,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.41,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.7,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 12.26,
+    "rounds": 20,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.83,
+    "prefill_s": 0.53,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 12.26,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 19.97,
+    "rounds": 46,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 9.72,
+    "prefill_s": 1.06,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 9.88,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 10.09,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.24
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 46.4,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.45,
+    "prefill_s": 2.58,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.36,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.6,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.72,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.72,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 90.04,
+    "rounds": 177,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.67,
+    "prefill_s": 4.22,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.07,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.3,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.41,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.41,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 11.41,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 11.07,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 11.07,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.3,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.44
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 53.71,
+    "rounds": 80,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.15,
+    "prefill_s": 2.17,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.43,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.43,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.43,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 13.43,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 19.03,
+    "rounds": 104,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 20.6,
+    "prefill_s": 1.76,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 4.76,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 4.76,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 4.76,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 4.76,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.731
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.0,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 9.21,
+    "prefill_s": 3.93,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.75,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.75,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.75,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.75,
+      "g": 3.92,
+      "n": 99
+     }
+    ],
+    "g_mean": 3.92
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 50.92,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.78,
+    "prefill_s": 5.49,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 12.73,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.73,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.73,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.73,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.667
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 62.62,
+    "rounds": 72,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.32,
+    "prefill_s": 1.68,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 15.66,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 15.66,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 15.66,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 15.66,
+      "g": 5.444,
+      "n": 99
+     }
+    ],
+    "g_mean": 5.444
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 55.36,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.94,
+    "prefill_s": 1.7,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.84,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.84,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.84,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.84,
+      "g": 4.524,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.524
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 11.1,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 34.58,
+    "prefill_s": 3.03,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.78,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.78,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.78,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.78,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.19,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 9.08,
+    "prefill_s": 2.52,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.58,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 10.8,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.91,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.91,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   }
+  ],
+  "rep3": [
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 22.92,
+    "rounds": 25,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.19,
+    "prefill_s": 0.9,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 22.92,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.47,
+    "rounds": 52,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.42,
+    "prefill_s": 1.13,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.74,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 21.74,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.659
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 56.78,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.87,
+    "prefill_s": 2.94,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 13.98,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.98,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.27,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.56,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 112.37,
+    "rounds": 229,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.92,
+    "prefill_s": 4.62,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 13.87,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.87,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.15,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.44,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 13.87,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 14.44,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 13.87,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 13.87,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.52
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 92.87,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.13,
+    "prefill_s": 1.99,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 23.22,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.22,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.22,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 23.22,
+      "g": 3.8,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.8
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 85.69,
+    "rounds": 108,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.48,
+    "prefill_s": 1.92,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.42,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.42,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.42,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 21.42,
+      "g": 3.519,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.519
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 55.91,
+    "rounds": 168,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.01,
+    "prefill_s": 2.01,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 13.98,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 13.98,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 13.98,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 13.98,
+      "g": 2.31,
+      "n": 98
+     }
+    ],
+    "g_mean": 2.31
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 71.43,
+    "rounds": 136,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.6,
+    "prefill_s": 4.1,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 17.86,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.86,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.86,
+      "g": 2.912,
+      "n": 100
+     },
+     {
+      "tok_s": 17.86,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 2.912
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 118.67,
+    "rounds": 76,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 3.24,
+    "prefill_s": 1.76,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 29.67,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.67,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.67,
+      "g": 5.0,
+      "n": 96
+     },
+     {
+      "tok_s": 29.67,
+      "g": 5.0,
+      "n": 96
+     }
+    ],
+    "g_mean": 5.0
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 81.53,
+    "rounds": 120,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.91,
+    "prefill_s": 1.64,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 20.38,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.38,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.38,
+      "g": 3.3,
+      "n": 100
+     },
+     {
+      "tok_s": 20.38,
+      "g": 3.3,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.3
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 12.17,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 31.57,
+    "prefill_s": 4.26,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 3.04,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.04,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.04,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.04,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 57.43,
+    "rounds": 128,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.79,
+    "prefill_s": 2.0,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 14.14,
+      "g": 3.8,
+      "n": 96
+     },
+     {
+      "tok_s": 14.14,
+      "g": 3.519,
+      "n": 96
+     },
+     {
+      "tok_s": 14.43,
+      "g": 2.31,
+      "n": 98
+     },
+     {
+      "tok_s": 14.73,
+      "g": 2.912,
+      "n": 100
+     }
+    ],
+    "g_mean": 3.135
+   },
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 13.73,
+    "rounds": 20,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.99,
+    "prefill_s": 0.47,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.73,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 20.25,
+    "rounds": 46,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 9.58,
+    "prefill_s": 0.91,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.02,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 10.23,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.24
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 46.3,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.47,
+    "prefill_s": 2.21,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.34,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.58,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.69,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.69,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 93.77,
+    "rounds": 177,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.33,
+    "prefill_s": 3.75,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.53,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.77,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.89,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.89,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 11.89,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 11.53,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 11.53,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.77,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 4.44
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 58.13,
+    "rounds": 80,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 6.61,
+    "prefill_s": 1.94,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 14.53,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 14.53,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 14.53,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 14.53,
+      "g": 4.75,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.75
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 43.71,
+    "rounds": 104,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.97,
+    "prefill_s": 1.67,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.93,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.93,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.93,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 10.93,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.731
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 42.79,
+    "rounds": 100,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 9.25,
+    "prefill_s": 2.04,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 10.7,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.7,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.7,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 10.7,
+      "g": 3.92,
+      "n": 99
+     }
+    ],
+    "g_mean": 3.92
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 51.78,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.65,
+    "prefill_s": 3.83,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 12.95,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.95,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.95,
+      "g": 4.667,
+      "n": 99
+     },
+     {
+      "tok_s": 12.95,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.667
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 50.37,
+    "rounds": 72,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.86,
+    "prefill_s": 5.43,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 12.59,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 12.59,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 12.59,
+      "g": 5.444,
+      "n": 99
+     },
+     {
+      "tok_s": 12.59,
+      "g": 5.444,
+      "n": 99
+     }
+    ],
+    "g_mean": 5.444
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 54.48,
+    "rounds": 84,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 7.05,
+    "prefill_s": 2.05,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 13.62,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.62,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.62,
+      "g": 4.524,
+      "n": 96
+     },
+     {
+      "tok_s": 13.62,
+      "g": 4.524,
+      "n": 96
+     }
+    ],
+    "g_mean": 4.524
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 11.39,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1098,
+    "dt": 33.71,
+    "prefill_s": 4.21,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 2.85,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.85,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.85,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 2.85,
+      "g": 0.118,
+      "n": 96
+     }
+    ],
+    "g_mean": 0.029
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 46.69,
+    "rounds": 92,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 8.4,
+    "prefill_s": 2.06,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 3,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": true,
+    "per_stream": [
+     {
+      "tok_s": 11.43,
+      "g": 4.75,
+      "n": 96
+     },
+     {
+      "tok_s": 11.67,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 11.79,
+      "g": 3.92,
+      "n": 99
+     },
+     {
+      "tok_s": 11.79,
+      "g": 4.667,
+      "n": 99
+     }
+    ],
+    "g_mean": 4.267
+   }
+  ],
+  "k6_chain_ref": [
+   {
+    "arm": "mix-B1",
+    "B": 1,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 17.1,
+    "rounds": 31,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.61,
+    "prefill_s": 0.8,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 17.1,
+      "g": 3.065,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.065
+   },
+   {
+    "arm": "mix-B2",
+    "B": 2,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 36.95,
+    "rounds": 65,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.22,
+    "prefill_s": 1.14,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 18.38,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 18.57,
+      "g": 2.824,
+      "n": 97
+     }
+    ],
+    "g_mean": 2.944
+   },
+   {
+    "arm": "mix-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 71.42,
+    "rounds": 122,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.49,
+    "prefill_s": 2.72,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 17.49,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 17.67,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 18.4,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 17.85,
+      "g": 2.771,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.301
+   },
+   {
+    "arm": "mix-B8",
+    "B": 8,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 135.01,
+    "rounds": 243,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.78,
+    "prefill_s": 4.31,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 16.62,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 16.79,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 17.48,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 16.96,
+      "g": 2.771,
+      "n": 98
+     },
+     {
+      "tok_s": 16.96,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 16.79,
+      "g": 3.2,
+      "n": 97
+     },
+     {
+      "tok_s": 16.62,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 16.79,
+      "g": 2.824,
+      "n": 97
+     }
+    ],
+    "g_mean": 3.253
+   },
+   {
+    "arm": "code-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 79.38,
+    "rounds": 124,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.84,
+    "prefill_s": 2.1,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 19.84,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 19.84,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 19.84,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 19.84,
+      "g": 3.065,
+      "n": 96
+     }
+    ],
+    "g_mean": 3.065
+   },
+   {
+    "arm": "prose-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 73.87,
+    "rounds": 136,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.25,
+    "prefill_s": 1.85,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 18.47,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 18.47,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 18.47,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 18.47,
+      "g": 2.824,
+      "n": 97
+     }
+    ],
+    "g_mean": 2.824
+   },
+   {
+    "arm": "reasoning-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 115.98,
+    "rounds": 88,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 3.48,
+    "prefill_s": 2.04,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 28.99,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 28.99,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 28.99,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 28.99,
+      "g": 4.545,
+      "n": 101
+     }
+    ],
+    "g_mean": 4.545
+   },
+   {
+    "arm": "summarize-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 72.73,
+    "rounds": 140,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.39,
+    "prefill_s": 3.92,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 18.18,
+      "g": 2.771,
+      "n": 98
+     },
+     {
+      "tok_s": 18.18,
+      "g": 2.771,
+      "n": 98
+     },
+     {
+      "tok_s": 18.18,
+      "g": 2.771,
+      "n": 98
+     },
+     {
+      "tok_s": 18.18,
+      "g": 2.771,
+      "n": 98
+     }
+    ],
+    "g_mean": 2.771
+   },
+   {
+    "arm": "tools-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 96.71,
+    "rounds": 104,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.05,
+    "prefill_s": 1.73,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 24.18,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 24.18,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 24.18,
+      "g": 3.731,
+      "n": 98
+     },
+     {
+      "tok_s": 24.18,
+      "g": 3.731,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.731
+   },
+   {
+    "arm": "qa-B4",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 84.18,
+    "rounds": 120,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 4.61,
+    "prefill_s": 1.7,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 4,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 21.05,
+      "g": 3.2,
+      "n": 97
+     },
+     {
+      "tok_s": 21.05,
+      "g": 3.2,
+      "n": 97
+     },
+     {
+      "tok_s": 21.05,
+      "g": 3.2,
+      "n": 97
+     },
+     {
+      "tok_s": 21.05,
+      "g": 3.2,
+      "n": 97
+     }
+    ],
+    "g_mean": 3.2
+   },
+   {
+    "arm": "mix-B4-ngram",
+    "B": 4,
+    "drafting": "ngram",
+    "eagle": false,
+    "agg_tok_s": 12.57,
+    "rounds": 380,
+    "depth": 4,
+    "wasted": 1113,
+    "dt": 30.62,
+    "prefill_s": 3.7,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 5,
+     "graph_skipped": 0
+    },
+    "aux_local": false,
+    "delockstep": false,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 3.14,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.14,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.14,
+      "g": 0.0,
+      "n": 96
+     },
+     {
+      "tok_s": 3.17,
+      "g": 0.067,
+      "n": 97
+     }
+    ],
+    "g_mean": 0.017
+   },
+   {
+    "arm": "mix-B4-hybrid",
+    "B": 4,
+    "drafting": "hybrid",
+    "eagle": true,
+    "agg_tok_s": 68.95,
+    "rounds": 122,
+    "depth": 1,
+    "wasted": 0,
+    "dt": 5.69,
+    "prefill_s": 3.38,
+    "receipts": 6,
+    "receipts_ok": true,
+    "graph_arm": {
+     "graph": true,
+     "graph_captured": 5,
+     "graph_skipped": 0
+    },
+    "aux_local": true,
+    "delockstep": true,
+    "tree": false,
+    "per_stream": [
+     {
+      "tok_s": 16.89,
+      "g": 3.065,
+      "n": 96
+     },
+     {
+      "tok_s": 17.06,
+      "g": 2.824,
+      "n": 97
+     },
+     {
+      "tok_s": 17.76,
+      "g": 4.545,
+      "n": 101
+     },
+     {
+      "tok_s": 17.24,
+      "g": 2.771,
+      "n": 98
+     }
+    ],
+    "g_mean": 3.301
+   }
+  ]
+ }
+}
