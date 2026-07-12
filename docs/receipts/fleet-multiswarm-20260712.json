@@ -1,0 +1,255 @@
+{
+ "receipt": "fleet-multiswarm-20260712",
+ "swarms": [
+  {
+   "round": 1,
+   "hops": 2,
+   "stages": [
+    {
+     "iid": "44626317",
+     "cls": "pro6000",
+     "geo": "Czechia, CZ",
+     "lo": 0,
+     "hi": 29,
+     "eager": false
+    },
+    {
+     "iid": "44626312",
+     "cls": "pro6000",
+     "geo": "Lithuania, LT",
+     "lo": 29,
+     "hi": 62,
+     "eager": false
+    }
+   ],
+   "scorecard": {
+    "mix-B1": {
+     "per_stream": 42.1,
+     "agg": 42.1,
+     "g": 4.22,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "mix-B2": {
+     "per_stream": 29.7,
+     "agg": 60.0,
+     "g": 3.59,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "mix-B4": {
+     "per_stream": 30.1,
+     "agg": 123.8,
+     "g": 3.92,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "mix-B8": {
+     "per_stream": 19.7,
+     "agg": 160.6,
+     "g": 3.87,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "code-B4": {
+     "per_stream": 40.3,
+     "agg": 161.3,
+     "g": 4.22,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "prose-B4": {
+     "per_stream": 29.5,
+     "agg": 118.1,
+     "g": 2.97,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "reasoning-B4": {
+     "per_stream": 51.1,
+     "agg": 204.5,
+     "g": 4.76,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "summarize-B4": {
+     "per_stream": 40.7,
+     "agg": 162.8,
+     "g": 4.12,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "tools-B4": {
+     "per_stream": 45.9,
+     "agg": 183.8,
+     "g": 4.32,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "qa-B4": {
+     "per_stream": 35.4,
+     "agg": 141.7,
+     "g": 3.28,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B4-ngram": {
+     "per_stream": 5.2,
+     "agg": 21.1,
+     "g": 0.04,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B4-hybrid": {
+     "per_stream": 30.4,
+     "agg": 125.1,
+     "g": 3.92,
+     "K": 8,
+     "receipts_ok": true
+    }
+   }
+  },
+  {
+   "round": 2,
+   "hops": 3,
+   "stages": [
+    {
+     "iid": "44626339",
+     "cls": "5090",
+     "geo": "Denmark, DK",
+     "lo": 0,
+     "hi": 9,
+     "eager": false
+    },
+    {
+     "iid": "44626315",
+     "cls": "pro6000",
+     "geo": "Norway, NO",
+     "lo": 9,
+     "hi": 42,
+     "eager": true
+    },
+    {
+     "iid": "44626344",
+     "cls": "h100",
+     "geo": "Bulgaria, BG",
+     "lo": 42,
+     "hi": 62,
+     "eager": false
+    }
+   ],
+   "scorecard": {
+    "mix-B1": {
+     "per_stream": 37.9,
+     "agg": 37.9,
+     "g": 4.59,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B2": {
+     "per_stream": 22.6,
+     "agg": 45.4,
+     "g": 3.91,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B4": {
+     "per_stream": 25.2,
+     "agg": 102.5,
+     "g": 3.98,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B8": {
+     "per_stream": 17.9,
+     "agg": 146.5,
+     "g": 3.7,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "code-B4": {
+     "per_stream": 36.3,
+     "agg": 145.1,
+     "g": 4.59,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "prose-B4": {
+     "per_stream": 22.6,
+     "agg": 91.5,
+     "g": 2.97,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "reasoning-B4": {
+     "per_stream": 34.7,
+     "agg": 139.4,
+     "g": 4.42,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "summarize-B4": {
+     "per_stream": 26.7,
+     "agg": 109.1,
+     "g": 3.95,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "tools-B4": {
+     "per_stream": 26.2,
+     "agg": 105.0,
+     "g": 3.52,
+     "K": 8,
+     "receipts_ok": true
+    },
+    "qa-B4": {
+     "per_stream": 24.8,
+     "agg": 100.9,
+     "g": 3.28,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B4-ngram": {
+     "per_stream": 4.7,
+     "agg": 18.9,
+     "g": 0.01,
+     "K": 6,
+     "receipts_ok": true
+    },
+    "mix-B4-hybrid": {
+     "per_stream": 26.1,
+     "agg": 106.1,
+     "g": 3.98,
+     "K": 6,
+     "receipts_ok": true
+    }
+   }
+  }
+ ],
+ "claim": "THE MOAT, end-to-end: the network measured 9 heterogeneous EU strangers, PARTITIONED them into 2 optimal-hop rings (greedy fewest-hops-first), served MiniMax-M2.5 on BOTH SIMULTANEOUSLY, and every content class clears the 20 bar. Fewer hops => higher per-stream: the 2-hop fat-card ring is the fastest scattered ring measured to date.",
+ "pool": {
+  "announced": 8,
+  "placed": 5,
+  "off_ring": [
+   "44626327 (HR 5090)",
+   "44626333 (BG 5090)",
+   "44626350 (NL 4090)",
+   "44626342 (SE 5090, no key at join)"
+  ],
+  "off_ring_reason": "3 consumer cards left = 28 layers, can't hold a 3rd 62-layer copy; pool ceiling = 2 full copies (166L capacity / 62). The loop found the maximum."
+ },
+ "measured_caps": {
+  "RTX PRO 6000 WS (cutlass, graph-clean)": "footprint 2329.5 MB/L, transient 72, layer_ms 0.207-0.24 graph, 35L density cap",
+  "RTX PRO 6000 WS (graph replay corrupt, cos 0.0)": "eager 0.29-0.91 ms/L \u2014 EAGER-ADMITTED as a 33L middle in sw2 (deploy graph-OFF); a card an allowlist discards, the function routes",
+  "H100 NVL (marlin, MEASURED)": "footprint 4057.5 MB/L, repack transient +4824, layer_ms 0.184 graph \u2014 20L on 93GB; the 80-95GB marlin tier now measured, not extrapolated",
+  "RTX 5090 (cutlass)": "2329.5 MB/L, layer_ms 0.20-0.21 graph",
+  "RTX 4090 (marlin)": "4057.5 MB/L, transient +4824, layer_ms 0.263 graph"
+ },
+ "headline": {
+  "swarm1_2hop_fat": "2x RTX PRO 6000 (CZ head[0:29] + LT tail[29:62]); reasoning 51.1 / tools 45.9 / summarize 40.7 / code 40.3 / qa 35.4 / mix 30.1 / prose 29.5 per-stream; solo 42.1; mix-B8 agg 160.6; 72/72 receipts",
+  "swarm2_3hop_mixed": "DK 5090 coord[0:9] + NO Pro EAGER[9:42] + BG H100 tail[42:62]; reasoning 34.7 / mix 25.2 / prose 22.6 / qa 24.8 per-stream; solo 37.9; 72/72 receipts \u2014 a graph-fail Pro + a marlin H100 still fully servable",
+  "vs_prior": "prose: 2-hop 29.5 > 4-hop hetero 23.4 > 6x5090 18.5 \u2014 the hop-count gradient is monotonic",
+  "receipts_total": "144/144 valid across both rings served in parallel"
+ },
+ "env": "fp8 wire+aux, CUDA graphs (eager where measured graph-corrupt), STATIC_KV, kv-maxlen 8192, B=8, receipts ON, K per (class,B), medians of 3, EU-scattered RTT 8.5-76ms"
+}
