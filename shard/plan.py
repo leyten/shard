@@ -39,6 +39,14 @@ M25_PROFILE = {
 
 _UNREACHABLE = 9000.0            # RTT sentinel: treat >= this as "no usable path" when ranking centrality
 
+_PROVEN_CAP_VRAM_MB = 32768.0    # the card size cap_layers was proven on; bigger cards scale by density
+
+
+def density_cap_layers(cap_layers, total_vram_mb):
+    """The proven layer DENSITY scaled to the card size — a flat cap collapsed a 96 GB card
+    to the 32 GB verdict (the spec's core distinction). ONE rule, shared with probe.derive_layers."""
+    return int(int(cap_layers) * float(total_vram_mb) / _PROVEN_CAP_VRAM_MB)
+
 
 def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     """Place a deployable sharded ring from announced capabilities + a measured RTT mesh.
@@ -46,8 +54,16 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     nodes: [{"id": <hashable>, "free_vram_mb": float, "subnet": str,
              "cpu_factor": float=1.0,          # >=1; pyloop/0.10 + load — a slow/loaded box drafts slower
              "up_mbps": float|None,            # optional; present on ALL nodes -> upload-aware placement
-             "trusted": bool=False}]           # ASSIGNED by the control plane (stake/reputation), never
+             "trusted": bool=False,            # ASSIGNED by the control plane (stake/reputation), never
                                                # self-reported by the node
+             # per-node MEASURED capability (the probe's cap vector; every field optional — absent
+             # fields fall back to the model profile, so a homogeneous pool plans byte-identically):
+             "layer_vram_mb": float|None,      # this node's per-layer footprint (arch/backend-specific:
+                                               # cutlass ~2330, marlin ~4060 — a hetero ring needs both)
+             "cap_layers": int|None,           # probe-verdict layer ceiling for THIS card (wins outright)
+             "total_vram_mb": float|None,      # else: density-scale the proven cap to the card size
+             "load_peak_extra_mb": float|None, # measured load/run transient above resident (peak gate)
+             "layer_ms": float|None}]          # measured decode ms/layer (overrides base*cpu_factor)
     rtt:   NxN one-way ms matrix, row/col order aligned to `nodes` (rtt[i][i] ignored).
     model: profile dict (see M25_PROFILE); defaults to M2.5.
     slack: select_ring pool headroom; defaults to len(nodes) (let it drop any weak/co-located box).
@@ -78,12 +94,26 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         raise ValueError("duplicate node id in `nodes`")     # (order/roles/boundary_stages) -> mis-deploy
     layer_vram, kv = float(m["layer_vram_mb"]), float(m["kv_mb_per_layer"])
     cap_layers = int(m["cap_layers"])
-    per_layer_mb = layer_vram + kv
 
-    # 1) calibrate free VRAM: strip the per-box reserve, then cap at the proven per-box layer ceiling.
-    free = {i: min(max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"]), 0.0), cap_layers * per_layer_mb)
+    # 1) calibrate free VRAM per node: strip the per-box reserve AND the node's measured load-peak
+    #    transient (the admit-then-OOM gate), then cap at the proven layer ceiling — density-scaled
+    #    to the card size when the node announces one (a flat cap collapsed a 96 GB card to the
+    #    32 GB verdict). The footprint is per-NODE too: a marlin card (~4.1 GB/layer) and a cutlass
+    #    card (~2.3 GB) hold very different blocks, and select_ring already takes the per-node dict.
+    lv = {i: float(nodes[i].get("layer_vram_mb") or layer_vram) for i in range(n)}
+    per_layer = {i: lv[i] + kv for i in range(n)}
+
+    def _node_cap(i):
+        if nodes[i].get("cap_layers") is not None:
+            return int(nodes[i]["cap_layers"])                    # probe-verdict ceiling wins outright
+        total = float(nodes[i].get("total_vram_mb") or 0.0)
+        return density_cap_layers(cap_layers, total) if total > 0 else cap_layers
+
+    free = {i: min(max(nodes[i]["free_vram_mb"] - float(m["reserve_mb"])
+                       - float(nodes[i].get("load_peak_extra_mb") or 0.0), 0.0),
+                   _node_cap(i) * per_layer[i])
             for i in range(n)}
-    cap_ok = [i for i in range(n) if free[i] >= per_layer_mb]
+    cap_ok = [i for i in range(n) if free[i] >= per_layer[i]]
     if not cap_ok:
         return None                                          # no node can hold even one layer
 
@@ -105,8 +135,13 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     head = min(head_pool, key=centrality)
     free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
 
-    # 3) launch-bound per-layer time: base * the node's cpu_factor; the head pays a coordinator penalty.
-    layer_ms = {i: float(m["layer_ms_base"]) * float(nodes[i].get("cpu_factor", 1.0)) for i in range(n)}
+    # 3) launch-bound per-layer time: base * the node's cpu_factor; the head pays a coordinator
+    #    penalty. A node announcing a MEASURED layer_ms (the probe's graph-replayed decode number)
+    #    is placed at that, not the modeled base — a box whose graph capture failed runs eager at
+    #    ~4x and must be planned as what it measured, not what its GPU label suggests.
+    layer_ms = {i: (float(nodes[i]["layer_ms"]) if nodes[i].get("layer_ms") is not None
+                    else float(m["layer_ms_base"]) * float(nodes[i].get("cpu_factor", 1.0)))
+                for i in range(n)}
     layer_ms[head] *= float(m["head_layer_ms_mult"])
 
     # 4) coordinator entry/return hops are measured relative to the chosen head.
@@ -137,18 +172,17 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     #    tail's block against the reserve, and if it doesn't fit, bake the reserve into
     #    that node's budget and re-plan (the tail may move; loop a few refinements).
     tail_reserve = float(m.get("tail_reserve_mb", 0.0))
-    per_layer_mb_full = layer_vram + kv
     spec = None
     for _ in range(4):
         spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
-                           subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=layer_vram,
+                           subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=lv,
                            kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
                            require=head, **extra)
         if spec is None:
             return None
         tail_i = spec["order"][-1]
         lo, hi = spec["blocks"][tail_i]
-        if tail_reserve == 0.0 or free[tail_i] >= (hi - lo) * per_layer_mb_full + tail_reserve:
+        if tail_reserve == 0.0 or free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
             break
         free[tail_i] = max(free[tail_i] - tail_reserve, 0.0)
     assert spec["order"][0] == head, "select_ring must return a head-first (deployable) order"
