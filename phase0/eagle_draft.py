@@ -402,6 +402,125 @@ def draft_batch(eagles, k):
     return out
 
 
+@torch.no_grad()
+def propose_tree_b(eagles, m, topb=3, max_depth=8):
+    """Expand ONE top-M speculative tree PER FORK, batched: the per-fork best-first heaps run in
+    LOCKSTEP and every pending node expansion — the GPU work — batches to one [n,...] forward per
+    round (linears/norms/log_softmax/topk row-wise, exactly draft_batch's split), while attention
+    stays per-fork over its own ragged committed context + ancestor scratch tail (the serial op,
+    verbatim). The de-lockstep coordinator drafts trees per REPLY, so serial propose_tree x B would
+    re-open the drafting tax draft_batch closed (~100 host syncs/tree: per-expansion topk/d2t reads);
+    here each lockstep round costs ONE host sync (the joint tokens+logps .tolist()) — <= m rounds.
+
+    Heap decisions are PER-FORK CPU state fed only by that fork's own batched-row values, so row j's
+    tree (tokens/parents/depths AND expansion order) is byte-identical to eagles[j].propose_tree(m)
+    — CPU-PROVEN (research/m25_tree_batch_test.py); on CUDA batched GEMM schedules may bit-drift
+    (draft_batch's caveat, harmless: trees are PROPOSALS, the ring greedy-verifies). n==1 runs this
+    same path sync-light (the per-reply draw). Committed caches never mutate (scratch-tail rule)."""
+    n_all = len(eagles)
+    if n_all == 0:
+        return []
+    E0 = eagles[0]
+    assert all(e.fc is E0.fc and e.lm is E0.lm and e.next_hidden == E0.next_hidden for e in eagles), \
+        "propose_tree_b needs forks of ONE head (shared weights, same carry rule)"
+    out = [None] * n_all
+    live = []
+    for j, e in enumerate(eagles):
+        if e.ctx_len == 0 or e._last_h is None or m <= 0:      # propose_tree's degenerate return, verbatim
+            out[j] = {"tokens": [], "parents": [], "depths": []}
+        else:
+            live.append(j)
+    if not live:
+        return out
+    lin = torch.nn.functional.linear
+    HD = E0.HD; maxp = E0.cos.shape[0] - 1
+    st = {}
+    for j in live:
+        e = eagles[j]
+        e._ensure_cap(e.ctx_len + max_depth + 1)               # ancestor chain + own slot, like propose_tree
+        st[j] = {"tokens": [], "parents": [], "depths": [], "cand": [], "seq": 0, "anc_of": {},
+                 "kside": torch.zeros(m, e.NKV, HD, dtype=e.fc.dtype, device=e.dev),
+                 "vside": torch.zeros(m, e.NKV, HD, dtype=e.fc.dtype, device=e.dev),
+                 # pend = (token, carried_h [1,H], depth, ancestors, own_idx, -cum_logp) — the fork's
+                 # next expansion; seeded with the anchor (own None, mirrors expand(..., None))
+                 "pend": (e._last_tok, e._last_h, 0, [], None, 0.0)}
+    while True:
+        # ---- CPU phase: pop each fork's heap (propose_tree's while, verbatim) until it either
+        # needs a node expansion (joins this round's batch) or its tree is complete ----------------
+        reqs = []
+        for j in live:
+            s = st[j]
+            if s["pend"] is None:
+                while s["cand"] and len(s["tokens"]) < m:
+                    nc, _, t, par, d, h = heapq.heappop(s["cand"])
+                    i = len(s["tokens"])
+                    s["tokens"].append(t); s["parents"].append(par); s["depths"].append(d)
+                    s["anc_of"][i] = (s["anc_of"][par] + [par] if par >= 0 else [])
+                    if d < max_depth and len(s["tokens"]) < m:
+                        s["pend"] = (t, h, d, s["anc_of"][i], i, nc)
+                        break
+            if s["pend"] is not None:
+                reqs.append(j)
+        if not reqs:
+            break
+        # ---- batched phase: ONE forward over this round's expansions (rows = forks) --------------
+        nb = len(reqs)
+        tok = torch.tensor([int(st[j]["pend"][0]) for j in reqs], dtype=torch.long, device=E0.dev)
+        h = torch.cat([st[j]["pend"][1] for j in reqs], 0)     # [nb,H] per-fork carried hidden
+        en = _rms(E0.embed[tok], E0.in_ln, E0.eps)
+        hn = _rms(h, E0.h_ln, E0.eps)
+        x = torch.cat([en, hn], -1)                            # [nb,2H]
+        res = h
+        P = torch.tensor([min(eagles[j]._last_pos + st[j]["pend"][2], maxp) for j in reqs],
+                         dtype=torch.long, device=E0.dev)      # anchor pos + depth, per fork
+        cos = E0.cos[P].unsqueeze(1); sin = E0.sin[P].unsqueeze(1)   # [nb,1,HD]
+        q = lin(x, E0.qp).view(nb, E0.NH, HD)
+        q = q * cos + _rotate_half(q) * sin
+        kk = lin(x, E0.kp).view(nb, E0.NKV, HD)
+        vv = lin(x, E0.vp).view(nb, E0.NKV, HD)
+        kk = kk * cos + _rotate_half(kk) * sin
+        os_ = []
+        for r_i, j in enumerate(reqs):                         # per-fork attention: committed ctx +
+            e = eagles[j]; s = st[j]                           # ancestors + own slot (serial op)
+            _, _, _, anc, own, _ = s["pend"]
+            T = e.ctx_len
+            for a in anc:
+                e.kbuf[T] = s["kside"][a]; e.vbuf[T] = s["vside"][a]; T += 1
+            if own is not None:                                # drafted node feeds itself + descendants
+                s["kside"][own] = kk[r_i]; s["vside"][own] = vv[r_i]
+                e.kbuf[T] = s["kside"][own]; e.vbuf[T] = s["vside"][own]; T += 1
+            qg = q[r_i].view(E0.NKV, E0.GRP, 1, HD)
+            Kt = e.kbuf[:T].permute(1, 2, 0).unsqueeze(1)
+            att = torch.softmax((qg @ Kt).float() / (HD ** 0.5), -1).to(q.dtype)
+            Vt = e.vbuf[:T].permute(1, 0, 2).unsqueeze(1)
+            os_.append((att @ Vt).reshape(1, E0.NH * HD))
+        o = torch.cat(os_, 0)
+        res = lin(o, E0.op) + res
+        hn2 = _rms(res, E0.post_ln, E0.eps)
+        res = lin(torch.nn.functional.silu(lin(hn2, E0.gp)) * lin(hn2, E0.upp), E0.dp) + res
+        hf = _rms(res, E0.norm, E0.eps)
+        lp, did = torch.log_softmax(lin(hf, E0.lm).float(), -1).topk(topb)   # [nb,topb]
+        kid_t = (did + E0.d2t[did]).tolist(); kid_l = lp.tolist()            # the round's ONE host sync
+        outh = hf if E0.next_hidden == "final" else res
+        # ---- CPU phase: feed each fork's children back into ITS heap ------------------------------
+        for r_i, j in enumerate(reqs):
+            s = st[j]
+            _, _, d, _, own, nc = s["pend"]; s["pend"] = None
+            hrow = outh[r_i:r_i + 1]
+            if own is None:                                    # anchor expansion seeds the heap
+                cand = [(-l, si, t, -1, 1, hrow) for si, (t, l) in enumerate(zip(kid_t[r_i], kid_l[r_i]))]
+                s["seq"] = len(cand)
+                heapq.heapify(cand)
+                s["cand"] = cand
+            else:
+                for t, l in zip(kid_t[r_i], kid_l[r_i]):
+                    heapq.heappush(s["cand"], (nc - l, s["seq"], t, own, d + 1, hrow)); s["seq"] += 1
+    for j in live:
+        s = st[j]
+        out[j] = {"tokens": s["tokens"], "parents": s["parents"], "depths": s["depths"]}
+    return out
+
+
 def fetch_b(drafters):
     """Batched drop-in for [d.fetch() for d in drafters] across B streams: the n-gram half runs per
     stream first (CPU dict lookups, free), then ALL EAGLE misses draft in ONE draft_batch chain instead
@@ -434,6 +553,33 @@ def fetch_b(drafters):
     for k, grp in batch.items():
         for (j, _), r in zip(grp, draft_batch([e for _, e in grp], k)):
             out[j] = r
+    return out
+
+
+def fetch_tree_b(drafters, m, topb=3, max_depth=8):
+    """fetch_b's per-stream routing with EAGLE misses drafting TREES: the n-gram half runs per stream
+    first (CPU lookups, free — coordinate_pipe_tree's exact matched rule), then ALL misses expand in
+    ONE propose_tree_b lockstep batch. Returns per-stream ("chain", [K ids]) on an n-gram hit or
+    ("tree", {tokens,parents,depths}) on a miss; a plain (non-EAGLE) drafter always chains. Consumes
+    pendings exactly like fetch()/fetch_b (sets .matched — the router flag)."""
+    out = [None] * len(drafters)
+    grp = []
+    for j, d in enumerate(drafters):
+        if isinstance(d, HybridDrafter):
+            ng = d.ngram.fetch()
+            if getattr(d.ngram, "matched", False):             # n-gram hit: draftable chain (fetch()'s rule)
+                d.matched = True; out[j] = ("chain", ng)
+                continue
+            d.matched = False
+            grp.append((j, d.eagle))
+        elif hasattr(d, "propose_tree"):                       # bare EagleDrafter: always tree (solo's ng=None)
+            grp.append((j, d))
+        else:
+            out[j] = ("chain", d.fetch())
+            continue
+    if grp:
+        for (j, _), t in zip(grp, propose_tree_b([e for _, e in grp], m, topb=topb, max_depth=max_depth)):
+            out[j] = ("tree", t)
     return out
 
 

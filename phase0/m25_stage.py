@@ -578,6 +578,39 @@ class Layer:
         x = x + self.mlp(self._rms(x, self.post_ln))   # ONE stream, s tokens — the solo MoE path
         return x
 
+    def attn_tree_row(self, x, row, start, pos_ids, mask):
+        """TREE-VERIFY attention for ONE de-lockstep stream against batched-KV ROW `row`: attn_tree's
+        math (per-node RoPE gather — siblings share a position, KV written at [start,start+N) and read
+        over [0,start+N) under the ancestor-only additive mask, manual broadcast-GQA) with
+        attn_decode_row's flat-view row addressing on the shared [B,NKV,MAXLEN,HD] buffers (fp8 bytes
+        under M25_KV_FP8, like every batched-KV op). A tree node's k/v at start+i overwrites any prior
+        speculative slot there — the same crop-to-start semantics as attn_tree — and only row `row` is
+        touched. ALWAYS eager: mask/pos_ids change shape per round and N is tiny (attn_tree's
+        manual-kernel rationale, verbatim); never routed through a _GR capture."""
+        from tree_spec import _gqa_masked_attend, _rope_gather
+        _, N, _ = x.shape
+        lin = torch.nn.functional.linear
+        cos, sin = get_pe(); rd = cos.shape[-1]
+        q = self._rms(lin(x, self.q_proj), self.q_norm).view(1, N, NH, HD).transpose(1, 2)
+        k = self._rms(lin(x, self.k_proj), self.k_norm).view(1, N, NKV, HD).transpose(1, 2)
+        v = lin(x, self.v_proj).view(1, N, NKV, HD).transpose(1, 2)
+        q = _rope_gather(q, cos, sin, pos_ids, rd); k = _rope_gather(k, cos, sin, pos_ids, rd)
+        total = start + N
+        if total > M25_KV_MAXLEN:                      # clean error, never an OOB put that kills the stage
+            raise RuntimeError(f"tree row context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN}")
+        cp = torch.arange(start, total, device=dev)
+        rows_i = row * NKV + torch.arange(NKV, device=dev)
+        kf = self.bkc.view(-1, M25_KV_MAXLEN, HD)      # [B*NKV, MAXLEN, HD] flat views (dtype-preserving)
+        vf = self.bvc.view(-1, M25_KV_MAXLEN, HD)
+        kf[rows_i[:, None], cp[None, :]] = _kv_enc(k[0])   # k[0] is [NKV,N,HD] already (attn_decode_row's
+        vf[rows_i[:, None], cp[None, :]] = _kv_enc(v[0])   # MAJOR-2-proofed write, same op)
+        cols = torch.arange(total, device=dev)
+        kcur = _kv_view(kf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16).unsqueeze(0)   # [1,NKV,total,HD]
+        vcur = _kv_view(vf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16).unsqueeze(0)
+        o = _gqa_masked_attend(q, kcur, vcur, mask, GRP)
+        o = o.transpose(1, 2).reshape(1, N, NH * HD)
+        return lin(o, self.o_proj)
+
 
 _PE = None
 # Rotary table length. MUST cover the full context: attn() indexes cos[start_pos:start_pos+s],
@@ -775,6 +808,28 @@ def run_block_decode_row(layers, row, start, h, vcfg):    # de-lockstep: ONE str
             h = L.forward_decode_row(h, row, start, pe)
             if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:   # SOLO-shaped aux ([s,H]) — the coordinator's
                 _AUX[L.li] = h[0].detach().to(torch.bfloat16)   # per-stream drafter consumes it like solo
+    return h
+
+
+def run_block_tree_row(layers, row, start, h, vcfg, parents, pos_ids):
+    """De-lockstep tree-verify: ONE stream's drafted tree (h: [1,N,H]) in one forward against KV ROW
+    `row` — run_block_tree's ancestor-only mask + per-node RoPE positions, attn_tree_row's row
+    addressing. MoE/MLP stay per-token on the solo path (the tree only changes attention); aux
+    snapshots SOLO-shaped [N,H], like run_block_decode_row — the coordinator's per-stream drafter
+    gathers by node index (_eagle_aux_nodes)."""
+    from vllm.forward_context import set_forward_context
+    from tree_spec import build_tree_mask
+    N = h.shape[1]
+    pos_ids = torch.as_tensor(pos_ids, dtype=torch.long, device=dev)
+    depths = (pos_ids - (start - 1)).tolist()                  # pos_ids == (start-1)+depth (run_block_tree's rule)
+    mask, _ = build_tree_mask(parents, depths, start, N)       # [1,1,N,start+N] additive bias
+    mask = mask.to(h.dtype).to(dev)
+    with torch.no_grad(), set_forward_context(None, vcfg):
+        for L in layers:
+            h = h + L.attn_tree_row(L._rms(h, L.in_ln), row, start, pos_ids, mask)
+            h = h + L.mlp(L._rms(h, L.post_ln))
+            if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS:
+                _AUX[L.li] = h[0].detach().to(torch.bfloat16)
     return h
 
 

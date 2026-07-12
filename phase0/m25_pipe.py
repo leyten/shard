@@ -1222,8 +1222,19 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     speedup over lockstep comes from (the streams ARE the pipeline). Replies arrive in global FIFO
     order (one pipe path, single-threaded stages); each carries a 'stream' tag the coordinator
     asserts against its own FIFO — any skew aborts LOUD. Job opening, prefill, receipts, graph-arm
-    stamping and the aux_local lane are the lockstep path's, verbatim."""
-    from eagle_draft import prefill_pair_tokens, fetch_b
+    stamping and the aux_local lane are the lockstep path's, verbatim.
+
+    PER-STREAM TREES (M25_TREE=1, the g lever for latency-floor rounds): each stream routes per
+    round by coordinate_pipe_tree's exact rule — n-gram MATCHED -> the plain chain frame above;
+    n-gram MISS -> one EAGLE tree frame (top-M best-first, run_block_tree_row against KV row b,
+    tree_greedy_walk commit). Tree draws batch across ready streams via propose_tree_b (serial
+    propose_tree x B would re-open the drafting tax). KV dirty-frontier contract per stream, solo's:
+    a tree round leaves the committed path's KV rows dirty (they were tree nodes at scattered
+    slots), tracked as pending_path[b] @ pos[b]; the NEXT frame re-feeds them — a tree as its causal
+    trunk, a chain frame as its causal prefix (accept offset len-1). After any chain commit the only
+    dirty token is cur (correction/bonus was never an input), so pending_path collapses to [cur] and
+    the frame IS the standard [anchor]+draft. GREEDY/LOSSLESS by construction on both routes."""
+    from eagle_draft import prefill_pair_tokens, fetch_b, fetch_tree_b, HybridDrafter
     from collections import deque
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
@@ -1237,7 +1248,24 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     reas_b = reasoning if isinstance(reasoning, list) else [reasoning] * B
     mxnew_b = max_new if isinstance(max_new, list) else [max_new] * B
     prompts = [render_ids(tok, m, tools=tb[b], reasoning=reas_b[b]) for b, m in enumerate(messages_list)]
-    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - 16)) if max_ctx else mxnew_b[b]
+    tree_on = S.M25_TREE
+    hd = 16                                              # ctx headroom past the stop: worst frame extent
+    if tree_on:
+        from tree_spec import tree_greedy_walk
+        if not all(isinstance(d, HybridDrafter) or hasattr(d, "propose_tree") for d in drafters):
+            # EXACTLY fetch_tree_b's tree-routing condition — a drafter that would silently chain
+            # (e.g. a wrapped Hybrid: passes a looser getattr check, never trees) is a poisoned
+            # tree-arm measurement, not a degrade (review F2)
+            raise RuntimeError("M25_TREE=1 needs tree-capable drafters (HybridDrafter or "
+                               "propose_tree; set M25_EAGLE=1 + M25_EAGLE_DIR)")
+        tree_m = int(os.environ.get("M25_TREE_M", "12"))
+        tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
+        tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
+        # a tree frame spans trunk (<= tree_depth+1 re-fed committed) + tree_m nodes — the fixed
+        # 16 headroom only covers K<=15 chains, and attn_tree_row's MAXLEN bound is a stage-killing
+        # RuntimeError, not an EDGE error (review: M25_TREE_M>=17 near the cap kills a warm stage)
+        hd = max(16, tree_m + tree_depth + 1)
+    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - hd)) if max_ctx else mxnew_b[b]
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     acc = [0] * B; vrounds = [0] * B
@@ -1289,21 +1317,40 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
         prefill_s = time.time() - t_pf; t0 = time.time()
         rx.settimeout(_reply_timeout(timeout))           # decode replies fail over in seconds, like solo
         dprefix = [prompts[b] + [cur[b]] for b in range(B)]
-        inflight_b = {}                                  # stream -> (send_pos, ds) — at most ONE per stream
-        pend = deque()                                   # global FIFO of streams with a frame in flight
+        pending_path = [[cur[b]] for b in range(B)]      # per-stream KV dirty frontier @ pos[b] (post-
+        inflight_b = {}                                  # prefill: cur's row is unwritten, like solo).
+        pend = deque()                                   # inflight_b: stream -> (kind, send_pos, payload,
+                                                         # off|L) — at most ONE per stream, ever.
 
-        def _fire(b, ds):
+        def _fire(b, route):
             nonlocal lseq_tx
-            fr = {"op": "verify", "stream": b, "token_ids": [dprefix[b][-1]] + ds, "start": pos[b]}
+            kind, payload = route
+            pp = pending_path[b]                         # dirty tokens re-fed as this frame's causal prefix
+            if kind == "tree":
+                token_ids, parents, pids = _build_tree_msg(pp, payload, pos[b])
+                fr = {"op": "verify", "stream": b, "tree": True, "token_ids": token_ids,
+                      "parents": parents, "pos_ids": pids, "start": pos[b]}
+                inflight_b[b] = ("tree", pos[b], payload, len(pp))
+            else:                                        # chain: pp==[cur] after chain commits -> the
+                off = len(pp) - 1                        # standard [anchor]+draft frame; longer only on
+                fr = {"op": "verify", "stream": b,       # the first frame after a tree round (refeed)
+                      "token_ids": pp + payload, "start": pos[b]}
+                inflight_b[b] = ("chain", pos[b], payload, off)
+                dprefix[b] = dprefix[b] + payload
             if aux_local:
                 fr["seq"] = lseq_tx; lseq_tx += 1
-            inflight_b[b] = (pos[b], ds)
-            dprefix[b] = dprefix[b] + ds
             kw.send(fr); pend.append(b)
 
+        def _draw(bs):
+            """Route + draft for streams bs (drafters already request()ed): chain on n-gram hit, tree
+            on miss when tree_on — misses expand in ONE propose_tree_b lockstep batch."""
+            if tree_on:
+                return fetch_tree_b([drafters[b] for b in bs], tree_m, topb=tree_topb, max_depth=tree_depth)
+            return [("chain", ds) for ds in fetch_b([drafters[b] for b in bs])]
+
         act = [b for b in range(B) if not done[b]]
-        for b, ds in zip(act, fetch_b([drafters[b] for b in act])):   # first draws batched in ONE pass
-            _fire(b, ds)
+        for b, route in zip(act, _draw(act)):            # first draws batched in ONE pass
+            _fire(b, route)
         while pend:
             tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
             if isinstance(resp, dict) and resp.get("stage_dt"):
@@ -1321,31 +1368,58 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
             if aux is None and rounds == 0:              # fail LOUD, like lockstep: no aux = a poisoned run
                 raise TransportError("EAGLE drafters but the ring returned no aux — launch stages "
                                      "with M25_EAGLE=1")
-            sp, ds = inflight_b.pop(b)
-            n = 0
-            for j in range(K):
-                if ds[j] == r[j]: n += 1
-                else: break
-            vrounds[b] += 1; acc[b] += n; rounds += 1
-            if n == K:                                   # full accept + bonus (nothing else in flight
-                committed = ds + [r[K]]                  # for THIS stream, ever — solo depth-1 rule)
-                out[b].extend(committed); cur[b] = r[K]; pos[b] += K + 1; acc[b] += 1
-                dprefix[b] = dprefix[b] + [r[K]]         # the NEXT frame's anchor IS the bonus (review
+            kind, sp, payload, ext = inflight_b.pop(b)
+            if kind == "tree":
+                if not resp.get("tree"):                 # version-mix guard: an OLD stage (no tree-row
+                    raise TransportError(                # branch) runs a tree frame as CHAIN math and
+                        f"tree frame for stream {b} came back without the tree echo — an old stage "
+                        f"ran it down the chain row path (corrupted row KV w/ valid receipts); "
+                        f"relaunch the ring on current code")
+                tree, L = payload, ext                   # trunk of L re-fed dirty tokens + M tree nodes
+                path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
+                vrounds[b] += 1; acc[b] += len(committed); rounds += 1
+                out[b].extend(committed); cur[b] = committed[-1]
+                pos[b] = sp + L                          # trunk KV is clean; the committed path is the
+                pending_path[b] = list(committed)        # new dirty frontier (nodes at scattered slots)
+                dprefix[b] = prompts[b] + out[b]
+                if aux is not None:                      # committed[0] predicted by the anchor (node L-1);
+                    pred_idx = ([L - 1] + [L + pi for pi in path_idx])[:len(committed)]   # committed[k>0]
+                    drafters[b].extend(committed, _eagle_aux_nodes(aux, pred_idx),        # by path node k-1
+                                       base_pos=pos[b] - 1)
+            else:
+                ds, off = payload, ext
+                n = 0
+                for j in range(K):
+                    if ds[j] == r[off + j]: n += 1
+                    else: break
+                vrounds[b] += 1; rounds += 1
+                if n == K:                               # full accept + bonus (nothing else in flight
+                    committed = ds + [r[off + K]]        # for THIS stream, ever — solo depth-1 rule)
+                    out[b].extend(committed); cur[b] = r[off + K]
+                    dprefix[b] = dprefix[b] + [r[off + K]]   # the NEXT frame's anchor IS the bonus (review
                                                          # MAJOR-1: omitting this fed ds[-1] at the
                                                          # bonus's position -> corrupted KV, valid receipts)
-            else:
-                committed = ds[:n] + [r[n]]
-                out[b].extend(committed); cur[b] = r[n]; pos[b] += n + 1
-                dprefix[b] = prompts[b] + out[b]         # divergence: rebase the prefix (no stale frames exist)
-            if aux is not None:
-                drafters[b].extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)
+                else:
+                    committed = ds[:n] + [r[off + n]]
+                    out[b].extend(committed); cur[b] = r[off + n]
+                    dprefix[b] = prompts[b] + out[b]     # divergence: rebase the prefix (no stale frames exist)
+                acc[b] += len(committed)                 # g = COMMITTED per verify round, UNIFORM across
+                                                         # chain and tree rounds (review F1: the old mixed
+                                                         # accept semantics — chain counted the bonus but
+                                                         # not the correction, tree neither — understated
+                                                         # tree arms by ~1/round and biased the A/B)
+                pos[b] = sp + off + len(committed)       # off=0 collapses to the old += n+1 / += K+1
+                pending_path[b] = [cur[b]]               # only cur is dirty after a chain commit
+                if aux is not None:                      # aux rows [off, off+len(committed)) — the frame
+                    drafters[b].extend(committed, _eagle_aux_range(aux, off, off + len(committed)),
+                                       base_pos=sp + off)   # positions the committed tokens landed on
             if on_commits and on_commits[b]: on_commits[b](out[b], time.time() - t0)
             if len(out[b]) >= mx[b] or (cur[b] in eos_set) or (eos_set & set(committed)):
                 done[b] = True
             else:
                 drafters[b].request(dprefix[b], K)
-                ds2 = fetch_b([drafters[b]])[0]          # one-stream draw runs the sync-free batched path;
-                _fire(b, ds2)                            # other streams' frames are on the WAN meanwhile
+                _fire(b, _draw([b])[0])                  # one-stream draw runs the sync-light batched path;
+                                                         # other streams' frames are on the WAN meanwhile
         for b in range(B):
             getattr(drafters[b], "cancel", lambda: None)()
         if RECEIPTS:
@@ -1367,11 +1441,13 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
         for ee in eos_set:
             if ee in o: o = o[:o.index(ee)]; break
         res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
-                    "g": round(acc[b] / max(vrounds[b], 1), 3),
-                    "text": tok.decode(o, skip_special_tokens=True)})
+                    "g": round(acc[b] / max(vrounds[b], 1), 3),   # committed/round (uniform chain+tree
+                    "text": tok.decode(o, skip_special_tokens=True)})   # since #86; pre-#86 receipts
+                                                                        # quoted accept-only g, ~1 lower
+                                                                        # on divergence-heavy content
     return {"streams": res, "B": B, "rounds": rounds, "depth": 1, "wasted": 0,
             "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
-            "receipts_ok": receipts_ok, "eagle": True, "delockstep": True,
+            "receipts_ok": receipts_ok, "eagle": True, "delockstep": True, "tree": bool(tree_on),
             "graph_arm": graph_arm, "aux_local": bool(aux_local),
             "per_stage": {k: [round(v[0], 1), round(v[1], 1), v[2]] for k, v in per_stage.items()},
             "agg_tok_s": sum(len(r["output_ids"]) for r in res) / max(dt, 1e-9)}
@@ -1794,6 +1870,21 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                             _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                        if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
+                            b = msg["stream"]                            # tree-masked block against KV row b —
+                            x = msg["h"].to(dev)                         # MUST route before the row branch (a
+                            h = S.run_block_tree_row(layers, b, msg["start"], x, vcfg,   # chain-math tree frame
+                                                     msg["parents"], msg["pos_ids"])     # = silent KV corruption
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0           # with valid receipts)
+                            if RECEIPTS and signer is not None:
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                            o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
+                            if S.M25_EAGLE:                              # this frame as chain math replies
+                                o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
+                            if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
+                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
+                            _ret_send(o); continue
                         if "stream" in msg and msg["op"] == "verify":   # DE-LOCKSTEP row decode: one stream's
                             b = msg["stream"]                            # solo-style frame against KV row b
                             x = msg["h"].to(dev)
@@ -1929,6 +2020,31 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
                                             "seq": msg.get("seq"),                      # the ring send (localhost
                                             "aux": {str(li): v.detach().to(torch.bfloat16).cpu()   # buffer deadlock)
+                                                    for li, v in S._AUX.items()}})
+                        continue
+                    if msg.get("tree") and "stream" in msg:     # DE-LOCKSTEP tree-verify: one stream's tree-
+                        b = msg["stream"]                       # masked block against KV row b — MUST route
+                        if parts["head"]:                       # before the row branch (a tree frame down the
+                            h = torch.nn.functional.embedding(  # chain-math row path = silent KV corruption
+                                torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])   # w/ valid receipts)
+                        else:
+                            h = msg["h"].to(dev)
+                        x = h
+                        h = S.run_block_tree_row(layers, b, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                        if RECEIPTS and signer is not None:
+                            signer.observe(_act_digest(x), _act_digest(h))
+                        fwd = {"op": "verify", "tree": True, "stream": b, "h": h, "start": msg["start"],
+                               "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
+                        if S.M25_EAGLE:
+                            if aux_local_job is None:                    # armed head: own aux on the local lane
+                                fwd["aux"] = _merge_aux(msg.get("aux"))
+                        if S.M25_STAGE_TIMING:
+                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                        nxt_kw.send(_hsend(fwd))
+                        if aux_local_job is not None:                    # forward-first, like every armed op
+                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
                                                     for li, v in S._AUX.items()}})
                         continue
                     if "stream" in msg and msg["op"] == "verify" and not msg.get("prefill"):   # DE-LOCKSTEP row decode
