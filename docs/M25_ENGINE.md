@@ -96,6 +96,32 @@ bar is now MET on the hetero ring class; the tree plan stays parked as a 5090-ri
 `.claude/plans/tree-graph-capture.md`) → probe fidelity leftovers → placement-as-protocol M1
 (verifiable-centralized — shippable, designed) → market iff #16.
 
+### ⇒ 2026-07-12 (latest) — THE MOAT, END-TO-END: the network partitioned 9 strangers into 2 optimal rings + served both in parallel (receipt fleet-multiswarm-20260712)
+leyten's ask: rent a heterogeneous EU fleet, let the network build MULTIPLE optimal swarms, sweep
+them. Delivered. 9-node pool (3× RTX PRO 6000 WS, 3× 5090, 1× H100 NVL, 1× 4090 — EU, RTT
+8.5-76ms), each self-measured via the probe; the loop's own `formSwarm` (greedy fewest-hops-first,
+one-slot leases) carved **TWO complete rings** and served MiniMax-M2.5 on **both in parallel**,
+**144/144 receipts valid**. Merged c0mpute **#26** (fleet driver), shard receipt banked. Fleet
+torn down (instances-v1==0), ~$18 of the ~$86 balance.
+- **SWARM 1 (2-hop fat, 2× Pro 6000: CZ[0:29]→LT[29:62])** — the FASTEST scattered ring measured
+  to date: reasoning **51.1**/stream, tools 45.9, summarize 40.7, code 40.3, qa 35.4, mix 30.1,
+  **prose 29.5**; solo 42.1; mix-B8 agg 160.6. Every class crushes the 20 bar.
+- **SWARM 2 (3-hop mixed: DK 5090 coord[0:9] → NO Pro EAGER[9:42] → BG H100 tail[42:62])** —
+  reasoning 34.7, mix 25.2, prose 22.6, qa 24.8; solo 37.9. Still fully servable — and its 33L
+  middle was a **graph-CORRUPT Pro 6000** (cos 0.0) EAGER-ADMITTED by the refined logic (relegate
+  a graph-fail card only if its eager layer_ms ALSO drags; a 96GB card at 0.29ms eager beats a
+  graph 5090) and its tail the **H100 on marlin** — a card an allowlist discards + a card on its
+  non-native path, both serving. Deploy launches such stages graph-OFF (scatter_pipe `:eager` order tag).
+- **The hop-count gradient is MONOTONIC**: prose 2-hop 29.5 > 4-hop hetero 23.4 > 6×5090 18.5.
+  Fat cards SUBTRACT HOPS — the admission thesis's sharpest proof. Pool ceiling correctly found:
+  3 leftover consumer cards (28L) can't hold a 3rd 62L copy → residual (routed, not wasted).
+- **MEASURED spec rows (were extrapolated): H100 NVL** marlin 4057 MB/L, transient +4824,
+  layer_ms 0.184 graph, 20L/93GB; **4090** marlin 0.263 graph. HETERO_DEVICES updated.
+- Ops: connect-during-tunnel-settle wedged sw2's first coordinator job (banked 3-5min hazard) →
+  clean pid-kill + coordinator restart against the settled ring fixed it (no re-warm needed); 6/12
+  boxes were ssh-key duds, `vastai attach ssh` rescued 4; run-once rent script still spawned 1
+  stray (killed). Driver bugs fixed at source: keyless-node RTT-matrix realignment; eager-admit.
+
 ### ⇒ 2026-07-12 (later) — LEG 6 SESSION: fat-card hetero join BANKED + MlxRuntime merged (Mac-gated) + placement-as-protocol designed
 Merged: shard **#90 #91** + c0mpute **#20 #21**. Ring up+down same session (~$10 of the ~$96
 balance; instances-v1==0 verified). Full story in leg 6 above; the operational trail:
