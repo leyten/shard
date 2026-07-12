@@ -41,22 +41,60 @@ real inference verifiably, and gets paid. Leg status:
    * **FULL-bar scorecard at B=4 (K-tuned chains)**: reasoning 29.0 ✓ tools 29.7 ✓ qa 21.1 ✓
      mix 17.9 ✓(≥16) code 19.8 ≈ summarize 18.2, prose 18.5 (target 20 — 1.5 short; remaining
      levers: tree-frame graphs + K=5 novel tier). B=2 tier: 21.7/stream ✓.
-6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
-   must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
-   CPU/local-first, multi-day, no further leyten decisions needed. **THE ACTIVE BUILD — leyten
-   confirmed 2026-07-12**: leg 5 is at diminishing returns (scorecard above; only prose 18.5 vs 20
-   open) while leg 6 changes what the PoC IS. Tree-frame graphs (the prose lever) stay PARKED-
-   DESIGNED (`.claude/plans/tree-graph-capture.md`) — pick up after leg 6 or interleave if a
-   session stalls on MLX. Build shape: MlxRuntime behind the existing ModelRuntime seam (node.py,
-   docs/MODEL_RUNTIME.md), M2.5 layer-range execution on Apple silicon (MoE dequant path = the
-   risk item), the same attest/receipt contract, offline parity gates vs the torch path, then ONE
-   mixed ring (5090s + a Mac stage) for the demo receipt.
+6. **Any-device proof** — ✅ THE FAT-CARD HALF BANKED 2026-07-12 (receipt
+   hetero-fatcard-join-20260712): a 96 GB RTX PRO 6000 joined THROUGH THE NETWORK (announce →
+   probe → role → shard.plan w/ per-node measured caps, #90 + c0mpute #20 — ring_up never ran),
+   anchored a 4-hop ring (31 L + coordinator) with three 5090s, and **the FULL per-stream bar is
+   MET on every content class incl. prose** (K-tuned medians of 3, B=4/stream: reasoning 37.2 /
+   tools 34.4 / code 29.3 / summarize 26.2 / qa 24.9 / prose 23.4 / mix 23.8; solo 30.1; agg
+   B-curve 30/50/96/136; 72/72 receipts valid). The prose 18.5-vs-20 gap CLOSED by admission, not
+   an engine lever — fat cards remove hops from everyone's ring. Second Pro 6000 measured graph
+   replay corrupt (cosine 0.0) → relegated off-ring by its own verdict (role verifier, binding
+   fast_kernel) — the silent-corruption class caught at admission. Spec: 96 GB tier = MEASURED
+   (2329.5 MB/L, 35-layer cap, transient 72 MB).
+   **MlxRuntime (the non-NVIDIA half): BUILT + MERGED (#91), Mac-gated.** mlx-lm already carries
+   a quality MiniMax port covering M2.5 + an official 4-bit conversion (~2.06 GB/L; a 64 GB Mac
+   holds ~20-26 layers). Range loader + KV-crop rollback + EAGLE aux + bf16 bridge, 3-skeptic-
+   class review fixed 3 MAJORs (completeness audit + strict load, config-driven tiedness, dtype
+   whitelist). 25 offline gates green; docs/MLX_RUNTIME.md = the Mac checklist. **BLOCKED ON
+   HARDWARE: no Apple silicon on vast (Apple licensing). Rentable: Scaleway M4-XL 64 GB €0.49/h
+   (24 h min ≈ €12, Paris DC — ideal for an EU ring). Needs leyten: a Scaleway account/API key,
+   or any reachable Mac.** Then: real range load + parity gates + ONE mixed ring (Mac stage +
+   5090s + fat card) = the flagship demo receipt.
+   **Placement-as-protocol DESIGNED (c0mpute PR #21, merged):** 3-angle panel + adversarial
+   verify (8 MAJORs caught: vapor slashing, nonexistent planInputsHash cited as shipped, wrong
+   determinism CI, forgeable gap-evidence). c0mpute/PLACEMENT_AS_PROTOCOL.md: records-as-hints +
+   re-measure-at-formation + member verify-and-sign + demand-side anchor; M0→M4 migration (M1
+   verifiable-centralized shippable now); §10 = leyten forks (global-truth vs demand-artifact,
+   purchasable placement, staked sets, emissions wash-trading gate).
 7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
    verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
    engine work**. Paper publish also on leyten (refresh the headline with the new B-curve +
    per-stream scorecard first).
-Sequence (leyten 2026-07-12): **leg-6 MlxRuntime NOW** → tree-frame graphs (prose bar) →
-probe fidelity leftovers → market iff #16.
+Sequence (updated 2026-07-12 evening): **Mac session next** (Scaleway M4-XL or leyten's Mac —
+MlxRuntime Mac gate → live Mac stage → the mixed-spectrum demo receipt) → tree-frame graphs
+(NOTE: the prose bar is now MET on the hetero ring class; the tree plan stays parked as a
+5090-ring-class lever, `.claude/plans/tree-graph-capture.md`) → probe fidelity leftovers →
+placement-as-protocol M1 (verifiable-centralized — shippable, designed) → market iff #16.
+
+### ⇒ 2026-07-12 (later) — LEG 6 SESSION: fat-card hetero join BANKED + MlxRuntime merged (Mac-gated) + placement-as-protocol designed
+Merged: shard **#90 #91** + c0mpute **#20 #21**. Ring up+down same session (~$10 of the ~$96
+balance; instances-v1==0 verified). Full story in leg 6 above; the operational trail:
+- **The join flow that worked** (scratchpad/runbook_hetero_20260712.md): rent_hetero → hetero_boot
+  (probe --measure per box) → hetero_join (node keys + serial net probes + announce set) →
+  scripts/hetero-join-live.ts (REAL SwarmManager: announce→admit→relegate→plan) → hetero_deploy
+  (pulls per the plan) → scatter_pipe warm-only → 6-pass sweep (3 reps × K∈{8,6}) → hetero_bank.
+- **Loop fixes that WERE the job:** plan_ring per-node measured caps (layer_vram_mb/cap_layers/
+  total_vram_mb density/load_peak_extra_mb/layer_ms — select_ring already took dicts, #90);
+  c0mpute NodeCapabilities + formSwarm thread the measured vector (#20); the loop e2e demo had
+  been INFEASIBLE on master since the 07-09 profile revision — fixed + now demos the hetero join.
+- **OPS (new dings, same lessons):** `pkill -f` self-match struck AGAIN (use safe_kill/pid-kill,
+  period); re-running a create-side rent script rents DUPLICATES (5 extras, caught+destroyed in
+  ~2 min — rent scripts must be run-once); `nohup CMD &` over vast ssh HANGS the client even with
+  full redirects — `setsid ... </dev/null &` + timeout-tolerant wrapper (the remote usually
+  succeeded); vast `-p 29600:29600` maps to a RANDOM host port — dial-back must advertise the
+  mapped port; scatter_pipe assumes /tmp/sidecar already pushed (fresh bootstrap paths must scp it);
+  2/8 boxes were ssh-key-propagation duds (destroy ~15 min, race-the-replacement).
 
 ### ⇒ 2026-07-10 (later) — THE DRAFTING TAX IS DEAD (PR #74): batched drafter forward + batched-stage CUDA graphs, live-proven
 The two ranked levers landed, adversarially reviewed pre-ring, and re-swept apples-to-apples
@@ -110,8 +148,9 @@ separate ssh calls); a vast host with wedged nvidia-uvm survives reboot+stop/sta
    fidelity leftovers, market iff c0mpute #16 (leyten's fork). Paper headline refresh (B-curve +
    per-stream scorecard) awaits leyten's publish call.
 
-**RING: none live** (instances-v1==0 verified 2026-07-12 post-teardown; ~$6 spent of the ~$102
-balance). c0mpute WIP untouched.
+**RING: none live** (instances-v1==0 verified 2026-07-12 EVENING post-hetero-teardown; balance
+~$86 — the leg-6 session used ~$10). c0mpute WIP untouched (worktree used for the loop changes;
+NETWORK_ARCHITECTURE.md gained §11 pointing at PLACEMENT_AS_PROTOCOL.md).
 
 ### ⇒ 2026-07-10 — FULL DRAFTER IN THE BATCHED PATH (PR #72) + batching = the STANDARD path + the 12-arm use-case sweep
 leyten's call executed end-to-end: wire the full drafting stack into the batcher, make batching the

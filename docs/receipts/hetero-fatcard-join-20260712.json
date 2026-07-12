@@ -1,0 +1,325 @@
+{
+ "receipt": "hetero-fatcard-join-20260712",
+ "claim": "a fat card joining THROUGH THE NETWORK (announce->probe->role->plan) raises the per-stream scorecard for every content class; placement was the loop's, not an operator's",
+ "ring": {
+  "placed_by": "c0mpute SwarmManager.formSwarm -> shard.plan (per-node measured caps), scripts/hetero-join-live.ts; ring_up NEVER ran",
+  "stages": [
+   {
+    "iid": 44593994,
+    "gpu": "RTX PRO 6000 WS Max-Q 96GB",
+    "geo": "CZ",
+    "layers": "0:31",
+    "role": "head+coordinator",
+    "probe": {
+     "footprint_mb_per_layer": 2329.5,
+     "load_peak_extra_mb": 72.0,
+     "layer_ms_graph": 0.241,
+     "graph": "bit-exact"
+    }
+   },
+   {
+    "iid": 44595226,
+    "gpu": "RTX 5090 32GB",
+    "geo": "HU",
+    "layers": "31:42"
+   },
+   {
+    "iid": 44594004,
+    "gpu": "RTX 5090 32GB",
+    "geo": "NO",
+    "layers": "42:53"
+   },
+   {
+    "iid": 44594009,
+    "gpu": "RTX 5090 32GB",
+    "geo": "DK",
+    "layers": "53:62",
+    "role": "tail"
+   }
+  ],
+  "relegated_off_ring": {
+   "iid": 44593999,
+   "gpu": "RTX PRO 6000 WS 96GB",
+   "geo": "CH",
+   "why": "probe measured graph replay cosine 0.0 (x2 deterministic) -> has_fast_kernel=false -> derive_role: verifier (binding: fast_kernel on anchor+filler) -> kept out of the stage pool by the role verdict; a graph-armed stage on it would corrupt silently",
+   "verdict_file": "scratchpad/ch_pro6000_verdict.json"
+  },
+  "hops": 4,
+  "rtt_mesh_ms": "13.6-56 (measured, co-timed)",
+  "env": "M25_EAGLE=1 fp8 wire+aux, CUDA graphs, STATIC_KV, kv-maxlen 8192, M25_BATCH=8, receipts ON, delockstep default, K per pass"
+ },
+ "baseline": "perstream-trees-ab-20260712 (6x5090 EU, K-tuned chains): reasoning 29.0 tools 29.7 qa 21.1 mix 17.9 code 19.8 summarize 18.2 prose 18.5 (the one gap vs 20); agg B-curve 23/31/54/112",
+ "medians_of_3_per_K": {
+  "code-B4|K6": {
+   "agg_median": 98.67,
+   "per_stream_min_median": 24.67,
+   "g_median": 3.2,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "code-B4|K8": {
+   "agg_median": 117.16,
+   "per_stream_min_median": 29.29,
+   "g_median": 3.96,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B1|K6": {
+   "agg_median": 25.42,
+   "per_stream_min_median": 25.42,
+   "g_median": 3.2,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B1|K8": {
+   "agg_median": 30.06,
+   "per_stream_min_median": 30.06,
+   "g_median": 3.96,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B2|K6": {
+   "agg_median": 49.73,
+   "per_stream_min_median": 24.74,
+   "g_median": 3.07,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B2|K8": {
+   "agg_median": 47.4,
+   "per_stream_min_median": 23.58,
+   "g_median": 3.48,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4|K6": {
+   "agg_median": 96.09,
+   "per_stream_min_median": 23.77,
+   "g_median": 3.44,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4|K8": {
+   "agg_median": 88.2,
+   "per_stream_min_median": 21.6,
+   "g_median": 3.63,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4-hybrid|K6": {
+   "agg_median": 91.84,
+   "per_stream_min_median": 22.72,
+   "g_median": 3.44,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4-hybrid|K8": {
+   "agg_median": 89.5,
+   "per_stream_min_median": 21.92,
+   "g_median": 3.63,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4-ngram|K6": {
+   "agg_median": 20.43,
+   "per_stream_min_median": 5.11,
+   "g_median": 0.01,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B4-ngram|K8": {
+   "agg_median": 18.27,
+   "per_stream_min_median": 4.57,
+   "g_median": 0.01,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B8|K6": {
+   "agg_median": 135.69,
+   "per_stream_min_median": 16.81,
+   "g_median": 3.45,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "mix-B8|K8": {
+   "agg_median": 127.67,
+   "per_stream_min_median": 15.75,
+   "g_median": 3.53,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "prose-B4|K6": {
+   "agg_median": 93.55,
+   "per_stream_min_median": 23.39,
+   "g_median": 2.94,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "prose-B4|K8": {
+   "agg_median": 93.34,
+   "per_stream_min_median": 23.33,
+   "g_median": 3.0,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "qa-B4|K6": {
+   "agg_median": 99.67,
+   "per_stream_min_median": 24.92,
+   "g_median": 3.17,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "qa-B4|K8": {
+   "agg_median": 99.08,
+   "per_stream_min_median": 24.77,
+   "g_median": 3.2,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "reasoning-B4|K6": {
+   "agg_median": 140.09,
+   "per_stream_min_median": 35.02,
+   "g_median": 4.36,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "reasoning-B4|K8": {
+   "agg_median": 148.64,
+   "per_stream_min_median": 37.16,
+   "g_median": 4.67,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "summarize-B4|K6": {
+   "agg_median": 104.86,
+   "per_stream_min_median": 26.21,
+   "g_median": 3.28,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "summarize-B4|K8": {
+   "agg_median": 92.21,
+   "per_stream_min_median": 23.05,
+   "g_median": 2.91,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "tools-B4|K6": {
+   "agg_median": 137.65,
+   "per_stream_min_median": 34.41,
+   "g_median": 4.52,
+   "reps": 3,
+   "receipts_all_ok": true
+  },
+  "tools-B4|K8": {
+   "agg_median": 113.87,
+   "per_stream_min_median": 28.47,
+   "g_median": 3.52,
+   "reps": 3,
+   "receipts_all_ok": true
+  }
+ },
+ "k_tuned_scorecard": {
+  "code-B4": {
+   "agg_median": 117.16,
+   "per_stream_min_median": 29.29,
+   "g_median": 3.96,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K8"
+  },
+  "mix-B1": {
+   "agg_median": 30.06,
+   "per_stream_min_median": 30.06,
+   "g_median": 3.96,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K8"
+  },
+  "mix-B2": {
+   "agg_median": 49.73,
+   "per_stream_min_median": 24.74,
+   "g_median": 3.07,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "mix-B4": {
+   "agg_median": 96.09,
+   "per_stream_min_median": 23.77,
+   "g_median": 3.44,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "mix-B4-hybrid": {
+   "agg_median": 91.84,
+   "per_stream_min_median": 22.72,
+   "g_median": 3.44,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "mix-B4-ngram": {
+   "agg_median": 20.43,
+   "per_stream_min_median": 5.11,
+   "g_median": 0.01,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "mix-B8": {
+   "agg_median": 135.69,
+   "per_stream_min_median": 16.81,
+   "g_median": 3.45,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "prose-B4": {
+   "agg_median": 93.55,
+   "per_stream_min_median": 23.39,
+   "g_median": 2.94,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "qa-B4": {
+   "agg_median": 99.67,
+   "per_stream_min_median": 24.92,
+   "g_median": 3.17,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "reasoning-B4": {
+   "agg_median": 148.64,
+   "per_stream_min_median": 37.16,
+   "g_median": 4.67,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K8"
+  },
+  "summarize-B4": {
+   "agg_median": 104.86,
+   "per_stream_min_median": 26.21,
+   "g_median": 3.28,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  },
+  "tools-B4": {
+   "agg_median": 137.65,
+   "per_stream_min_median": 34.41,
+   "g_median": 4.52,
+   "reps": 3,
+   "receipts_all_ok": true,
+   "K": "K6"
+  }
+ },
+ "notes": [
+  "per_stream_min_median = the WORST stream's tok/s per arm (conservative quote)",
+  "g rows = committed/round (uniform since #86); fp8-wire numerics env (quote g per wire mode)",
+  "5090 probe layer_ms 0.203-0.207 graph bit-exact (NO/DK/HU); uplinks receiver-timed 352-480 Mbps"
+ ]
+}
