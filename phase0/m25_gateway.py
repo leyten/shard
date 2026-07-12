@@ -38,6 +38,37 @@ _ids = itertools.count(1)
 RING_LOCK = threading.Lock()   # one ring job at a time (a job may carry up to M25_GW_BATCH streams)
 GW_BATCH = int(os.environ.get("M25_GW_BATCH", os.environ.get("M25_BATCH", "1")))
 GW_WINDOW_MS = float(os.environ.get("M25_GW_WINDOW_MS", "40"))
+# ---- content routing (per-stream-20 work, 2026-07-11): like-with-like batching + per-content K ----
+# The de-lockstep receipt split per-stream speed by CONTENT regime: tools/reasoning/code clear the
+# 20+/stream bar while reasoning-off novel prose and long-context answers run g 1.3-2.7 — where a
+# K=8 frame carries 5-6 dead draft slots of payload+verify every round on a payload-priced ring.
+# Route by cheap request features (no model call): tools or reasoning -> "draftable" (full K);
+# reasoning-off + long prompt -> "context" (summarize/RAG answers); else "novel". The dispatcher
+# batches LIKE WITH LIKE (single-class jobs: one K per job, and a job's round cadence fits its
+# regime), FIFO-fair — the queue head always defines the next job's class, so no class starves.
+# Per-class K is env-tunable; M25_GW_CONTENT_K=0 disables routing (every job rides args.K). NOTE:
+# distinct K values mean distinct [*, K+1] frame shapes stage-side -> more CUDA-graph captures per
+# bucket (bounded by M25_GRAPH_MAX + the free-VRAM capture guard; excess shapes run eager).
+CONTENT_K = os.environ.get("M25_GW_CONTENT_K", "1") != "0"
+CTX_CHARS = int(os.environ.get("M25_GW_CTX_CHARS", "6000"))    # prompt chars >= this = "context" class
+K_CTX = int(os.environ.get("M25_GW_K_CTX", "6"))
+K_NOVEL = int(os.environ.get("M25_GW_K_NOVEL", "5"))
+
+
+def _content_class(messages, tools, reasoning):
+    if tools or reasoning:
+        return "draftable"
+    n = sum(len(str(m.get("content") or "")) for m in (messages or []))
+    return "context" if n >= CTX_CHARS else "novel"
+
+
+def _class_k(cls):
+    """The batched job's K for a content class. Applies to BATCHED jobs only — solo keeps args.K
+    (K=8 is the measured single-stream sweet spot; the dead-slot payload argument is per-stream-
+    batched physics, not solo's)."""
+    if not CONTENT_K or cls == "draftable":
+        return A.K
+    return K_CTX if cls == "context" else K_NOVEL
 
 
 class ClientGone(Exception):
@@ -114,11 +145,12 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
 
 class _Req:
     __slots__ = ("messages", "tools", "max_new", "reasoning", "on_commit", "event",
-                 "result", "error", "dead")
+                 "result", "error", "dead", "cls")
 
     def __init__(self, messages, tools, max_new, reasoning, on_commit):
         self.messages = messages; self.tools = tools; self.max_new = max_new
         self.reasoning = reasoning; self.on_commit = on_commit
+        self.cls = _content_class(messages, tools, reasoning)
         self.event = threading.Event(); self.result = None; self.error = None; self.dead = False
 
 
@@ -166,13 +198,14 @@ def _run_solo(rq):
 
 
 def _run_batch(reqs):
+    k = _class_k(reqs[0].cls)                          # single-class job (the dispatcher groups), one K
     for attempt in (1, 2):
         try:
             if "pipe" not in SOCKS or attempt == 2:
                 _connect(1800)
             drafters = make_drafters_b(len(reqs), A.ngram_n)
             r = coordinate_pipe_batch(
-                SOCKS["pipe"], tok, [rq.messages for rq in reqs], A.K,
+                SOCKS["pipe"], tok, [rq.messages for rq in reqs], k,
                 [rq.max_new for rq in reqs], 1800, SOCKS["ret"], drafters, depth=A.depth,
                 tools_b=[rq.tools for rq in reqs], prefill_chunk=4096, max_ctx=A.max_ctx,
                 reasoning=[rq.reasoning for rq in reqs], on_commits=[_stream_cb(rq) for rq in reqs])
@@ -197,7 +230,9 @@ def _run_batch(reqs):
 def _dispatcher():
     """The one ring writer. Pop a burst (first request + whatever lands inside GW_WINDOW_MS, up to
     GW_BATCH), run it as one job, wake every caller. GW_BATCH=1 (an un-batched ring) degenerates to
-    the exact old serialize-through-a-lock behavior."""
+    the exact old serialize-through-a-lock behavior. CONTENT ROUTING: a job carries only requests of
+    the queue HEAD's content class (like with like — one K per job, homogeneous round regime);
+    other-class requests keep their queue order and lead a following job, so nothing starves."""
     while True:
         with _QCOND:
             while not _QUEUE:
@@ -205,8 +240,15 @@ def _dispatcher():
         if GW_BATCH > 1:
             time.sleep(GW_WINDOW_MS / 1000.0)           # let a burst gather
         with _QCOND:
-            batch = _QUEUE[:GW_BATCH]
-            del _QUEUE[:GW_BATCH]
+            if CONTENT_K and GW_BATCH > 1 and _QUEUE:
+                head_cls = _QUEUE[0].cls
+                batch, rest = [], []
+                for rq in _QUEUE:
+                    (batch if (rq.cls == head_cls and len(batch) < GW_BATCH) else rest).append(rq)
+                _QUEUE[:] = rest
+            else:
+                batch = _QUEUE[:GW_BATCH]
+                del _QUEUE[:GW_BATCH]
         # a caller that timed out waiting marked itself dead — never run its job (solo would hand its
         # raw callback to generate() and a write to the gone client would abort the ring pass)
         for rq in [r for r in batch if r.dead]:

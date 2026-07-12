@@ -96,12 +96,14 @@ M25_AUX_SLIM = os.environ.get("M25_AUX_SLIM", "1") != "0"
 # (receipt batched-viability-20260711 - 3 armed passes, all receipts valid, zero pairing aborts,
 # ~20-30% round-time cut at fp8; the A/B knob remains for measurement).
 M25_AUX_LOCAL = os.environ.get("M25_AUX_LOCAL", "1") != "0"
-# De-lockstep (M25_DELOCKSTEP=1, default OFF until live-proven): batched EAGLE jobs run per-stream
-# ASYNC solo-style frames that interleave on the ring instead of one lockstep [B,...] frame per
-# round — the streams ARE the pipeline (each stream's WAN wait hides the others' compute+drafting;
-# zero staleness, per-stream commit cadence, done streams stop sending, decode MoE back on the solo
-# token-count-invariant path). The per-stream-20 plan's build #1 (.claude/plans/per-stream-20-plan.md).
-M25_DELOCKSTEP = os.environ.get("M25_DELOCKSTEP", "0") != "0"
+# De-lockstep (M25_DELOCKSTEP): batched EAGLE jobs run per-stream ASYNC solo-style frames that
+# interleave on the ring instead of one lockstep [B,...] frame per round — the streams ARE the
+# pipeline (each stream's WAN wait hides the others' compute+drafting; zero staleness, per-stream
+# commit cadence, done streams stop sending, decode MoE back on the solo token-count-invariant
+# path). The per-stream-20 plan's build #1 (.claude/plans/per-stream-20-plan.md). Default ON since
+# 2026-07-11: live-proven (receipt perstream-delockstep-20260711 — 3 reps, receipts valid, B=4
+# per-stream 1.6-2.7x over lockstep same-ring); the env stays as the lockstep A/B hatch.
+M25_DELOCKSTEP = os.environ.get("M25_DELOCKSTEP", "1") != "0"
 
 def _pack_h(h):
     """fp8 (e4m3) per-tensor quantize a hidden-state activation for transport. A per-tensor scale keeps the
