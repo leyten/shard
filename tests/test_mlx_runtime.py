@@ -145,7 +145,13 @@ def test_kv_rollback_reproduces_fresh_runtime():
     b.forward(prompt, 0)
     b.forward(spec[:, :1], 6)             # the accepted token only
     out_b = b.forward(fix, 7)
-    np.testing.assert_array_equal(out_a, out_b)
+    # near-equality, not byte-equality: the STUB's numpy attention accumulates in a
+    # different order between the two paths under macOS Accelerate BLAS (~1 ULP, 3e-08
+    # measured) — platform summation order, not a crop bug. A no-op trim still fails this
+    # by ~7 orders of magnitude (stale rows shift values at the 1e-1 scale). The REAL
+    # runtime's contract stays byte-equal and is enforced on-device by the Mac gate
+    # (docs/receipts/mlx-mac-gate-20260712.json: kv_rollback_crop, byte-equal).
+    np.testing.assert_allclose(out_a, out_b, rtol=1e-6, atol=1e-7)
 
 
 def test_full_rollback_to_zero_equals_fresh():
