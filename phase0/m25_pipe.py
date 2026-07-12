@@ -1234,7 +1234,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     trunk, a chain frame as its causal prefix (accept offset len-1). After any chain commit the only
     dirty token is cur (correction/bonus was never an input), so pending_path collapses to [cur] and
     the frame IS the standard [anchor]+draft. GREEDY/LOSSLESS by construction on both routes."""
-    from eagle_draft import prefill_pair_tokens, fetch_b, fetch_tree_b
+    from eagle_draft import prefill_pair_tokens, fetch_b, fetch_tree_b, HybridDrafter
     from collections import deque
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
@@ -1248,19 +1248,28 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     reas_b = reasoning if isinstance(reasoning, list) else [reasoning] * B
     mxnew_b = max_new if isinstance(max_new, list) else [max_new] * B
     prompts = [render_ids(tok, m, tools=tb[b], reasoning=reas_b[b]) for b, m in enumerate(messages_list)]
-    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - 16)) if max_ctx else mxnew_b[b]
+    tree_on = S.M25_TREE
+    hd = 16                                              # ctx headroom past the stop: worst frame extent
+    if tree_on:
+        from tree_spec import tree_greedy_walk
+        if not all(isinstance(d, HybridDrafter) or hasattr(d, "propose_tree") for d in drafters):
+            # EXACTLY fetch_tree_b's tree-routing condition — a drafter that would silently chain
+            # (e.g. a wrapped Hybrid: passes a looser getattr check, never trees) is a poisoned
+            # tree-arm measurement, not a degrade (review F2)
+            raise RuntimeError("M25_TREE=1 needs tree-capable drafters (HybridDrafter or "
+                               "propose_tree; set M25_EAGLE=1 + M25_EAGLE_DIR)")
+        tree_m = int(os.environ.get("M25_TREE_M", "12"))
+        tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
+        tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
+        # a tree frame spans trunk (<= tree_depth+1 re-fed committed) + tree_m nodes — the fixed
+        # 16 headroom only covers K<=15 chains, and attn_tree_row's MAXLEN bound is a stage-killing
+        # RuntimeError, not an EDGE error (review: M25_TREE_M>=17 near the cap kills a warm stage)
+        hd = max(16, tree_m + tree_depth + 1)
+    mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - hd)) if max_ctx else mxnew_b[b]
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
     acc = [0] * B; vrounds = [0] * B
     t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None; per_stage = {}
-    tree_on = S.M25_TREE
-    if tree_on:
-        from tree_spec import tree_greedy_walk
-        if not all(hasattr(getattr(d, "eagle", d), "propose_tree") for d in drafters):
-            raise RuntimeError("M25_TREE=1 needs EAGLE drafters (set M25_EAGLE=1 + M25_EAGLE_DIR)")
-        tree_m = int(os.environ.get("M25_TREE_M", "12"))
-        tree_topb = int(os.environ.get("M25_TREE_TOPB", "3"))
-        tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
     for d in drafters:
         d.reset()                                        # fresh per-stream EAGLE context per job
     job_nonce = os.urandom(16).hex() if RECEIPTS else None
@@ -1368,7 +1377,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                         f"relaunch the ring on current code")
                 tree, L = payload, ext                   # trunk of L re-fed dirty tokens + M tree nodes
                 path_idx, committed = tree_greedy_walk(tree["tokens"], tree["parents"], r[L:], r[L - 1])
-                vrounds[b] += 1; acc[b] += len(committed) - 1; rounds += 1   # solo tree's accept metric
+                vrounds[b] += 1; acc[b] += len(committed); rounds += 1
                 out[b].extend(committed); cur[b] = committed[-1]
                 pos[b] = sp + L                          # trunk KV is clean; the committed path is the
                 pending_path[b] = list(committed)        # new dirty frontier (nodes at scattered slots)
@@ -1383,10 +1392,10 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                 for j in range(K):
                     if ds[j] == r[off + j]: n += 1
                     else: break
-                vrounds[b] += 1; acc[b] += n; rounds += 1
+                vrounds[b] += 1; rounds += 1
                 if n == K:                               # full accept + bonus (nothing else in flight
                     committed = ds + [r[off + K]]        # for THIS stream, ever — solo depth-1 rule)
-                    out[b].extend(committed); cur[b] = r[off + K]; acc[b] += 1
+                    out[b].extend(committed); cur[b] = r[off + K]
                     dprefix[b] = dprefix[b] + [r[off + K]]   # the NEXT frame's anchor IS the bonus (review
                                                          # MAJOR-1: omitting this fed ds[-1] at the
                                                          # bonus's position -> corrupted KV, valid receipts)
@@ -1394,6 +1403,11 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                     committed = ds[:n] + [r[off + n]]
                     out[b].extend(committed); cur[b] = r[off + n]
                     dprefix[b] = prompts[b] + out[b]     # divergence: rebase the prefix (no stale frames exist)
+                acc[b] += len(committed)                 # g = COMMITTED per verify round, UNIFORM across
+                                                         # chain and tree rounds (review F1: the old mixed
+                                                         # accept semantics — chain counted the bonus but
+                                                         # not the correction, tree neither — understated
+                                                         # tree arms by ~1/round and biased the A/B)
                 pos[b] = sp + off + len(committed)       # off=0 collapses to the old += n+1 / += K+1
                 pending_path[b] = [cur[b]]               # only cur is dirty after a chain commit
                 if aux is not None:                      # aux rows [off, off+len(committed)) — the frame
@@ -1427,8 +1441,10 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
         for ee in eos_set:
             if ee in o: o = o[:o.index(ee)]; break
         res.append({"ok": True, "output_ids": o, "n_tokens": len(o), "prompt_tokens": len(prompts[b]),
-                    "g": round(acc[b] / max(vrounds[b], 1), 3),
-                    "text": tok.decode(o, skip_special_tokens=True)})
+                    "g": round(acc[b] / max(vrounds[b], 1), 3),   # committed/round (uniform chain+tree
+                    "text": tok.decode(o, skip_special_tokens=True)})   # since #86; pre-#86 receipts
+                                                                        # quoted accept-only g, ~1 lower
+                                                                        # on divergence-heavy content
     return {"streams": res, "B": B, "rounds": rounds, "depth": 1, "wasted": 0,
             "dt": dt, "prefill_s": prefill_s, "receipts": receipts,
             "receipts_ok": receipts_ok, "eagle": True, "delockstep": True, "tree": bool(tree_on),

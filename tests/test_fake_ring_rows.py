@@ -173,6 +173,23 @@ def test_rows_tree_trap_divergence(monkeypatch):
         assert (b, True) in kinds and (b, False) in kinds, f"stream {b} never flipped chain<->tree"
 
 
+def test_version_mix_guards_abort_loud(monkeypatch):
+    """The two version-mix guards' FAILURE paths (review adoption — both fakes echoing correctly
+    would let a guard regress to a no-op unnoticed): an old stage that chain-mathed a tree frame
+    replies without the tree echo -> LOUD abort; a pre-#84 stage replying untagged -> LOUD abort.
+    In both mixes row KV is already corrupted with valid receipts — dying before commit is the
+    whole defense."""
+    _tree_env(monkeypatch)
+    Ts, PLs = [fr.novel_T(300)], [60]
+    base = _base()
+    with pytest.raises(Exception, match="tree echo"):
+        fr.run_rows_coordinator(Ts, PLs, [HybridDrafter(_ngram(), base.fork())], K=K, max_new=40,
+                                strip_tree_echo=True)
+    with pytest.raises(Exception, match="UNTAGGED"):
+        fr.run_rows_coordinator(Ts, PLs, [HybridDrafter(_ngram(), base.fork())], K=K, max_new=40,
+                                strip_stream_tag=True)
+
+
 def test_rows_tree_extend_pairing(monkeypatch):
     """The EAGLE extend contract on the rows tree path (position-encoded aux): every
     extend(tokens, auxes, base_pos) pairs auxes[i] with absolute position base_pos+i and

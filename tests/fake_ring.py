@@ -257,13 +257,16 @@ class FakeRingB(threading.Thread):
     like FakeRing, so a rows stream and a solo reference run against FakeRing(T=Ts[b]) see
     BYTE-IDENTICAL aux -> byte-identical drafter evolution -> the equivalence gate is exact."""
 
-    def __init__(self, pipe_sock, ret_sock, Ts, aux_h=32, aux_layer_ids=None):
+    def __init__(self, pipe_sock, ret_sock, Ts, aux_h=32, aux_layer_ids=None,
+                 strip_tree_echo=False, strip_stream_tag=False):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
         self.Ts = [[int(t) for t in T] for T in Ts]
         self.aux_h = aux_h
         self.aux_ids = list(aux_layer_ids if aux_layer_ids is not None else S.EAGLE_AUX_LAYER_IDS)
+        self.strip_tree_echo = strip_tree_echo      # play an OLD stage that chain-mathed the tree frame
+        self.strip_stream_tag = strip_stream_tag    # play a pre-#84 stage replying untagged
         self.st = [{"clean": 0, "written": {}, "viol": [], "starts": []} for _ in Ts]
         self.log = []
         self.error = None
@@ -322,9 +325,9 @@ class FakeRingB(threading.Thread):
                                      "token_ids": [int(t) for t in msg["token_ids"]], "pos": pos})
                     toks = [self._tok_at(b, p) for p in pos]
                     o = {"toks": toks, "aux": self._aux(pos)}
-                    if not msg.get("prefill"):
+                    if not msg.get("prefill") and not self.strip_stream_tag:
                         o["stream"] = b                 # decode replies carry the FIFO-pairing tag
-                    if msg.get("tree"):
+                    if msg.get("tree") and not self.strip_tree_echo:
                         o["tree"] = True                # tree echo (the coordinator's version-mix guard)
                     send_msg(self.ret, o)
                 else:
@@ -369,13 +372,15 @@ class FakeTokB:
         return {"input_ids": []}
 
 
-def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill_chunk=24, timeout=30):
+def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill_chunk=24, timeout=30,
+                         **ring_kw):
     """One coordinate_pipe_rows job against a fresh FakeRingB. S.M25_TREE (monkeypatched by the
-    caller) arms the per-stream tree route, same as production. Returns (result, ring)."""
+    caller) arms the per-stream tree route, same as production. ring_kw reaches FakeRingB (the
+    version-mix strip_* arms). Returns (result, ring)."""
     c_pipe, r_pipe = socket.socketpair()
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)
-    ring = FakeRingB(r_pipe, r_ret, Ts)
+    ring = FakeRingB(r_pipe, r_ret, Ts, **ring_kw)
     ring.start()
     tok = FakeTokB([T[:pl] for T, pl in zip(Ts, prompt_lens)])
     msgs = [[{"role": "user", "content": str(b)}] for b in range(len(Ts))]
