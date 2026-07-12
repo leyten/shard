@@ -67,15 +67,28 @@ real inference verifiably, and gets paid. Leg status:
    re-measure-at-formation + member verify-and-sign + demand-side anchor; M0→M4 migration (M1
    verifiable-centralized shippable now); §10 = leyten forks (global-truth vs demand-artifact,
    purchasable placement, staked sets, emissions wash-trading gate).
-7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
+7. **The join gateway (node daemon)** — ❌ SPEC'D 2026-07-12 (c0mpute NODE_DAEMON.md, #22; the
+   leg the DoD missed — leyten: "what is the gateway between the network and a user machine?").
+   Decision: ships INSIDE `@c0mpute/worker` (one product, one install; shard mode = a long-lived
+   daemon: enroll → standby → serve). The 45-min virgin-box join decomposes into bytes-moving,
+   not deciding (placement = seconds, measured) — so the fixes are packaging: the RUNTIME as a
+   signed content-addressed artifact over the weights block-exchange (kills the pip term, pins
+   the numerics env receipts quote), ranges retained on disk (re-join ≤3 min), probe overlap.
+   One new engine seam: `python -m shard.stage` (promote scatter_pipe's launch_stage). Acceptance:
+   a stranger's machine, ONE command, no operator ssh — enrolled, measured, placed by the loop,
+   serving with valid receipts, warm re-join. leyten forks flagged in the spec §7 (auto-update
+   key/staging, seeding-default consent, Windows tier).
+8. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
    verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
    engine work**. Paper publish also on leyten (refresh the headline with the new B-curve +
    per-stream scorecard first).
 Sequence (updated 2026-07-12 evening): **Mac session next** (Scaleway M4-XL or leyten's Mac —
-MlxRuntime Mac gate → live Mac stage → the mixed-spectrum demo receipt) → tree-frame graphs
-(NOTE: the prose bar is now MET on the hetero ring class; the tree plan stays parked as a
-5090-ring-class lever, `.claude/plans/tree-graph-capture.md`) → probe fidelity leftovers →
-placement-as-protocol M1 (verifiable-centralized — shippable, designed) → market iff #16.
+MlxRuntime Mac gate → live Mac stage → the mixed-spectrum demo receipt) → **leg-7 node daemon**
+(NODE_DAEMON.md build list: worker shard mode + `shard.stage` entrypoint + the sm120 runtime
+artifact — the "one command, no operator ssh" acceptance) → tree-frame graphs (NOTE: the prose
+bar is now MET on the hetero ring class; the tree plan stays parked as a 5090-ring-class lever,
+`.claude/plans/tree-graph-capture.md`) → probe fidelity leftovers → placement-as-protocol M1
+(verifiable-centralized — shippable, designed) → market iff #16.
 
 ### ⇒ 2026-07-12 (later) — LEG 6 SESSION: fat-card hetero join BANKED + MlxRuntime merged (Mac-gated) + placement-as-protocol designed
 Merged: shard **#90 #91** + c0mpute **#20 #21**. Ring up+down same session (~$10 of the ~$96
