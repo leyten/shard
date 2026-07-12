@@ -102,6 +102,8 @@ def run_arm(name, prompts, kind):
         "graph_arm": r.get("graph_arm"),                # the tail's APPLIED route + counters (M25_GRAPH_JOB
                                                         # stamped jobs) — an arm must never lie about its route
         "aux_local": r.get("aux_local"),                # armed head-local lane vs ridden-ring aux (never conflate)
+        "delockstep": r.get("delockstep", False),       # which dispatch ACTUALLY ran (rows vs lockstep)
+        "tree": r.get("tree", False),                   # per-stream trees armed on this job (rows only)
         "per_stream": [{"tok_s": round(s["n_tokens"] / max(r["dt"], 1e-9), 2), "g": s["g"],
                         "n": s["n_tokens"]} for s in r["streams"]],
         "g_mean": round(sum(s["g"] for s in r["streams"]) / len(r["streams"]), 3),
@@ -145,7 +147,22 @@ AUX_PASSES = [p.strip() for p in os.environ.get("SWEEP_AUX_ARMS", "").split(",")
 # SWEEP_DELOCK_ARMS="off,on": the de-lockstep A/B on ONE warm ring — graph-stamped, aux_local per
 # build default; only the coordinator-side dispatch flips per pass (rows vs lockstep frames).
 DELOCK_PASSES = [p.strip() for p in os.environ.get("SWEEP_DELOCK_ARMS", "").split(",") if p.strip()]
-if DELOCK_PASSES:
+# SWEEP_TREE_ARMS="off,on": per-stream trees A/B on ONE warm ring, de-lockstep rows on BOTH passes —
+# only the coordinator-side S.M25_TREE flips (the stage tree kernel routes per FRAME, nothing to
+# relaunch; tree frames run eager so there is nothing extra to graph-warm). off = K-chain rows (the
+# perstream-delockstep baseline); on = n-gram-miss rounds verify top-M trees. Rows tagged tree_pass;
+# each job also carries r["tree"] (the ARMED truth). SWEEP_K retunes K for a chain-reference pass.
+TREE_PASSES = [p.strip() for p in os.environ.get("SWEEP_TREE_ARMS", "").split(",") if p.strip()]
+if TREE_PASSES:
+    P.M25_GRAPH_JOB = True
+    P.M25_DELOCKSTEP = True                            # rows on both passes: trees are the only delta
+    if os.environ.get("SWEEP_WARMUP", "1") != "0":
+        warmup()                                       # row-chain graph captures off the clock
+    for p in TREE_PASSES:
+        S.M25_TREE = (p == "on")
+        print(f"=== PASS tree={p} (delockstep rows) ===", flush=True)
+        results += [{**row, "tree_pass": p} for row in run_all()]
+elif DELOCK_PASSES:
     P.M25_GRAPH_JOB = True
     if os.environ.get("SWEEP_WARMUP", "1") != "0":
         P.M25_DELOCKSTEP = True                        # warm BOTH graph shapes (row + batched)

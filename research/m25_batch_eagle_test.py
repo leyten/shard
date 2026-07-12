@@ -76,6 +76,10 @@ import eagle_draft                                     # noqa: E402
 from eagle_draft import EagleDrafter, HybridDrafter    # noqa: E402
 from ngram_draft import NgramDrafter                   # noqa: E402
 
+# This gate pins BOTH batched paths explicitly: the baseline arms are the LOCKSTEP fill loop, the
+# rows arms patch M25_DELOCKSTEP True. Independent of the build default (flipped ON 2026-07-11).
+m25_pipe.M25_DELOCKSTEP = False
+
 
 def make_head(tmp, seed=0):
     json.dump({"hidden_size": H, "num_attention_heads": NH, "num_key_value_heads": NKV,

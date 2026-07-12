@@ -122,3 +122,82 @@ def test_ring_error_reaches_every_caller(monkeypatch):
     results = {}
     _submit_many(2, results)
     assert all(isinstance(results[i], RuntimeError) for i in range(2))
+
+
+# ---- content routing: like-with-like batching + per-content K -------------------------------------
+
+TOOL = [{"type": "function", "function": {"name": "f", "parameters": {}}}]
+
+
+def _fake_batch_recorder(calls):
+    def fake_batch(pipe, tok, messages_list, K, max_new, timeout, ret, drafters, **kw):
+        calls.append({"B": len(messages_list), "K": K, "tools_b": kw.get("tools_b")})
+        return {"streams": [{"text": f"s{b}", "n_tokens": 5, "prompt_tokens": 3, "g": 2.0,
+                             "output_ids": [1, 2, 3, 4, 5]} for b in range(len(messages_list))],
+                "B": len(messages_list), "dt": 0.5, "receipts": [], "rounds": 3}
+    return fake_batch
+
+
+def test_content_class_and_k_policy(monkeypatch):
+    monkeypatch.setattr(gw, "CONTENT_K", True)
+    assert gw._content_class([{"content": "hi"}], TOOL, False) == "draftable"
+    assert gw._content_class([{"content": "hi"}], None, True) == "draftable"
+    assert gw._content_class([{"content": "x" * 7000}], None, False) == "context"
+    assert gw._content_class([{"content": "hi"}], None, False) == "novel"
+    assert gw._class_k("draftable") == 8                # args.K (fixture)
+    assert gw._class_k("context") == gw.K_CTX
+    assert gw._class_k("novel") == gw.K_NOVEL
+    monkeypatch.setattr(gw, "CONTENT_K", False)         # kill switch: every class rides args.K
+    assert gw._class_k("novel") == 8
+
+
+def test_dispatcher_batches_like_with_like(monkeypatch):
+    """A mixed burst (2 tool-calling + 2 reasoning-off novel) must split into TWO single-class jobs
+    with the class's K — never one mixed job — and every caller still gets its own stream."""
+    calls = []
+    monkeypatch.setattr(gw, "coordinate_pipe_batch", _fake_batch_recorder(calls))
+    monkeypatch.setattr(gw, "make_drafters_b", lambda B, n=3: [object()] * B)
+    monkeypatch.setattr(gw, "_connect", lambda t: gw.SOCKS.update(
+        pipe=types.SimpleNamespace(close=lambda: None), ret=types.SimpleNamespace(close=lambda: None)))
+    results = {}
+
+    def one(i):
+        tools = TOOL if i < 2 else None
+        reasoning = i < 2
+        try:
+            results[i] = gw.run_request([{"role": "user", "content": f"p{i}"}], tools, 32,
+                                        reasoning, timeout=10)
+        except Exception as e:  # noqa: BLE001
+            results[i] = e
+    ths = [threading.Thread(target=one, args=(i,)) for i in range(4)]
+    for t in ths: t.start()
+    for t in ths: t.join(20)
+    assert all(results[i]["ok"] for i in range(4)), results
+    assert len(calls) == 2, f"mixed burst must split into two single-class jobs: {calls}"
+    by_k = {c["K"]: c for c in calls}
+    assert 8 in by_k and gw.K_NOVEL in by_k, f"per-class K missing: {calls}"
+    assert all(t is not None for t in by_k[8]["tools_b"]), "draftable job must carry the tool streams"
+    assert all(t is None for t in by_k[gw.K_NOVEL]["tools_b"]), "novel job must carry the bare streams"
+
+
+def test_rows_result_shape_consumed(monkeypatch):
+    """The de-lockstep rows result (extra delockstep/tree/agg keys, per-stream g) must assemble into
+    per-caller results exactly like the lockstep shape — the gateway path for M25_DELOCKSTEP rings."""
+    def fake_rows(pipe, tok, messages_list, K, max_new, timeout, ret, drafters, **kw):
+        B = len(messages_list)
+        return {"streams": [{"ok": True, "text": f"r{b}", "n_tokens": 4, "prompt_tokens": 2,
+                             "g": 3.5, "output_ids": [9, 9, 9, 9]} for b in range(B)],
+                "B": B, "rounds": 7, "depth": 1, "wasted": 0, "dt": 0.4, "prefill_s": 0.1,
+                "receipts": [], "receipts_ok": None, "eagle": True, "delockstep": True,
+                "tree": True, "graph_arm": None, "aux_local": True, "per_stage": {},
+                "agg_tok_s": 20.0}
+    monkeypatch.setattr(gw, "coordinate_pipe_batch", fake_rows)
+    monkeypatch.setattr(gw, "make_drafters_b", lambda B, n=3: [object()] * B)
+    monkeypatch.setattr(gw, "_connect", lambda t: gw.SOCKS.update(
+        pipe=types.SimpleNamespace(close=lambda: None), ret=types.SimpleNamespace(close=lambda: None)))
+    results = {}
+    _submit_many(3, results)
+    for i in range(3):
+        assert results[i]["ok"] and results[i]["batched_B"] == 3
+        assert results[i]["mean_accept"] == 3.5 and results[i]["output_ids"] == [9, 9, 9, 9]
+    assert {results[i]["text"] for i in range(3)} == {"r0", "r1", "r2"}
