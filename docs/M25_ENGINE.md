@@ -43,13 +43,20 @@ real inference verifiably, and gets paid. Leg status:
      levers: tree-frame graphs + K=5 novel tier). B=2 tier: 21.7/stream ✓.
 6. **Any-device proof (MlxRuntime)** — ❌ the biggest UNBUILT thesis piece ("torrent for compute"
    must not be an NVIDIA-only club; a Mac serving layers in a live ring = the flagship demo).
-   CPU/local-first, multi-day, no leyten decisions needed. Queued BEHIND the per-stream-20 work
-   (leg 5 re-scoped above).
+   CPU/local-first, multi-day, no further leyten decisions needed. **THE ACTIVE BUILD — leyten
+   confirmed 2026-07-12**: leg 5 is at diminishing returns (scorecard above; only prose 18.5 vs 20
+   open) while leg 6 changes what the PoC IS. Tree-frame graphs (the prose lever) stay PARKED-
+   DESIGNED (`.claude/plans/tree-graph-capture.md`) — pick up after leg 6 or interleave if a
+   session stalls on MLX. Build shape: MlxRuntime behind the existing ModelRuntime seam (node.py,
+   docs/MODEL_RUNTIME.md), M2.5 layer-range execution on Apple silicon (MoE dequant path = the
+   risk item), the same attest/receipt contract, offline parity gates vs the torch path, then ONE
+   mixed ring (5090s + a Mac stage) for the demo receipt.
 7. **(gated) Market leg** — c0mpute #16 open since 07-08; everything it needs exists (node_role
    verdicts, pay-by-layers, settle seam) but it is a PRODUCT-DIRECTION call: **leyten's fork, not
-   engine work**. Paper publish also on leyten (refresh the headline with the new B-curve first).
-Sequence: leg-5 ring → leg-6 MlxRuntime (depth>1 stale-context EAGLE folds into a ring A/B only if
-the leg-5 decomposition says rounds went ring-latency-bound; K<8 same rule).
+   engine work**. Paper publish also on leyten (refresh the headline with the new B-curve +
+   per-stream scorecard first).
+Sequence (leyten 2026-07-12): **leg-6 MlxRuntime NOW** → tree-frame graphs (prose bar) →
+probe fidelity leftovers → market iff #16.
 
 ### ⇒ 2026-07-10 (later) — THE DRAFTING TAX IS DEAD (PR #74): batched drafter forward + batched-stage CUDA graphs, live-proven
 The two ranked levers landed, adversarially reviewed pre-ring, and re-swept apples-to-apples
@@ -89,18 +96,19 @@ measurement, no drafter-tax discount). Ops lessons: HF xet pulls stall (kill+res
 `pkill -f` self-match struck AGAIN via a heredoc body carrying the pattern (split kill/launch into
 separate ssh calls); a vast host with wedged nvidia-uvm survives reboot+stop/start → destroy+replace.
 
-**NEXT SESSION (per-stream era, post trees-A/B):**
-1. **Tree-frame CUDA graphs** — the ONE lever the 07-12 decomposition points at (tree stage
-   compute 154→~50-70ms candidate → tree rounds ~200-240ms → the g lift nets +20-40%/stream
-   instead of −13%). Full design + the dummy-KV trash-slot hazard: `.claude/plans/tree-graph-capture.md`.
-   Offline gates first (graph-vs-eager bit-equality, no-poison row test, fake-ring equivalence
-   unchanged), adversarial review, THEN one ring for the re-A/B (same kill criterion).
-2. **MlxRuntime (leg 6)** — the biggest unbuilt thesis piece; CPU/local-first, multi-day, no
-   leyten decisions needed. Now unblocked as THE next build if trees-graphs is deprioritized.
-3. prose's last 1.5 tok/s to the 20 bar: K=5 novel tier is live (gateway), measure with tree
-   graphs; also consider per-(class,B) K tuning from real gateway traffic.
-4. Then: probe fidelity leftovers → market iff c0mpute #16 (leyten's fork). Paper headline refresh
-   (B-curve + per-stream scorecard) also awaits leyten's publish call.
+**NEXT SESSION — MlxRuntime (leg 6), leyten's call 2026-07-12:**
+1. **MlxRuntime** — the any-device proof, THE active build (see leg 6 above for the build shape:
+   ModelRuntime seam → M2.5 layer-range on Apple silicon, MoE dequant = the risk item → same
+   attest/receipt contract → offline parity gates vs torch → ONE mixed ring w/ a Mac stage for the
+   demo receipt). CPU/local-first; no ring spend until the demo. Needs a target Mac to serve from —
+   confirm which machine with leyten at session start if none is already reachable.
+2. PARKED-DESIGNED: **tree-frame CUDA graphs** (the prose-bar lever; tree stage compute 154→~50-70ms
+   candidate → the g lift nets +20-40%/stream instead of −13%). Design + the dummy-KV trash-slot
+   hazard: `.claude/plans/tree-graph-capture.md`. Offline gates + adversarial review before any
+   ring, same kill criterion. Pick up after leg 6 (or interleave if MLX blocks on hardware).
+3. Then: prose's last 1.5 tok/s (tree graphs + K=5 novel tier, both live-measurable), probe
+   fidelity leftovers, market iff c0mpute #16 (leyten's fork). Paper headline refresh (B-curve +
+   per-stream scorecard) awaits leyten's publish call.
 
 **RING: none live** (instances-v1==0 verified 2026-07-12 post-teardown; ~$6 spent of the ~$102
 balance). c0mpute WIP untouched.
