@@ -1,11 +1,21 @@
-# MlxRuntime — the Apple-silicon backend (draft, offline-validated)
+# MlxRuntime — the Apple-silicon backend (MAC GATE GREEN 2026-07-12)
 
 `shard/mlx_runtime.py` implements `ModelRuntime` (shard/node.py — the firewall of
 docs/MODEL_RUNTIME.md) on MLX: one Mac serves a contiguous layer range of an MLX-converted
 checkpoint out of unified memory, speaking the exact per-node contract the proven CUDA stage
-(phase0/m25_stage.py) runs on. Written **without a Mac on hand**: the mlx-facing calls are
-faithful to mlx-lm's own load/pipeline patterns but untested on Metal — do not place a Mac
-stage on a ring before the checklist below is green.
+(phase0/m25_stage.py) runs on.
+
+**GATE STATUS: 11/11 real-silicon checks PASSED on a rented Scaleway M2 Pro (16 GB, macOS
+Tahoe, mlx 0.32.0 / mlx-lm 0.31.3, python 3.13) against the REAL
+`mlx-community/MiniMax-M2.5-4bit` checkpoint, layers [29:32)** — receipt
+`docs/receipts/mlx-mac-gate-20260712.json`. Highlights: range load 5.77 GiB active for 3
+layers (≈1.9 GiB/layer, matching the memo's math); forward finite + run-to-run byte-equal in
+BOTH wire representations; **KV rollback byte-equal to a fresh cache on-device** (the m25 crop
+contract holds on Metal; gap hard-errors); aux capture per contract; the corrupt-index refusal
+fires on the real index; real tail logits (200 064 vocab) + head embed; **our wrapper is
+byte-identical to a hand-driven mlx-lm layer loop** (mask/positions/trim bookkeeping adds
+zero drift); **measured decode 0.94 ms/layer (M2 Pro, B=1)** — the first real Apple-silicon
+row for the admission spec. All 13 MAC-VALIDATE API assumptions held as written.
 
 ## Build shape
 
@@ -43,7 +53,13 @@ stage on a ring before the checklist below is green.
   rollback (rolled-back runtime == fresh runtime), reset, gap refusal; aux capture in-range
   only, per-forward refresh, aux-under-rollback equality.
 
-## Needs a Mac (the gate — in order)
+## Needs a Mac (the gate — in order) — STATUS after 2026-07-12 (M2 Pro 16 GB run)
+
+Done: items 1 (range load), 3 (all API assumptions), 4 (on-device rollback), 6's decode half
+(0.94 ms/layer measured; prefill still unmeasured), plus wrapper-vs-mlx-lm byte parity.
+Remaining, in order: **7 (fake-ring stage swap → live mixed ring — the flagship)**, 2
+(full-model reference greedy agreement — needs a ≥96 GB Mac; the 16 GB box can't hold the
+model), 5 (wired-limit sizing table at larger RAM), 6's prefill measurement.
 
 1. **Real range load** of `mlx-community/MiniMax-M2.5-4bit`: `load_shard` on a mid-range
    `[20:30)`, memory ≈ 10 × ~2.06 GB (not the full 129 GB) — proves lazy load + None-pad.

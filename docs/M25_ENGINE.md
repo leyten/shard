@@ -52,15 +52,21 @@ real inference verifiably, and gets paid. Leg status:
    replay corrupt (cosine 0.0) → relegated off-ring by its own verdict (role verifier, binding
    fast_kernel) — the silent-corruption class caught at admission. Spec: 96 GB tier = MEASURED
    (2329.5 MB/L, 35-layer cap, transient 72 MB).
-   **MlxRuntime (the non-NVIDIA half): BUILT + MERGED (#91), Mac-gated.** mlx-lm already carries
-   a quality MiniMax port covering M2.5 + an official 4-bit conversion (~2.06 GB/L; a 64 GB Mac
-   holds ~20-26 layers). Range loader + KV-crop rollback + EAGLE aux + bf16 bridge, 3-skeptic-
-   class review fixed 3 MAJORs (completeness audit + strict load, config-driven tiedness, dtype
-   whitelist). 25 offline gates green; docs/MLX_RUNTIME.md = the Mac checklist. **BLOCKED ON
-   HARDWARE: no Apple silicon on vast (Apple licensing). Rentable: Scaleway M4-XL 64 GB €0.49/h
-   (24 h min ≈ €12, Paris DC — ideal for an EU ring). Needs leyten: a Scaleway account/API key,
-   or any reachable Mac.** Then: real range load + parity gates + ONE mixed ring (Mac stage +
-   5090s + fat card) = the flagship demo receipt.
+   **MlxRuntime (the non-NVIDIA half): MAC GATE GREEN 2026-07-12 (receipt
+   mlx-mac-gate-20260712).** Built + merged #91 (3-skeptic review fixed 3 loader MAJORs), then
+   leyten provided a Scaleway key and a rented M2 Pro (16 GB, €0.21/h) ran **11/11
+   real-silicon checks** against the real mlx-community/MiniMax-M2.5-4bit slice [29:32):
+   range load 1.9 GiB/layer; forward byte-deterministic in both wire representations; **KV
+   rollback byte-equal on Metal** (gap refused); aux contract; corrupt-index refusal fires on
+   the real index; real tail logits (200k vocab) + head embed; **wrapper byte-identical to a
+   hand-driven mlx-lm layer loop**; first measured Apple row **0.94 ms/layer decode (M2 Pro,
+   B=1, mlx 0.32.0)**. pytest green on BOTH platforms (Mac 24/2skip incl. the real-mlx smoke).
+   All 13 MAC-VALIDATE assumptions held as written. Ops: Scaleway creds
+   ~/.config/scw/shard_creds.env (0600, NEVER tracked); M4 quotas=0 until leyten's card
+   verifies (M4-XL 64 GB = the fat demo-stage box; M4-SP 16 GB high-stock); the Mac stays warm
+   through its 24 h lease. **REMAINING for leg 6: fake-ring stage swap → ONE live mixed ring
+   (Mac + 5090s + fat card, all network-joined) = the flagship demo receipt.** Full-model
+   reference greedy-agreement + the wired-limit table need a ≥96 GB Mac (post-quota).
    **Placement-as-protocol DESIGNED (c0mpute PR #21, merged):** 3-angle panel + adversarial
    verify (8 MAJORs caught: vapor slashing, nonexistent planInputsHash cited as shipped, wrong
    determinism CI, forgeable gap-evidence). c0mpute/PLACEMENT_AS_PROTOCOL.md: records-as-hints +
