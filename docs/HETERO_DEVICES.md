@@ -17,8 +17,16 @@ ring-wide env). Probed on a live rented card:
 | GPU | arch | cutlass | marlin | emulation | MoE VRAM/layer | decode MoE latency |
 |---|---|---|---|---|---|---|
 | RTX 5090 | sm_120 | ✅ native FP4 (fast path) | ✅ | ✅ (Triton, batch-invariant) | ~1.7 GB (4-bit) | ~0.65 ms (graph) |
+| **RTX PRO 6000 WS (96 GB)** | **sm_120** | ✅ native (probe 2026-07-12: full-layer footprint **2329.5 MB**, transient 72 MB, graph **bit-exact**, layer_ms 0.24 graph / 0.75 eager — Max-Q edition) | ✅ | ✅ | 2.33 GB full-layer (== 5090; density-scaled cap **35 layers**) | 0.24 ms (graph) |
 | **RTX 4090** | **sm_89 (Ada)** | ❌ *"kernel does not support current device"* | ✅ **RUNS** | ❌ *illegal memory access* | **4.08 GB** (dequant, ~2.4×) | **0.35 ms/tok** (T=1), 0.48 (T=8) |
 | RTX 3090 | sm_86 (Ampere) | ❌ (expected) | ✅ (probe pending) | ❌ (expected) | ~4 GB (est) | est ~0.5-0.9 ms |
+
+**Same-model-name ≠ same verdict (2026-07-12, the reason admission MEASURES):** two rented RTX PRO
+6000 WS boxes probed the same footprint but opposite fast-kernel verdicts — one graph-replayed
+bit-exact (cosine 1.0), the other's replay produced garbage (cosine 0.0, twice, deterministic; runs
+eager at 0.96 ms/layer). The second box was relegated off-ring by its own measured verdict — a
+graph-armed stage on it would corrupt silently behind valid-looking transport receipts. A per-model
+allowlist admits both; the capability function admits one and routes the other.
 
 **Verdict: a 4090 serves the M2.5 NVFP4 MoE today via marlin** — same signed checkpoint, no
 re-quant, dequant-in-kernel to fp8/bf16. cutlass is Blackwell-only (refuses pre-sm_120); emulation
@@ -49,6 +57,7 @@ co-locate to manufacture the number — every verdict below is for scattered WAN
 
 | Device | BW GB/s | Mem GB | ~layers @ arch footprint | est layer_ms | Verdict |
 |---|---|---|---|---|---|
+| **RTX PRO 6000 (WS/S)** | 1792 | 96 | **35** (2.33 GB, density-scaled cap; MEASURED 2026-07-12) | **0.24 (measured, graph)** | **ring ANCHOR — proven live**: held 31 L + coordinator in a 4-hop hetero ring the c0mpute loop placed |
 | RTX 5090 | 1792 | 32 | ~13 (1.7 GB) | 0.65-1.5 | **ring — proven** |
 | RTX 4090 | 1008 | 24 | ~4-5 (4.08 GB marlin) | 1.2-2.5 | **ring** — fewer layers, marlin |
 | RTX 3090 | 936 | 24 | ~4-5 | 1.3-2.9 | **ring** (probe pending) |

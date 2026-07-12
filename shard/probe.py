@@ -49,7 +49,7 @@ import sys
 import threading
 import time
 
-from .plan import M25_PROFILE
+from .plan import M25_PROFILE, density_cap_layers
 
 # Admission thresholds — docs/ADMISSION_SPEC.md v0 (LIVING: revise here AND there).
 SPEC_V0 = {
@@ -81,8 +81,6 @@ ROLES = ("interactive-anchor", "batched-filler", "verifier", "seeder", "reject")
 # 31.5/32.6 GiB, brim-riding, never a plan target. plan.py now carries the measured
 # numbers (layer_vram_mb 2330, cap_layers 12); admission inherits them directly.
 ADMISSION_MODEL_V0 = dict(M25_PROFILE)
-_PROVEN_CAP_VRAM_MB = 32768.0    # the card size cap_layers was proven on; bigger cards
-                                 # scale by density (a flat cap made 48 GB == 32 GB)
 
 
 # ---------------------------------------------------------------------------
@@ -106,8 +104,8 @@ def derive_layers(cap, model):
     per_layer = fp + float(model["kv_mb_per_layer"])
     # cap_layers was proven on a 32 GB card; scale the proven DENSITY to the card size
     # (a flat cap collapsed 48 GB to the 32 GB verdict — the spec's core distinction).
-    density_cap = int(int(model["cap_layers"]) * total / _PROVEN_CAP_VRAM_MB)
-    return max(0, min(int(usable // per_layer), density_cap))
+    # ONE rule, shared with plan_ring's per-node calibration (plan.density_cap_layers).
+    return max(0, min(int(usable // per_layer), density_cap_layers(model["cap_layers"], total)))
 
 
 def _hop_budget(bar_tok_s, g, c_ms, rtt_ms):

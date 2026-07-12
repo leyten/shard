@@ -101,6 +101,72 @@ def test_cli_bad_request_reports_error():
     assert "error" in json.loads(r.stdout)
 
 
+def test_fat_card_density_cap_shrinks_the_ring():
+    """A 96 GB card announcing total_vram_mb gets the proven DENSITY scaled to its size
+    (12 * 97887/32768 = 35 layers), not the flat 32 GB cap — so a fat-card pool plans a
+    ring with FEWER hops than the all-5090 six-stage split."""
+    nodes, rtt = _pool(6)
+    nodes[0]["free_vram_mb"] = 97887.0
+    nodes[0]["total_vram_mb"] = 97887.0
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    fat = next(s for s in plan["stages"] if s["id"] == "node0")
+    assert fat["layers"] > 13                    # flat-cap behavior would pin it at <=13
+    assert plan["k"] < 6                         # fewer, fatter stages: the fat card absorbed hops
+    # a probe-verdict cap_layers wins outright over the density rule
+    nodes[0]["cap_layers"] = 20
+    plan20 = plan_ring(nodes, rtt)
+    fat20 = next(s for s in plan20["stages"] if s["id"] == "node0")
+    assert fat20["layers"] <= 20
+
+
+def test_per_node_footprint_marlin_holds_fewer_layers():
+    """A marlin-path card (~4060 MB/layer measured) in a cutlass pool must be planned at ITS
+    footprint: same free VRAM, roughly half the layers of its cutlass twin."""
+    nodes, rtt = _pool(7)
+    nodes[6]["layer_vram_mb"] = 4060.0           # the H100/4090 dequant-path footprint class
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    by_id = {s["id"]: s for s in plan["stages"]}
+    if "node6" in by_id:                         # if selected, its block must respect ITS footprint
+        m = plan_ring.__globals__["M25_PROFILE"]
+        free = 30.0 * 1024 - m["reserve_mb"]
+        assert by_id["node6"]["layers"] * (4060.0 + m["kv_mb_per_layer"]) <= free + 1e-6
+        assert by_id["node6"]["layers"] < 12     # cutlass twins hold 12-13; marlin can't
+
+
+def test_measured_layer_ms_overrides_modeled_base():
+    """A node announcing its probe-measured layer_ms (e.g. a box whose graph capture failed,
+    running eager at ~4x) must be planned at that measurement — the planner balances stage
+    time, so the slow box lands fewer layers than its VRAM twin."""
+    nodes, rtt = _pool(7)
+    nodes[5]["layer_ms"] = 2.6                   # eager-ish measured, vs base 0.65 modeled
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    by_id = {s["id"]: s for s in plan["stages"]}
+    if "node5" in by_id:
+        twin = max(s["layers"] for s in plan["stages"] if s["id"] not in ("node5", plan["head"]))
+        assert by_id["node5"]["layers"] < twin
+
+
+def test_load_peak_transient_gates_admission():
+    """The measured load transient (marlin repack peaked 4.8 GB above resident, live 2026-07-09)
+    subtracts from usable free — the admit-then-OOM fix, now honored per node in the plan."""
+    nodes, rtt = _pool(6)
+    plan_before = plan_ring(nodes, rtt)
+    lay_before = {s["id"]: s["layers"] for s in plan_before["stages"]}
+    nodes[3]["load_peak_extra_mb"] = 4824.0
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    by_id = {s["id"]: s for s in plan["stages"]}
+    if "node3" in by_id and "node3" in lay_before:
+        assert by_id["node3"]["layers"] < lay_before["node3"]
+
+
 def test_tail_reserve_shrinks_or_moves_the_tail():
     """The tail stage also loads final norm + lm_head (measured 1.15 GiB on M2.5): a plan
     that packs the tail to its VRAM brim OOMs at load (live, 2026-07-09). The landed tail's
