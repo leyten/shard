@@ -38,37 +38,45 @@ _ids = itertools.count(1)
 RING_LOCK = threading.Lock()   # one ring job at a time (a job may carry up to M25_GW_BATCH streams)
 GW_BATCH = int(os.environ.get("M25_GW_BATCH", os.environ.get("M25_BATCH", "1")))
 GW_WINDOW_MS = float(os.environ.get("M25_GW_WINDOW_MS", "40"))
-# ---- content routing (per-stream-20 work, 2026-07-11): like-with-like batching + per-content K ----
-# The de-lockstep receipt split per-stream speed by CONTENT regime: tools/reasoning/code clear the
-# 20+/stream bar while reasoning-off novel prose and long-context answers run g 1.3-2.7 — where a
-# K=8 frame carries 5-6 dead draft slots of payload+verify every round on a payload-priced ring.
-# Route by cheap request features (no model call): tools or reasoning -> "draftable" (full K);
-# reasoning-off + long prompt -> "context" (summarize/RAG answers); else "novel". The dispatcher
-# batches LIKE WITH LIKE (single-class jobs: one K per job, and a job's round cadence fits its
-# regime), FIFO-fair — the queue head always defines the next job's class, so no class starves.
-# Per-class K is env-tunable; M25_GW_CONTENT_K=0 disables routing (every job rides args.K). NOTE:
-# distinct K values mean distinct [*, K+1] frame shapes stage-side -> more CUDA-graph captures per
-# bucket (bounded by M25_GRAPH_MAX + the free-VRAM capture guard; excess shapes run eager).
+# ---- content routing (per-stream-20 work): like-with-like batching + per-(content, B) K ----------
+# The de-lockstep receipts split per-stream speed by CONTENT regime, and the 2026-07-12 K-reference
+# pass (receipt perstream-trees-ab-20260712) pinned the K physics: at B<=2 the payload is amortized
+# and g dominates, so full K wins (mix-B1 22.5 at K=8 vs 17.1 at K=6); at B>=4 a K=8 frame's dead
+# draft slots bind on the payload-priced ring and K=6 lifted EVERY g-bound arm 20-100% (reasoning
+# 14->29, mix 14.2->17.9, summarize ->18.2, qa ->21.1) — only tools' g~5 still earns K=8. Route by
+# cheap request features (no model call): tools -> "tools"; reasoning-on -> "reasoning";
+# reasoning-off + long prompt -> "context"; else "novel". The dispatcher batches LIKE WITH LIKE
+# (single-class jobs: one K per job, and a job's round cadence fits its regime), FIFO-fair — the
+# queue head always defines the next job's class, so no class starves. K then keys on (class, B).
+# Env-tunable; M25_GW_CONTENT_K=0 disables routing (every job rides args.K). NOTE: distinct K
+# values mean distinct [*, K+1] frame shapes stage-side -> more CUDA-graph captures per bucket
+# (bounded by M25_GRAPH_MAX + the free-VRAM capture guard; excess shapes run eager).
 CONTENT_K = os.environ.get("M25_GW_CONTENT_K", "1") != "0"
 CTX_CHARS = int(os.environ.get("M25_GW_CTX_CHARS", "6000"))    # prompt chars >= this = "context" class
-K_CTX = int(os.environ.get("M25_GW_K_CTX", "6"))
+K_CTX = int(os.environ.get("M25_GW_K_CTX", "6"))               # context AND reasoning at wide B
 K_NOVEL = int(os.environ.get("M25_GW_K_NOVEL", "5"))
+K_WIDE_B = int(os.environ.get("M25_GW_K_WIDE_B", "3"))         # batch width where dead slots start binding
 
 
 def _content_class(messages, tools, reasoning):
-    if tools or reasoning:
-        return "draftable"
+    if tools:
+        return "tools"
+    if reasoning:
+        return "reasoning"
     n = sum(len(str(m.get("content") or "")) for m in (messages or []))
     return "context" if n >= CTX_CHARS else "novel"
 
 
-def _class_k(cls):
-    """The batched job's K for a content class. Applies to BATCHED jobs only — solo keeps args.K
-    (K=8 is the measured single-stream sweet spot; the dead-slot payload argument is per-stream-
-    batched physics, not solo's)."""
-    if not CONTENT_K or cls == "draftable":
+def _class_k(cls, B=1):
+    """The batched job's K for (content class, batch width). Solo and narrow batches keep args.K
+    (the measured g-dominates regime); wide batches drop to the class K — the dead-slot payload
+    argument is B>=4 physics (receipt perstream-trees-ab-20260712). Tools' g~5 earns full K at
+    every width."""
+    if not CONTENT_K or cls == "tools" or B < K_WIDE_B:
         return A.K
-    return K_CTX if cls == "context" else K_NOVEL
+    if cls == "novel":
+        return K_NOVEL
+    return K_CTX                                       # context + reasoning at wide B
 
 
 class ClientGone(Exception):
@@ -198,7 +206,7 @@ def _run_solo(rq):
 
 
 def _run_batch(reqs):
-    k = _class_k(reqs[0].cls)                          # single-class job (the dispatcher groups), one K
+    k = _class_k(reqs[0].cls, B=len(reqs))             # single-class job (the dispatcher groups), one K
     for attempt in (1, 2):
         try:
             if "pipe" not in SOCKS or attempt == 2:
