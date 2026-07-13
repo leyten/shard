@@ -95,6 +95,87 @@ def test_libp2p_sidecar_cmd_quotes_hostile_maddr():
     _assert_contained(cmd, HOSTILE_MADDR)
 
 
+# ---------------------------------------------------------------- main() drive harness
+
+class Drive:
+    """run msp.main() with every remote op stubbed; record what the launcher would execute."""
+
+    def __init__(self, monkeypatch, argv, sh_rc=0, sidecar_ok=True, warm_ok=True):
+        self.sh_cmds = []            # (host, cmd) of every sh() the launcher runs
+        self.stage_calls = []        # (args, kwargs) per launch_stage
+        self.sidecar_calls = []      # (args, kwargs) per launch_sidecar
+        self.exit_code = None
+        pids = {}
+
+        def fake_vinst(iid):
+            return {"ssh_host": f"h{iid}", "ssh_port": 22, "public_ipaddr": "1.2.3.4",
+                    "ports": {"29600/tcp": [{"HostPort": "29600"}]}}
+
+        def fake_peerid(host, port):
+            return pids.setdefault(host, "12D3KooW" + host.ljust(44, "x"))
+
+        def fake_sh(host, port, cmd, timeout=120):
+            self.sh_cmds.append((host, cmd))
+            return _res("GPU\n" if "nvidia-smi" in cmd else "")
+
+        monkeypatch.setattr(msp, "vinst", fake_vinst)
+        monkeypatch.setattr(msp, "push_code", lambda h, p: None)
+        monkeypatch.setattr(msp, "peerid", fake_peerid)
+        monkeypatch.setattr(msp, "sh", fake_sh)
+        monkeypatch.setattr(msp, "launch_sidecar",
+                            lambda *a, **k: (self.sidecar_calls.append((a, k)), sidecar_ok)[1])
+        monkeypatch.setattr(msp, "launch_stage",
+                            lambda *a, **k: (self.stage_calls.append((a, k)), "stubnonce")[1])
+        monkeypatch.setattr(msp, "warm", lambda *a, **k: warm_ok)
+        monkeypatch.setattr(msp.time, "sleep", lambda s: None)
+        if hasattr(msp, "fresh_count"):
+            monkeypatch.setattr(msp, "fresh_count", lambda *a, **k: "1" if sh_rc == 0 else "0")
+        monkeypatch.setattr(sys, "argv", ["m25_scatter_pipe.py"] + argv)
+        monkeypatch.setenv("M25_CWND_KEEPWARM_MS", "150")   # keep main() from mutating real env
+        try:
+            msp.main()
+        except SystemExit as e:
+            self.exit_code = e.code
+
+    def gw_cmd(self):
+        return next(c for _, c in self.sh_cmds if "m25_gateway.py" in c)
+
+    def coord_cmd(self):
+        return next(c for _, c in self.sh_cmds if "m25_pipe.py coord" in c)
+
+
+ORDER3 = ["--order", "A:1:0:20", "B:2:20:41", "C:3:41:62"]
+
+
+# ---------------------------------------------------------------- H1: one negotiated ctx limit
+
+def test_negotiated_max_ctx():
+    assert msp.negotiated_max_ctx(131072, [40960, 40960]) == 40960
+    assert msp.negotiated_max_ctx(16384, [40960, 40960]) == 16384
+    assert msp.negotiated_max_ctx(131072, [0, 40960]) == 40960     # zero caps filtered
+    assert msp.negotiated_max_ctx(131072, []) == 131072
+
+
+def test_launcher_pins_kv_and_gateway_max_ctx(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"])
+    # every stage gets the pinned KV cap (40960 = m25_stage default, now EXPLICIT config)
+    for args, kwargs in d.stage_calls:
+        assert 40960 in args or kwargs.get("kv_maxlen") == 40960
+    assert "--max-ctx 40960" in d.gw_cmd()
+
+
+def test_launcher_negotiates_operator_ceiling(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve", "--max-ctx", "16384"])
+    assert "--max-ctx 16384" in d.gw_cmd()
+    d = Drive(monkeypatch, ORDER3 + ["--serve", "--kv-maxlen", "12288"])
+    assert "--max-ctx 12288" in d.gw_cmd()
+
+
+def test_oneshot_coord_gets_max_ctx(monkeypatch):
+    d = Drive(monkeypatch, ORDER3)
+    assert "--max-ctx 40960" in d.coord_cmd()
+
+
 def test_sidecar_cmd_benign_values_unchanged():
     """for legit values the built command is the same shape as the old literal one-quote form."""
     fwd = f"127.0.0.1:29611=/ip4/5.6.7.8/tcp/29600/p2p/{VALID_PID}"
