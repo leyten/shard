@@ -340,6 +340,41 @@ def test_stream_max_tokens_one_usage_is_one():
     assert usage and usage[-1]["completion_tokens"] == 1
 
 
+# ---- M5: one valid SSE error+end sequence, one status line ---------------------------------------------
+
+def test_stream_engine_failure_emits_sse_error_and_done(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("ring fell over")
+    monkeypatch.setattr(gw, "run_request", boom)
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    h.do_POST()
+    frames = _sse_frames(h.wfile)
+    assert h.statuses == [200], f"exactly one status line, got {h.statuses}"
+    errs = [f for f in frames if f != "[DONE]" and "error" in json.loads(f)]
+    assert len(errs) == 1, f"exactly one SSE error frame, got {frames}"
+    assert "ring fell over" in errs[0]
+    assert frames[-1] == "[DONE]", "stream must terminate with [DONE]"
+
+
+def test_stream_client_gone_stays_silent():
+    """A dead client gets nothing appended — no JSON 500, no half SSE error into a closed pipe."""
+    wf = _FakeWfile(fail_after=1)                        # role chunk ok, first delta write dies
+    h = _handler(wfile=wf, body={"messages": [{"role": "user", "content": "hi"}], "stream": True})
+    h.do_POST()
+    assert h.statuses == [200]
+    assert all(b"engine_error" not in c for c in wf.chunks)
+
+
+def test_stream_happy_path_single_done():
+    h = _handler(body={"messages": [{"role": "user", "content": "hello"}], "stream": True})
+    h.do_POST()
+    frames = _sse_frames(h.wfile)
+    assert h.statuses == [200]
+    assert frames.count("[DONE]") == 1 and frames[-1] == "[DONE]"
+    content = "".join(d["delta"].get("content", "") for d in _sse_deltas(h.wfile) if d.get("delta"))
+    assert "concise answer" in content and content.count("concise answer") == 1
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:

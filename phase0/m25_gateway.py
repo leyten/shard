@@ -577,10 +577,14 @@ class H(BaseHTTPRequestHandler):
         except (BrokenPipeError, ClientGone):
             pass                                          # client is gone — nothing to send, ring already released
         except JobRejected as e:
+            if getattr(self, "_sse_started", False):
+                return                                    # _stream already reported in-band (M5)
             try: self._json({"error": {"message": str(e), "type": "invalid_request_error",
                                        "code": "job_rejected"}}, 400)
             except Exception: pass
         except Exception as e:
+            if getattr(self, "_sse_started", False):
+                return                                    # _stream already emitted the SSE error + [DONE]
             err = {"error": {"message": f"{type(e).__name__}: {str(e)[:200]}", "type": "engine_error"}}
             try: self._json(err, 500)
             except Exception: pass
@@ -613,51 +617,68 @@ class H(BaseHTTPRequestHandler):
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close")
         self.send_header("Access-Control-Allow-Origin", "*"); self.end_headers()
+        self._sse_started = True   # stream committed: from here ANY report goes in-band, never a 2nd status line
         self.connection.settimeout(STREAM_WRITE_TIMEOUT)   # a stalled client write must not pin the ring
+
+        def raw(b):
+            try:
+                self.wfile.write(b); self.wfile.flush()
+            except OSError as e:                           # client disconnected OR stalled past the timeout:
+                raise ClientGone(f"{type(e).__name__}: {e}") from e   # abort the job, never retry (see generate)
 
         def chunk(delta, finish=None):
             o = {"id": cid, "object": "chat.completion.chunk", "created": created, "model": MODEL_ID,
                  "choices": [{"index": 0, "delta": delta, "finish_reason": finish}]}
+            raw(f"data: {json.dumps(o)}\n\n".encode())
+
+        try:
+            chunk({"role": "assistant"})
+            state = {"r": 0, "c": 0}
+            def on_commit(out, _dt):
+                if not MOCK:                               # strict max_tokens + earliest-eos: never stream
+                    out, _ = _cap_output(out, max_new, EOS_SET)   # tokens the final message won't carry
+                text = _decode_running(out, self)
+                if MOCK:
+                    text = text[:max_new * 4]              # mock counts tokens as chars//4
+                reasoning_txt, content = _split_stream(text, reasoning)   # `reasoning` = the request's bool (closure)
+                if len(reasoning_txt) > state["r"]:
+                    chunk({"reasoning_content": reasoning_txt[state["r"]:]}); state["r"] = len(reasoning_txt)
+                if len(content) > state["c"]:
+                    chunk({"content": content[state["c"]:]}); state["c"] = len(content)
+
+            r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
+            fin_cap = _enforce_cap(r, max_new)
+            parsed = parse_completion(r["text"])
+            if require_tool and not parsed["tool_calls"]:
+                raise RuntimeError("tool_choice required a tool call but the model produced none")
+            # flush any tail not yet streamed (final trimmed text), then tool calls
+            _, fcontent = _split_stream(r["text"], reasoning)
+            final_content = parsed["content"] or ""
+            if len(final_content) > state["c"]:
+                chunk({"content": final_content[state["c"]:]})
+            finish = "stop"
+            if tools and parsed["tool_calls"]:
+                msg, _ = to_openai_message(parsed)
+                chunk({"tool_calls": msg["tool_calls"]}); finish = "tool_calls"
+            if fin_cap == "length":
+                finish = "length"
+            chunk({}, finish=finish)
+            usage = {"prompt_tokens": r.get("prompt_tokens", 0), "completion_tokens": r["n_tokens"],
+                     "total_tokens": r.get("prompt_tokens", 0) + r["n_tokens"]}
+            raw(f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [], 'usage': usage})}\n\n".encode())
+            raw(b"data: [DONE]\n\n")
+        except ClientGone:
+            raise                                          # client is gone: nothing can be sent to it
+        except Exception as e:                             # noqa: BLE001 — engine/ring failure mid-stream:
+            # the 200 + SSE framing is already on the wire, so a JSON 500 here would be a SECOND
+            # status line spliced into the event stream. Emit exactly ONE in-band error event, then
+            # terminate the stream properly with [DONE].
+            err = {"error": {"message": f"{type(e).__name__}: {str(e)[:200]}", "type": "engine_error"}}
             try:
-                self.wfile.write(f"data: {json.dumps(o)}\n\n".encode()); self.wfile.flush()
-            except OSError as e:                           # client disconnected OR stalled past the timeout:
-                raise ClientGone(f"{type(e).__name__}: {e}") from e   # abort the job, never retry (see generate)
-
-        chunk({"role": "assistant"})
-        state = {"r": 0, "c": 0}
-        def on_commit(out, _dt):
-            if not MOCK:                               # strict max_tokens + earliest-eos: never stream
-                out, _ = _cap_output(out, max_new, EOS_SET)   # tokens the final message won't carry
-            text = _decode_running(out, self)
-            if MOCK:
-                text = text[:max_new * 4]              # mock counts tokens as chars//4
-            reasoning_txt, content = _split_stream(text, reasoning)   # `reasoning` = the request's bool (closure)
-            if len(reasoning_txt) > state["r"]:
-                chunk({"reasoning_content": reasoning_txt[state["r"]:]}); state["r"] = len(reasoning_txt)
-            if len(content) > state["c"]:
-                chunk({"content": content[state["c"]:]}); state["c"] = len(content)
-
-        r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
-        fin_cap = _enforce_cap(r, max_new)
-        parsed = parse_completion(r["text"])
-        if require_tool and not parsed["tool_calls"]:
-            raise RuntimeError("tool_choice required a tool call but the model produced none")
-        # flush any tail not yet streamed (final trimmed text), then tool calls
-        _, fcontent = _split_stream(r["text"], reasoning)
-        final_content = parsed["content"] or ""
-        if len(final_content) > state["c"]:
-            chunk({"content": final_content[state["c"]:]})
-        finish = "stop"
-        if tools and parsed["tool_calls"]:
-            msg, _ = to_openai_message(parsed)
-            chunk({"tool_calls": msg["tool_calls"]}); finish = "tool_calls"
-        if fin_cap == "length":
-            finish = "length"
-        chunk({}, finish=finish)
-        usage = {"prompt_tokens": r.get("prompt_tokens", 0), "completion_tokens": r["n_tokens"],
-                 "total_tokens": r.get("prompt_tokens", 0) + r["n_tokens"]}
-        self.wfile.write(f"data: {json.dumps({'id': cid, 'object': 'chat.completion.chunk', 'created': created, 'model': MODEL_ID, 'choices': [], 'usage': usage})}\n\n".encode())
-        self.wfile.write(b"data: [DONE]\n\n"); self.wfile.flush()
+                raw(f"data: {json.dumps(err)}\n\n".encode())
+                raw(b"data: [DONE]\n\n")
+            except ClientGone:
+                pass                                       # client died while we reported — nothing left
 
 
 if __name__ == "__main__":
