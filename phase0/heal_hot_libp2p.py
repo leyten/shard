@@ -166,7 +166,9 @@ def main():
     # 5. RESUME (retry): the FIRST resume's reset is what makes the pred engine notice its now-broken forward
     # socket (the old sidecar died) and relink to the repointed :29611 -> spare; that attempt drops fast, the
     # next one rides the healed path to completion. Re-prefills prompt+committed, continues to completion.
-    rssh(head, "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps({"output_ids": committed}) + "\nEOF", 30)
+    # pass the FULL checkpoint (versioned envelope) through: the resume coordinator validates its
+    # job/prompt/model/settings binding + token digest and refuses a stale/foreign checkpoint
+    rssh(head, "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps(d1) + "\nEOF", 30)
     resume_max = len(committed) + 24                            # short continuation: isolate the failover blip
     d2 = None
     for attempt in range(4):

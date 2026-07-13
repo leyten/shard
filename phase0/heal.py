@@ -144,8 +144,10 @@ def main():
     healed_tail_ep = f"{ep(healed[-1])[0]}:{ep(healed[-1])[1]}"
 
     # 5. RESUME: re-prefill prompt+committed on the healed ring, continue to completion
-    # stage the committed tokens where the resume coordinator reads them, THEN launch it
-    rssh(healed[0], "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps({"output_ids": committed}) + "\nEOF", 30)
+    # stage the FULL checkpoint (versioned envelope, not bare output_ids) where the resume
+    # coordinator reads it, THEN launch it — the coordinator validates the envelope's job/prompt/
+    # model/settings binding + token digest, so a stale or foreign checkpoint is refused
+    rssh(healed[0], "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps(d1) + "\nEOF", 30)
     fire(healed[0], "rm -f /root/ft.json /root/coord.log; " +
          coord_cmd(nstages, healed_tail_ep, a.prompt_file, a.max_new, a.max_ctx, "/root/ft.json",
                    a.timeout + 1770, resume_file="/root/ft2_in.json"))
