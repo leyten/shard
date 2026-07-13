@@ -40,3 +40,36 @@ def test_decode_kv_check_message_is_actionable(monkeypatch):
 def test_decode_kv_check_returns_total(monkeypatch):
     monkeypatch.setattr(S, "M25_KV_MAXLEN", 40960)
     assert S._decode_kv_check(1000, 9) == 1009        # the reused context length (feeds _bucket)
+
+
+def _bare_graph_runner(s):
+    """GraphRunner without __init__ (which needs CUDA + static-KV layers): only the attributes
+    run()'s pre-capture path touches, so the host-side bound is unit-testable on CPU."""
+    gr = object.__new__(S.GraphRunner)
+    gr.s = s
+    gr.graphs = {}
+    gr.eager = set()
+    return gr
+
+
+def test_solo_graph_run_bound(monkeypatch):
+    # The SOLO graph path: run() computes alen via _bucket (which CLAMPS to MAXLEN) and then set()
+    # fills the static cp buffer with positions >= MAXLEN — the replayed index_copy_ scatters out
+    # of bounds (device assert, dead stage). Row/BatchGraphRunner bound this host-side; solo must too.
+    monkeypatch.setattr(S, "M25_KV_MAXLEN", 100)
+    gr = _bare_graph_runner(8)
+    with pytest.raises(RuntimeError, match="exceeds M25_KV_MAXLEN"):
+        gr.run(93, None)                              # total 101 -> would write index 100 (OOB)
+    with pytest.raises(RuntimeError, match="exceeds M25_KV_MAXLEN"):
+        gr.run(100, None)                             # one past the end
+
+
+def test_solo_graph_run_bound_exact_fit(monkeypatch):
+    # total == MAXLEN writes max index MAXLEN-1 -> in bounds; must fall through past the bound
+    # (eager-marked bucket routes to run_block, stubbed — no CUDA in the test env).
+    monkeypatch.setattr(S, "M25_KV_MAXLEN", 100)
+    monkeypatch.setattr(S, "run_block", lambda layers, sp, x, vcfg: "eager-ran")
+    gr = _bare_graph_runner(8)
+    gr.layers, gr.vcfg = [], None
+    gr.eager = {100}                                  # permanently-eager bucket -> run_block fallback
+    assert gr.run(92, "x") == "eager-ran"             # total 100 == MAXLEN -> exactly fits, no raise
