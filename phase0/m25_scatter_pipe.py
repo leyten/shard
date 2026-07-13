@@ -76,6 +76,14 @@ def check_peerid(pid):
     return pid
 
 
+def negotiated_max_ctx(operator_max_ctx, stage_kv_caps):
+    """ONE context limit for the whole ring: min(operator ceiling, every stage's KV cap). Same
+    pure function the gateway exposes (m25_gateway.negotiated_max_ctx) — the launcher computes it
+    once and every downstream process receives it as explicit config, so no process ever trusts
+    its own 131072 default over a 40960-capped ring."""
+    return min([int(operator_max_ctx)] + [int(c) for c in stage_kv_caps if c and int(c) > 0])
+
+
 def peerid(host, port):
     r = sh(host, port, "/tmp/sidecar -key /root/node.key -prove ping 2>/dev/null | grep PEERID")
     for ln in r.stdout.splitlines():
@@ -162,6 +170,8 @@ def main():
     ap.add_argument("--warm-only", action="store_true", help="warm stages+sidecars then STOP (no coord/gateway) so a measurement tool can run as the SOLE first coordinator on the head box")
     ap.add_argument("--batch", type=int, default=1, help="continuous batching: stages allocate [B,...] KV (M25_BATCH); warm the ring with --serve then drive coordinate_pipe_batch")
     ap.add_argument("--kv-maxlen", type=int, default=0, help="cap M25_KV_MAXLEN (batched KV is B*MAXLEN per layer; 40960 default OOMs the tail at B>=4)")
+    ap.add_argument("--max-ctx", type=int, default=131072, dest="max_ctx",
+                    help="operator context ceiling; the gateway gets min(this, every stage's KV cap)")
     ap.add_argument("--seed-shards", action="store_true",
                     help="torrent seeding lifecycle: every stage's sidecar also SEEDS its verified layer range "
                          "on the shard DHT (/root/m25_manifest.json=/root/m25, neighbours as bootstrap) so "
@@ -193,6 +203,13 @@ def main():
                           pip=(j.get("public_ipaddr") or "").strip(), pport=m[0]["HostPort"] if m else None,
                           lo=int(lo), hi=int(hi), forced_eager=forced_eager))
     n = len(nodes)
+    # H1: ONE negotiated context limit. Pin the stage KV cap explicitly (40960 = m25_stage.py's
+    # M25_KV_MAXLEN default) so the negotiated ctx is REAL config, not a guessed default; the
+    # gateway/coordinator then reject-or-clamp at min(operator ceiling, every stage's cap) instead
+    # of silently running 131072 over 40960 stages (KV overflow mid-job).
+    kv_eff = a.kv_maxlen or 40960
+    eff_max_ctx = negotiated_max_ctx(a.max_ctx, [kv_eff] * n)
+    print(f"[pipe] negotiated max_ctx {eff_max_ctx} (operator {a.max_ctx}, stage KV cap {kv_eff})", flush=True)
     print("[pipe] push code + PeerIds ...", flush=True)
     for nd in nodes:
         push_code(nd["host"], nd["port"])
@@ -230,7 +247,7 @@ def main():
 
     print("[pipe] stages tail-first ...", flush=True)
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, a.kv_maxlen, graph_off=nodes[k].get("graph_off", False))
+        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False))
     for k in range(n - 1, -1, -1):
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
@@ -250,7 +267,7 @@ def main():
         bt = f"M25_BATCH={a.batch} " if a.batch > 1 else ""   # gateway micro-batches up to the ring's KV rows
         gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
-              f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
+              f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
         sh(head["host"], head["port"], gw, 30); time.sleep(4)
         up = sh(head["host"], head["port"], "grep -c 'm25-gateway' /root/gateway.log 2>/dev/null || echo 0", 20)
         ok = (up.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0")
@@ -265,7 +282,7 @@ def main():
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
     cmd = (f"cd /root && {rc}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
-           f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
+           f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} --max-ctx {eff_max_ctx} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
     r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth or a.validate) else 1200)
     print(r.stdout, flush=True)
     if r.stderr.strip():
