@@ -310,14 +310,40 @@ def _act_digest(t):
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
 
 
-def _verify_receipts(receipts, layer_count, expected_nonce=None, check_chain=False):
+_ASSIGNMENTS = "unset"                                  # _load_assignments cache sentinel
+
+
+def _load_assignments():
+    """Cached loader for SHARD_ASSIGNMENTS — a path to the launcher's assignment map
+    ({pubkey_b64: [lo, hi]}, receipt-signing pubkeys, NOT sidecar identities). Set -> receipts_ok
+    is the PINNED verdict (verify_coverage rejects any signer outside the map — the H2 fail-closed
+    settlement rule); unset/unreadable -> None, today's unpinned verdict, announced ONCE so runs
+    are auditable."""
+    global _ASSIGNMENTS
+    if _ASSIGNMENTS == "unset":
+        path = os.environ.get("SHARD_ASSIGNMENTS")
+        if not path:
+            print("[receipts] UNPINNED (no SHARD_ASSIGNMENTS)", flush=True)
+            _ASSIGNMENTS = None
+        else:
+            try:
+                _ASSIGNMENTS = json.load(open(path))
+            except Exception as e:
+                print(f"[receipts] WARN: SHARD_ASSIGNMENTS unreadable ({e}) — UNPINNED verdict", flush=True)
+                _ASSIGNMENTS = None
+    return _ASSIGNMENTS
+
+
+def _verify_receipts(receipts, layer_count, expected_nonce=None, check_chain=False, assignments=None):
     """Coordinator-side PROVE: every per-stage receipt's signature must verify AND the blocks must
     tile [0:layer_count] with no gap/overlap — so no node is paid without proving its own block and
     the coordinator cannot fabricate one. layer_count is the model's TRUE depth (config), never
     derived from the receipts under test: a ring that omits layers must FAIL coverage, not shrink
     the target to whatever it did attest. `expected_nonce` binds the set to THIS job (rejects a
     replayed receipt); `check_chain` asserts adjacent out_root==in_root (bind to one real ring pass —
-    lossless wire only). Returns True/False (fails closed). Prints a per-stage line."""
+    lossless wire only). `assignments` ({pubkey_b64: [lo, hi]}, from SHARD_ASSIGNMENTS) PINS the set:
+    a validly-signed receipt from a signer that was never assigned layers must FAIL, not settle —
+    passing no map was the H2 fail-open. Returns True/False (fails closed). Prints a per-stage line."""
     bodies = [{k: v for k, v in rr.items() if k != "stage"} for rr in receipts]
     ok = True
     for rr, body in zip(receipts, bodies):
@@ -329,7 +355,10 @@ def _verify_receipts(receipts, layer_count, expected_nonce=None, check_chain=Fal
         except Exception as e:
             ok = False; print(f"  stage {rr.get('stage')}: sig FAILED ({e})", flush=True)
     try:
-        verify_coverage(bodies, layer_count, expected_nonce=expected_nonce, check_chain=check_chain)
+        verify_coverage(bodies, layer_count,
+                        expected_by_signer=({k: tuple(v) for k, v in assignments.items()}
+                                            if assignments else None),
+                        expected_nonce=expected_nonce, check_chain=check_chain)
     except Exception as e:
         ok = False; print(f"  coverage FAILED: {e}", flush=True)
     return ok
@@ -784,6 +813,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     # expected_nonce binds the set to THIS job (anti-replay); check_chain (lossless wire only, fp8 is
     # intentionally lossy so out_root!=in_root) binds them to one real ring pass.
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    assignments=_load_assignments(),
                                     check_chain=not M25_FP8_WIRE) if receipts
                    else (False if RECEIPTS else None))
     return {"ok": True, "text": tok.decode(out, skip_special_tokens=True), "n_tokens": len(out), "rounds": valid,
@@ -994,6 +1024,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     for ee in eos_set:
         if ee in out: out = out[:out.index(ee)]; break
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    assignments=_load_assignments(),
                                     check_chain=not M25_FP8_WIRE) if receipts
                    else (False if RECEIPTS else None))
     # mean_accept counts DRAFT tokens accepted per round, same as coordinate_pipe — NOT committed-1:
@@ -1218,6 +1249,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             _drain_aux_local(pipe_sock, lseq_tx - lseq_rx)  # mid-send on a full lane / the lane dirty (review F1)
         kw.stop()                                           # job over: never leak a noop thread onto the reused socket
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    assignments=_load_assignments(),
                                     check_chain=not M25_FP8_WIRE) if receipts   # fp8 wire is intentionally lossy
                    else (False if RECEIPTS else None))                          # fail closed, like solo
     dt = time.time() - t0
@@ -1459,6 +1491,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
             _drain_aux_local(pipe_sock, lseq_tx - lseq_rx)
         kw.stop()
     receipts_ok = (_verify_receipts(receipts, S.cfg.num_hidden_layers, expected_nonce=job_nonce,
+                                    assignments=_load_assignments(),
                                     check_chain=not M25_FP8_WIRE) if receipts
                    else (False if RECEIPTS else None))
     dt = time.time() - t0
