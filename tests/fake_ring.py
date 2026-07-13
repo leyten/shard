@@ -111,12 +111,13 @@ class FakeRing(threading.Thread):
     per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
 
     def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None,
-                 stall_decode=None, stall_prefill=None):
+                 stall_decode=None, stall_prefill=None, slice_prefill=False):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
         self.stall_decode = stall_decode            # (n, seconds): sleep before the first n decode replies —
         self.stall_prefill = stall_prefill          # (n, seconds): sleep before the first n PREFILL replies —
+        self.slice_prefill = slice_prefill          # model the P1 tail: prefill toks = FINAL position only
         self.stalled_pf = 0                         # the F6 heartbeat exempts prefill, so this must NOT trip it
         self.stalled = 0                            # a pipelining coordinator fills its depth window during the
         self.T = [int(t) for t in T]                # stall (deterministic backlog); a sync one cannot send at all
@@ -215,6 +216,8 @@ class FakeRing(threading.Thread):
                                      "prefill": bool(msg.get("prefill")),
                                      "token_ids": [int(t) for t in msg["token_ids"]], "pos": pos})
                     toks = [self._tok_at(p) for p in pos]
+                    if self.slice_prefill and msg.get("prefill"):
+                        toks = toks[-1:]            # P1 tail: only the final position's argmax rides back
                     o = {"toks": toks, "aux": self._aux(pos)} if self.eagle else toks
                     if self.stage_dt is not None:   # M25_STAGE_TIMING tail: timing rows promote a bare list to a dict
                         o = o if isinstance(o, dict) else {"toks": o}
@@ -455,7 +458,7 @@ def trap_T(n, seed=7, break_at=168, novel_len=30):
 
 def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefill_chunk=4096,
                     eagle_ring=False, timeout=30, on_commit=None, stage_dt=None, stall_decode=None,
-                    stall_prefill=None):
+                    stall_prefill=None, slice_prefill=False):
     """One coordinate_pipe job against a fresh FakeRing. S.M25_TREE (monkeypatched by the caller)
     routes to coordinate_pipe_tree inside coordinate_pipe, same as production. Returns (result, ring);
     ring.log is the wire-level ground truth."""
@@ -463,7 +466,7 @@ def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefil
     c_ret, r_ret = socket.socketpair()
     c_ret.settimeout(timeout)                       # mirror coord(): bound return-channel recv
     ring = FakeRing(r_pipe, r_ret, T, eagle=eagle_ring, stage_dt=stage_dt, stall_decode=stall_decode,
-                    stall_prefill=stall_prefill)
+                    stall_prefill=stall_prefill, slice_prefill=slice_prefill)
     ring.tail_slack = depth                         # end-of-job drain window exempt from the healing check
     ring.start()
     tok = FakeTok(T[:prompt_len])
