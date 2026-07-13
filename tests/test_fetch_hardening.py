@@ -7,6 +7,9 @@ these are the adversarial regressions from the external audit:
         publisher key was written world-readable (0644 under umask 022).
   M9  — python's default redirect handler forwards Authorization to the redirect target,
         so a mirror 302ing cross-origin exfiltrates the bearer (e.g. an HF_TOKEN).
+  L1  — a provider claiming success without leaving a readable file raised a raw
+        FileNotFoundError from _verify, which ChainProvider does not catch — one broken
+        peer blocked a valid later mirror instead of falling back.
 
 Run: python3 -m pytest tests/test_fetch_hardening.py -q
 """
@@ -151,3 +154,32 @@ def test_engine_http_uses_hardened_opener():
     assert any(isinstance(h, F._SafeRedirectHandler) for h in F._OPENER.handlers)
     import publish_manifest as pub
     assert pub._fetch is F
+
+
+# ---- L1: a provider that lies about success must not wedge the chain --------------------------------
+
+class _LyingProvider(F.Provider):
+    """Returns 'success' without writing any file — e.g. a hostile/buggy seeder."""
+
+    def fetch(self, shard, dest):
+        return                                             # no file, no exception
+
+
+def test_chain_falls_back_past_provider_with_no_file(tmp_path):
+    src = tmp_path / "src"
+    src.mkdir()
+    (src / "shard.bin").write_bytes(b"good-bytes")
+    sha, size = mf.sha256_file(str(src / "shard.bin"))
+    shard = {"path": "shard.bin", "sha256": sha, "size": size, "shard_id": mf.cidv1_raw(sha)}
+    chain = F.ChainProvider([_LyingProvider(), F.LocalDirProvider(str(src))])
+    dest = str(tmp_path / "shard.bin")
+    chain.fetch(shard, dest)                               # old code: FileNotFoundError escapes here
+    assert os.path.exists(dest)
+    got, _ = mf.sha256_file(dest)
+    assert got == sha                                      # the honest mirror served it
+
+
+def test_verify_missing_file_is_fetcherror(tmp_path):
+    shard = {"path": "x.bin", "sha256": "00" * 32, "size": 4, "shard_id": mf.cidv1_raw("00" * 32)}
+    with pytest.raises(FetchError, match="unreadable"):
+        F._verify(str(tmp_path / "nope.bin"), shard)
