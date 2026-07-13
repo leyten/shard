@@ -33,7 +33,35 @@ host needs no CUDA stack to judge them. torch imports are lazy for the same reas
 import hashlib
 import json
 import math
+import secrets
 import sys
+
+# The pre-commit fixed projection seed (v0). PREDICTABLE: a cheater who learns the 256 sampled
+# coordinates once can forge a passing sketch forever (preserve those coords + the norm, garbage
+# everywhere else). Kept ONLY as an explicit back-compat/diagnostics opt-in — never a payment check.
+LEGACY_SEED = "fixed-v0"
+_LEGACY_PROJ_SEED = 1234567
+
+
+def sketch_seed() -> str:
+    """A fresh UNPREDICTABLE per-challenge projection seed (verifier-side). Commit to it with
+    seed_commitment() BEFORE the prover sees the challenge, reveal it with the challenge: the
+    prover can't know which coordinates will be sampled, so it must produce the whole correct
+    tensor — preserving a fixed subset no longer passes."""
+    return secrets.token_hex(16)
+
+
+def seed_commitment(seed: str) -> str:
+    """Publishable commitment to a projection seed (sha256 hex). Posting this before the
+    challenge and revealing `seed` with it proves the sampled coordinates weren't chosen after
+    seeing the prover's answer."""
+    return hashlib.sha256(f"sketch-seed:{seed}".encode()).hexdigest()
+
+
+def _proj_seed(seed) -> int:
+    if seed == LEGACY_SEED:
+        return _LEGACY_PROJ_SEED
+    return int.from_bytes(hashlib.sha256(str(seed).encode()).digest()[:8], "big")
 
 
 def derive_challenge(seed: str, n_tokens: int, hidden_size: int,
@@ -62,29 +90,47 @@ def block_forward(parts, x, start: int = 0):
         return run_block(x, parts, cache, start)
 
 
-def sketch(h) -> dict:
+def sketch(h, seed: str = None, full: bool = False) -> dict:
     """A compact, transport-friendly fingerprint of a block output: shape, L2 norm, and a
     low-dim random projection (enough to compare via cosine without shipping the full tensor).
-    The projection seed is fixed so verifier and node project identically."""
+
+    COMMIT-FIRST projection: the sampled coordinates derive from `seed`. Default (seed=None)
+    draws a fresh unpredictable seed via sketch_seed() and records it in the sketch — the
+    challenged node must sketch with the seed the VERIFIER supplies, and compare_sketches
+    fails closed on a seed mismatch. seed=LEGACY_SEED restores the old fixed projection
+    (predictable → forgeable; back-compat/diagnostics only). full=True ships the entire
+    flattened activation for an occasional full-tensor audit — nothing to hide behind."""
     import torch
     hf = h.detach().to(torch.float32).flatten()
+    if full:
+        return {"n": int(hf.numel()), "norm": float(hf.norm()), "proj": hf.cpu().tolist(),
+                "full": True}
+    if seed is None:
+        seed = sketch_seed()
     g = torch.Generator(device=hf.device if hf.is_cuda else "cpu")
-    g.manual_seed(1234567)
+    g.manual_seed(_proj_seed(seed))
     dim = min(256, hf.numel())
     idx = torch.randint(0, hf.numel(), (dim,), generator=g, device=hf.device)
-    return {"n": int(hf.numel()), "norm": float(hf.norm()), "proj": hf[idx].cpu().tolist()}
+    out = {"n": int(hf.numel()), "norm": float(hf.norm()), "proj": hf[idx].cpu().tolist()}
+    if seed != LEGACY_SEED:
+        out["seed"] = seed                             # legacy sketches keep their v0 shape
+    return out
 
 
 def compare_sketches(a: dict, b: dict, cos_thresh: float = 0.99) -> dict:
     """Torch-free sketch comparison — the control-plane side of the spot-check. Same tolerance
-    semantics as compare(): cosine over the fixed-seed projections + relative L2 norm. Malformed
-    or shape-mismatched sketches FAIL CLOSED (a cheater must not be able to dodge the check by
-    sending a sketch the verifier can't line up with its own)."""
+    semantics as compare(): cosine over the seed-derived projections + relative L2 norm.
+    Malformed, shape-mismatched or seed-mismatched sketches FAIL CLOSED (a cheater must not be
+    able to dodge the check by sending a sketch the verifier can't line up with its own — or
+    one projected with a seed of its OWN choosing)."""
     try:
+        if a.get("seed") != b.get("seed"):
+            return {"cosine": 0.0, "rel_norm": 1.0, "passed": False,
+                    "error": "projection seed mismatch"}
         va, vb = list(map(float, a["proj"])), list(map(float, b["proj"]))
         na, nb = float(a["norm"]), float(b["norm"])
         n_a, n_b = int(a["n"]), int(b["n"])
-    except (KeyError, TypeError, ValueError):
+    except (KeyError, TypeError, ValueError, AttributeError):
         return {"cosine": 0.0, "rel_norm": 1.0, "passed": False, "error": "malformed sketch"}
     if not va or len(va) != len(vb) or n_a != n_b:
         return {"cosine": 0.0, "rel_norm": 1.0, "passed": False, "error": "sketch shape mismatch"}
