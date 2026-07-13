@@ -375,6 +375,52 @@ def test_stream_happy_path_single_done():
     assert "concise answer" in content and content.count("concise answer") == 1
 
 
+# ---- M4: liveness vs readiness ------------------------------------------------------------------------
+
+def test_health_is_liveness_with_queue_state():
+    h = _handler(path="/health")
+    h.do_GET()
+    r = _json_reply(h)
+    assert h.statuses == [200]
+    for key in ("queue", "inflight", "ring_connected", "max_ctx"):
+        assert key in r, f"/health must expose {key}"
+
+
+def test_ready_endpoint_exists_and_mock_is_ready():
+    h = _handler(path="/ready")
+    h.do_GET()
+    r = _json_reply(h)
+    assert h.statuses == [200]
+    assert r["ready"] is True
+
+
+def test_ready_503_when_ring_unreachable(monkeypatch):
+    monkeypatch.setattr(gw, "MOCK", False)
+    gw._LAST_OK["t"] = 0.0
+    gw._READY_CACHE.update(t=0.0, ok=None, why="")
+    def refuse(addr, timeout=None):
+        raise ConnectionRefusedError("no ring")
+    monkeypatch.setattr(gw.socket, "create_connection", refuse)
+    h = _handler(path="/ready")
+    h.do_GET()
+    r = _json_reply(h)
+    gw._READY_CACHE.update(t=0.0, ok=None, why="")
+    assert h.statuses == [503]
+    assert r["ready"] is False and r["reason"]
+
+
+def test_ready_uses_recent_job_instead_of_probe(monkeypatch):
+    monkeypatch.setattr(gw, "MOCK", False)
+    gw._LAST_OK["t"] = gw.time.monotonic()
+    def boom(addr, timeout=None):
+        raise AssertionError("must not probe when a job just succeeded")
+    monkeypatch.setattr(gw.socket, "create_connection", boom)
+    h = _handler(path="/ready")
+    h.do_GET()
+    gw._LAST_OK["t"] = 0.0
+    assert h.statuses == [200]
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:
