@@ -44,6 +44,10 @@ import (
 // activationProto is the stream protocol carrying inter-stage traffic (and the self-test).
 const activationProto = "/shard/activation/1.0.0"
 
+// maxFrame caps a tunneled frame's declared length, mirroring the engine's M25_MAX_FRAME:
+// a lying 8-byte prefix must not make the tunnel copy up to 16 EB.
+const maxFrame = 256 << 20
+
 // stringList is a repeatable string flag (used for -forward).
 type stringList []string
 
@@ -175,6 +179,7 @@ func main() {
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
 	var allowPeers stringList
 	flag.Var(&allowPeers, "allow", "PeerId allowed to open inbound activation streams (repeatable; none = allow all)")
+	frameTimeout := flag.Int("frame-timeout", 60, "tunnel: abort when a frame doesn't complete within this many seconds of its first byte (0 = legacy raw pipe)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
 	relaySvc := flag.Bool("relay", false, "run as a circuit-relay-v2 server (public rendezvous for NAT'd nodes)")
 	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
@@ -365,15 +370,16 @@ func main() {
 	// code and just talks to localhost; the sidecar carries each connection to/from the
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
 	if *inbound != "" || len(forwards) > 0 {
+		frameT := time.Duration(*frameTimeout) * time.Second
 		if *inbound != "" {
-			runInbound(h, *inbound, allow)
+			runInbound(h, *inbound, allow, frameT)
 		}
 		for _, f := range forwards {
 			pp := strings.SplitN(f, "=", 2)
 			if len(pp) != 2 {
 				log.Fatalf("bad -forward %q (want localAddr=peerMultiaddr)", f)
 			}
-			go runForward(h, pp[0], pp[1])
+			go runForward(h, pp[0], pp[1], frameT)
 		}
 		log.Printf("tunnel up (inbound=%q forwards=%v)", *inbound, []string(forwards))
 		select {}
@@ -490,9 +496,78 @@ func pipe(a, b io.ReadWriteCloser) {
 	b.Close()
 }
 
+// deadlineConn is what both tunnel legs satisfy: *net.TCPConn and libp2p's
+// network.Stream both carry read/write deadlines.
+type deadlineConn interface {
+	io.ReadWriteCloser
+	SetReadDeadline(time.Time) error
+	SetWriteDeadline(time.Time) error
+}
+
+// copyFramed copies engine frames (8-byte big-endian length prefix + body, exactly
+// send_msg's wire format in shard/transport.py) src->dst under an ABSOLUTE per-frame
+// deadline. Pre-frame idle is unlimited — a quiet ring stays up forever — but the
+// moment the first prefix byte arrives, the entire remainder of the frame (rest of the
+// prefix + whole body) must complete within T. A slow-loris peer trickling one byte per
+// idle-timeout used to hold the tunnel forever; now it dies at the deadline like a dead
+// edge. The deadline is deliberately NOT refreshed mid-body: absolute means absolute.
+// It covers the write leg too — a stalled DOWNSTREAM reader is the same hazard.
+func copyFramed(dst, src deadlineConn, T time.Duration) error {
+	var hdr [8]byte
+	for {
+		// (a) pre-frame idle: block indefinitely for the first prefix byte
+		if err := src.SetReadDeadline(time.Time{}); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(src, hdr[:1]); err != nil {
+			return err
+		}
+		// (b) first byte arrived: ONE absolute deadline for the whole frame, both legs
+		dl := time.Now().Add(T)
+		if err := src.SetReadDeadline(dl); err != nil {
+			return err
+		}
+		if err := dst.SetWriteDeadline(dl); err != nil {
+			return err
+		}
+		if _, err := io.ReadFull(src, hdr[1:8]); err != nil {
+			return err
+		}
+		n := binary.BigEndian.Uint64(hdr[:])
+		if n > maxFrame {
+			return fmt.Errorf("frame length %d exceeds max %d", n, maxFrame)
+		}
+		if _, err := dst.Write(hdr[:]); err != nil {
+			return err
+		}
+		if _, err := io.CopyN(dst, src, int64(n)); err != nil {
+			return err
+		}
+		// (e) frame complete: clear both deadlines before the next pre-frame idle
+		if err := src.SetReadDeadline(time.Time{}); err != nil {
+			return err
+		}
+		if err := dst.SetWriteDeadline(time.Time{}); err != nil {
+			return err
+		}
+	}
+}
+
+// pipeFramed is pipe() with the per-frame deadline: the first error in either
+// direction closes BOTH conns, so the engine sees a wedged peer as a died edge
+// (its existing EDGE_ERRORS recovery handles the rest).
+func pipeFramed(a, b deadlineConn, T time.Duration) {
+	errc := make(chan error, 2)
+	go func() { errc <- copyFramed(a, b, T) }()
+	go func() { errc <- copyFramed(b, a, T) }()
+	<-errc
+	a.Close()
+	b.Close()
+}
+
 // runForward listens on a local TCP addr; each accepted connection is carried to the
 // peer over a fresh libp2p stream — so the engine dials localhost and reaches the peer.
-func runForward(h host.Host, listenAddr, peerMaddr string) {
+func runForward(h host.Host, listenAddr, peerMaddr string, frameT time.Duration) {
 	// pre-establish the connection so DCUtR can upgrade relay->direct BEFORE data flows
 	// (otherwise the engine's first stream lands on the slow relay connection).
 	if ma, err := multiaddr.NewMultiaddr(peerMaddr); err == nil {
@@ -525,7 +600,11 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 				c.Close()
 				return
 			}
-			pipe(c, s)
+			if frameT > 0 {
+				pipeFramed(c, s, frameT)
+			} else {
+				pipe(c, s)
+			}
 		}()
 	}
 }
@@ -534,7 +613,7 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 // engine — so the engine accepts on localhost, fed by its ring neighbours. When an
 // allowlist is set, a stream from any other PeerId is reset BEFORE the engine is
 // dialed: an unassigned peer never gets a byte of reach into the engine.
-func runInbound(h host.Host, engineAddr string, allow map[peer.ID]bool) {
+func runInbound(h host.Host, engineAddr string, allow map[peer.ID]bool, frameT time.Duration) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
 		if len(allow) > 0 && !allow[s.Conn().RemotePeer()] {
 			log.Printf("DENY inbound stream from %s (not in -allow)", s.Conn().RemotePeer())
@@ -550,6 +629,10 @@ func runInbound(h host.Host, engineAddr string, allow map[peer.ID]bool) {
 		if tc, ok := c.(*net.TCPConn); ok { // disable Nagle: the relay-back is small ping-pong messages
 			tc.SetNoDelay(true)
 		}
-		pipe(s, c)
+		if frameT > 0 {
+			pipeFramed(s, c, frameT)
+		} else {
+			pipe(s, c)
+		}
 	})
 }
