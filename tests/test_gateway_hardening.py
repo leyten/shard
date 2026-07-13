@@ -231,6 +231,115 @@ def test_body_read_timeout_drops_connection():
     assert h.close_connection
 
 
+# ---- M2: OpenAI semantics ----------------------------------------------------------------------------
+
+def test_cap_output_strict_max_tokens():
+    ids, fin = gw._cap_output([1, 2, 3, 4, 5], 3, set())
+    assert ids == [1, 2, 3] and fin == "length"
+
+
+def test_cap_output_earliest_eos_wins():
+    ids, fin = gw._cap_output([1, 2, 9, 3, 9, 4], 10, {9})
+    assert ids == [1, 2] and fin == "stop"
+
+
+def test_cap_output_under_cap_untouched():
+    ids, fin = gw._cap_output([1, 2], 10, {9})
+    assert ids == [1, 2] and fin is None
+
+
+def test_max_tokens_one_returns_exactly_one():
+    h = _handler(body={"messages": [{"role": "user", "content": "hello"}], "max_tokens": 1})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [200]
+    assert r["usage"]["completion_tokens"] == 1
+    assert r["choices"][0]["finish_reason"] == "length"
+
+
+def test_nonzero_temperature_rejected_400():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "temperature": 0.7})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [400]
+    assert "temperature" in r["error"]["message"]
+
+
+def test_greedy_compatible_sampling_accepted():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}],
+                       "temperature": 0, "top_p": 1, "top_k": 1})
+    h.do_POST()
+    assert h.statuses == [200]
+
+
+def test_top_p_rejected_400():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "top_p": 0.9})
+    h.do_POST()
+    assert h.statuses == [400]
+
+
+_TOOLS = [{"type": "function", "function": {"name": "lookup", "parameters": {}}}]
+
+
+def test_tool_choice_named_unknown_tool_400():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "tools": _TOOLS,
+                       "tool_choice": {"type": "function", "function": {"name": "nope"}}})
+    h.do_POST()
+    assert h.statuses == [400]
+
+
+def test_tool_choice_named_filters_tools(monkeypatch):
+    tools2 = _TOOLS + [{"type": "function", "function": {"name": "other", "parameters": {}}}]
+    seen = {}
+    def fake_run(messages, tools, max_new, reasoning, on_commit=None, timeout=1800):
+        seen["tools"] = tools
+        return gw._mock_generate(messages, tools, max_new, on_commit, reasoning)
+    monkeypatch.setattr(gw, "run_request", fake_run)
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "tools": tools2,
+                       "tool_choice": {"type": "function", "function": {"name": "other"}}})
+    h.do_POST()
+    assert h.statuses == [200]
+    assert [t["function"]["name"] for t in seen["tools"]] == ["other"]
+
+
+def test_tool_choice_required_without_tools_400():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "tool_choice": "required"})
+    h.do_POST()
+    assert h.statuses == [400]
+
+
+def test_tool_choice_required_unfulfilled_is_error(monkeypatch):
+    """The engine returned prose where a tool call was required: never silently hand prose back."""
+    monkeypatch.setattr(gw, "run_request",
+                        lambda *a, **k: {"ok": True, "text": "just prose", "n_tokens": 2,
+                                         "prompt_tokens": 1, "output_ids": []})
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "tools": _TOOLS,
+                       "tool_choice": "required"})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [502]
+    assert "tool" in r["error"]["message"]
+
+
+def test_tool_choice_required_fulfilled_ok():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}], "tools": _TOOLS,
+                       "tool_choice": "required"})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [200]
+    assert r["choices"][0]["finish_reason"] == "tool_calls"
+    assert r["choices"][0]["message"]["tool_calls"]
+
+
+def test_stream_max_tokens_one_usage_is_one():
+    h = _handler(body={"messages": [{"role": "user", "content": "hello"}], "stream": True,
+                       "max_tokens": 1})
+    h.do_POST()
+    usage = [json.loads(f)["usage"] for f in _sse_frames(h.wfile)
+             if f != "[DONE]" and "usage" in json.loads(f)]
+    assert usage and usage[-1]["completion_tokens"] == 1
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:

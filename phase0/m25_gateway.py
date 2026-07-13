@@ -14,8 +14,9 @@ M25_BATCH so an un-batched ring never sees a batched op.
   SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_gateway.py --head H:P --tail H:P --port 29600
   M25_GATEWAY_MOCK=1 python m25_gateway.py --head x --tail x --port 29600   # local api/shape test, no GPU
 
-Beta notes: decoding is greedy (speculative verify); `temperature`/`top_p`/`top_k` are accepted
-but not yet applied (lossless sampling is a separate engine lever — the tail argmaxes today).
+Beta notes: decoding is greedy (speculative verify); non-greedy `temperature`/`top_p`/`top_k`
+values are REJECTED with a 400 (silently ignoring them misrepresents the sampling the caller asked
+for — lossless sampling is a separate engine lever; the tail argmaxes today).
 """
 import argparse, json, os, socket, sys, threading, time, itertools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -106,6 +107,39 @@ def spec_headroom(k_max: int, tree: bool = False, tree_m: int = 0) -> int:
     return (max(int(k_max), int(tree_m)) if tree else int(k_max)) + 16
 
 
+def _cap_output(ids, max_new, eos_set):
+    """OpenAI semantics, enforced gateway-side: stop at the EARLIEST eos (speculative commits can
+    land tokens PAST the eos before the coordinator trims — post-eos text must never leak) and treat
+    max_tokens as a STRICT cap (a K-token round can overshoot max_new by up to K). Returns
+    (capped_ids, finish) with finish "stop" (eos), "length" (cap hit) or None (untouched)."""
+    for i, t in enumerate(ids):
+        if t in eos_set:
+            ids = ids[:i]                              # eos itself is never content
+            return (ids[:max_new], "length") if len(ids) > max_new else (ids, "stop")
+    if len(ids) >= max_new:
+        return ids[:max_new], "length"
+    return ids, None
+
+
+def _enforce_cap(r, max_new):
+    """Apply _cap_output to a finished result dict IN PLACE (text/n_tokens/output_ids); returns the
+    finish override ("length"/"stop") or None. MOCK results carry no ids — cap in the same chars//4
+    currency the mock counts tokens in, so the strict-cap path is testable without a GPU."""
+    ids = r.get("output_ids")
+    if not MOCK and ids:
+        capped, fin = _cap_output(ids, max_new, EOS_SET)
+        if len(capped) != len(ids):
+            r["output_ids"] = capped
+            r["text"] = tok.decode(capped, skip_special_tokens=True)
+            r["n_tokens"] = len(capped)
+        return fin
+    if r.get("n_tokens", 0) > max_new:
+        r["text"] = (r.get("text") or "")[:max_new * 4]
+        r["n_tokens"] = max_new
+        return "length"
+    return None
+
+
 class JobRejected(Exception):
     """A stage refused the job with a structured per-job error (e.g. kv_overflow) — the job is dead
     but the ring is healthy. Deliberately NOT an OSError so neither coordinate_pipe's EDGE_ERRORS
@@ -137,6 +171,7 @@ class ClientGone(Exception):
 
 A = None
 tok = None
+EOS_SET = frozenset()          # real eos ids bound by _engine_init; MOCK carries text, not ids
 # speculative headroom defaults; _configure() derives the real values from the parsed args (K_MAX
 # spans every K content routing may pick — a routed job must never out-run the reserved margin).
 K_MAX = 8
@@ -164,7 +199,7 @@ def _configure(args):
 
 def _engine_init():
     """Import the M2.5 engine + tokenizer and resolve head/tail endpoints (real mode only)."""
-    global tok, coordinate_pipe, coordinate_pipe_batch, make_drafter, make_drafters_b, JobRejected
+    global tok, coordinate_pipe, coordinate_pipe_batch, make_drafter, make_drafters_b, JobRejected, EOS_SET
     import m25_stage as S
     from m25_pipe import (coordinate_pipe as cp, coordinate_pipe_batch as cpb,
                           make_drafter as md, make_drafters_b as mdb)
@@ -176,6 +211,8 @@ def _engine_init():
     except ImportError:
         pass
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
+    _eos = tok.eos_token_id
+    EOS_SET = set(_eos) if isinstance(_eos, (list, tuple)) else {_eos}   # same int-or-list handling as m25_pipe
 
 
 def _drop_socks():
@@ -469,10 +506,44 @@ class H(BaseHTTPRequestHandler):
             _release()
 
     def _do_completion(self, body, messages):
+        # decoding is greedy (speculative verify): a non-greedy sampling request must be REJECTED,
+        # not silently executed greedily — the caller asked for a distribution we don't produce.
+        for knob, allowed in (("temperature", {0.0}), ("top_p", {1.0}), ("top_k", {0.0, 1.0})):
+            v = body.get(knob)
+            if v is None:
+                continue
+            try:
+                greedy = float(v) in allowed
+            except (TypeError, ValueError):
+                greedy = False
+            if not greedy:
+                return self._json({"error": {
+                    "message": f"{knob}={v!r} is unsupported: decoding is greedy (speculative "
+                               f"verify); omit {knob} or pass a greedy value",
+                    "type": "invalid_request_error", "code": "unsupported_sampling"}}, 400)
         tools = body.get("tools") or None
-        if body.get("tool_choice") == "none":
+        tc = body.get("tool_choice")
+        require_tool = False                           # 'required'/named: prose-only output = error
+        if tc == "none":
             tools = None
-        max_new = int(body.get("max_tokens") or body.get("max_completion_tokens") or 512)
+        elif isinstance(tc, dict):                     # named function: offer ONLY that tool
+            name = (tc.get("function") or {}).get("name")
+            named = [t for t in (tools or []) if (t.get("function") or {}).get("name") == name]
+            if not named:
+                return self._json({"error": {"message": f"tool_choice names unknown tool {name!r}",
+                                             "type": "invalid_request_error"}}, 400)
+            tools = named
+            require_tool = True
+        elif tc == "required":
+            if not tools:
+                return self._json({"error": {"message": "tool_choice 'required' needs a non-empty "
+                                                        "tools list",
+                                             "type": "invalid_request_error"}}, 400)
+            require_tool = True
+        elif tc not in (None, "auto"):
+            return self._json({"error": {"message": f"unsupported tool_choice {tc!r}",
+                                         "type": "invalid_request_error"}}, 400)
+        max_new = max(1, int(body.get("max_tokens") or body.get("max_completion_tokens") or 512))
         stream = bool(body.get("stream"))
         if body.get("reasoning") is not None:                    # explicit bool override
             reasoning = bool(body.get("reasoning"))
@@ -500,9 +571,9 @@ class H(BaseHTTPRequestHandler):
             # no ring lock here: the dispatcher owns the ring; handlers enqueue and wait, so a burst
             # of concurrent requests rides ONE batched job instead of serializing.
             if stream:
-                self._stream(cid, created, messages, tools, max_new, reasoning)
+                self._stream(cid, created, messages, tools, max_new, reasoning, require_tool)
             else:
-                self._complete(cid, created, messages, tools, max_new, reasoning)
+                self._complete(cid, created, messages, tools, max_new, reasoning, require_tool)
         except (BrokenPipeError, ClientGone):
             pass                                          # client is gone — nothing to send, ring already released
         except JobRejected as e:
@@ -514,12 +585,19 @@ class H(BaseHTTPRequestHandler):
             try: self._json(err, 500)
             except Exception: pass
 
-    def _complete(self, cid, created, messages, tools, max_new, reasoning=True):
+    def _complete(self, cid, created, messages, tools, max_new, reasoning=True, require_tool=False):
         r = run_request(messages, tools, max_new, reasoning, on_commit=None)
+        fin_cap = _enforce_cap(r, max_new)
         parsed = parse_completion(r["text"])
+        if require_tool and not parsed["tool_calls"]:
+            return self._json({"error": {"message": "tool_choice required a tool call but the model "
+                                                    "produced none",
+                                         "type": "engine_error", "code": "tool_choice_unfulfilled"}}, 502)
         msg, finish = to_openai_message(parsed)
         if not (tools and parsed["tool_calls"]) and finish == "tool_calls":
             finish = "stop"
+        if fin_cap == "length":
+            finish = "length"
         self._json({
             "id": cid, "object": "chat.completion", "created": created, "model": MODEL_ID,
             "choices": [{"index": 0, "message": msg, "finish_reason": finish}],
@@ -530,7 +608,7 @@ class H(BaseHTTPRequestHandler):
                         "receipts_ok": r.get("receipts_ok"), "n_receipts": len(r.get("receipts") or [])},
         })
 
-    def _stream(self, cid, created, messages, tools, max_new, reasoning=True):
+    def _stream(self, cid, created, messages, tools, max_new, reasoning=True, require_tool=False):
         self.close_connection = True   # no chunked framing -> close at end so clients get clean EOF after [DONE]
         self.send_response(200); self.send_header("Content-Type", "text/event-stream")
         self.send_header("Cache-Control", "no-cache"); self.send_header("Connection", "close")
@@ -548,7 +626,11 @@ class H(BaseHTTPRequestHandler):
         chunk({"role": "assistant"})
         state = {"r": 0, "c": 0}
         def on_commit(out, _dt):
+            if not MOCK:                               # strict max_tokens + earliest-eos: never stream
+                out, _ = _cap_output(out, max_new, EOS_SET)   # tokens the final message won't carry
             text = _decode_running(out, self)
+            if MOCK:
+                text = text[:max_new * 4]              # mock counts tokens as chars//4
             reasoning_txt, content = _split_stream(text, reasoning)   # `reasoning` = the request's bool (closure)
             if len(reasoning_txt) > state["r"]:
                 chunk({"reasoning_content": reasoning_txt[state["r"]:]}); state["r"] = len(reasoning_txt)
@@ -556,7 +638,10 @@ class H(BaseHTTPRequestHandler):
                 chunk({"content": content[state["c"]:]}); state["c"] = len(content)
 
         r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
+        fin_cap = _enforce_cap(r, max_new)
         parsed = parse_completion(r["text"])
+        if require_tool and not parsed["tool_calls"]:
+            raise RuntimeError("tool_choice required a tool call but the model produced none")
         # flush any tail not yet streamed (final trimmed text), then tool calls
         _, fcontent = _split_stream(r["text"], reasoning)
         final_content = parsed["content"] or ""
@@ -566,6 +651,8 @@ class H(BaseHTTPRequestHandler):
         if tools and parsed["tool_calls"]:
             msg, _ = to_openai_message(parsed)
             chunk({"tool_calls": msg["tool_calls"]}); finish = "tool_calls"
+        if fin_cap == "length":
+            finish = "length"
         chunk({}, finish=finish)
         usage = {"prompt_tokens": r.get("prompt_tokens", 0), "completion_tokens": r["n_tokens"],
                  "total_tokens": r.get("prompt_tokens", 0) + r["n_tokens"]}
