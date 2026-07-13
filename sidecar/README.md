@@ -13,16 +13,18 @@ node — a node needs no Go toolchain to run it.
 
 ```sh
 cd sidecar
-GOTOOLCHAIN=local GOPROXY=https://goproxy.io,direct go build -o /tmp/sidecar .
+GOTOOLCHAIN=auto GOPROXY=https://goproxy.cn,https://goproxy.io,direct go build -o /tmp/sidecar .
 ```
 
 Two load-bearing build pins (in the spirit of `phase0/setup_box.sh`'s `kernels` pin):
 
-- **`go-libp2p v0.33.2`** — builds on Go 1.22 (our toolchain); newer releases want Go 1.23/1.25+.
-  It still ships DCUtR + circuit-relay-v2, so step 2 (NAT traversal) isn't blocked by the pin.
-- **`GOPROXY=goproxy.io`** — `proxy.golang.org` returns `403` on the `klauspost/compress` zip
+- **Go `1.25.7` + `go-libp2p v0.48.0`** — `go.mod` is the source of truth. A local Go ≥1.22
+  with `GOTOOLCHAIN=auto` fetches the pinned 1.25.7 toolchain by itself; it just needs a
+  proxy that serves toolchains (`goproxy.cn` does, `goproxy.io` does not — hence the order
+  above; a plain `apt`/tarball Go ≥1.25 also works with any proxy).
+- **`GOPROXY` fallback list** — `proxy.golang.org` returns `403` on some module zips
   (and Go only falls back to `direct` on `404`, not `403`), which stalls the whole resolve.
-  `goproxy.io` serves it fine.
+  The mirrors above serve them fine.
 
 ## Run as a tunnel (how the engine uses it)
 
@@ -35,8 +37,18 @@ each connection to/from the right ring neighbour:
 # next-hop connection to the downstream peer over libp2p
 sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/29600 \
         -inbound 127.0.0.1:29610 \
-        -forward 127.0.0.1:29611=/ip4/<peer_ip>/tcp/<peer_port>/p2p/<peer_id>
+        -forward 127.0.0.1:29611=/ip4/<peer_ip>/tcp/<peer_port>/p2p/<peer_id> \
+        -allow <predecessor_peer_id>
 ```
+
+Tunnel hardening flags:
+
+- `-allow PEERID` (repeatable) — only these (Noise-authenticated) PeerIds may open
+  inbound activation streams; anyone else is reset before the engine is dialed.
+  No `-allow` flags = open (legacy).
+- `-frame-timeout N` — absolute per-frame deadline in seconds (default 60): once a
+  frame's first prefix byte arrives, the whole frame must complete within N or the
+  tunnel closes (slow-loris guard). Pre-frame idle is unlimited. `0` = legacy raw pipe.
 
 The engine runs unchanged except one import: `import wire` → `import shard.transport as
 wire` (see `../shard/transport.py`). Proven: gpt-oss-120B across 4 scattered boxes over
