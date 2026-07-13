@@ -176,6 +176,52 @@ def test_oneshot_coord_gets_max_ctx(monkeypatch):
     assert "--max-ctx 40960" in d.coord_cmd()
 
 
+# ---------------------------------------------------------------- C2: allowlist + token + bind
+
+def test_sidecar_allowlist_is_neighbour_pinned(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"])
+    allows = [k.get("allow") for _, k in d.sidecar_calls]
+    pid = {h: "12D3KooW" + h.ljust(44, "x") for h in ("h1", "h2", "h3")}
+    assert allows[0] is None                              # head has no -inbound, no allowlist
+    assert allows[1] == [pid["h1"]]                       # middle: predecessor only
+    assert allows[2] == [pid["h2"], pid["h1"]]            # tail: predecessor + HEAD (return tunnel)
+
+
+def test_sidecar_cmd_renders_allow_flags():
+    cmd = msp.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "127.0.0.1:29610", [], allow=[VALID_PID])
+    assert f"-allow {VALID_PID}" in _bash_c_payload(cmd)
+    cmd = msp.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "127.0.0.1:29610", [])
+    assert "-allow" not in cmd                            # unset = open (legacy)
+
+
+def test_stage_cmd_token_and_loopback_bind():
+    cmd = msp.stage_cmd(1, 3, 20, 41, False, token="deadbeef")
+    assert "SHARD_SWARM_TOKEN=deadbeef " in cmd
+    assert "M25_ENGINE_BIND=127.0.0.1 " in cmd
+    assert "SHARD_SWARM_TOKEN" not in msp.stage_cmd(1, 3, 20, 41, False)   # unset = legacy
+
+
+def test_swarm_token_reaches_stages_and_gateway_unprinted(monkeypatch, capsys):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"])
+    toks = {k.get("token") for _, k in d.stage_calls}
+    assert len(toks) == 1
+    tok = toks.pop()
+    assert tok and len(tok) == 32                         # secrets.token_hex(16)
+    assert f"SHARD_SWARM_TOKEN={tok} " in d.gw_cmd()      # gateway gets the SAME epoch token
+    assert tok not in capsys.readouterr().out             # never printed in the banner
+
+
+def test_swarm_token_reaches_oneshot_coord(monkeypatch):
+    d = Drive(monkeypatch, ORDER3)
+    tok = d.stage_calls[0][1]["token"]
+    assert f"SHARD_SWARM_TOKEN={tok} " in d.coord_cmd()
+
+
+def test_warm_only_stays_tokenless(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--warm-only"])
+    assert all(k.get("token") is None for _, k in d.stage_calls)
+
+
 def test_sidecar_cmd_benign_values_unchanged():
     """for legit values the built command is the same shape as the old literal one-quote form."""
     fwd = f"127.0.0.1:29611=/ip4/5.6.7.8/tcp/29600/p2p/{VALID_PID}"
