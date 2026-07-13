@@ -163,7 +163,7 @@ def main():
     if os.path.exists(a.key):
         priv = mf.load_key(a.key)
     else:
-        os.makedirs(os.path.dirname(a.key) or ".", exist_ok=True)
+        os.makedirs(os.path.dirname(a.key) or ".", mode=0o700, exist_ok=True)
         priv = mf.gen_key()
         mf.save_key(priv, a.key)
         print(f"generated new publisher key -> {a.key}", file=sys.stderr)
