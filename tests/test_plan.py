@@ -188,3 +188,44 @@ def test_tail_reserve_shrinks_or_moves_the_tail():
     plan0 = plan_ring(nodes, rtt, model={"tail_reserve_mb": 0.0})
     tail0 = next(s for s in plan0["stages"] if s["tail"])
     assert tail0["layers"] >= tail["layers"]
+
+
+def test_tail_reserve_never_returns_an_unfittable_tail():
+    """The old refinement loop ran 4 blind rounds and then returned the LAST spec even when its
+    tail never fit: rotate the tail across three sacrificial nodes (each dies on its dock), and
+    round 4 lands the tail FRESH on a node whose block + reserve exceeds its real budget — the
+    26-on-20 shape: the returned tail held 6 MB of layers + a 20 MB lm_head reserve on a 20 MB
+    budget (guaranteed OOM at load). A plan must fit, or the answer is None."""
+    model = {"n_layers": 8, "layer_vram_mb": 1.0, "kv_mb_per_layer": 0.0, "layer_ms_base": 1.0,
+             "reserve_mb": 0.0, "head_reserve_mb": 0.0, "tail_reserve_mb": 20.0,
+             "cap_layers": 100, "head_layer_ms_mult": 1.0}
+    frees = {"h": 2.0, "p": 6.9, "q": 6.9, "s": 6.9, "r": 20.0}
+    ids = list(frees)
+    nodes = [{"id": k, "free_vram_mb": frees[k], "subnet": f"10.{i}.0.0/24"}
+             for i, k in enumerate(ids)]
+    # h/p/q/s are mutually close (10 ms); r is far (40 ms) so it is only chosen when forced.
+    rtt = [[0.0 if i == j else (40.0 if "r" in (ids[i], ids[j]) else 10.0)
+            for j in range(5)] for i in range(5)]
+    plan = plan_ring(nodes, rtt, model)
+    if plan is not None:                         # a returned plan MUST fit its tail's real budget
+        tail = next(s for s in plan["stages"] if s["tail"])
+        assert tail["layers"] * 1.0 + 20.0 <= frees[tail["id"]] + 1e-6, \
+            f"tail {tail['id']} needs {tail['layers'] + 20.0} MB on {frees[tail['id']]} MB"
+
+
+def test_tail_reserve_docked_once_reappearing_tail_still_plans():
+    """A node that reappears as tail must have the reserve modeled ONCE: the old loop docked it
+    again on every reappearance (the check demanded the reserve on top of the already-docked
+    budget) until the pool read as infeasible. This pool has an obvious valid plan — A holds 11
+    layers, B tails 4 layers + the 6 MB reserve exactly filling its 10 MB budget."""
+    model = {"n_layers": 15, "layer_vram_mb": 1.0, "kv_mb_per_layer": 0.0, "layer_ms_base": 1.0,
+             "reserve_mb": 0.0, "head_reserve_mb": 0.0, "tail_reserve_mb": 6.0,
+             "cap_layers": 100, "head_layer_ms_mult": 1.3}
+    nodes = [{"id": "A", "free_vram_mb": 20.0, "subnet": "10.0.0.0/24"},
+             {"id": "B", "free_vram_mb": 10.0, "subnet": "10.1.0.0/24"}]
+    rtt = [[0.0, 10.0], [10.0, 0.0]]
+    plan = plan_ring(nodes, rtt, model)
+    assert plan is not None, "feasible pool rejected: the tail reserve was double-counted"
+    _assert_tiles_simple(plan, 15)
+    tail = next(s for s in plan["stages"] if s["tail"])
+    assert tail["layers"] * 1.0 + 6.0 <= {"A": 20.0, "B": 10.0}[tail["id"]] + 1e-6

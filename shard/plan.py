@@ -170,10 +170,18 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     #    the same 13 layers warmed fine as a middle). The reserve applies to WHICHEVER
     #    node lands the tail, which select_ring decides — so plan, check the landed
     #    tail's block against the reserve, and if it doesn't fit, bake the reserve into
-    #    that node's budget and re-plan (the tail may move; loop a few refinements).
+    #    that node's budget EXACTLY ONCE and re-plan (the tail may move). Convergence is
+    #    checked against the ORIGINAL budget: the old loop compared against the already-
+    #    docked value — re-demanding the reserve on top of itself — so a node that
+    #    reappeared as tail was docked again each round (a feasible pool read as
+    #    infeasible), and after 4 blind rounds the LAST spec was returned even when its
+    #    tail never fit at all. The docked set is finite and only grows, so this
+    #    converges in <= n rounds or honestly reports None.
     tail_reserve = float(m.get("tail_reserve_mb", 0.0))
+    base_free = dict(free)                       # budgets to validate against (head reserve included)
+    docked = set()                               # nodes whose budget already models the tail reserve
     spec = None
-    for _ in range(4):
+    for _ in range(n + 1):
         spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
                            subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=lv,
                            kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
@@ -182,10 +190,23 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
             return None
         tail_i = spec["order"][-1]
         lo, hi = spec["blocks"][tail_i]
-        if tail_reserve == 0.0 or free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
-            break
-        free[tail_i] = max(free[tail_i] - tail_reserve, 0.0)
+        if tail_reserve == 0.0 or base_free[tail_i] >= (hi - lo) * per_layer[tail_i] + tail_reserve:
+            break                                # the landed tail fits block + reserve in its budget
+        if tail_i in docked:
+            return None                          # reserve already modeled and it STILL can't fit
+        docked.add(tail_i)
+        free[tail_i] = max(base_free[tail_i] - tail_reserve, 0.0)
+    else:
+        return None                              # no tail placement converged: the reserve fits nowhere
     assert spec["order"][0] == head, "select_ring must return a head-first (deployable) order"
+    # belt-and-braces: every stage's block must fit the node's ORIGINAL budget (the tail
+    # including its reserve) — a violation here is a planner bug, never a deployable answer
+    for i in spec["order"]:
+        lo, hi = spec["blocks"][i]
+        need = (hi - lo) * per_layer[i] + (tail_reserve if i == spec["order"][-1] else 0.0)
+        if need > base_free[i] + 1e-6:
+            raise RuntimeError(f"planned block [{lo}:{hi}) needs {need:.0f} MB on node {ids[i]!r} "
+                               f"whose budget is {base_free[i]:.0f} MB")
 
     boundary = set(spec.get("boundary", []))
     order = [ids[i] for i in spec["order"]]
