@@ -322,8 +322,19 @@ def _safe_rel(model_dir: str, rel: str) -> str:
 
 
 def _verify(path: str, shard: dict) -> None:
-    """Re-hash a file and fail closed on any mismatch (size, sha256, or CID)."""
-    sha, size = mf.sha256_file(path)
+    """Re-hash a file and fail closed on any mismatch (size, sha256, or CID).
+    A missing/unreadable file is a FETCH failure (FetchError), not a raw OSError:
+    ChainProvider catches only provider exceptions, so a provider that claims success
+    without leaving readable bytes must hand the shard to the next source, not
+    crash the whole pull."""
+    try:
+        sha, size = mf.sha256_file(path)
+    except OSError as e:
+        try:
+            os.remove(path)
+        except OSError:
+            pass
+        raise FetchError(f"{shard['path']}: unreadable after fetch ({e})") from e
     if size != shard["size"]:
         os.remove(path)
         raise FetchError(f"{shard['path']}: size {size} != manifest {shard['size']}")
