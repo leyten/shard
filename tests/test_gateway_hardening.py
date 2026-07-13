@@ -96,6 +96,89 @@ def _cfg(monkeypatch):
     yield
 
 
+# ---- H1: negotiated max_ctx (pure functions + rejection before dispatch) ----------------------------
+
+def test_negotiated_max_ctx_takes_stage_min():
+    assert gw.negotiated_max_ctx(131072, [40960, 40960]) == 40960
+
+
+def test_negotiated_max_ctx_operator_can_be_lower():
+    assert gw.negotiated_max_ctx(16384, [40960, 65536]) == 16384
+
+
+def test_negotiated_max_ctx_ignores_zero_caps():
+    assert gw.negotiated_max_ctx(131072, [0, 40960, 0]) == 40960
+    assert gw.negotiated_max_ctx(131072, []) == 131072
+
+
+def test_spec_headroom_values():
+    assert gw.spec_headroom(8) == 24
+    assert gw.spec_headroom(6, tree=True, tree_m=16) == 32
+
+
+def test_over_limit_prompt_rejected_before_dispatch(monkeypatch):
+    """MOCK estimates chars//4; a prompt past A.max_ctx - HEADROOM gets a 400 with
+    code=context_length_exceeded and never produces a completion."""
+    monkeypatch.setattr(gw.A, "max_ctx", 256)
+    called = []
+    monkeypatch.setattr(gw, "run_request", lambda *a, **k: called.append(1) or {})
+    h = _handler(body={"messages": [{"role": "user", "content": "x" * 4096}]})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [400]
+    assert r["error"]["code"] == "context_length_exceeded"
+    assert r["error"]["max_ctx"] == 256
+    assert called == [], "over-limit request must never reach the ring"
+
+
+def test_under_limit_max_new_clamped_to_headroom(monkeypatch):
+    """A fitting prompt passes, but max_tokens is silently clamped so prompt+new+headroom <= max_ctx."""
+    monkeypatch.setattr(gw.A, "max_ctx", 300)
+    seen = {}
+    def fake_run(messages, tools, max_new, reasoning, on_commit=None, timeout=1800):
+        seen["max_new"] = max_new
+        return gw._mock_generate(messages, tools, max_new, on_commit, reasoning)
+    monkeypatch.setattr(gw, "run_request", fake_run)
+    prompt = "x" * 400                                   # ~100 estimated tokens
+    h = _handler(body={"messages": [{"role": "user", "content": prompt}], "max_tokens": 10000})
+    h.do_POST()
+    assert h.statuses == [200]
+    assert seen["max_new"] == 300 - 100 - gw.HEADROOM
+
+
+def test_job_rejected_maps_to_400_and_never_retries(monkeypatch):
+    calls = []
+    def cp(*a, **k):
+        calls.append(1)
+        raise gw.JobRejected('{"code": "kv_overflow"}')
+    monkeypatch.setattr(gw, "MOCK", False)
+    monkeypatch.setattr(gw, "coordinate_pipe", cp)
+    monkeypatch.setattr(gw, "make_drafter", lambda n: object())
+    fake_sock = lambda: types.SimpleNamespace(close=lambda: None)  # noqa: E731
+    monkeypatch.setattr(gw, "_connect", lambda t: gw.SOCKS.update(pipe=fake_sock(), ret=fake_sock()))
+    with pytest.raises(gw.JobRejected):
+        gw.generate([{"role": "user", "content": "hi"}], None, 32, on_commit=None)
+    assert calls == [1], "a rejected job must never be retried"
+    assert not gw.SOCKS, "rejected job must drop the ring sockets"
+
+
+def test_do_post_maps_job_rejected_to_400(monkeypatch):
+    def boom(*a, **k):
+        raise gw.JobRejected("kv overflow at stage 2")
+    monkeypatch.setattr(gw, "run_request", boom)
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}]})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [400]
+    assert r["error"]["code"] == "job_rejected"
+
+
+def test_health_reports_negotiated_max_ctx():
+    h = _handler(path="/health")
+    h.do_GET()
+    assert _json_reply(h)["max_ctx"] == gw.A.max_ctx
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:
