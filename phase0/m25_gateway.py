@@ -53,6 +53,14 @@ REQ_TIMEOUT = float(os.environ.get("M25_GW_REQ_TIMEOUT", "30"))
 MAX_INFLIGHT = int(os.environ.get("M25_GW_MAX_INFLIGHT", str(max(GW_BATCH * 4, 16))))
 _INFLIGHT = {"n": 0}
 _INFLIGHT_LOCK = threading.Lock()
+# ---- liveness vs readiness (M4): /health = the PROCESS is up (always 200, carries queue/ring
+# state); /ready = this gateway can plausibly serve NOW (503 otherwise) — a recent successful job
+# is end-to-end proof, else a bounded TCP probe of head+tail (cached READY_TTL, never a ring pass).
+READY_PROBE_TIMEOUT = float(os.environ.get("M25_GW_READY_TIMEOUT", "2"))
+READY_TTL = float(os.environ.get("M25_GW_READY_TTL", "5"))
+READY_WINDOW = float(os.environ.get("M25_GW_READY_WINDOW", "300"))
+_LAST_OK = {"t": 0.0}                  # monotonic time of the last successful ring job
+_READY_CACHE = {"t": 0.0, "ok": None, "why": ""}
 # ---- content routing (per-stream-20 work): like-with-like batching + per-(content, B) K ----------
 # The de-lockstep receipts split per-stream speed by CONTENT regime, and the 2026-07-12 K-reference
 # pass (receipt perstream-trees-ab-20260712) pinned the K physics: at B<=2 the payload is amortized
@@ -160,6 +168,38 @@ def _admit():
 def _release():
     with _INFLIGHT_LOCK:
         _INFLIGHT["n"] -= 1
+
+
+def _gw_state():
+    """Observable queue/ring state for /health and /ready."""
+    with _INFLIGHT_LOCK:
+        inflight = _INFLIGHT["n"]
+    return {"queue": len(_QUEUE), "inflight": inflight, "max_inflight": MAX_INFLIGHT,
+            "ring_connected": "pipe" in SOCKS,
+            "last_ok_age_s": round(time.monotonic() - _LAST_OK["t"], 1) if _LAST_OK["t"] else None}
+
+
+def _ring_ready():
+    """Readiness verdict (ok, reason) — bounded and cached. A job that succeeded inside READY_WINDOW
+    is end-to-end proof; otherwise TCP-probe head+tail under READY_PROBE_TIMEOUT and cache the
+    verdict for READY_TTL so health-checkers can poll hot without hammering the ring endpoints."""
+    if MOCK:
+        return True, "mock engine"
+    now = time.monotonic()
+    if _LAST_OK["t"] and now - _LAST_OK["t"] < READY_WINDOW:
+        return True, f"last ring job ok {now - _LAST_OK['t']:.0f}s ago"
+    if _READY_CACHE["ok"] is not None and now - _READY_CACHE["t"] < READY_TTL:
+        return _READY_CACHE["ok"], _READY_CACHE["why"]
+    ok, why = True, "head+tail reachable"
+    try:
+        for ep in (A.head, A.tail):
+            hh, pp = ep.rsplit(":", 1)
+            s = socket.create_connection((hh, int(pp)), timeout=READY_PROBE_TIMEOUT)
+            s.close()
+    except OSError as e:
+        ok, why = False, f"{type(e).__name__}: {e}"
+    _READY_CACHE.update(t=now, ok=ok, why=why)
+    return ok, why
 
 
 class ClientGone(Exception):
@@ -395,6 +435,8 @@ def _dispatcher():
             for rq in batch:    # hangs every future request silently); report to the batch instead
                 rq.error = rq.error or e
         finally:
+            if any(rq.result and not rq.error for rq in batch):
+                _LAST_OK["t"] = time.monotonic()        # end-to-end proof for /ready
             for rq in batch:
                 rq.event.set()
 
@@ -467,9 +509,14 @@ class H(BaseHTTPRequestHandler):
         if self.path in ("/v1/models", "/models"):
             return self._json({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "shard"}]})
-        if self.path in ("/health", "/"):
+        if self.path in ("/health", "/"):                    # liveness: the process answers
             return self._json({"status": "ok", "model": MODEL_ID, "engine": "mock" if MOCK else "ring",
-                               "max_ctx": A.max_ctx if A else None})
+                               "max_ctx": A.max_ctx if A else None, **_gw_state()})
+        if self.path == "/ready":                            # readiness: this gateway can serve NOW
+            ok, why = _ring_ready()
+            return self._json({"ready": ok, "reason": why, "model": MODEL_ID,
+                               "max_ctx": A.max_ctx if A else None, **_gw_state()},
+                              200 if ok else 503)
         self._json({"error": {"message": "not found", "type": "invalid_request_error"}}, 404)
 
     def do_POST(self):
