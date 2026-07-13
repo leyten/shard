@@ -170,10 +170,16 @@ func waitRoutingTable(d *dht.IpfsDHT, deadline time.Duration) {
 }
 
 // manifestShards reads a manifest (shard/manifest.py schema) and maps shard_id (CID)
-// -> local path for every shard PRESENT in modelDir at the manifest's exact size.
-// Partial or missing files are simply not seeded; a size-mismatched file is never
-// served (the fetcher's re-hash would reject it anyway — don't waste its time).
-func manifestShards(manifestPath, modelDir string) (map[string]string, error) {
+// -> RELATIVE path (under the seeding root) for every shard PRESENT at the manifest's
+// exact size. The manifest is VERIFIED before anything is seeded: every shard_id must
+// be a decodable CID and every path must stay inside the model dir — a traversal entry
+// ("../..", absolute path) fails the whole manifest, because a manifest that names
+// files outside the model dir is hostile or corrupt wholesale. Partial or missing
+// files are simply not seeded; a size-mismatched file is never served (the fetcher's
+// re-hash would reject it anyway — don't waste its time). Stats go through the
+// pre-opened root, so an entry whose file is a symlink escaping the model dir
+// resolves to an error and is not held.
+func manifestShards(manifestPath string, root *os.Root) (map[string]string, error) {
 	raw, err := os.ReadFile(manifestPath)
 	if err != nil {
 		return nil, err
@@ -190,8 +196,14 @@ func manifestShards(manifestPath, modelDir string) (map[string]string, error) {
 	}
 	held := map[string]string{}
 	for _, s := range m.Shards {
-		p := filepath.Join(modelDir, s.Path)
-		if st, err := os.Stat(p); err == nil && st.Size() == s.Size {
+		if _, err := cid.Decode(s.ShardID); err != nil {
+			return nil, fmt.Errorf("manifest shard_id %q: %w", s.ShardID, err)
+		}
+		p := filepath.Clean(s.Path)
+		if !filepath.IsLocal(p) {
+			return nil, fmt.Errorf("manifest path %q escapes the model dir", s.Path)
+		}
+		if st, err := root.Stat(p); err == nil && st.Size() == s.Size {
 			held[s.ShardID] = p
 		}
 	}
@@ -201,14 +213,22 @@ func manifestShards(manifestPath, modelDir string) (map[string]string, error) {
 // runSeeder serves blockx requests for the held shards and keeps their provider
 // records alive on the DHT (records expire; re-provide well inside the window).
 func runSeeder(ctx context.Context, h host.Host, d *dht.IpfsDHT, manifestPath, modelDir string) error {
-	held, err := manifestShards(manifestPath, modelDir)
+	// The root confines every open to the model dir for the seeder's whole life:
+	// traversal and symlink escapes are rejected at OPEN time, so a file swapped for a
+	// hostile symlink AFTER the scan (TOCTOU) still can't leak bytes from outside.
+	// Deliberately never closed — it lives as long as the stream handler.
+	root, err := os.OpenRoot(modelDir)
+	if err != nil {
+		return err
+	}
+	held, err := manifestShards(manifestPath, root)
 	if err != nil {
 		return err
 	}
 	if len(held) == 0 {
 		return fmt.Errorf("no complete manifest shards found under %s", modelDir)
 	}
-	h.SetStreamHandler(blockxProto, func(s network.Stream) { serveBlock(s, held) })
+	h.SetStreamHandler(blockxProto, func(s network.Stream) { serveBlock(s, root, held) })
 	go func() {
 		for {
 			ok := 0
@@ -248,8 +268,10 @@ func runSeeder(ctx context.Context, h host.Host, d *dht.IpfsDHT, manifestPath, m
 
 // serveBlock answers one blockx request: a JSON header frame, then raw bytes from
 // the requested offset. Only CIDs from OUR manifest map are served — the requester
-// never names a path, so there is nothing to traverse.
-func serveBlock(s network.Stream, held map[string]string) {
+// never names a path — and the open goes through the pre-opened model-dir root, so
+// even a path that turned into an escaping symlink since the scan cannot leak bytes
+// from outside the model dir.
+func serveBlock(s network.Stream, root *os.Root, held map[string]string) {
 	defer s.Close()
 	fail := func(msg string) {
 		b, _ := json.Marshal(blockxResp{Err: msg})
@@ -269,7 +291,7 @@ func serveBlock(s network.Stream, held map[string]string) {
 		fail("not held")
 		return
 	}
-	f, err := os.Open(path)
+	f, err := root.Open(path)
 	if err != nil {
 		fail("open failed")
 		return
