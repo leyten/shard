@@ -187,26 +187,26 @@ class _KeepWarm:
             return n
 
     def _noop_once(self):
-        """Send one noop, called holding self.lock. Bounds the lock-hold to <=2s regardless of the
-        socket's production timeout, so a hung/full-buffer peer can't pin the lock (and a real send
-        queued behind it) for minutes. Re-reads self.sock ONCE into a local — attach() may swap it
+        """Send one noop, called holding self.lock. Bounds the lock-hold to <=~2s WITHOUT touching the
+        socket's timeout: the old settimeout(2.0)-then-restore dance mutated shared socket state from
+        a background thread, racing the job thread's own recv/settimeout on the same socket (a recv
+        entered inside the window ran with the noop's 2s deadline -> spurious mid-decode timeouts) and,
+        on a reused gateway socket, restoring a STALE timeout over the next job's. Instead wait <=2s
+        for send-buffer space via select and skip when the peer is backed up — a full buffer means the
+        leg isn't idle-cold anyway, and a tiny noop frame fits whatever space select just reported, so
+        sendall completes without blocking. Re-reads self.sock ONCE into a local — attach() may swap it
         concurrently, and a noop racing the just-detached old socket is harmless. Swallows all errors:
         a dead socket is the serve loop's problem, never the noop thread's to crash on."""
         sock = self.sock
         if sock is None:
             return
         try:
-            old = sock.gettimeout()
-        except OSError:
-            return
-        try:
-            sock.settimeout(2.0 if old is None else min(old, 2.0))
+            if not select.select([], [sock], [], 2.0)[1]:
+                return                        # no buffer space: peer backed up -> skip this tick
             send_msg(sock, {"op": "noop"})
         except Exception:
             pass
         finally:
-            try: sock.settimeout(old)         # restore the production timeout for the next real send
-            except OSError: pass
             self._last = time.monotonic()      # reset cadence even on failure — retry at interval, not spin
 
     def _run(self):
@@ -233,10 +233,19 @@ class _KeepWarm:
                     t.start()
 
     def stop(self):
+        """Kill the noop thread AND WAIT for it (M1). stop() is the job's finally — without the join a
+        runner mid-noop outlived the job on the REUSED gateway socket, and its sendall interleaved with
+        the NEXT job's frames (two _KeepWarm instances = two locks on one socket = corrupted stream).
+        The join is bounded: a noop send holds the lock <=~2s (select-bounded, see _noop_once) and the
+        runner re-checks _stop every iv/3 — so after stop() returns there is ONE lifetime sender per
+        socket, ever. No lock is held across the join (_life is only taken by the runner's exit path)."""
         self._stop = True                                   # lockless: teardown must not wait on a stuck send
+        t = self._runner
+        if t is not None and t is not threading.current_thread():
+            t.join(timeout=5.0)
 
     def close(self):
-        self._stop = True
+        self.stop()
         s, self.sock = self.sock, None
         if s is not None:
             try: s.close()
