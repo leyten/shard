@@ -9,7 +9,7 @@ dials the head engine locally; the tail's hidden relays back up the ring to it.
   python m25_scatter.py --order CA:42512149:0:10 WA:42512151:10:23 MA:...:23:36 ... --max-new 64 \
       --prompt-file /root/copy_prompt.txt
 """
-import sys, json, time, subprocess, argparse
+import re, sys, json, time, shlex, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
@@ -44,22 +44,40 @@ def sh(host, port, cmd, timeout=120):
                           capture_output=True, text=True, timeout=timeout)
 
 
+# A PeerId is REMOTE stdout interpolated into root shell commands on other boxes — validate
+# strict base58btc before it can touch a command string (shlex-quoted again at point of use).
+PEERID_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{40,64}$")
+
+
+def check_peerid(pid):
+    if not PEERID_RE.fullmatch(pid or ""):
+        raise ValueError(f"invalid PeerId from node (not base58btc): {pid!r}")
+    return pid
+
+
 def peerid(host, port):
     r = sh(host, port, "/tmp/sidecar -key /root/node.key -prove ping 2>/dev/null | grep PEERID")
     for ln in r.stdout.splitlines():
         if ln.startswith("PEERID "):
-            return ln.split()[1]
+            return check_peerid(ln.split()[1])
     raise RuntimeError(f"no PeerId from {host}:{port}: {r.stdout[-200:]} {r.stderr[-200:]}")
 
 
-def launch_sidecar(host, port, announce, inbound, forward):
-    inb = f"-inbound {inbound}" if inbound else ""
-    fw = f"-forward {forward}" if forward else ""
+def sidecar_cmd(announce, inbound, forward):
+    """Pure builder (unit-testable): remote-influenced values (multiaddrs carry PeerIds from remote
+    stdout) are shlex-quoted, and the inner command is quoted ONCE for the bash -c level."""
+    inb = f"-inbound {shlex.quote(inbound)}" if inbound else ""
+    fw = f"-forward {shlex.quote(forward)}" if forward else ""
+    inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
+             f"-announce {shlex.quote(announce)} {inb} {fw} > /root/sidecar.log 2>&1")
     # free ALL sidecar ports (29600 listen + 29611/29612 forward listeners) — stale sidecars from a
     # prior run holding 29611 make the new forward listener fail to bind, silently breaking the ring.
-    cmd = (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD}/tcp 29612/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
-           f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-           f"-announce {announce} {inb} {fw} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
+    return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD}/tcp 29612/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
+            f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
+
+
+def launch_sidecar(host, port, announce, inbound, forward):
+    cmd = sidecar_cmd(announce, inbound, forward)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):

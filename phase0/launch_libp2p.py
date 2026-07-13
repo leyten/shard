@@ -17,7 +17,7 @@ coordinator-return by content (hello_return), both arriving on the tail engine's
       --prompt-file /root/ft_prompt.txt --K 4 --depth 2 --max-new 64
 
 Teardown is manual (vastai destroy)."""
-import argparse, time
+import argparse, re, shlex, time
 
 from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK
 
@@ -26,19 +26,46 @@ ENG_IN = 29610          # engine listen / sidecar inbound target
 FWD_RING = 29611        # engine --next -> sidecar forward to successor
 FWD_RET = 29612         # coordinator ret -> head sidecar forward to tail
 
+# A PeerId is REMOTE stdout interpolated into root shell commands on other boxes — validate
+# strict base58btc before it can touch a command string (shlex-quoted again at point of use).
+PEERID_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{40,64}$")
+
+
+def check_peerid(pid):
+    if not PEERID_RE.fullmatch(pid or ""):
+        raise ValueError(f"invalid PeerId from node (not base58btc): {pid!r}")
+    return pid
+
 
 def peerid(inst):
     """create-or-load the node key and print its PeerId (the sidecar embeds the pubkey in the id)."""
     r = rssh(inst, "/tmp/sidecar -key /root/node.key -prove ping 2>/dev/null | grep PEERID", 60)
     for line in r.stdout.splitlines():
         if line.startswith("PEERID "):
-            return line.split()[1]
+            return check_peerid(line.split()[1])
     raise RuntimeError(f"no PeerId from {inst['id']}: {r.stdout[-200:]} {r.stderr[-200:]}")
 
 
 def maddr(inst, pid):
     ip, port = ep(inst)
     return f"/ip4/{ip}/tcp/{port}/p2p/{pid}"
+
+
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
+    """Pure builder (unit-testable): remote-influenced values (multiaddrs carry PeerIds from remote
+    stdout) are shlex-quoted, and the inner command is quoted ONCE for the bash -c level.
+    Detach + pkill notes: proper detach (setsid bash -c '...' </dev/null >/dev/null 2>&1 &) — a bare
+    setsid keeps the ssh channel's fds and the daemon dies when ssh closes. Do NOT `pkill -f
+    /tmp/sidecar` here — this command STRING contains "/tmp/sidecar", so pkill -f self-matches and
+    kills the launching shell (the documented specpipe footgun). Free the libp2p port instead."""
+    fw = " ".join(f"-forward {shlex.quote(f)}" for f in forwards)
+    inb = f"-inbound {shlex.quote(inbound)}" if inbound else ""
+    sd = f"-seed {shlex.quote(seed)}" if seed else ""
+    bs = " ".join(f"-dht-bootstrap {shlex.quote(b)}" for b in (dht_bootstrap or []))
+    inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1")
+    return (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
+            f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
 def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=None):
@@ -48,18 +75,7 @@ def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=N
     dht_bootstrap: peer multiaddrs to join the DHT through (ring neighbours work fine).
     RETRIES: vast SSH is flaky (rc=255 'try again after a few seconds'), and a missed sidecar launch =
     the engine's forward connect gets refused. So launch + verify ('listening' in sidecar.log) up to 4×."""
-    fw = " ".join(f"-forward {f}" for f in forwards)
-    inb = f"-inbound {inbound}" if inbound else ""
-    sd = f"-seed {seed}" if seed else ""
-    bs = " ".join(f"-dht-bootstrap {b}" for b in (dht_bootstrap or []))
-    # proper detach (setsid bash -c '...' </dev/null >/dev/null 2>&1 &) — a bare setsid keeps the ssh
-    # channel's fds and the daemon dies when ssh closes (the round-trip self-test only stayed up this way).
-    # NB: do NOT `pkill -f /tmp/sidecar` here — this command STRING contains "/tmp/sidecar", so pkill -f
-    # self-matches and kills the launching shell before the daemon starts (the documented specpipe footgun).
-    # Free the libp2p port instead (kills any old sidecar bound there; never matches the launch shell).
-    cmd = (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
-           f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-           f"-announce {announce} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap)
     for attempt in range(6):
         fire(inst, cmd)
         for _ in range(4):                              # tolerant verify: vast ssh rc=255 can flake the CHECK too
