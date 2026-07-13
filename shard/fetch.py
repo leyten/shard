@@ -272,10 +272,18 @@ def _safe_rel(model_dir: str, rel: str) -> str:
     names to disk must fail closed on a traversal, not trust it. Returns the safe dest."""
     if os.path.isabs(rel) or os.path.splitdrive(rel)[0]:
         raise FetchError(f"unsafe shard path (absolute): {rel!r}")
-    dest = os.path.normpath(os.path.join(model_dir, rel))
-    root = os.path.normpath(model_dir)
+    root = os.path.realpath(model_dir)
+    dest = os.path.normpath(os.path.join(root, rel))
     if dest != root and not dest.startswith(root + os.sep):
         raise FetchError(f"unsafe shard path (escapes model_dir): {rel!r}")
+    # Lexical containment is NOT enough: a pre-existing symlink — a directory component
+    # or the destination file itself — redirects the write outside the model root even
+    # though the string checks pass. Resolve what exists and require it stays inside.
+    if os.path.islink(dest):
+        raise FetchError(f"unsafe shard path (destination is a symlink): {rel!r}")
+    real = os.path.realpath(dest)
+    if real != root and not real.startswith(root + os.sep):
+        raise FetchError(f"unsafe shard path (symlink escapes model_dir): {rel!r}")
     return dest
 
 
