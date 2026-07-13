@@ -769,7 +769,12 @@ class GraphRunner:
         a capture failure mid-serve marks the bucket permanently eager and falls back to run_block — a
         stage must never die from graph capture."""
         global _GRAPH_SKIPPED
-        alen = self._bucket(start_pos + self.s)
+        total = start_pos + self.s
+        if total > M25_KV_MAXLEN:                    # host-side bound (Row/BatchGraphRunner have it): a replay's
+            # captured index_copy_ reads st.cp, which set() would fill with positions >= MAXLEN — an OOB
+            # device assert that kills the stage. Raise the same clean, recoverable error as the eager path.
+            raise RuntimeError(f"context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN} (raise --kv-maxlen or shorten the prompt)")
+        alen = self._bucket(total)
         if alen not in self.graphs:
             if alen in self.eager:
                 _GRAPH_SKIPPED += 1
