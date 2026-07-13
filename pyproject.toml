@@ -22,3 +22,14 @@ build-backend = "setuptools.build_meta"
 
 [tool.setuptools.packages.find]
 include = ["shard*"]
+
+[tool.pytest.ini_options]
+# a plain root `pytest` must NEVER discover research/ or scratchpad/ scripts --
+# several execute real work (model loads, subprocesses, network) at import time.
+testpaths = ["tests"]
+markers = [
+    "hardware: needs specific hardware attached (any accelerator or device)",
+    "integration: spawns real processes / crosses process boundaries (no GPU)",
+    "gpu: needs a CUDA GPU",
+    "mlx: needs Apple silicon + mlx installed",
+]
