@@ -36,6 +36,8 @@ import base64
 import copy
 import hashlib
 import json
+import os
+import stat
 
 from cryptography.exceptions import InvalidSignature
 from cryptography.hazmat.primitives.asymmetric import ed25519
@@ -116,12 +118,20 @@ def gen_key() -> ed25519.Ed25519PrivateKey:
 
 def save_key(priv: ed25519.Ed25519PrivateKey, path: str) -> None:
     """Persist the raw 32-byte private key (base64). Keep this file secret — anyone
-    holding it can publish manifests that nodes will trust for the pinned pubkey."""
-    with open(path, "w") as f:
+    holding it can publish manifests that nodes will trust for the pinned pubkey.
+    Created EXCLUSIVELY at 0600: a plain open('w') under umask 022 lands 0644, exposing
+    the trust root to every local user, and silently clobbers an existing key."""
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, "w") as f:
         f.write(base64.b64encode(priv.private_bytes_raw()).decode())
 
 
 def load_key(path: str) -> ed25519.Ed25519PrivateKey:
+    st = os.stat(path)
+    if stat.S_ISREG(st.st_mode) and st.st_mode & 0o077:
+        raise ManifestError(
+            f"publisher key {path} is group/world accessible (mode {stat.S_IMODE(st.st_mode):o}) "
+            "— chmod 600 it; anyone reading it can sign manifests nodes trust")
     with open(path) as f:
         return ed25519.Ed25519PrivateKey.from_private_bytes(base64.b64decode(f.read().strip()))
 
