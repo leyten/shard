@@ -9,7 +9,7 @@ via the 29612 return tunnel.
   python m25_scatter_pipe.py --order CA:42545183:0:10 WA:..:10:23 MN:..:23:36 NJ:..:36:49 NC:..:49:62 \
       --K 6 --depth 4 --max-new 256 --prompt-file /root/copy_prompt.txt
 """
-import os, re, sys, json, time, shlex, secrets, subprocess, argparse
+import os, re, sys, json, time, shlex, secrets, tempfile, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
@@ -75,6 +75,44 @@ def check_peerid(pid):
     if not PEERID_RE.fullmatch(pid or ""):
         raise ValueError(f"invalid PeerId from node (not base58btc): {pid!r}")
     return pid
+
+
+# a receipt pubkey is REMOTE stdout headed for a JSON config — keep it strictly base64-shaped
+PUBKEY_RE = re.compile(r"^[A-Za-z0-9+/]+={0,2}$")
+
+
+def collect_assignments(nodes):
+    """H2 fail-closed settlement: {receipt_pubkey_b64: [lo, hi]} straight from each box's SIGNING
+    key (/root/.shard_node_key — NOT the sidecar's libp2p /root/node.key). The coordinator pins
+    receipt verification to this map via SHARD_ASSIGNMENTS, so an interloper's validly-signed
+    receipt for someone else's layers can never settle."""
+    m = {}
+    for nd in nodes:
+        r = sh(nd["host"], nd["port"],
+               "/root/venv/bin/python -c \"from receipt import load_or_make_node_key, pub_b64; "
+               "print(pub_b64(load_or_make_node_key('/root/.shard_node_key')))\"", 60)
+        pub = (r.stdout.strip().splitlines() or [""])[-1].strip()
+        if not PUBKEY_RE.fullmatch(pub):
+            raise RuntimeError(f"bad receipt pubkey from {nd['region']}: {pub!r} {r.stderr[-200:]}")
+        if pub in m:
+            raise RuntimeError(f"duplicate receipt pubkey across nodes ({nd['region']}) — two boxes share a signing key")
+        m[pub] = [nd["lo"], nd["hi"]]
+    return m
+
+
+def push_assignments(head, assigns):
+    """write the assignment map to the HEAD box as /root/assignments.json (the coordinator/gateway
+    runs there and reads it via SHARD_ASSIGNMENTS)."""
+    with tempfile.NamedTemporaryFile("w", suffix=".json", delete=False) as f:
+        json.dump(assigns, f)
+        path = f.name
+    try:
+        r = subprocess.run(["scp", *SSHO, "-P", str(head["port"]), path, f"root@{head['host']}:/root/assignments.json"],
+                           capture_output=True, text=True)
+        if r.returncode != 0:
+            raise RuntimeError(f"assignments push failed: {r.stderr.strip()[-200:]}")
+    finally:
+        os.unlink(path)
 
 
 def negotiated_max_ctx(operator_max_ctx, stage_kv_caps):
@@ -263,6 +301,10 @@ def main():
         print(f"  {nd['region']} {nd['gpu']} {nd['pip']}:{nd['pport']} [{nd['lo']},{nd['hi']}) "
               f"{'eager' if nd['graph_off'] else 'graph'} {nd['pid'][:14]}..", flush=True)
 
+    if a.receipts:                                    # H2: pin settlement to the assigned signer set
+        print("[pipe] collecting receipt pubkeys -> head:/root/assignments.json ...", flush=True)
+        push_assignments(nodes[0], collect_assignments(nodes))
+
     print("[pipe] sidecars (direct-return: head forwards ring+ret) ...", flush=True)
     for k, nd in enumerate(nodes):
         announce = f"/ip4/{nd['pip']}/tcp/{nd['pport']}"
@@ -309,7 +351,7 @@ def main():
         return
     if a.serve:                                   # DEPLOY: start the OpenAI /v1 gateway on the head over the warm ring
         GW = 18000
-        rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
+        rc = "SHARD_RECEIPTS=1 SHARD_ASSIGNMENTS=/root/assignments.json " if a.receipts else ""
         bt = f"M25_BATCH={a.batch} " if a.batch > 1 else ""   # gateway micro-batches up to the ring's KV rows
         tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
         gnonce = secrets.token_hex(8)
@@ -331,7 +373,7 @@ def main():
         return
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
     sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
-    rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
+    rc = "SHARD_RECEIPTS=1 SHARD_ASSIGNMENTS=/root/assignments.json " if a.receipts else ""
     tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
     # M4: pipefail — without it the pipeline's rc is the trailing grep's, and a crashed coordinator
