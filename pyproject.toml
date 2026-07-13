@@ -7,14 +7,20 @@ dependencies = [
     # wire security (phase 0): authenticated encryption for the inter-stage transport
     # (phase0/wire.py). required to import any node -- the wire won't load without it.
     "cryptography>=42",
+    # shard/transport.py imports both at module level (activation codec + framing) --
+    # a clean-env install of the advertised `shard*` modules must be importable. box
+    # setups may pre-install a specific CUDA torch build; pip keeps a satisfying one.
+    "numpy>=1.26",
+    "torch>=2.1",
     # per-node serving engine (we wrap it, don't rebuild it)
     # "sglang",
     # transport (phase 0-1): quic in python, lift hot path to rust later
     # "aioquic",
-    # tensors / activation codec -- torch + transformers (+ numpy) are needed to run
-    # phase0/, installed by the box setup (a specific CUDA build), not resolved here.
-    # "torch",
 ]
+
+[project.optional-dependencies]
+# Apple-silicon backend: shard/mlx_runtime.py imports these lazily (Mac-only)
+mlx = ["mlx>=0.21", "mlx-lm>=0.20"]
 
 [build-system]
 requires = ["setuptools>=68"]
