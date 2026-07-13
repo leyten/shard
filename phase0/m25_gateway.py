@@ -486,12 +486,97 @@ def _split_stream(text, reasoning_on=True):
     return text.split(THINK_BEGIN)[-1], ""
 
 
-def _decode_running(out, handler):
-    """on_commit payload -> decoded text. MOCK carries text in the payload; real mode carries token
-    ids that the tokenizer decodes (skip_special_tokens keeps the tool-call/think markers)."""
-    if MOCK:
-        return out[0][1]
-    return tok.decode(out, skip_special_tokens=True)
+class _IncrDetok:
+    """Incremental detokenizer (vLLM-style prefix/read offsets). on_commit fires every ring round
+    with the FULL running output ids; `tok.decode(out)` each round is O(n) per commit -> O(n^2) per
+    generation on the coordinator CPU. Decode only a bounded recent window instead: text settled at
+    a previous step is never re-decoded, and a window that ends in U+FFFD (a byte-level BPE token
+    split mid-UTF-8 char) is held until the rest of the bytes land."""
+    __slots__ = ("tok", "po", "ro", "text")
+
+    def __init__(self, tokenizer=None):
+        self.tok = tokenizer if tokenizer is not None else tok
+        self.po = 0            # prefix offset: start of the re-decoded window (a settled boundary)
+        self.ro = 0            # read offset: ids already reflected in .text
+        self.text = ""
+
+    def feed(self, ids):
+        """Advance on the running ids list (monotonic prefix growth); returns the stable text."""
+        if len(ids) <= self.ro:
+            return self.text
+        new = self.tok.decode(ids[self.po:], skip_special_tokens=True)
+        if not new or new.endswith("�"):
+            return self.text                            # mid-char: wait for the remaining bytes
+        prev = self.tok.decode(ids[self.po:self.ro], skip_special_tokens=True) if self.ro > self.po else ""
+        if len(new) <= len(prev):
+            return self.text
+        self.text += new[len(prev):]
+        self.po = self.ro
+        self.ro = len(ids)
+        return self.text
+
+
+class _SSESplitter:
+    """Incremental (reasoning, content) split — the streaming counterpart of _split_stream that
+    scans only the NEW text of each commit instead of re-splitting the whole running generation
+    (O(n^2) across a stream). Holds back len(marker)-1 chars so a marker straddling two commits is
+    never half-emitted; end() flushes the held tail at end-of-stream. Semantics mirror
+    _split_stream, except a reasoning-off </think> echo drops only the (held) prefix best-effort —
+    already-streamed chars cannot be retracted."""
+    _HOLD = max(len(THINK_BEGIN), len(THINK_END), len(TOOLCALL_BEGIN)) - 1
+
+    def __init__(self, reasoning_on):
+        self.reasoning_on = reasoning_on
+        self.phase = 0 if reasoning_on else 1          # 0=reasoning, 1=content, 2=tool call (swallow)
+        self.buf = ""
+
+    def _take(self, upto):
+        s, self.buf = self.buf[:upto], self.buf[upto:]
+        return s
+
+    def feed(self, delta):
+        self.buf += delta
+        r = c = ""
+        while True:
+            if self.phase == 0:
+                i = self.buf.find(THINK_END)
+                if i >= 0:
+                    r += self._take(i).replace(THINK_BEGIN, "")
+                    self.buf = self.buf[len(THINK_END):]
+                    self.phase = 1
+                    continue
+                safe = len(self.buf) - self._HOLD
+                if safe > 0:
+                    r += self._take(safe).replace(THINK_BEGIN, "")
+                return r, c
+            if self.phase == 1:
+                i = self.buf.find(TOOLCALL_BEGIN)
+                if i >= 0:
+                    c += self._take(i)
+                    self.buf = ""
+                    self.phase = 2
+                    return r, c
+                if not self.reasoning_on:
+                    j = self.buf.find(THINK_END)       # defensive echo-drop (see _split_stream)
+                    if j >= 0:
+                        self._take(j)                  # drop the echoed prefix, not emit it
+                        self.buf = self.buf[len(THINK_END):]
+                        continue
+                safe = len(self.buf) - self._HOLD
+                if safe > 0:
+                    c += self._take(safe)
+                return r, c
+            return r, c                                # phase 2: the tool-call block never streams
+
+    def end(self):
+        """End-of-stream: flush whatever the hold-back kept (no more text is coming)."""
+        r = c = ""
+        if self.phase == 0:
+            r = self.buf.replace(THINK_BEGIN, "")
+        elif self.phase == 1:
+            c = self.buf
+        self.buf = ""
+        return r, c
 
 
 class H(BaseHTTPRequestHandler):
@@ -681,25 +766,35 @@ class H(BaseHTTPRequestHandler):
         try:
             chunk({"role": "assistant"})
             state = {"r": 0, "c": 0}
+            detok = None if MOCK else _IncrDetok()         # bounded-window decode (never the full list)
+            split = _SSESplitter(reasoning)                # O(delta) split (never the full text)
+            seen = {"n": 0}                                # stable chars already fed to the splitter
+
+            def _emit(rd, cd):
+                if rd:
+                    chunk({"reasoning_content": rd}); state["r"] += len(rd)
+                if cd:
+                    chunk({"content": cd}); state["c"] += len(cd)
+
             def on_commit(out, _dt):
-                if not MOCK:                               # strict max_tokens + earliest-eos: never stream
-                    out, _ = _cap_output(out, max_new, EOS_SET)   # tokens the final message won't carry
-                text = _decode_running(out, self)
                 if MOCK:
-                    text = text[:max_new * 4]              # mock counts tokens as chars//4
-                reasoning_txt, content = _split_stream(text, reasoning)   # `reasoning` = the request's bool (closure)
-                if len(reasoning_txt) > state["r"]:
-                    chunk({"reasoning_content": reasoning_txt[state["r"]:]}); state["r"] = len(reasoning_txt)
-                if len(content) > state["c"]:
-                    chunk({"content": content[state["c"]:]}); state["c"] = len(content)
+                    text = out[0][1][:max_new * 4]         # mock carries text; tokens = chars//4
+                else:                                      # strict max_tokens + earliest-eos: never
+                    out, _ = _cap_output(out, max_new, EOS_SET)   # stream tokens the message won't carry
+                    text = detok.feed(out)
+                delta = text[seen["n"]:]
+                if not delta:
+                    return
+                seen["n"] = len(text)
+                _emit(*split.feed(delta))
 
             r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
             fin_cap = _enforce_cap(r, max_new)
             parsed = parse_completion(r["text"])
             if require_tool and not parsed["tool_calls"]:
                 raise RuntimeError("tool_choice required a tool call but the model produced none")
+            _emit(*split.end())                            # release the marker hold-back
             # flush any tail not yet streamed (final trimmed text), then tool calls
-            _, fcontent = _split_stream(r["text"], reasoning)
             final_content = parsed["content"] or ""
             if len(final_content) > state["c"]:
                 chunk({"content": final_content[state["c"]:]})

@@ -421,6 +421,96 @@ def test_ready_uses_recent_job_instead_of_probe(monkeypatch):
     assert h.statuses == [200]
 
 
+# ---- detokenize-perf: incremental decode + incremental split --------------------------------------------
+
+class _CountingTok:
+    """Counts how many ids each decode call touches — the O(n^2) regression detector."""
+    def __init__(self):
+        self.decoded = 0
+
+    def decode(self, ids, skip_special_tokens=True):
+        self.decoded += len(ids)
+        return "".join(chr(97 + (i % 26)) for i in ids)
+
+
+def test_incr_detok_is_linear_not_quadratic():
+    t = _CountingTok()
+    d = gw._IncrDetok(t)
+    ids = []
+    n = 200
+    for i in range(n):
+        ids.append(i % 26)
+        d.feed(list(ids))
+    assert t.decoded <= 6 * n, f"decode touched {t.decoded} ids over {n} commits — O(n^2) re-decode"
+    # exactness: the accumulated text equals a one-shot full decode
+    assert d.text == "".join(chr(97 + (i % 26)) for i in ids)
+
+
+def test_incr_detok_holds_partial_char():
+    class T:
+        def decode(self, ids, skip_special_tokens=True):
+            return "".join("x" if i else "�" for i in ids)
+    d = gw._IncrDetok(T())
+    assert d.feed([1, 0]) == "", "partial UTF-8 must be held back, never streamed"
+    assert d.feed([1, 0, 1]) == "x�x", "held bytes flush once the char completes"
+
+
+def test_splitter_matches_split_stream_reasoning_on():
+    from m25_tools import THINK_END, TOOLCALL_BEGIN
+    text = f"deep thought{THINK_END}the answer{TOOLCALL_BEGIN}<invoke/>"
+    sp = gw._SSESplitter(reasoning_on=True)
+    r = c = ""
+    for i in range(0, len(text), 3):                      # tiny slices: markers straddle commits
+        rd, cd = sp.feed(text[i:i + 3])
+        r += rd; c += cd
+    rd, cd = sp.end()
+    r += rd; c += cd
+    want_r, want_c = gw._split_stream(text, reasoning_on=True)
+    assert r == want_r and c == want_c
+
+
+def test_splitter_matches_split_stream_reasoning_off():
+    text = "Here is the direct answer."
+    sp = gw._SSESplitter(reasoning_on=False)
+    r = c = ""
+    for ch in text:
+        rd, cd = sp.feed(ch)
+        r += rd; c += cd
+    rd, cd = sp.end()
+    r += rd; c += cd
+    assert r == "" and c == text
+
+
+def test_splitter_never_leaks_partial_marker():
+    from m25_tools import THINK_END, TOOLCALL_BEGIN
+    sp = gw._SSESplitter(reasoning_on=True)
+    sp.feed(f"t{THINK_END}answer")
+    _, cd = sp.feed(TOOLCALL_BEGIN[:8])                   # half a tool-call marker
+    assert "<" not in cd, "partial tool-call marker leaked into content"
+
+
+def test_stream_on_commit_decodes_incrementally(monkeypatch):
+    """End-to-end: the stream path must never re-decode the full output ids on every commit."""
+    t = _CountingTok()
+    monkeypatch.setattr(gw, "tok", t)
+    n = 100
+    def fake_run(messages, tools, max_new, reasoning, on_commit=None, timeout=1800):
+        ids = []
+        for i in range(n):
+            ids.append(i % 26)
+            on_commit(list(ids), 0.0)
+        return {"ok": True, "text": t.decode(ids), "n_tokens": len(ids), "prompt_tokens": 1,
+                "output_ids": ids}
+    monkeypatch.setattr(gw, "run_request", fake_run)
+    monkeypatch.setattr(gw, "MOCK", False)
+    wf = _FakeWfile()
+    h = _handler(wfile=wf)
+    h._stream("cid", 0, [{"role": "user", "content": "hi"}], None, 4096, reasoning=False)
+    assert t.decoded <= 8 * n, f"decode touched {t.decoded} ids over {n} commits — O(n^2) stream decode"
+    content = "".join(d["delta"].get("content", "") for d in _sse_deltas(wf) if d.get("delta"))
+    assert content == t.decode(list(range(n))) == "".join(chr(97 + (i % 26)) for i in range(n))
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:
