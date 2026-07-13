@@ -37,29 +37,50 @@ from shard.fetch import (ChainProvider, FetchError, Libp2pProvider,     # noqa: 
 import publish_manifest as pub                                          # noqa: E402
 
 
-# ---- sidecar binary (build once per session, skip when impossible) --------------------------------
+pytestmark = pytest.mark.integration
+
+
+# ---- sidecar binary (built lazily in a session fixture: collect-only must run NO subprocess;
+#      Go absent -> clean skip; Go present but build FAILS -> the suite FAILS, never a silent skip)
 def _sidecar_bin():
+    """Returns (path, err): (path, None) usable; (None, None) Go absent; (None, msg) build failed."""
     env = os.environ.get("SHARD_SIDECAR_BIN")
     if env and os.path.exists(env):
-        return env
+        return env, None
     cached = "/tmp/sidecar_new"
     src = os.path.join(_REPO, "sidecar")
     if os.path.exists(cached) and os.path.getmtime(cached) >= max(
             os.path.getmtime(os.path.join(src, f)) for f in ("main.go", "blockx.go")):
-        return cached
+        return cached, None
     try:
         r = subprocess.run(["go", "build", "-o", cached, "."], cwd=src, timeout=300,
                            capture_output=True, text=True,
                            env={**os.environ, "GOTOOLCHAIN": os.environ.get("GOTOOLCHAIN", "auto")})
-        if r.returncode == 0:
-            return cached
-    except (FileNotFoundError, subprocess.TimeoutExpired):
-        pass
-    return None
+    except FileNotFoundError:
+        return None, None
+    except subprocess.TimeoutExpired:
+        return None, "go build timed out (300s)"
+    if r.returncode == 0:
+        return cached, None
+    return None, ((r.stderr or "") + (r.stdout or ""))[-800:] or f"go build exit {r.returncode}"
 
 
-BIN = _sidecar_bin()
-pytestmark = pytest.mark.skipif(BIN is None, reason="sidecar binary unavailable (no Go toolchain)")
+BIN = None            # set by the sidecar_bin fixture; Seeder/_pull read it
+_BUILD = None
+
+
+@pytest.fixture(scope="session")
+def sidecar_bin():
+    global BIN, _BUILD
+    if _BUILD is None:
+        _BUILD = _sidecar_bin()
+    path, err = _BUILD
+    if path is None:
+        if err is None:
+            pytest.skip("sidecar binary unavailable (no Go toolchain)")
+        pytest.fail(f"Go is installed but the sidecar build FAILED:\n{err}", pytrace=False)
+    BIN = path
+    return path
 
 
 def _free_port():
@@ -101,7 +122,7 @@ class Seeder:
 
 
 @pytest.fixture()
-def net(tmp_path):
+def net(tmp_path, sidecar_bin):
     """A signed 2-file checkpoint + one live seeder (peer A) + an OFFLINE mirror copy."""
     tmp = str(tmp_path)
     ckpt = pub_checkpoint(tmp_path)
@@ -249,3 +270,24 @@ def test_all_sources_dead_fails_closed(net, tmp_path):
     os.makedirs(empty)
     with pytest.raises(FetchError):
         _pull(net, str(tmp_path / "nodeB"), [], empty)
+
+
+# ---- 7. build classification: a FAILED build must never masquerade as "no Go" (silent skip) --------
+def test_sidecar_build_failure_is_distinguished(monkeypatch):
+    """Go present + broken build -> (None, msg); the fixture turns msg into pytest.fail."""
+    monkeypatch.delenv("SHARD_SIDECAR_BIN", raising=False)
+    monkeypatch.setattr(os.path, "exists", lambda p: False)   # defeat the /tmp cache
+    monkeypatch.setattr(subprocess, "run", lambda *a, **k: subprocess.CompletedProcess(
+        a, 2, stdout="", stderr="main.go:1:1: syntax error"))
+    path, err = _sidecar_bin()
+    assert path is None and err and "syntax error" in err
+
+
+def test_sidecar_no_go_toolchain_is_skip(monkeypatch):
+    """Go absent entirely -> (None, None); the fixture turns that into a clean skip."""
+    def no_go(*a, **k):
+        raise FileNotFoundError("go")
+    monkeypatch.delenv("SHARD_SIDECAR_BIN", raising=False)
+    monkeypatch.setattr(os.path, "exists", lambda p: False)
+    monkeypatch.setattr(subprocess, "run", no_go)
+    assert _sidecar_bin() == (None, None)
