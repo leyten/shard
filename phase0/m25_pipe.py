@@ -272,6 +272,22 @@ def recv_data(sock):
         return m
 
 
+class JobRejected(Exception):
+    """A stage rejected THIS job with a structured per-job error (e.g. KV overflow) — the ring is
+    healthy, the JOB is dead. Deliberately NOT an OSError (same rationale as the gateway's
+    ClientGone): EDGE_ERRORS recovery must never eat it, and retrying the identical request would
+    only be rejected again. The gateway maps it to a 400, never a reconnect-retry."""
+
+
+def _reply_ok(resp):
+    """Gate a ring reply on the coordinator's return channel: a dict carrying 'error' is a stage's
+    structured per-job rejection (the H1 backstop — the stage stayed alive, the job died) ->
+    JobRejected. Everything else passes through untouched."""
+    if isinstance(resp, dict) and "error" in resp:
+        raise JobRejected(json.dumps(resp["error"]))
+    return resp
+
+
 def _reply_timeout(timeout):
     """Per-reply recv deadline for the coordinator's DECODE loop (F6). An internal-ring leg can blip
     while the coordinator is alive — the steady state on a permissionless ring — and the tail then
@@ -675,12 +691,12 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
-                toks, aux = _unpack(recv_data(rx))
+                toks, aux = _unpack(_reply_ok(recv_data(rx)))
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
-            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_data(rx)); cur = toks[-1]
+            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
             _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
         rx.settimeout(_reply_timeout(timeout))              # F6: tighten the per-reply deadline for decode — a mid-decode ring blip fails over in seconds, not up to the full timeout
@@ -699,7 +715,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
-            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
             r, aux = _unpack(resp)
             sp, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
@@ -855,12 +871,12 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
             d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
-                toks, aux = _unpack(recv_data(rx))
+                toks, aux = _unpack(_reply_ok(recv_data(rx)))
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)            # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
-            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(recv_data(rx)); cur = toks[-1]
+            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
             _pf_extend(0, toks, aux)
         if aux is None:                                     # fail loud, not a mid-job TypeError: stages must run M25_EAGLE
             raise TransportError("tree-verify got no aux from the ring — launch stages with M25_TREE=1/M25_EAGLE=1")
@@ -909,7 +925,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 t_sent = time.monotonic()
                 kw.send({"op": "verify", "tree": True, "token_ids": token_ids,
                          "parents": parents, "pos_ids": pos_ids, "start": vbase})
-                tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+                tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
                 t_trav += time.monotonic() - t_sent         # depth-1: this IS the clean per-round T_traversal
                 s_, c_ = _acc_stage_dt(resp, per_stage); t_stage += s_; t_stage_comp += c_
                 r, aux = _unpack(resp)
@@ -926,7 +942,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
                 if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
                 continue
             # ---- BURST REPLY: same accept/divergence bookkeeping as coordinate_pipe ----------------
-            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
             r, aux = _unpack(resp)
             off, start, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent             # count discarded chunks too — they traversed
@@ -1102,7 +1118,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                 if aux_local:
                     pf["seq"] = lseq_tx; lseq_tx += 1
                 kw.send(pf)
-                rr, aux = _unpack(recv_data(rx))         # stream-b prefill reply is solo-shaped ({toks, aux})
+                rr, aux = _unpack(_reply_ok(recv_data(rx)))   # stream-b prefill reply is solo-shaped ({toks, aux})
                 if aux_local:                            # the head's own aux layers arrive on the local lane
                     loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
                     if loc:
@@ -1150,7 +1166,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                 inflight.append(row)
             if not inflight:
                 break
-            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
             if isinstance(resp, dict) and resp.get("stage_dt"):   # per-stage [span, compute] stamps (M25_STAGE_TIMING)
                 _acc_stage_dt(resp, per_stage)
             rb, aux_b = _unpack_b(resp)                         # rb: [B][K+1] per-stream argmax; aux rows under EAGLE
@@ -1312,7 +1328,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                 if aux_local:
                     pf["seq"] = lseq_tx; lseq_tx += 1
                 kw.send(pf)
-                rr, aux = _unpack(recv_data(rx))
+                rr, aux = _unpack(_reply_ok(recv_data(rx)))
                 if aux_local:
                     loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
                     if loc:
@@ -1363,7 +1379,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
         for b, route in zip(act, _draw(act)):            # first draws batched in ONE pass
             _fire(b, route)
         while pend:
-            tr = time.time(); resp = recv_data(rx); t_recv += time.time() - tr
+            tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
             if isinstance(resp, dict) and resp.get("stage_dt"):
                 _acc_stage_dt(resp, per_stage)
             b = pend.popleft()
@@ -1824,6 +1840,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if ret is None or msg.get("op") not in ("reset", "reset_batch"):
                                 continue
                             stale = False
+                        if msg.get("op") == "job_error":   # an upstream stage rejected THIS job (H1
+                            _ret_send({"error": msg["error"]})   # backstop): relay the structured error;
+                            stale = True; continue               # job dead, KV+process alive — the next
+                                                                 # reset re-arms via the stale machinery
                         if msg["op"] == "reset":
                             job_graph = _reset_flags(msg)   # per-job runtime flags (graph A/B toggle)
                             for L in layers:
@@ -1866,84 +1886,95 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                       {"ok": 1, "graph": job_graph,     # route + counters (_check_reset_ack's food);
                                        "graph_captured": S._GRAPH_COUNT,   # plain jobs keep the bare ok (compat)
                                        "graph_skipped": S._GRAPH_SKIPPED}); continue
-                        if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
+                        try:
+                            if msg["op"] == "verify_batch":     # batched decode: [B,K+1,H] -> per-stream argmax [B][K+1]
+                                x = msg["h"].to(dev)
+                                h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
+                                t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                                if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
+                                    signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
+                                toks = _tail_logits(h, parts).argmax(-1).tolist()
+                                if S.M25_EAGLE:
+                                    aux = _merge_aux(msg.get("aux"))
+                                    if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
+                                        aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
+                                    o = {"toks": toks, "aux": aux}
+                                else:
+                                    o = {"toks": toks}                # timing promotes bare rows to a dict (like solo)
+                                if S.M25_STAGE_TIMING:                # batched rounds get the same per-stage [span,
+                                    o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)   # compute] stamps as solo — the
+                                                                      # round-decomposition experiment's food
+                                _ret_send(o if (S.M25_EAGLE or S.M25_STAGE_TIMING) else toks)
+                                continue
+                            if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
+                                x = msg["h"].to(dev)
+                                h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], x, vcfg)
+                                if RECEIPTS and signer is not None:
+                                    signer.observe(_act_digest(x), _act_digest(h))
+                                toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                                _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                            if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
+                                b = msg["stream"]                            # tree-masked block against KV row b —
+                                x = msg["h"].to(dev)                         # MUST route before the row branch (a
+                                h = S.run_block_tree_row(layers, b, msg["start"], x, vcfg,   # chain-math tree frame
+                                                         msg["parents"], msg["pos_ids"])     # = silent KV corruption
+                                t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0           # with valid receipts)
+                                if RECEIPTS and signer is not None:
+                                    signer.observe(_act_digest(x), _act_digest(h))
+                                toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                                o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
+                                if S.M25_EAGLE:                              # this frame as chain math replies
+                                    o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
+                                if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
+                                    o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
+                                _ret_send(o); continue
+                            if "stream" in msg and msg["op"] == "verify":   # DE-LOCKSTEP row decode: one stream's
+                                b = msg["stream"]                            # solo-style frame against KV row b
+                                x = msg["h"].to(dev)
+                                h = _block_row(graph_runners_r, layers, b, msg["start"], x, vcfg)
+                                t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                                if RECEIPTS and signer is not None:          # row frames are attested like every op
+                                    signer.observe(_act_digest(x), _act_digest(h))
+                                toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                                o = {"toks": toks, "stream": b}              # stream tag = the coordinator's LOUD
+                                if S.M25_EAGLE:                              # FIFO-pairing guard
+                                    o["aux"] = _merge_aux(msg.get("aux"))
+                                if S.M25_STAGE_TIMING:
+                                    o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
+                                _ret_send(o); continue
+                            if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
+                                x = msg["h"].to(dev)
+                                h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
+                                t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                                if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
+                                    signer.observe(_act_digest(x), _act_digest(h))
+                                toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                                o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                                if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                                    o = o if isinstance(o, dict) else {"toks": o}
+                                    o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                                _ret_send(o); continue
                             x = msg["h"].to(dev)
-                            h = _block_b(graph_runners_b, layers, msg["start_b"], x, vcfg)
+                            h = _block(graph_runners, layers, msg["start"], x, vcfg)
                             t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                            if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
-                                signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
-                            toks = _tail_logits(h, parts).argmax(-1).tolist()
-                            if S.M25_EAGLE:
-                                aux = _merge_aux(msg.get("aux"))
-                                if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
-                                    aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
-                                o = {"toks": toks, "aux": aux}
-                            else:
-                                o = {"toks": toks}                # timing promotes bare rows to a dict (like solo)
-                            if S.M25_STAGE_TIMING:                # batched rounds get the same per-stage [span,
-                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)   # compute] stamps as solo — the
-                                                                  # round-decomposition experiment's food
-                            _ret_send(o if (S.M25_EAGLE or S.M25_STAGE_TIMING) else toks)
-                            continue
-                        if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
-                            x = msg["h"].to(dev)
-                            h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], x, vcfg)
-                            if RECEIPTS and signer is not None:
-                                signer.observe(_act_digest(x), _act_digest(h))
-                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
-                        if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
-                            b = msg["stream"]                            # tree-masked block against KV row b —
-                            x = msg["h"].to(dev)                         # MUST route before the row branch (a
-                            h = S.run_block_tree_row(layers, b, msg["start"], x, vcfg,   # chain-math tree frame
-                                                     msg["parents"], msg["pos_ids"])     # = silent KV corruption
-                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0           # with valid receipts)
-                            if RECEIPTS and signer is not None:
-                                signer.observe(_act_digest(x), _act_digest(h))
-                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
-                            if S.M25_EAGLE:                              # this frame as chain math replies
-                                o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
-                            if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
-                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
-                            _ret_send(o); continue
-                        if "stream" in msg and msg["op"] == "verify":   # DE-LOCKSTEP row decode: one stream's
-                            b = msg["stream"]                            # solo-style frame against KV row b
-                            x = msg["h"].to(dev)
-                            h = _block_row(graph_runners_r, layers, b, msg["start"], x, vcfg)
-                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                            if RECEIPTS and signer is not None:          # row frames are attested like every op
-                                signer.observe(_act_digest(x), _act_digest(h))
-                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                            o = {"toks": toks, "stream": b}              # stream tag = the coordinator's LOUD
-                            if S.M25_EAGLE:                              # FIFO-pairing guard
-                                o["aux"] = _merge_aux(msg.get("aux"))
-                            if S.M25_STAGE_TIMING:
-                                o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
-                            _ret_send(o); continue
-                        if msg.get("tree"):                 # EAGLE tree-verify: per-node argmax over the tree-masked block
-                            x = msg["h"].to(dev)
-                            h = S.run_block_tree(layers, msg["start"], x, vcfg, msg["parents"], msg["pos_ids"])
-                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                            if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
+                            if RECEIPTS and signer is not None:   # attest this block's input->output transform
                                 signer.observe(_act_digest(x), _act_digest(h))
                             toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                             o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
-                            if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
+                            if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                 o = o if isinstance(o, dict) else {"toks": o}
                                 o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                            _ret_send(o); continue
-                        x = msg["h"].to(dev)
-                        h = _block(graph_runners, layers, msg["start"], x, vcfg)
-                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                        if RECEIPTS and signer is not None:   # attest this block's input->output transform
-                            signer.observe(_act_digest(x), _act_digest(h))
-                        toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                        o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
-                        if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
-                            o = o if isinstance(o, dict) else {"toks": o}
-                            o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                        _ret_send(o)
+                            _ret_send(o)
+                        except RuntimeError as e:
+                            # H1 stage backstop: a KV overflow (or any per-job compute failure) is a JOB
+                            # error, never a process exit — serve()'s entrypoint is unwrapped, and a
+                            # RuntimeError is NOT in EDGE_ERRORS, so it used to escape the edge recovery
+                            # and KILL the warm tail. Reply the structured error, hold the session stale;
+                            # the coordinator raises JobRejected (never retried as an edge fault).
+                            _ret_send({"error": {"code": "kv_overflow", "stage": "tail",
+                                                 "message": str(e)[:300]}})
+                            stale = True
+                            continue
                 except EDGE_ERRORS as e:
                     # PREDECESSOR edge died (ret failures are absorbed in _ret_send, never here). This is
                     # either the coordinator dying (cascade) OR just an INTERNAL ring leg blipping while the
@@ -1991,6 +2022,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     if msg.get("op") == "noop":                 # predecessor keep-warm frame: leg-local,
                         continue                                # never forwarded/answered/attested/timed
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
+                    if msg.get("op") == "job_error":     # an upstream stage rejected the job (H1
+                        nxt_kw.send(msg); continue          # backstop): relay it down to the tail untouched
                     if msg["op"] == "reset":
                         _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
                         aux_local_job = None                    # a solo job takes over: the local lane closes
@@ -2020,131 +2053,140 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                                    msg.get("job_id", "job"), lo, hi,         # bleed into batched)
                                                    nonce=msg.get("nonce"))
                         nxt_kw.send(msg); continue
-                    if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
-                        if parts["head"]:
-                            h = torch.nn.functional.embedding(torch.tensor(msg["token_ids_b"], device=dev), parts["embed_w"])
+                    try:
+                        if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
+                            if parts["head"]:
+                                h = torch.nn.functional.embedding(torch.tensor(msg["token_ids_b"], device=dev), parts["embed_w"])
+                            else:
+                                h = msg["h"].to(dev)
+                            x = h
+                            h = _block_b(graph_runners_b, layers, msg["start_b"], h, vcfg)
+                            if RECEIPTS and signer is not None:     # attest batched rounds like solo
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
+                            if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
+                                if aux_local_job is None:            # armed head: its own aux goes on the LOCAL lane
+                                    fwd["aux"] = _merge_aux(msg.get("aux"))   # (below), never onto the WAN legs
+                                tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
+                                if tb is not None:                               # ints) so it can slice the return-leg
+                                    fwd["tids"] = tb                             # aux to accepted prefixes (M25_AUX_SLIM)
+                            if S.M25_STAGE_TIMING:
+                                fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
+                            nxt_kw.send(_hsend(fwd))
+                            if aux_local_job is not None:            # forward-FIRST, then the local lane: a big local
+                                send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
+                                                "seq": msg.get("seq"),                      # the ring send (localhost
+                                                "aux": {str(li): v.detach().to(torch.bfloat16).cpu()   # buffer deadlock)
+                                                        for li, v in S._AUX.items()}})
+                            continue
+                        if msg.get("tree") and "stream" in msg:     # DE-LOCKSTEP tree-verify: one stream's tree-
+                            b = msg["stream"]                       # masked block against KV row b — MUST route
+                            if parts["head"]:                       # before the row branch (a tree frame down the
+                                h = torch.nn.functional.embedding(  # chain-math row path = silent KV corruption
+                                    torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])   # w/ valid receipts)
+                            else:
+                                h = msg["h"].to(dev)
+                            x = h
+                            h = S.run_block_tree_row(layers, b, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                            if RECEIPTS and signer is not None:
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            fwd = {"op": "verify", "tree": True, "stream": b, "h": h, "start": msg["start"],
+                                   "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
+                            if S.M25_EAGLE:
+                                if aux_local_job is None:                    # armed head: own aux on the local lane
+                                    fwd["aux"] = _merge_aux(msg.get("aux"))
+                            if S.M25_STAGE_TIMING:
+                                fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                            nxt_kw.send(_hsend(fwd))
+                            if aux_local_job is not None:                    # forward-first, like every armed op
+                                send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                                "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
+                                                        for li, v in S._AUX.items()}})
+                            continue
+                        if "stream" in msg and msg["op"] == "verify" and not msg.get("prefill"):   # DE-LOCKSTEP row decode
+                            b = msg["stream"]
+                            if parts["head"]:
+                                h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                            else:
+                                h = msg["h"].to(dev)
+                            x = h
+                            h = _block_row(graph_runners_r, layers, b, msg["start"], h, vcfg)
+                            if RECEIPTS and signer is not None:
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            fwd = {"op": "verify", "stream": b, "h": h, "start": msg["start"]}
+                            if S.M25_EAGLE:
+                                if aux_local_job is None:                    # armed head: own aux on the local lane
+                                    fwd["aux"] = _merge_aux(msg.get("aux"))
+                            if S.M25_STAGE_TIMING:
+                                fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
+                            nxt_kw.send(_hsend(fwd))
+                            if aux_local_job is not None:                    # forward-first, like every armed op
+                                send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                                "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
+                                                        for li, v in S._AUX.items()}})
+                            continue
+                        if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
+                            if parts["head"]:
+                                h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                            else:
+                                h = msg["h"].to(dev)
+                            x = h
+                            h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
+                            if RECEIPTS and signer is not None:
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
+                            if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
+                                if aux_local_job is None:            # armed head: own aux on the local lane (below)
+                                    fwd["aux"] = _merge_aux(msg.get("aux"))
+                            nxt_kw.send(_hsend(fwd))
+                            if aux_local_job is not None:            # forward-first, exactly like verify_batch
+                                send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
+                                                "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
+                                                        for li, v in S._AUX.items()}})
+                            continue
+                        if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
+                            if parts["head"]:
+                                h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
+                            else:
+                                h = msg["h"].to(dev)
+                            x = h
+                            h = S.run_block_tree(layers, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                            t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
+                            if RECEIPTS and signer is not None:     # attest tree blocks too — verification must not silently turn off under M25_TREE
+                                signer.observe(_act_digest(x), _act_digest(h))
+                            fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
+                                   "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
+                            if S.M25_EAGLE:
+                                fwd["aux"] = _merge_aux(msg.get("aux"))
+                            fwd = _hsend(fwd)
+                            if S.M25_STAGE_TIMING:
+                                fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
+                            nxt_kw.send(fwd); continue
+                        if "token_ids" in msg:                      # head: embed the coordinator's token ids
+                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
                         else:
                             h = msg["h"].to(dev)
                         x = h
-                        h = _block_b(graph_runners_b, layers, msg["start_b"], h, vcfg)
-                        if RECEIPTS and signer is not None:     # attest batched rounds like solo
-                            signer.observe(_act_digest(x), _act_digest(h))
-                        fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
-                        if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
-                            if aux_local_job is None:            # armed head: its own aux goes on the LOCAL lane
-                                fwd["aux"] = _merge_aux(msg.get("aux"))   # (below), never onto the WAN legs
-                            tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
-                            if tb is not None:                               # ints) so it can slice the return-leg
-                                fwd["tids"] = tb                             # aux to accepted prefixes (M25_AUX_SLIM)
-                        if S.M25_STAGE_TIMING:
-                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
-                        nxt_kw.send(_hsend(fwd))
-                        if aux_local_job is not None:            # forward-FIRST, then the local lane: a big local
-                            send_msg(conn, {"op": "aux_local", "job": aux_local_job,   # frame must never block
-                                            "seq": msg.get("seq"),                      # the ring send (localhost
-                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()   # buffer deadlock)
-                                                    for li, v in S._AUX.items()}})
-                        continue
-                    if msg.get("tree") and "stream" in msg:     # DE-LOCKSTEP tree-verify: one stream's tree-
-                        b = msg["stream"]                       # masked block against KV row b — MUST route
-                        if parts["head"]:                       # before the row branch (a tree frame down the
-                            h = torch.nn.functional.embedding(  # chain-math row path = silent KV corruption
-                                torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])   # w/ valid receipts)
-                        else:
-                            h = msg["h"].to(dev)
-                        x = h
-                        h = S.run_block_tree_row(layers, b, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                        h = _block(graph_runners, layers, msg["start"], h, vcfg)
                         t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                        if RECEIPTS and signer is not None:
+                        if RECEIPTS and signer is not None:         # attest this block's input->output transform
                             signer.observe(_act_digest(x), _act_digest(h))
-                        fwd = {"op": "verify", "tree": True, "stream": b, "h": h, "start": msg["start"],
-                               "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                        if S.M25_EAGLE:
-                            if aux_local_job is None:                    # armed head: own aux on the local lane
-                                fwd["aux"] = _merge_aux(msg.get("aux"))
-                        if S.M25_STAGE_TIMING:
-                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                        nxt_kw.send(_hsend(fwd))
-                        if aux_local_job is not None:                    # forward-first, like every armed op
-                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
-                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
-                                                    for li, v in S._AUX.items()}})
-                        continue
-                    if "stream" in msg and msg["op"] == "verify" and not msg.get("prefill"):   # DE-LOCKSTEP row decode
-                        b = msg["stream"]
-                        if parts["head"]:
-                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
-                        else:
-                            h = msg["h"].to(dev)
-                        x = h
-                        h = _block_row(graph_runners_r, layers, b, msg["start"], h, vcfg)
-                        if RECEIPTS and signer is not None:
-                            signer.observe(_act_digest(x), _act_digest(h))
-                        fwd = {"op": "verify", "stream": b, "h": h, "start": msg["start"]}
-                        if S.M25_EAGLE:
-                            if aux_local_job is None:                    # armed head: own aux on the local lane
-                                fwd["aux"] = _merge_aux(msg.get("aux"))
-                        if S.M25_STAGE_TIMING:
-                            fwd["stage_dt"] = _dt_row(msg, stage, t_rx, _dt_sync())
-                        nxt_kw.send(_hsend(fwd))
-                        if aux_local_job is not None:                    # forward-first, like every armed op
-                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
-                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
-                                                    for li, v in S._AUX.items()}})
-                        continue
-                    if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> normal path)
-                        if parts["head"]:
-                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
-                        else:
-                            h = msg["h"].to(dev)
-                        x = h
-                        h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], h, vcfg)
-                        if RECEIPTS and signer is not None:
-                            signer.observe(_act_digest(x), _act_digest(h))
-                        fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
-                        if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
-                            if aux_local_job is None:            # armed head: own aux on the local lane (below)
-                                fwd["aux"] = _merge_aux(msg.get("aux"))
-                        nxt_kw.send(_hsend(fwd))
-                        if aux_local_job is not None:            # forward-first, exactly like verify_batch
-                            send_msg(conn, {"op": "aux_local", "job": aux_local_job, "seq": msg.get("seq"),
-                                            "aux": {str(li): v.detach().to(torch.bfloat16).cpu()
-                                                    for li, v in S._AUX.items()}})
-                        continue
-                    if msg.get("tree"):                         # EAGLE tree-verify: tree-masked block, thread the tree forward
-                        if parts["head"]:
-                            h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
-                        else:
-                            h = msg["h"].to(dev)
-                        x = h
-                        h = S.run_block_tree(layers, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
-                        t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                        if RECEIPTS and signer is not None:     # attest tree blocks too — verification must not silently turn off under M25_TREE
-                            signer.observe(_act_digest(x), _act_digest(h))
-                        fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
-                               "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                        if S.M25_EAGLE:
+                        fwd = {"op": "verify", "h": h, "start": msg["start"]}
+                        if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
                             fwd["aux"] = _merge_aux(msg.get("aux"))
                         fwd = _hsend(fwd)
                         if S.M25_STAGE_TIMING:
                             fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                        nxt_kw.send(fwd); continue
-                    if "token_ids" in msg:                      # head: embed the coordinator's token ids
-                        h = torch.nn.functional.embedding(torch.tensor([msg["token_ids"]], device=dev), parts["embed_w"])
-                    else:
-                        h = msg["h"].to(dev)
-                    x = h
-                    h = _block(graph_runners, layers, msg["start"], h, vcfg)
-                    t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                    if RECEIPTS and signer is not None:         # attest this block's input->output transform
-                        signer.observe(_act_digest(x), _act_digest(h))
-                    fwd = {"op": "verify", "h": h, "start": msg["start"]}
-                    if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
-                        fwd["aux"] = _merge_aux(msg.get("aux"))
-                    fwd = _hsend(fwd)
-                    if S.M25_STAGE_TIMING:
-                        fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
-                    nxt_kw.send(fwd)
+                        nxt_kw.send(fwd)
+                    except RuntimeError as e:
+                        # H1 stage backstop, head/middle half: a per-job compute failure (KV overflow)
+                        # must never escape serve()'s unwrapped entrypoint and kill the warm stage.
+                        # Signal a structured job_error down the ring — the tail relays it to the
+                        # coordinator, which raises JobRejected. Ring alive, job dead.
+                        nxt_kw.send({"op": "job_error", "stage": stage,
+                                     "error": {"code": "kv_overflow", "message": str(e)[:300]}})
+                        continue
             except EDGE_ERRORS as e:
                 print(f"[s{stage}] edge closed ({type(e).__name__}); reset + drop forward link", flush=True)
                 for L in layers:
@@ -2176,14 +2218,16 @@ def _sweep_summary(rows):
     return "\n".join(lines), best
 
 
-def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk, tools=None):
+def _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk, tools=None,
+             max_ctx=131072):
     """One coordinate_pipe job with a FRESH drafter (clean n-gram state per config). Sockets are
     reused across jobs — coordinate_pipe drains in-flight + opens each job with `reset`, which clears
     every stage's KV, so back-to-back jobs on the same ring are clean. make_drafter adds the EAGLE
-    hybrid when M25_EAGLE=1."""
+    hybrid when M25_EAGLE=1. `max_ctx` is the launcher-negotiated ring limit (--max-ctx, H1) — the
+    old hardcoded 131072 silently overran a 40960-KV ring."""
     drafter = make_drafter(ngram_n)
     return coordinate_pipe(pipe, tok, messages, k, max_new, timeout, d, ret_sock=ret,
-                           local_draft=drafter, tools=tools, prefill_chunk=prefill_chunk, max_ctx=131072)
+                           local_draft=drafter, tools=tools, prefill_chunk=prefill_chunk, max_ctx=max_ctx)
 
 
 def _validate(pipe, ret, tok, K, depth, ngram_n, prefill_chunk, timeout, longctx_path):
@@ -2233,7 +2277,7 @@ def _validate(pipe, ret, tok, K, depth, ngram_n, prefill_chunk, timeout, longctx
     print("[validate] === END ===", flush=True)
 
 
-def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=None, sweep_depth=None, prefill_chunk=512, validate=False):
+def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=None, sweep_depth=None, prefill_chunk=512, validate=False, max_ctx=131072):
     from transformers import AutoTokenizer
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
     hh, hp = head_ep.rsplit(":", 1); th, tp = tail_ep.rsplit(":", 1)
@@ -2256,7 +2300,7 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
                 row = {"K": k, "depth": d, "tok_s": 0.0, "g": 0.0, "accept": 0.0,
                        "prefill_s": 0.0, "ntok": 0, "h_kb": (k + 1) * S.H * 2 / 1024, "ok": False, "text": ""}
                 try:
-                    r = _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk)
+                    r = _run_job(pipe, ret, tok, messages, k, max_new, timeout, d, ngram_n, prefill_chunk, max_ctx=max_ctx)
                     row.update(tok_s=r["tok_s"], g=r["toks_per_traversal"], accept=r["mean_accept"] / max(k, 1),
                                prefill_s=r["prefill_s"], ntok=r["n_tokens"], ok=r.get("ok", False), text=r.get("text", ""))
                 except Exception as e:
@@ -2271,7 +2315,7 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
         return
 
     print(f"[coord] pipelined (K={K} depth={depth} ngram={ngram_n}) -> head {head_ep}, ret {tail_ep}", flush=True)
-    r = _run_job(pipe, ret, tok, messages, K, max_new, timeout, depth, ngram_n, prefill_chunk)
+    r = _run_job(pipe, ret, tok, messages, K, max_new, timeout, depth, ngram_n, prefill_chunk, max_ctx=max_ctx)
     if r.get("ok"):
         parsed = parse_completion(r["text"])
         print(f"\n[coord] {r['n_tokens']}tok  {r['tok_s']:.2f} tok/s  g={r['toks_per_traversal']:.2f}  "
@@ -2322,6 +2366,7 @@ if __name__ == "__main__":
     pc.add_argument("--sweep-depth", default=None, help="comma depth list, e.g. 2,4,8 (default: --depth)")
     pc.add_argument("--prefill-chunk", type=int, default=512, help="prefill tokens per ring traversal; under M25_SDPA (default) attn is O(chunk) not O(chunk*ctx), so this is now a TTFT/bandwidth knob, not the OOM guard")
     pc.add_argument("--validate", action="store_true", help="full usability pass: tools + multi-turn + long-ctx (needle) + receipts, one warm ring")
+    pc.add_argument("--max-ctx", type=int, default=131072, help="negotiated ring context limit (the launcher passes min(operator ceiling, every stage's KV cap)); jobs clamp max_new against it")
     a = ap.parse_args()
 
     def _ilist(s): return [int(x) for x in s.split(",") if x.strip()] if s else None
@@ -2334,4 +2379,5 @@ if __name__ == "__main__":
     else:
         prompt = open(a.prompt_file).read() if a.prompt_file else a.prompt
         coord(a.head, a.tail, prompt, a.K, a.max_new, a.depth, a.ngram_n, a.timeout,
-              sweep=_ilist(a.sweep), sweep_depth=_ilist(a.sweep_depth), prefill_chunk=a.prefill_chunk, validate=a.validate)
+              sweep=_ilist(a.sweep), sweep_depth=_ilist(a.sweep_depth), prefill_chunk=a.prefill_chunk,
+              validate=a.validate, max_ctx=a.max_ctx)
