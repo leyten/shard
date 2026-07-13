@@ -13,7 +13,7 @@ M2.5 specifics (verified from the real nvidia/MiniMax-M2.5-NVFP4 config):
 
   self-test:  python m25_stage.py --dir /root/m25 --layers 29 30
 """
-import os, json, argparse, torch
+import os, sys, json, argparse, torch
 os.environ.setdefault("MASTER_ADDR", "127.0.0.1"); os.environ.setdefault("MASTER_PORT", "29577")
 os.environ.setdefault("RANK", "0"); os.environ.setdefault("WORLD_SIZE", "1"); os.environ.setdefault("LOCAL_RANK", "0")
 from safetensors import safe_open
@@ -24,6 +24,21 @@ from torch.nn.attention.bias import causal_lower_right                 # bottom-
 
 dev = "cuda"
 _CTX = None
+
+
+def _cli_dir(argv):
+    """Pre-parse --dir from a script invocation. Module init below consumes M25_DIR at import time
+    (AutoConfig + the safetensors index), so the self-test's --dir must win BEFORE that runs — the
+    old flow parsed it in __main__ AFTER init and silently ignored it."""
+    p = argparse.ArgumentParser(add_help=False)
+    p.add_argument("--dir")
+    return p.parse_known_args(argv)[0].dir
+
+
+if __name__ == "__main__":
+    _d = _cli_dir(sys.argv[1:])
+    if _d:
+        os.environ["M25_DIR"] = _d
 DIR = os.environ.get("M25_DIR", "/root/m25")
 cfg = AutoConfig.from_pretrained(DIR)
 H, NH, NKV, HD = cfg.hidden_size, cfg.num_attention_heads, cfg.num_key_value_heads, cfg.head_dim
