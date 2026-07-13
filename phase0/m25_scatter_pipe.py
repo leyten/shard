@@ -9,7 +9,7 @@ via the 29612 return tunnel.
   python m25_scatter_pipe.py --order CA:42545183:0:10 WA:..:10:23 MN:..:23:36 NJ:..:36:49 NC:..:49:62 \
       --K 6 --depth 4 --max-new 256 --prompt-file /root/copy_prompt.txt
 """
-import os, re, sys, json, time, shlex, subprocess, argparse
+import os, re, sys, json, time, shlex, secrets, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
@@ -92,7 +92,7 @@ def peerid(host, port):
     raise RuntimeError(f"no PeerId {host}:{port}: {r.stdout[-200:]}{r.stderr[-200:]}")
 
 
-def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
     """Pure builder (unit-testable): every remote-influenced value (multiaddrs carry PeerIds from
     remote stdout) is shlex-quoted, and the whole inner command is quoted ONCE for the bash -c
     level — correct two-level quoting, byte-identical to the old literal form for legit values."""
@@ -102,14 +102,17 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
     # shard DHT from the SAME tunnel daemon — 'manifest.json=modelDir' + neighbour bootstrap addrs.
     sd = f"-seed {shlex.quote(seed)}" if seed else ""
     bs = " ".join(f"-dht-bootstrap {shlex.quote(b)}" for b in (dht_bootstrap or []))
+    # C2: cryptographic neighbour allowlist — the sidecar Reset()s inbound streams whose
+    # Noise-authenticated RemotePeer isn't one of these PeerIds (empty = open, legacy).
+    al = " ".join(f"-allow {shlex.quote(p)}" for p in (allow or []))
     inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1")
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} > /root/sidecar.log 2>&1")
     return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
-def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None):
-    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap)
+def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):
@@ -123,7 +126,7 @@ def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_boots
     return False
 
 
-def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False):
+def stage_cmd(stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False, token=None):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
@@ -131,12 +134,22 @@ def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, ba
     # path; a non-Blackwell (marlin) stage runs eager (this env assignment comes AFTER eng_env()'s, so
     # bash uses the last one). A marlin card holds few layers, so it barely benefits from graph anyway.
     goff = "M25_CUDA_GRAPH=0 " if graph_off else ""
-    cmd = (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-           f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
-           f"{rc}SHARD_TRANSPORT=libp2p M25_BATCH={batch} {eng_env()}{goff}"
-           f"{kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
-           f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
-           f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
+    # C2: per-swarm epoch token — engine peers greet with it (hello_pred/hello_return) so a stage
+    # never adopts a silent/foreign connection; never printed in any banner or log.
+    tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
+    # C2: in libp2p mode the only legitimate dialer is the LOCAL sidecar (and the local coordinator
+    # on the head) — bind the engine hop to loopback so raw TCP can't bypass the sidecar allowlist.
+    return (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
+            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
+            f"{rc}{tk}SHARD_TRANSPORT=libp2p M25_ENGINE_BIND=127.0.0.1 M25_BATCH={batch} {eng_env()}{goff}"
+            f"{kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
+            f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
+            f"--port {ENG_IN} {nxt} > /root/stage.log 2>&1' </dev/null >/dev/null 2>&1 &")
+
+
+def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False, token=None):
+    cmd = stage_cmd(stage, nstages, lo, hi, is_tail, receipts=receipts, batch=batch,
+                    kv_maxlen=kv_maxlen, graph_off=graph_off, token=token)
     try:
         sh(host, port, cmd, 25)
     except subprocess.TimeoutExpired:
@@ -210,6 +223,10 @@ def main():
     kv_eff = a.kv_maxlen or 40960
     eff_max_ctx = negotiated_max_ctx(a.max_ctx, [kv_eff] * n)
     print(f"[pipe] negotiated max_ctx {eff_max_ctx} (operator {a.max_ctx}, stage KV cap {kv_eff})", flush=True)
+    # C2: one per-launch swarm/epoch token, injected as env into every stage + the gateway/coord
+    # (never printed). --warm-only stays token-less: its whole point is an EXTERNAL measurement
+    # coordinator on the head box, which predates the greeting protocol — legacy classification.
+    swarm_token = None if a.warm_only else secrets.token_hex(16)
     print("[pipe] push code + PeerIds ...", flush=True)
     for nd in nodes:
         push_code(nd["host"], nd["port"])
@@ -240,14 +257,22 @@ def main():
         # bootstrap through the PREDECESSOR's sidecar only — it launched before us (k asc), so the
         # DHT link is up when we dial; the successor reciprocates when it launches. k=0 seeds solo.
         bsp = [nodes[k - 1]["maddr"]] if (a.seed_shards and k > 0) else None
-        ok = launch_sidecar(nd["host"], nd["port"], announce, inbound, forwards, seed=seed, dht_bootstrap=bsp)
+        # C2: each inbound sidecar only admits its PREDECESSOR's PeerId; the TAIL also admits the
+        # HEAD's — the coordinator-return tunnel is the head sidecar's -forward, so return streams
+        # arrive at the tail with RemotePeer == head. Head (k==0) has no -inbound, no allowlist.
+        allow = None
+        if k > 0:
+            allow = [nodes[k - 1]["pid"]]
+            if k == n - 1:
+                allow.append(nodes[0]["pid"])
+        ok = launch_sidecar(nd["host"], nd["port"], announce, inbound, forwards, seed=seed, dht_bootstrap=bsp, allow=allow)
         print(f"  {'OK' if ok else 'FAIL'} {nd['region']}", flush=True)
         if not ok:
             print(sh(nd["host"], nd["port"], "tail -4 /root/sidecar.log", 20).stdout); return
 
     print("[pipe] stages tail-first ...", flush=True)
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False))
+        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False), token=swarm_token)
     for k in range(n - 1, -1, -1):
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
@@ -265,7 +290,8 @@ def main():
         GW = 18000
         rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
         bt = f"M25_BATCH={a.batch} " if a.batch > 1 else ""   # gateway micro-batches up to the ring's KV rows
-        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
+        tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
+        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}{tk}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
               f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
         sh(head["host"], head["port"], gw, 30); time.sleep(4)
@@ -279,8 +305,9 @@ def main():
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
     sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
     rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
+    tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
-    cmd = (f"cd /root && {rc}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
+    cmd = (f"cd /root && {rc}{tk}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
            f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} --max-ctx {eff_max_ctx} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
     r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth or a.validate) else 1200)
