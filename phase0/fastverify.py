@@ -26,6 +26,29 @@ class ContextOverflow(Exception):
     catches it, resets the edge, and the node stays up (vs a silent CUDA OOB)."""
 
 
+def validate_tree(M, par, dep):
+    """Reject a malformed tree BEFORE _tbuild walks parents: the old unchecked
+    `while j != -1: j = par[j]` walk spins FOREVER on a cyclic par (wedging the stage) and
+    index-errors/wraps on an out-of-range one. Rules: par/dep are M-long; every parent is an
+    int in [-1, M); dep is the true root-distance (parent -1 -> 0, else dep[parent]+1) — that
+    consistency alone forces acyclicity (depth strictly decreases along any parent chain), in
+    any node order. Raises ValueError; the serve loop's bad-msg handler resets the edge."""
+    if not isinstance(M, int) or M < 1:
+        raise ValueError(f"tree size {M!r} invalid")
+    if len(par) != M or len(dep) != M:
+        raise ValueError(f"tree par/dep lengths {len(par)}/{len(dep)} != {M} nodes")
+    for i in range(M):
+        p, d = par[i], dep[i]
+        if not isinstance(p, int) or isinstance(p, bool) or not (-1 <= p < M) or p == i:
+            raise ValueError(f"tree node {i}: parent {p!r} out of range [-1, {M})")
+        if not isinstance(d, int) or isinstance(d, bool) or d < 0:
+            raise ValueError(f"tree node {i}: depth {d!r} invalid")
+    for i in range(M):
+        want = 0 if par[i] == -1 else dep[par[i]] + 1
+        if dep[i] != want:
+            raise ValueError(f"tree node {i}: depth {dep[i]} != {want} (parent {par[i]}; cycle or bad depth)")
+
+
 class StaticKV:
     """fixed [1, kv_heads, MAXLEN, head_dim] K/V per layer; update() writes at the cache's
     own index buffer (self.cp). Two read modes, both bit-identical to a full-buffer masked read:
@@ -256,6 +279,10 @@ class FastVerify:
         return self._layers(self.th, self.tpos, self.rotary(self.th, self.tpos), self.tmf, self.tmw)
 
     def tree_decode(self, h, start, par, dep):
+        validate_tree(h.shape[1], list(par), list(dep))     # bounded, acyclic — BEFORE any parent walk
+        if start + h.shape[1] > self.maxlen:                # scratch slots [start, start+M) must fit
+            raise ContextOverflow(f"tree decode needs {start + h.shape[1]} positions > max_ctx "
+                                  f"{self.maxlen} (raise --max-ctx)")
         if getattr(self, "tM", None) != h.shape[1] or getattr(self, "tpar", None) != list(par):
             self._tbuild(h.shape[1], par, dep); self.tgraph = None
         self._tset(h, start, par, dep)
