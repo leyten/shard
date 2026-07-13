@@ -43,6 +43,15 @@ _ids = itertools.count(1)
 RING_LOCK = threading.Lock()   # one ring job at a time (a job may carry up to M25_GW_BATCH streams)
 GW_BATCH = int(os.environ.get("M25_GW_BATCH", os.environ.get("M25_BATCH", "1")))
 GW_WINDOW_MS = float(os.environ.get("M25_GW_WINDOW_MS", "40"))
+# ---- intake bounds (H5): the stdlib ThreadingHTTPServer spawns a thread per connection with no
+# body cap and no read deadline, and every handler then parks on the dispatcher queue — so a flood
+# (or one slow-loris) accumulates unbounded threads/bytes while the ring grinds. Bound all three:
+# body size (413), header/body read deadline (H.timeout -> socket timeout), in-flight requests (429).
+MAX_BODY = int(os.environ.get("M25_GW_MAX_BODY", str(16 << 20)))
+REQ_TIMEOUT = float(os.environ.get("M25_GW_REQ_TIMEOUT", "30"))
+MAX_INFLIGHT = int(os.environ.get("M25_GW_MAX_INFLIGHT", str(max(GW_BATCH * 4, 16))))
+_INFLIGHT = {"n": 0}
+_INFLIGHT_LOCK = threading.Lock()
 # ---- content routing (per-stream-20 work): like-with-like batching + per-(content, B) K ----------
 # The de-lockstep receipts split per-stream speed by CONTENT regime, and the 2026-07-12 K-reference
 # pass (receipt perstream-trees-ab-20260712) pinned the K physics: at B<=2 the payload is amortized
@@ -102,6 +111,21 @@ class JobRejected(Exception):
     but the ring is healthy. Deliberately NOT an OSError so neither coordinate_pipe's EDGE_ERRORS
     recovery nor generate()'s reconnect-retry ever eats it: a rejected job must never be re-run.
     Rebound to m25_pipe.JobRejected by _engine_init so gateway excepts match the coordinator's."""
+
+
+def _admit():
+    """Non-blocking in-flight slot: False = the caller must fast-fail 429 instead of parking another
+    handler thread on the dispatcher queue."""
+    with _INFLIGHT_LOCK:
+        if _INFLIGHT["n"] >= MAX_INFLIGHT:
+            return False
+        _INFLIGHT["n"] += 1
+        return True
+
+
+def _release():
+    with _INFLIGHT_LOCK:
+        _INFLIGHT["n"] -= 1
 
 
 class ClientGone(Exception):
@@ -393,6 +417,7 @@ def _decode_running(out, handler):
 
 class H(BaseHTTPRequestHandler):
     server_version = "shard-m25-gateway"
+    timeout = REQ_TIMEOUT          # socket deadline on header/body reads (slow-loris guard, H5)
     def log_message(self, *a): pass
 
     def _json(self, obj, code=200):
@@ -414,13 +439,36 @@ class H(BaseHTTPRequestHandler):
         if self.path not in ("/v1/chat/completions", "/chat/completions"):
             return self._json({"error": {"message": "not found", "type": "invalid_request_error"}}, 404)
         n = int(self.headers.get("Content-Length", 0))
+        if n > MAX_BODY:
+            self.close_connection = True               # body left unread -> the connection is unusable
+            return self._json({"error": {"message": f"request body is {n} bytes; this gateway caps "
+                                                    f"bodies at {MAX_BODY}",
+                                         "type": "invalid_request_error",
+                                         "code": "request_too_large"}}, 413)
         try:
-            body = json.loads(self.rfile.read(n) or b"{}")
+            raw = self.rfile.read(n)
+        except OSError:                                # client stalled past REQ_TIMEOUT or died mid-body
+            self.close_connection = True
+            return
+        try:
+            body = json.loads(raw or b"{}")
         except Exception:
             return self._json({"error": {"message": "invalid JSON body", "type": "invalid_request_error"}}, 400)
         messages = body.get("messages")
         if not messages:
             return self._json({"error": {"message": "messages is required", "type": "invalid_request_error"}}, 400)
+        if not _admit():                               # fast-fail: never park an unbounded thread pile
+            self.close_connection = True               # on the dispatcher while the ring is saturated
+            return self._json({"error": {"message": f"gateway at capacity ({MAX_INFLIGHT} requests "
+                                                    f"in flight); retry with backoff",
+                                         "type": "rate_limit_error",
+                                         "code": "gateway_overloaded"}}, 429)
+        try:
+            self._do_completion(body, messages)
+        finally:
+            _release()
+
+    def _do_completion(self, body, messages):
         tools = body.get("tools") or None
         if body.get("tool_choice") == "none":
             tools = None
