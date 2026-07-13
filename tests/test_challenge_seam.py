@@ -70,7 +70,7 @@ def test_matches_torch_compare_semantics():
         return
     from shard.challenge import compare, sketch
     t = torch.randn(1, 8, 64)
-    honest, garbage = sketch(t), sketch(torch.randn(1, 8, 64))
+    honest, garbage = sketch(t, seed="seam-7"), sketch(torch.randn(1, 8, 64), seed="seam-7")
     assert compare(honest, dict(honest))["passed"] is True
     assert compare(honest, garbage)["passed"] is False
     r_pure, r_ref = compare_sketches(honest, garbage), compare(honest, garbage)
