@@ -73,12 +73,21 @@ def _greet_role(hello):
     if SWARM_TOKEN is not None:
         if op not in ("hello_return", "hello_pred"):
             return None
-        if not hmac.compare_digest(str(hello.get("token", "")), SWARM_TOKEN):
+        # compare as bytes: hmac.compare_digest raises TypeError on a non-ASCII str, so a greeting
+        # like {"token": "€"} on the raw str path would crash the (unwrapped) stage — a one-frame DoS
+        # on the very auth path this adds. Encoding both sides keeps it timing-safe and total.
+        if not hmac.compare_digest(str(hello.get("token", "")).encode("utf-8"), SWARM_TOKEN.encode("utf-8")):
             return None
         return "ret" if op == "hello_return" else "pred"
     if op == "hello_return":
         return "ret"
     return "pred" if "op" in hello else None
+
+
+def _engine_bind_addr():
+    """C2 item 4: the stage engine listens on loopback by default — only the co-located sidecar and
+    coordinator dial it (both via 127.0.0.1). A launcher may set M25_ENGINE_BIND to expose it."""
+    return os.environ.get("M25_ENGINE_BIND", "127.0.0.1")
 
 # opt-in fp8 activations on the wire: the MEASURED per-hop bottleneck is moving the bf16 activation, so
 # transporting it as fp8 (e4m3) halves bytes/hop (~2x tok/s) at a small, MEASURED precision cost. Lossy but
@@ -1842,7 +1851,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         nxt_kw.attach(nxt_sock)
         print(f"[s{stage}] forward connected -> {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-    srv.bind(("0.0.0.0", port)); srv.listen(2)
+    srv.bind((_engine_bind_addr(), port)); srv.listen(2)
     print(f"[s{stage}] WARM, listening :{port}", flush=True)
 
     if parts["tail"]:

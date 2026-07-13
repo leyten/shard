@@ -275,3 +275,26 @@ def test_tail_token_session_end_to_end(monkeypatch):
     assert isinstance(recv_msg(ret), list)
     for s in (ret, pred, hijack):
         s.close()
+
+
+def test_malformed_token_greeting_never_crashes(monkeypatch):
+    """A greeting whose token is non-ASCII or not a string must AUTH-REJECT (None), never raise:
+    hmac.compare_digest throws TypeError on a non-ASCII str, and every _greet_role call site sits
+    outside EDGE_ERRORS recovery on an unwrapped serve(), so one such frame used to kill the warm
+    stage — a DoS on the exact auth path C2 adds."""
+    monkeypatch.setattr(MP, "SWARM_TOKEN", TOK)
+    for tok in ("€", "ü-junk", 12345, {"x": 1}, None, b"a" * 32, [1, 2]):
+        for op in ("hello_pred", "hello_return"):
+            assert MP._greet_role({"op": op, "token": tok}) is None
+    # the genuine token still classifies both roles
+    assert MP._greet_role({"op": "hello_pred", "token": TOK}) == "pred"
+    assert MP._greet_role({"op": "hello_return", "token": TOK}) == "ret"
+
+
+def test_engine_binds_loopback_by_default(monkeypatch):
+    """C2 item 4: the stage engine listens on loopback unless a launcher deliberately overrides
+    M25_ENGINE_BIND — only the co-located sidecar and coordinator dial it, both via 127.0.0.1."""
+    monkeypatch.delenv("M25_ENGINE_BIND", raising=False)
+    assert MP._engine_bind_addr() == "127.0.0.1"
+    monkeypatch.setenv("M25_ENGINE_BIND", "0.0.0.0")
+    assert MP._engine_bind_addr() == "0.0.0.0"
