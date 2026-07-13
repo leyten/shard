@@ -286,3 +286,98 @@ def test_publish_dir_refuses_index_referencing_missing_files(tmp_path):
               open(d / "model.safetensors.index.json", "w"))
     with pytest.raises(ValueError, match="no shard entry"):
         pub.build_from_dir(str(d))
+
+
+# ---- M7 (fetch): source routing, map==index equality, stray-weight quarantine -----------------------
+
+def _mk(src, path, data, kind="weights"):
+    full = os.path.join(src, path)
+    with open(full, "wb") as f:
+        f.write(data)
+    sha, size = mf.sha256_file(full)
+    return {"path": path, "size": size, "sha256": sha, "shard_id": mf.cidv1_raw(sha), "kind": kind}
+
+
+def _mini_repo(tmp_path, priv, index_map=None, weight_map=None):
+    """A 1-file signed repo; index_map lets the on-disk index disagree with the manifest."""
+    src = str(tmp_path / "src")
+    os.makedirs(src, exist_ok=True)
+    wm = weight_map if weight_map is not None else {
+        "model.layers.0.q.weight": "model-00001.safetensors",
+        "model.layers.1.q.weight": "model-00001.safetensors",
+        "model.embed_tokens.weight": "model-00001.safetensors",
+        "model.norm.weight": "model-00001.safetensors",
+        "lm_head.weight": "model-00001.safetensors",
+    }
+    shards = [
+        _mk(src, "model-00001.safetensors", b"W" * 64),
+        _mk(src, "config.json", b"{}", "config"),
+        _mk(src, "model.safetensors.index.json",
+            json.dumps({"weight_map": wm if index_map is None else index_map}).encode(), "config"),
+    ]
+    manifest = {"schema": mf.SCHEMA, "model_id": "t", "layer_count": 2,
+                "weight_map": wm, "shards": shards}
+    return src, mf.sign_manifest(manifest, priv)
+
+
+def test_mirror_routes_by_shard_source(tmp_path, monkeypatch):
+    """A shard declaring repo/revision (e.g. a separate tokenizer repo) must resolve
+    against ITS source, not the mirror's base repo — the old code always used base+path."""
+    urls = []
+
+    def fake(req, timeout=None):
+        urls.append(req.full_url)
+        return io.BytesIO(b"tokdata")
+
+    monkeypatch.setattr(F, "urlopen", fake)
+    prov = F.MirrorProvider("https://huggingface.co/org/model/resolve/rev1/")
+    prov.fetch({"path": "tokenizer.json", "size": 7, "repo": "other/tok", "revision": "trev"},
+               str(tmp_path / "tokenizer.json"))
+    assert urls == ["https://huggingface.co/other/tok/resolve/trev/tokenizer.json"]
+    urls.clear()                                           # no declared source -> legacy base+path
+    prov.fetch({"path": "tokenizer.json", "size": 7}, str(tmp_path / "t2.json"))
+    assert urls == ["https://huggingface.co/org/model/resolve/rev1/tokenizer.json"]
+
+
+def test_fetch_rejects_index_disagreeing_with_signed_map(tmp_path):
+    """A (validly signed) manifest whose bundled index carries a DIFFERENT weight_map than
+    the manifest's own: the runtime loader trusts the on-disk index, so a file only the
+    index references would load unverified. The pair must be refused."""
+    from shard.fetch import LocalDirProvider, fetch_block
+    priv = mf.gen_key()
+    src, manifest = _mini_repo(tmp_path, priv,
+                               index_map={"model.layers.0.q.weight": "model-00099.safetensors"})
+    dest = str(tmp_path / "model")
+    with pytest.raises(FetchError, match="weight_map"):
+        fetch_block(manifest, dest, stage=0, nstages=1, role="stage",
+                    provider=LocalDirProvider(src), expected_pubkey=mf.pub_b64(priv))
+    assert not os.path.exists(os.path.join(dest, "model.safetensors.index.json"))
+
+
+def test_fetch_rejects_map_referencing_unlisted_files(tmp_path):
+    from shard.fetch import LocalDirProvider, fetch_block
+    priv = mf.gen_key()
+    wm = {"model.layers.0.q.weight": "model-00001.safetensors",
+          "model.layers.1.q.weight": "ghost.safetensors"}          # no shard entry for this
+    src, manifest = _mini_repo(tmp_path, priv, weight_map=wm, index_map=wm)
+    with pytest.raises(FetchError, match="no shard entry"):
+        fetch_block(manifest, str(tmp_path / "model"), stage=0, nstages=1, role="stage",
+                    provider=LocalDirProvider(src), expected_pubkey=mf.pub_b64(priv))
+
+
+def test_stray_weight_file_is_quarantined(tmp_path):
+    """A stale safetensors already in the model dir but absent from the signed manifest
+    must not be loadable by the runtime's index-driven loader."""
+    from shard.fetch import LocalDirProvider, fetch_block
+    priv = mf.gen_key()
+    src, manifest = _mini_repo(tmp_path, priv)
+    dest = str(tmp_path / "model")
+    os.makedirs(dest)
+    stale = os.path.join(dest, "model-00099.safetensors")
+    with open(stale, "wb") as f:
+        f.write(b"never-verified")
+    fetch_block(manifest, dest, stage=0, nstages=1, role="stage",
+                provider=LocalDirProvider(src), expected_pubkey=mf.pub_b64(priv))
+    assert not os.path.exists(stale), "stray weight file left loadable"
+    assert os.path.exists(stale + ".quarantined")
+    assert os.path.exists(os.path.join(dest, "model-00001.safetensors"))   # the real one intact
