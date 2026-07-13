@@ -26,7 +26,7 @@ piggybacked, so a round costs exactly one round-trip end to end.
       --next 127.0.0.1:29501 --draft DRAFT --device cuda:0 --draft-device cuda:1 --adaptive
 """
 
-import argparse, socket, time, threading, queue, os
+import argparse, socket, time, threading, queue, os, json, hashlib
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 if os.environ.get("SHARD_TRANSPORT") == "libp2p":   # libp2p sidecar transport (no PSK; see node_kv)
@@ -51,6 +51,67 @@ NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 def _act_digest(t):
     """A deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
+
+
+# ---- fault-tolerance CHECKPOINT envelope (--ft-dump / --resume-file) ----
+# The old dump was a bare {"output_ids": [...]}: nothing bound it to the generation it came from,
+# so a stale/foreign checkpoint (other prompt, other model, other sampling settings) resumed
+# silently and produced a HYBRID generation. The envelope binds every generation input plus a
+# digest of the committed tokens; the resume side refuses anything that doesn't match THIS run.
+CKPT_SCHEMA = "shard-ckpt-v1"
+
+
+class CheckpointError(Exception):
+    """A resume checkpoint is unversioned, corrupt, or bound to a different generation."""
+
+
+def _sha256_text(s):
+    return hashlib.sha256(s.encode("utf-8", "replace")).hexdigest()
+
+
+def _ids_digest(ids):
+    return hashlib.sha256(json.dumps([int(i) for i in ids]).encode()).hexdigest()
+
+
+def checkpoint_env(*, prompt, model, tokenizer, settings):
+    """The generation-input binding a checkpoint carries and a resume must match exactly.
+    `job` is derived from the binding fields, so same-request heal+resume matches for free
+    while any cross-job reuse (different prompt/model/tokenizer/settings) is a mismatch."""
+    env = {"schema": CKPT_SCHEMA, "prompt_sha256": _sha256_text(prompt), "model": str(model),
+           "tokenizer": str(tokenizer), "settings": dict(settings)}
+    env["job"] = _sha256_text(json.dumps(env, sort_keys=True))
+    return env
+
+
+def write_checkpoint(path, env, output_ids, **extra):
+    """Write the versioned checkpoint ATOMICALLY (tmp + rename): a healer polling the file can
+    never read a torn dump, and a crash mid-write can't leave a truncated checkpoint behind."""
+    ids = [int(i) for i in output_ids]
+    d = {**env, "output_ids": ids, "ids_sha256": _ids_digest(ids), **extra}
+    tmp = f"{path}.tmp.{os.getpid()}"
+    with open(tmp, "w") as f:
+        json.dump(d, f); f.flush(); os.fsync(f.fileno())
+    os.replace(tmp, path)
+    return d
+
+
+def load_checkpoint(path, env):
+    """Load the committed tokens for a resume; REJECT (CheckpointError) anything not bound to
+    this exact generation -- never splice another job's tokens into a fresh prefill."""
+    d = json.load(open(path))
+    if d.get("schema") != CKPT_SCHEMA:
+        raise CheckpointError(f"checkpoint schema {d.get('schema')!r} != {CKPT_SCHEMA!r} "
+                              f"(unversioned/foreign checkpoint refused)")
+    for k in ("job", "prompt_sha256", "model", "tokenizer", "settings"):
+        if d.get(k) != env[k]:
+            raise CheckpointError(f"checkpoint {k} mismatch: resuming it would splice another "
+                                  f"generation (checkpoint {str(d.get(k))[:60]!r}, this run {str(env[k])[:60]!r})")
+    ids = d.get("output_ids")
+    if not isinstance(ids, list) or not all(isinstance(i, int) and not isinstance(i, bool) for i in ids):
+        raise CheckpointError("checkpoint output_ids malformed (not a list of token ids)")
+    if d.get("ids_sha256") != _ids_digest(ids):
+        raise CheckpointError("checkpoint committed-token digest mismatch (corrupt or edited)")
+    return ids
 
 
 SOCK_BUF = 32 << 20   # 32MB SO_SNDBUF/SO_RCVBUF: a ~24MB prefill-chunk activation buffers in-kernel,
@@ -1016,10 +1077,12 @@ def main():
                     "themselves, which a layer-omitting ring can game (warned loudly)")
     ap.add_argument("--sample-test", type=int, default=0, help="coordinator: draw N iid next-tokens via PLAIN vs "
                     "SPECULATIVE sampling and report TV distance (on-swarm losslessness proof); needs --ngram-draft")
-    ap.add_argument("--resume-file", default="", help="coordinator: JSON {output_ids:[...]} of already-committed "
-                    "tokens to RESUME from (re-prefill prompt+committed on a healed ring, continue) — fault tolerance")
-    ap.add_argument("--ft-dump", default="", help="coordinator: run resumable + write {ok,output_ids,...} here on "
-                    "completion OR mid-request node death (exit 3 if a node died), so the control plane can heal+resume")
+    ap.add_argument("--resume-file", default="", help="coordinator: versioned checkpoint (as written by --ft-dump) "
+                    "to RESUME from (re-prefill prompt+committed on a healed ring, continue) — fault tolerance; "
+                    "a checkpoint from another prompt/model/settings is REFUSED (CheckpointError)")
+    ap.add_argument("--ft-dump", default="", help="coordinator: run resumable + atomically write the versioned "
+                    "checkpoint {schema,job,prompt_sha256,...,output_ids,ids_sha256} here on completion OR "
+                    "mid-request node death (exit 3 if a node died), so the control plane can heal+resume")
     ap.add_argument("--compare", action="store_true", help="coordinator: SYNC then PIPE (cold+warm) in ONE process for a clean A/B")
     ap.add_argument("--depths", default="2,4,8", help="--compare: pipe depths to sweep (one process)")
     ap.add_argument("--ks", default="4", help="--compare: K values to sweep (one process; graph recaptures per K)")
@@ -1129,18 +1192,22 @@ def main():
                 print(f"[coord] dumped sample-test -> {args.dump}", flush=True)
             return
         if args.ft_dump:                                   # FAULT-TOLERANT run: resumable, dump partial on node death
-            import json as _json, sys as _sys
-            resume_ids = _json.load(open(args.resume_file)).get("output_ids", []) if args.resume_file else None
+            import sys as _sys
+            ck_env = checkpoint_env(prompt=args.prompt, model=args.model,
+                                    tokenizer=getattr(tok, "name_or_path", args.model),
+                                    settings={"temp": args.temp, "top_p": args.top_p, "top_k": args.top_k,
+                                              "seed": args.seed, "reasoning": args.reasoning or None})
+            resume_ids = load_checkpoint(args.resume_file, ck_env) if args.resume_file else None
             r = coordinate_pipe(draft_sock, pipe_sock, tok, args.prompt, args.K, args.max_new, args.timeout,
                                 args.depth, ret_sock=ret_sock, prefill_chunk=args.prefill_chunk,
                                 draft_ctx=args.draft_ctx, local_draft=local_draft, reasoning=(args.reasoning or None),
                                 temp=args.temp, top_p=args.top_p, top_k=args.top_k, seed=args.seed,
                                 prefill_depth=args.prefill_depth, resume_ids=resume_ids, resumable=True)
-            _json.dump({"ok": r.get("ok", False), "output_ids": r.get("output_ids", []),
-                        "n_tokens": r.get("n_tokens", 0), "text": r.get("text", ""),
-                        "error": r.get("error"), "tok_s": round(r.get("tok_s", 0.0), 2),
-                        "prefill_s": round(r.get("prefill_s", 0.0), 2),
-                        "resume_tokens": (len(resume_ids) if resume_ids else 0)}, open(args.ft_dump, "w"))
+            write_checkpoint(args.ft_dump, ck_env, r.get("output_ids", []),
+                             ok=r.get("ok", False), n_tokens=r.get("n_tokens", 0), text=r.get("text", ""),
+                             error=r.get("error"), tok_s=round(r.get("tok_s", 0.0), 2),
+                             prefill_s=round(r.get("prefill_s", 0.0), 2),
+                             resume_tokens=(len(resume_ids) if resume_ids else 0))
             status = "OK" if r.get("ok") else f"NODE-DEATH (committed {r.get('n_tokens', 0)} tok)"
             print(f"[coord] FT run {status} -> {args.ft_dump} | {r.get('n_tokens',0)} tok"
                   f"{' | '+r['error'] if r.get('error') else ''}", flush=True)
