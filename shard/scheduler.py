@@ -64,9 +64,46 @@ class Scheduler:
         return {nid: max(0, int((n.vram_gb - headroom_gb - boundary_gb) / per))
                 for nid, n in self.nodes.items()}
 
+    def plan(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
+             headroom_gb: float = 2.0, boundary_gb: float = 1.0) -> dict:
+        """ONE joint placement: pipeline order and contiguous blocks decided together.
+
+        allocate() + topology() compose incorrectly as a pair: allocate() hands the coordinator
+        a block and lays ranges fat-first while topology() excludes the coordinator and orders by
+        latency, so zipping the two can put layers [20,30) BEFORE [0,20) in the pipeline. This
+        delegates to shard.plan.plan_ring, which picks the head (the coordinator runs ON it), the
+        ring order and the per-stage blocks in one solve; the returned stages tile
+        [0, total_layers) IN ring order. `boundary_gb` maps to the head/tail reserves (embed on
+        the head, lm_head on the tail); node ids double as subnet keys because this facade carries
+        no subnet info (no co-location constraint). Raises ValueError when the joined pool can't
+        hold the model — the same contract as allocate()."""
+        from .plan import plan_ring
+        ids = list(self.nodes)
+        nodes = [{"id": nid, "free_vram_mb": self.nodes[nid].vram_gb * 1024.0, "subnet": nid}
+                 for nid in ids]
+        rtt = [[0.0 if a == b else float(self.nodes[a].rtt_ms[b]) for b in ids] for a in ids]
+        model = {"n_layers": self.total_layers,
+                 "layer_vram_mb": gb_per_layer * 1024.0,
+                 "kv_mb_per_layer": kv_gb_per_layer * 1024.0,
+                 "layer_ms_base": 0.65,
+                 "reserve_mb": headroom_gb * 1024.0,
+                 "head_reserve_mb": boundary_gb * 1024.0,
+                 "tail_reserve_mb": boundary_gb * 1024.0,
+                 "cap_layers": self.total_layers,       # no proven-density ceiling in this facade
+                 "head_layer_ms_mult": 1.0}
+        out = plan_ring(nodes, rtt, model)
+        if out is None:
+            raise ValueError(f"insufficient VRAM: pool can't hold {self.total_layers} layers "
+                             f"at {gb_per_layer:.2f} GB/layer")
+        return out
+
     def allocate(self, gb_per_layer: float, kv_gb_per_layer: float = 0.0,
                  headroom_gb: float = 2.0, boundary_gb: float = 1.0) -> dict[str, LayerRange]:
-        """assign each node a contiguous block that fits its vram, covering the whole stack,
+        """DEPRECATED as half of a pair: composing allocate() with topology() is incoherent (this
+        gives the coordinator a block and orders ranges fat-first; topology() excludes it and
+        orders by latency — the two orderings disagree). Use plan() for a deployable result.
+
+        assign each node a contiguous block that fits its vram, covering the whole stack,
         FAT NODES FIRST (a 48GB card holds more layers than a 24GB one -> fewer nodes, fewer
         WAN hops). Contiguous so each node's KV-cache is a simple per-block window; the block's
         layer indices reindex 0-based on the node (pipeline.load_stage --lo/--hi).
@@ -91,7 +128,9 @@ class Scheduler:
         return out
 
     def topology(self, coordinator_id: str, k: int | None = None) -> list[str]:
-        """order nodes into the cheapest pipeline loop on the measured rtt mesh.
+        """DEPRECATED as half of a pair: see allocate() — use plan() for a deployable result.
+
+        order nodes into the cheapest pipeline loop on the measured rtt mesh.
 
         the coordinator is the depot (entry hop out, direct-return hop back); the stage
         order is the min-latency Hamiltonian loop through it. with k set, also selects the
