@@ -130,9 +130,12 @@ def verify_coverage(receipts: list[dict], layer_count: int,
     activation a node attests it output is byte-identical to what the next node attests it received.
     Chaining catches fabricated roots and binds the receipt set to one real ring pass; it holds by
     construction only on the LOSSLESS wire (the caller passes check_chain=not fp8_wire, since fp8
-    activation transport is intentionally lossy). expected_by_signer maps pubkey -> the block
-    c0mpute assigned it (optional pinning)."""
+    activation transport is intentionally lossy). expected_by_signer maps pubkey -> the block the
+    swarm assigned it; passing it IS payment (pinned) mode and fails CLOSED: a signer absent from
+    the map is rejected, and every assigned signer must produce exactly one receipt (set equality).
+    In both modes a duplicate signer or a zero-work receipt (n_chunks missing/<=0) is rejected."""
     entries = []
+    seen_pubkeys = set()
     for r in receipts:
         verify_receipt(r, None)
         if expected_nonce is not None and r.get("nonce") != expected_nonce:
@@ -140,11 +143,23 @@ def verify_coverage(receipts: list[dict], layer_count: int,
         lo, hi = r["layer_start"], r["layer_end"]
         if not (0 <= lo < hi <= layer_count):
             raise ReceiptError(f"receipt block [{lo}:{hi}] outside [0:{layer_count}]")
+        if not isinstance(r.get("n_chunks"), int) or r["n_chunks"] <= 0:
+            raise ReceiptError(f"receipt for [{lo}:{hi}] attests {r.get('n_chunks')!r} chunks (zero-work receipt)")
+        pub = r["pubkey"]
+        if pub in seen_pubkeys:                      # one receipt per identity — a key signing two
+            raise ReceiptError(f"duplicate signer {pub[:12]}..")  # blocks is double-crediting
+        seen_pubkeys.add(pub)
         if expected_by_signer is not None:
-            want = expected_by_signer.get(r["pubkey"])
-            if want is not None and tuple(want) != (lo, hi):
-                raise ReceiptError(f"signer {r['pubkey'][:12]}.. attested [{lo}:{hi}], assigned {tuple(want)}")
+            want = expected_by_signer.get(pub)
+            if want is None:                         # fail CLOSED: an interloper's validly-signed
+                raise ReceiptError(f"signer {pub[:12]}.. is not in the assignment map")  # receipt never settles
+            if tuple(want) != (lo, hi):
+                raise ReceiptError(f"signer {pub[:12]}.. attested [{lo}:{hi}], assigned {tuple(want)}")
         entries.append((lo, hi, r))
+    if expected_by_signer is not None:               # assigned set == received set (extras died above)
+        missing = set(expected_by_signer) - seen_pubkeys
+        if missing:
+            raise ReceiptError(f"assigned signer(s) produced no receipt: {sorted(p[:12] for p in missing)}")
     entries.sort(key=lambda e: e[0])
     cursor = 0
     for lo, hi, _ in entries:
