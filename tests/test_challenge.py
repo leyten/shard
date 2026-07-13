@@ -44,8 +44,8 @@ def test_derive_challenge_differs_by_seed():
 
 def test_sketch_is_deterministic_and_compact():
     h = torch.randn(1, 8, 64)
-    s1, s2 = ch.sketch(h), ch.sketch(h)
-    assert s1 == s2                                   # fixed projection seed -> verifier & node project identically
+    s1, s2 = ch.sketch(h, seed="chal-1"), ch.sketch(h, seed="chal-1")
+    assert s1 == s2                                   # same per-challenge seed -> verifier & node project identically
     assert s1["n"] == 8 * 64 and len(s1["proj"]) == min(256, 8 * 64)
     assert abs(s1["norm"] - float(h.flatten().norm())) < 1e-2
 
@@ -96,8 +96,9 @@ def test_compare_partial_direction_fails():
 
 def test_compare_works_on_sketches():
     h = torch.randn(1, 16, 128)
-    assert ch.compare(ch.sketch(h), ch.sketch(h.clone()))["passed"]
-    assert not ch.compare(ch.sketch(h), ch.sketch(torch.randn(1, 16, 128)))["passed"]
+    s = ch.sketch_seed()                              # the verifier's committed per-challenge seed
+    assert ch.compare(ch.sketch(h, seed=s), ch.sketch(h.clone(), seed=s))["passed"]
+    assert not ch.compare(ch.sketch(h, seed=s), ch.sketch(torch.randn(1, 16, 128), seed=s))["passed"]
 
 
 # ---- 4. challenge_block: honest recompute passes, a skipped/wrong block fails ----------------------
@@ -144,3 +145,60 @@ def test_challenge_block_uses_same_seeded_input_both_sides(monkeypatch):
     block = _linear(1, 32)
     ch.challenge_block(block, block, "seed-x", 6, 32, device="cpu")
     assert len(seen) == 2 and torch.equal(seen[0], seen[1])
+
+
+# ---- 5. commit-first projection (M12): a fixed public seed is forgeable ------------------------------
+
+def _legacy_idx(numel, dim=256):
+    """Recompute the coordinates the OLD fixed-seed (1234567) projection samples — public forever."""
+    g = torch.Generator()
+    g.manual_seed(1234567)
+    return torch.randint(0, numel, (dim,), generator=g)
+
+
+def _forge(h):
+    """The M12 forgery: garbage everywhere EXCEPT the legacy-sampled coords, rescaled so the
+    total L2 norm matches (defeats the rel_norm guard). Full cosine ~0 — a 99%-wrong tensor."""
+    keep = torch.zeros(h.numel(), dtype=torch.bool)
+    keep[_legacy_idx(h.numel())] = True
+    forged = torch.randn(h.numel())
+    forged[keep] = h[keep]
+    forged[~keep] *= float(h[~keep].norm()) / float(forged[~keep].norm())
+    return forged
+
+
+def test_fixed_seed_forgery_fails_under_committed_seed():
+    torch.manual_seed(3)
+    h = torch.randn(10_000)
+    forged = _forge(h)
+    assert not ch.compare(h, forged)["passed"]        # the full tensors really are garbage-far apart
+    # legacy fixed projection: the forgery PASSES — this is the hole, kept only as an explicit opt-in
+    legacy = ch.compare_sketches(ch.sketch(h, seed=ch.LEGACY_SEED), ch.sketch(forged, seed=ch.LEGACY_SEED))
+    assert legacy["passed"], "legacy path changed; update the forgery to match"
+    # committed unpredictable seed: the SAME forgery FAILS (coords unknown at forge time)
+    s = "committed-chal-7"                            # any seed the prover didn't know when forging
+    r = ch.compare_sketches(ch.sketch(h, seed=s), ch.sketch(forged, seed=s))
+    assert not r["passed"] and r["cosine"] < 0.5
+
+
+def test_default_sketch_seed_is_unpredictable_and_recorded():
+    h = torch.randn(1, 8, 64)
+    s1, s2 = ch.sketch(h), ch.sketch(h)
+    assert s1["seed"] != s2["seed"]                   # fresh per-challenge draw, never the fixed literal
+    assert not ch.compare_sketches(s1, s2)["passed"]  # mismatched seeds fail closed
+    # the node sketching with the verifier's seed lines up
+    assert ch.compare_sketches(s1, ch.sketch(h, seed=s1["seed"]))["passed"]
+
+
+def test_seed_commitment_binds():
+    s = ch.sketch_seed()
+    assert ch.seed_commitment(s) == ch.seed_commitment(s) and len(ch.seed_commitment(s)) == 64
+    assert ch.seed_commitment(s) != ch.seed_commitment(ch.sketch_seed())
+
+
+def test_full_sketch_ships_whole_activation():
+    h = torch.randn(1, 4, 8)
+    f = ch.sketch(h, full=True)
+    assert f["n"] == len(f["proj"]) == 32 and f.get("full") is True
+    assert ch.compare_sketches(f, ch.sketch(h.clone(), full=True))["passed"]
+    assert not ch.compare_sketches(f, ch.sketch(torch.randn(1, 4, 8), full=True))["passed"]
