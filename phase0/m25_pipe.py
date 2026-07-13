@@ -1613,6 +1613,17 @@ def _dt_row(msg, stage, t_rx, t_comp):
                                            round((t_comp - t_rx) * 1e3, 2)]]
 
 
+def _recv_pred(conn):
+    """Head/middle predecessor recv (H4). Pre-frame idle is UNLIMITED — a warm ring parks between
+    jobs indefinitely, so the blocking wait happens in select, which ignores the socket timeout —
+    and the socket's timeout (set at accept, mirroring the tail's pred.settimeout) then only bounds
+    a MID-frame stall: a peer that wedges half-way through a frame surfaces as socket.timeout ->
+    EDGE_ERRORS -> the existing edge recovery, instead of holding the stage's only loop forever
+    (the accepted socket used to have NO timeout at all)."""
+    select.select([conn], [], [])
+    return _hrecv(recv_msg(conn))
+
+
 def _tail_accept(srv, pending=None, ret=None, timeout=None):
     """Tail bring-up handshake. TWO connections land on the tail: the coordinator-RETURN channel (greets
     with {op:'hello_return'} the instant it connects, because the coordinator sends data immediately) and
@@ -1970,12 +1981,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     print(f"[s{stage}] forward re-dial {nxt} still failing ({tries} tries)", flush=True)
                 time.sleep(0.5)
         conn, _ = srv.accept(); conn.setsockopt(*NODELAY); _keepalive(conn)
+        conn.settimeout(timeout)                  # bounds a MID-frame stall (H4); idle waits in _recv_pred's select
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
         with torch.no_grad():
             try:
                 while True:
-                    msg = _hrecv(recv_msg(conn))
+                    msg = _recv_pred(conn)
                     if msg.get("op") == "noop":                 # predecessor keep-warm frame: leg-local,
                         continue                                # never forwarded/answered/attested/timed
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
