@@ -14,7 +14,7 @@ fire-forward, the tail returns straight to the coordinator (serve_tail_direct's 
   coord:  SHARD_TRANSPORT=libp2p M25_DIR=/root/m25 python m25_pipe.py coord --head 127.0.0.1:29610 \
               --tail 127.0.0.1:29612 --K 6 --depth 4 --max-new 256 --prompt-file p.txt
 """
-import os, sys, socket, select, time, threading, argparse, hashlib, torch
+import os, sys, socket, select, time, threading, argparse, hashlib, hmac, torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("M25_DIR", "/root/m25")
 import json
@@ -50,6 +50,35 @@ except Exception:
     ReceiptSigner = None
 RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
+
+# C2 activation authorization, engine layer: a per-swarm/epoch token minted ONCE per launch by the
+# launcher (SHARD_SWARM_TOKEN env, never printed/committed). Set -> every ring connection must open
+# with an explicit identity-bound greeting carrying it ({op: hello_pred|hello_return, token: ...})
+# and role adoption happens ONLY on a valid greeting — silence-inference (the old "a silent conn is
+# the predecessor" rule, incl. its H6 mid-session variant) is dead. Unset -> exact legacy behavior.
+# The token is VALIDATED (hmac.compare_digest), never echoed into receipts, replies, forwarded
+# frames or logs; greetings are consumed before any signer exists and are never attested.
+SWARM_TOKEN = os.environ.get("SHARD_SWARM_TOKEN")
+GREET_TIMEOUT = float(os.environ.get("M25_GREET_TIMEOUT", "15") or 15)
+
+
+def _greet_role(hello):
+    """Classify a connection's FIRST frame -> 'ret' / 'pred' / None (close, adopt nothing). With
+    SWARM_TOKEN set only an explicit greeting with the right token classifies; anything else —
+    wrong/missing token, a bare job frame, junk — is None. Legacy (no token): hello_return -> ret,
+    any op-carrying dict -> pred whose first frame is job data (handed back), like always."""
+    if not isinstance(hello, dict):
+        return None
+    op = hello.get("op")
+    if SWARM_TOKEN is not None:
+        if op not in ("hello_return", "hello_pred"):
+            return None
+        if not hmac.compare_digest(str(hello.get("token", "")), SWARM_TOKEN):
+            return None
+        return "ret" if op == "hello_return" else "pred"
+    if op == "hello_return":
+        return "ret"
+    return "pred" if "op" in hello else None
 
 # opt-in fp8 activations on the wire: the MEASURED per-hop bottleneck is moving the bf16 activation, so
 # transporting it as fp8 (e4m3) halves bytes/hop (~2x tok/s) at a small, MEASURED precision cost. Lossy but
@@ -1695,21 +1724,37 @@ def _tail_accept(srv, pending=None, ret=None, timeout=None):
     coordinator's hello_return may already have been accepted when the old predecessor died) — closing
     them instead would EOF the reconnecting peer and re-wedge. `ret` seeds an already-live return
     channel (kept across a pred-death that raced a fresh coordinator) — then only the predecessor is
-    awaited. `timeout` bounds the greeting read so a half-sent frame can't hang bring-up."""
-    pred, first, pending = None, None, list(pending or [])
+    awaited. `timeout` bounds the greeting read so a half-sent frame can't hang bring-up.
+
+    C2 (SWARM_TOKEN set): classification is by explicit token-bearing greeting ONLY (_greet_role) —
+    hello_pred adopts the predecessor with first_msg=None (its next frame is job data), a silent
+    connection is NEVER adopted (the select gets a 1s tick and any pending conn older than
+    M25_GREET_TIMEOUT is closed), and a wrong/missing token or a bare job frame is an AUTH REJECT."""
+    pred, first = None, None
+    pending = {s: time.monotonic() for s in (pending or [])}   # conn -> accept time (greet deadline)
     while ret is None or pred is None:
-        if ret is not None and pred is None and pending:   # silent conn + live ret -> it's the predecessor
-            pred = pending.pop()
-            for extra in pending:                          # 2-conn ring never leaves extras, but stay clean
+        if SWARM_TOKEN is None and ret is not None and pred is None and pending:
+            conns = list(pending); pending.clear()         # legacy only: silent conn + live ret -> it's
+            pred = conns.pop()                             # the predecessor (token mode adopts NOTHING
+            for extra in conns:                            # that hasn't greeted)
                 try: extra.close()
                 except OSError: pass
-            pending = []
             break
-        ready, _, _ = select.select([srv] + pending, [], [])   # wake on a new conn OR a pending conn speaking
+        ready, _, _ = select.select([srv] + list(pending), [], [],   # wake on a new conn OR a pending conn
+                                    1.0 if SWARM_TOKEN is not None else None)   # speaking (+1s greet tick)
+        if SWARM_TOKEN is not None:
+            now = time.monotonic()
+            for s in [s for s, t0 in pending.items() if now - t0 > GREET_TIMEOUT]:
+                del pending[s]                             # a silent conn is never adopted: reap it
+                print("[tail] AUTH REJECT: conn silent past greet timeout — closed", flush=True)
+                try: s.close()
+                except OSError: pass
         for s in ready:
             if s is srv:
-                c, _ = srv.accept(); c.setsockopt(*NODELAY); _keepalive(c); pending.append(c); continue
-            pending.remove(s)                              # it spoke -> classify by content
+                c, _ = srv.accept(); c.setsockopt(*NODELAY); _keepalive(c); pending[c] = time.monotonic(); continue
+            if s not in pending:                           # reaped by the greet timeout this very tick
+                continue
+            del pending[s]                                 # it spoke -> classify by content
             if timeout:
                 s.settimeout(timeout)
             try:
@@ -1718,7 +1763,8 @@ def _tail_accept(srv, pending=None, ret=None, timeout=None):
                 try: s.close()
                 except OSError: pass
                 continue
-            if isinstance(hello, dict) and hello.get("op") == "hello_return":
+            role = _greet_role(hello)
+            if role == "ret":
                 if ret is not None:                        # newer coordinator wins (the old one is dead/stale)
                     try: ret.close()
                     except OSError: pass
@@ -1729,12 +1775,16 @@ def _tail_accept(srv, pending=None, ret=None, timeout=None):
                     try: ret.close()
                     except OSError: pass
                     ret = None
-            elif isinstance(hello, dict) and "op" in hello:
+            elif role == "pred":
                 if pred is not None:                       # a speaking predecessor replaces a stale one
                     try: pred.close()
                     except OSError: pass
-                pred = s; first = hello                    # its first frame is real job data — hand it back
+                pred = s                                   # token mode: the greeting is consumed, job data
+                first = None if SWARM_TOKEN is not None else hello   # follows; legacy: the first frame IS
+                                                           # real job data — hand it back
             else:
+                if SWARM_TOKEN is not None:                # wrong/missing token or a bare job frame
+                    print("[tail] AUTH REJECT: first frame is not a valid greeting — closed", flush=True)
                 try: s.close()                             # unexpected greeter (junk/probe) -> drop, keep waiting
                 except OSError: pass
     return ret, pred, first
@@ -1751,7 +1801,9 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
         _keepalive(s)
-        return s
+        if SWARM_TOKEN is not None:                   # C2: identity-bound greeting, FIRST frame on every
+            send_msg(s, {"op": "hello_pred", "token": SWARM_TOKEN})   # (re)dial — the downstream stage
+        return s                                      # adopts a predecessor by this greeting, not silence
     nxt_sock = None
     nxt_kw = _KeepWarm()                              # cwnd keep-warm on the forward ring leg (idle a full
     if not parts["tail"]:                             # traversal between frames); attach() tracks re-dials
@@ -1834,7 +1886,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     try: spoke.close()
                                     except OSError: pass
                                     continue
-                                if isinstance(hello, dict) and hello.get("op") == "hello_return":
+                                role = _greet_role(hello)  # C2/H6: with SWARM_TOKEN set, mid-session role
+                                if role == "ret":          # adoption too is by token-bearing greeting ONLY
                                     if ret is not None:    # coordinator churn: the old return channel is dead
                                         try: ret.close()   # even if this write-only socket never told us
                                         except OSError: pass
@@ -1848,14 +1901,18 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                         try: ret.close()
                                         except OSError: pass
                                         ret = None; ret_kw.attach(None)
-                                elif isinstance(hello, dict) and "op" in hello:
-                                    # a NEW predecessor speaking its first job frame (direct-TCP stage
-                                    # replacement after a silent pred death) — adopt it, keep the frame
+                                elif role == "pred":
+                                    # a NEW predecessor (direct-TCP stage replacement after a silent pred
+                                    # death): legacy speaks its first JOB frame (kept); token mode greets
+                                    # (consumed — the next frame is job data)
                                     try: pred.close()
                                     except OSError: pass
-                                    pred = spoke; queued = hello; stale = False
+                                    pred = spoke; stale = False
+                                    queued = None if SWARM_TOKEN is not None else hello
                                     print("[tail] predecessor REPLACED mid-session", flush=True)
                                 else:
+                                    if SWARM_TOKEN is not None:
+                                        print("[tail] AUTH REJECT: mid-session conn spoke a non-greeting — closed", flush=True)
                                     try: spoke.close()     # unexpected greeter (junk/probe) -> drop
                                     except OSError: pass
                                 continue
@@ -2046,6 +2103,18 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 time.sleep(0.5)
         conn, _ = srv.accept(); conn.setsockopt(*NODELAY); _keepalive(conn)
         conn.settimeout(timeout)                  # bounds a MID-frame stall (H4); idle waits in _recv_pred's select
+        if SWARM_TOKEN is not None:               # C2: the predecessor must greet with the swarm token
+            try:                                  # BEFORE any job frame; the greeting is consumed, never
+                hello = recv_msg(conn)            # forwarded. Anything else -> close and re-accept.
+            except EDGE_ERRORS:
+                try: conn.close()
+                except OSError: pass
+                continue
+            if _greet_role(hello) != "pred":
+                print(f"[s{stage}] AUTH REJECT: predecessor greeting missing/invalid — closed", flush=True)
+                try: conn.close()
+                except OSError: pass
+                continue
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
         with torch.no_grad():
@@ -2316,7 +2385,9 @@ def coord(head_ep, tail_ep, prompt, K, max_new, depth, ngram_n, timeout, sweep=N
     hh, hp = head_ep.rsplit(":", 1); th, tp = tail_ep.rsplit(":", 1)
     pipe = socket.create_connection((hh, int(hp)), timeout=timeout); pipe.setsockopt(*NODELAY)
     ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
-    send_msg(ret, {"op": "hello_return"})                       # identify the return channel to the tail
+    if SWARM_TOKEN is not None:                                 # C2: the head adopts its predecessor (us)
+        send_msg(pipe, {"op": "hello_pred", "token": SWARM_TOKEN})   # by greeting, first frame on the pipe
+    send_msg(ret, {"op": "hello_return", **({"token": SWARM_TOKEN} if SWARM_TOKEN is not None else {})})
     recv_data(ret)                                              # wait ret_ok: tail confirmed ret before any reset flows
     messages = [{"role": "user", "content": prompt}]
 
