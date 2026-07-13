@@ -9,7 +9,7 @@ via the 29612 return tunnel.
   python m25_scatter_pipe.py --order CA:42545183:0:10 WA:..:10:23 MN:..:23:36 NJ:..:36:49 NC:..:49:62 \
       --K 6 --depth 4 --max-new 256 --prompt-file /root/copy_prompt.txt
 """
-import os, sys, json, time, subprocess, argparse
+import os, re, sys, json, time, shlex, subprocess, argparse
 
 KEY = "/root/.ssh/vast_c0mpute"
 SSHO = ["-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=25", "-i", KEY]
@@ -64,24 +64,44 @@ def push_code(host, port):
                 raise RuntimeError(f"push_code {host}:{port} failed on {f}: {r.stderr.strip()[-200:]}")
 
 
+# A PeerId arrives as a REMOTE box's stdout and gets interpolated into root shell commands on
+# EVERY other box — validate strict base58btc (libp2p PeerIds; no 0OIl, no quotes/metachars)
+# BEFORE it can touch a command string. shlex-quoted again at the point of use (defense in depth).
+PEERID_RE = re.compile(r"^[1-9A-HJ-NP-Za-km-z]{40,64}$")
+
+
+def check_peerid(pid):
+    if not PEERID_RE.fullmatch(pid or ""):
+        raise ValueError(f"invalid PeerId from node (not base58btc): {pid!r}")
+    return pid
+
+
 def peerid(host, port):
     r = sh(host, port, "/tmp/sidecar -key /root/node.key -prove ping 2>/dev/null | grep PEERID")
     for ln in r.stdout.splitlines():
         if ln.startswith("PEERID "):
-            return ln.split()[1]
+            return check_peerid(ln.split()[1])
     raise RuntimeError(f"no PeerId {host}:{port}: {r.stdout[-200:]}{r.stderr[-200:]}")
 
 
-def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None):
-    fw = " ".join(f"-forward {f}" for f in forwards)
-    inb = f"-inbound {inbound}" if inbound else ""
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
+    """Pure builder (unit-testable): every remote-influenced value (multiaddrs carry PeerIds from
+    remote stdout) is shlex-quoted, and the whole inner command is quoted ONCE for the bash -c
+    level — correct two-level quoting, byte-identical to the old literal form for legit values."""
+    fw = " ".join(f"-forward {shlex.quote(f)}" for f in forwards)
+    inb = f"-inbound {shlex.quote(inbound)}" if inbound else ""
     # seeding lifecycle (torrent): a stage that verified-pulled its layer range seeds it on the
     # shard DHT from the SAME tunnel daemon — 'manifest.json=modelDir' + neighbour bootstrap addrs.
-    sd = f"-seed {seed}" if seed else ""
-    bs = " ".join(f"-dht-bootstrap {b}" for b in (dht_bootstrap or []))
-    cmd = (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
-           f"setsid bash -c '/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-           f"-announce {announce} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1' </dev/null >/dev/null 2>&1 &")
+    sd = f"-seed {shlex.quote(seed)}" if seed else ""
+    bs = " ".join(f"-dht-bootstrap {shlex.quote(b)}" for b in (dht_bootstrap or []))
+    inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1")
+    return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
+            f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
+
+
+def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None):
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):
