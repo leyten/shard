@@ -16,7 +16,9 @@
 package main
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/binary"
 	"encoding/json"
 	"fmt"
@@ -33,6 +35,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	"github.com/multiformats/go-multiaddr"
+	mh "github.com/multiformats/go-multihash"
 )
 
 // blockxProto requests one manifest shard by CID and streams its bytes.
@@ -71,12 +74,24 @@ func readCtrlFrame(s network.Stream) ([]byte, error) {
 }
 
 // copyIdle streams up to `want` bytes src->dst, resetting an idle deadline each chunk so
-// a stalled peer aborts instead of hanging past the fetch timeout. Returns bytes copied.
-func copyIdle(s network.Stream, dst io.Writer, src io.Reader, want int64) (int64, error) {
+// a stalled peer aborts instead of hanging past the fetch timeout. `abs` (non-zero) is
+// the fetch's ABSOLUTE deadline: a flowing-but-slow transfer used to outlive the overall
+// -fetch-timeout because per-chunk deadlines kept resetting; now every chunk deadline is
+// capped at abs, so the whole pull ends when the fetch budget says so. Returns bytes copied.
+func copyIdle(s network.Stream, dst io.Writer, src io.Reader, want int64, abs time.Time) (int64, error) {
 	buf := make([]byte, 1<<20)
 	var done int64
 	for done < want {
-		if err := s.SetReadDeadline(time.Now().Add(idleTimeout)); err != nil {
+		dl := time.Now().Add(idleTimeout)
+		if !abs.IsZero() {
+			if !time.Now().Before(abs) {
+				return done, fmt.Errorf("fetch deadline exceeded")
+			}
+			if abs.Before(dl) {
+				dl = abs
+			}
+		}
+		if err := s.SetReadDeadline(dl); err != nil {
 			return done, err
 		}
 		chunk := int64(len(buf))
@@ -355,6 +370,18 @@ func runFetchCid(ctx context.Context, h host.Host, d *dht.IpfsDHT, known []peer.
 	if err != nil {
 		return fmt.Errorf("bad cid: %w", err)
 	}
+	// The CID names the bytes (shard/manifest.py: CIDv1 raw + sha2-256), so Go can
+	// verify each provider's transfer ITSELF instead of accepting the first
+	// size-complete one and leaving Python to reject it after Go stopped trying peers
+	// — a wrong-bytes provider now just means "next peer", not a failed fetch.
+	dec, err := mh.Decode(c.Hash())
+	if err != nil {
+		return fmt.Errorf("bad cid multihash: %w", err)
+	}
+	if dec.Code != mh.SHA2_256 {
+		return fmt.Errorf("unsupported cid hash code %d (want sha2-256)", dec.Code)
+	}
+	wantDigest := dec.Digest
 	fctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	prefix := fmt.Sprintf("%s.p2p.%d.", out, os.Getpid())
@@ -367,6 +394,14 @@ func runFetchCid(ctx context.Context, h host.Host, d *dht.IpfsDHT, known []peer.
 	seen := map[peer.ID]bool{h.ID(): true}
 	lastErr := fmt.Errorf("no providers for %s", cidStr)
 	tried := 0
+	// Global download budget: with a manifest size, no combination of providers may
+	// make us pull more than a few times the shard — a swarm of wrong-bytes seeders
+	// burns bounded bandwidth, not the node's whole uplink window.
+	var pulled int64
+	budget := int64(-1)
+	if size > 0 {
+		budget = 4 * size
+	}
 	partSize := func(p string) int64 {
 		st, err := os.Stat(p)
 		if err != nil {
@@ -385,13 +420,24 @@ func runFetchCid(ctx context.Context, h host.Host, d *dht.IpfsDHT, known []peer.
 		// offset: a transient WAN stall (a 60 s idle mid-5 GB — observed live: a ring
 		// seeder sent 4.27 GB then stalled) must not cost the honest bytes already
 		// pulled. Each retry must GROW the partial or we stop — a hostile/refusing
-		// peer makes no progress and exits in one round; wrong bytes still die at the
-		// caller's manifest re-hash. Cross-peer resume stays impossible (peer-scoped
-		// partial file).
+		// peer makes no progress and exits in one round. Wrong bytes die HERE at the
+		// per-provider CID re-hash (and again at the caller's manifest re-hash), so
+		// the next provider still gets its chance. Cross-peer resume stays impossible
+		// (peer-scoped partial file).
 		var ferr error
 		for try := 0; try < 3; try++ {
 			before := partSize(part)
-			if ferr = fetchFromPeer(fctx, h, ai, cidStr, part, size); ferr == nil {
+			ferr = fetchFromPeer(fctx, h, ai, cidStr, part, size)
+			pulled += partSize(part) - before
+			if budget >= 0 && pulled > budget {
+				os.Remove(part)
+				return true, fmt.Errorf("fetch byte budget exceeded (%d pulled for a %d-byte shard)", pulled, size)
+			}
+			if ferr == nil {
+				if herr := verifySHA256(part, wantDigest); herr != nil {
+					ferr = herr // deterministic for this peer: drop its bytes, next provider
+					break
+				}
 				if err := os.Rename(part, out); err != nil {
 					return true, err
 				}
@@ -487,14 +533,34 @@ func fetchFromPeer(ctx context.Context, h host.Host, ai peer.AddrInfo, cidStr, p
 	if start > resp.Size {
 		return fmt.Errorf("partial %d exceeds peer size %d", start, resp.Size)
 	}
-	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o644)
+	f, err := os.OpenFile(part, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) // private: unverified peer bytes
 	if err != nil {
 		return err
 	}
-	n, err := copyIdle(s, f, s, resp.Size-start)
+	abs, _ := ctx.Deadline() // the fetch's absolute deadline caps every chunk deadline
+	n, err := copyIdle(s, f, s, resp.Size-start, abs)
 	f.Close()
 	if err != nil {
 		return fmt.Errorf("transfer stopped at %d/%d: %w", start+n, resp.Size, err)
+	}
+	return nil
+}
+
+// verifySHA256 re-hashes a completed transfer against the CID's sha2-256 digest —
+// the per-provider trust boundary: a size-complete but wrong-bytes transfer is
+// rejected here, before the file may be renamed into place.
+func verifySHA256(path string, want []byte) error {
+	f, err := os.Open(path)
+	if err != nil {
+		return err
+	}
+	defer f.Close()
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return err
+	}
+	if got := h.Sum(nil); !bytes.Equal(got, want) {
+		return fmt.Errorf("content sha256 %x.. != cid digest %x..", got[:8], want[:8])
 	}
 	return nil
 }
