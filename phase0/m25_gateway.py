@@ -30,6 +30,11 @@ MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
 # answer DIRECTLY by default (fast, for latency-sensitive/high-overlap normal usage); a request can
 # override per-call with {"reasoning": true/false} or {"reasoning_effort": "none"|...}. Default ON (quality).
 DEFAULT_REASONING = os.environ.get("M25_DEFAULT_REASONING", "1") != "0"
+# Per-swarm/epoch token (C2 activation authorization): when the launcher sets SHARD_SWARM_TOKEN,
+# every ring connection opens with an explicit identity-bound greeting so the tail/head adopt a
+# socket by GREETING, never by silence-inference. Unset = exact legacy wire behavior. The token is
+# validated ring-side and must never appear in receipts, replies, or logs.
+SWARM_TOKEN = os.environ.get("SHARD_SWARM_TOKEN")
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 # A stalled streaming client must not pin the single-stream ring: bound each chunk write so a client
 # that stops reading is dropped in seconds, not up to the ring timeout (was ~30 min). Env-tunable.
@@ -123,7 +128,13 @@ def _connect(timeout):
     pipe = socket.create_connection((hh, int(hp)), timeout=timeout); pipe.setsockopt(*NODELAY)
     ret = socket.create_connection((th, int(tp)), timeout=timeout); ret.setsockopt(*NODELAY); ret.settimeout(timeout)
     from node_kv import send_msg, recv_msg
-    send_msg(ret, {"op": "hello_return"}); recv_msg(ret)   # wait ret_ok before any reset flows
+    if SWARM_TOKEN:
+        # C2 greetings: hello_return (with the swarm token) on the return channel, and hello_pred as
+        # the FIRST frame on the head socket — the tail/head classify by these, never by silence.
+        send_msg(ret, {"op": "hello_return", "token": SWARM_TOKEN}); recv_msg(ret)   # wait ret_ok
+        send_msg(pipe, {"op": "hello_pred", "token": SWARM_TOKEN})
+    else:
+        send_msg(ret, {"op": "hello_return"}); recv_msg(ret)   # wait ret_ok before any reset flows
     SOCKS.update(pipe=pipe, ret=ret)
 
 
