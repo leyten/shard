@@ -17,7 +17,7 @@ coordinator-return by content (hello_return), both arriving on the tail engine's
       --prompt-file /root/ft_prompt.txt --K 4 --depth 2 --max-new 64
 
 Teardown is manual (vastai destroy)."""
-import argparse, re, shlex, time
+import argparse, re, secrets, shlex, sys, time
 
 from launch_oss import ep, fire, instances, rssh, warm_stage, M120, PORT, PSK
 
@@ -51,7 +51,7 @@ def maddr(inst, pid):
     return f"/ip4/{ip}/tcp/{port}/p2p/{pid}"
 
 
-def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, nonce=""):
     """Pure builder (unit-testable): remote-influenced values (multiaddrs carry PeerIds from remote
     stdout) are shlex-quoted, and the inner command is quoted ONCE for the bash -c level.
     Detach + pkill notes: proper detach (setsid bash -c '...' </dev/null >/dev/null 2>&1 &) — a bare
@@ -62,9 +62,10 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None):
     inb = f"-inbound {shlex.quote(inbound)}" if inbound else ""
     sd = f"-seed {shlex.quote(seed)}" if seed else ""
     bs = " ".join(f"-dht-bootstrap {shlex.quote(b)}" for b in (dht_bootstrap or []))
+    nn = f"echo {nonce} > /root/sidecar.nonce; " if nonce else ""
     inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
              f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} > /root/sidecar.log 2>&1")
-    return (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; "
+    return (f"fuser -k {LIBP2P}/tcp 2>/dev/null; sleep 1; rm -f /root/sidecar.log; {nn}"
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
@@ -75,13 +76,17 @@ def launch_sidecar(inst, announce, inbound, forwards, seed=None, dht_bootstrap=N
     dht_bootstrap: peer multiaddrs to join the DHT through (ring neighbours work fine).
     RETRIES: vast SSH is flaky (rc=255 'try again after a few seconds'), and a missed sidecar launch =
     the engine's forward connect gets refused. So launch + verify ('listening' in sidecar.log) up to 4×."""
-    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap)
+    nonce = secrets.token_hex(8)
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, nonce=nonce)
     for attempt in range(6):
         fire(inst, cmd)
         for _ in range(4):                              # tolerant verify: vast ssh rc=255 can flake the CHECK too
             time.sleep(3)
             try:
-                r = rssh(inst, "grep -cE 'tunnel up|listening' /root/sidecar.log 2>/dev/null || echo 0", 20)
+                # nonce-gated (M4): only THIS launch's log can satisfy the check — a stale
+                # sidecar.log from a previous run (flaked ssh never ran the rm) reads as 0.
+                r = rssh(inst, f"[ \"$(cat /root/sidecar.nonce 2>/dev/null)\" = \"{nonce}\" ] && "
+                               f"grep -cE 'tunnel up|listening' /root/sidecar.log 2>/dev/null || echo 0", 20)
                 if r.returncode == 0:
                     last = r.stdout.strip().splitlines()[-1].strip() if r.stdout.strip() else "0"
                     if last not in ("", "0"):
@@ -159,7 +164,8 @@ def main():
                 forwards.append(f"127.0.0.1:{FWD_RING}={maddrs[k + 1]}")
             if k == 0:                                          # head also tunnels the coordinator's ret -> tail
                 forwards.append(f"127.0.0.1:{FWD_RET}={maddrs[-1]}")
-            launch_sidecar(s, ann, inbound, forwards)
+            if not launch_sidecar(s, ann, inbound, forwards):
+                sys.exit(1)                # M4: a failed launch must FAIL the launcher
         time.sleep(4)
         # engines tail-first (so a forward dial finds a listening successor); retry once for SSH flakiness
         print("[libp2p] launching engines tail-first (SHARD_TRANSPORT=libp2p, --fast --direct-return) ...", flush=True)
@@ -177,14 +183,15 @@ def main():
             if not ok:
                 print("[abort] engine failed to warm; sidecar.log + stage.log:", flush=True)
                 print(rssh(stages[k], "tail -5 /root/sidecar.log; echo ---; tail -8 /root/stage.log", 30).stdout, flush=True)
-                return
+                sys.exit(1)
 
     # coordinator on the head: --next = head engine (local), --tail = head sidecar ret-forward
     print("[libp2p] running n-gram coordinator on head ...", flush=True)
     sync = " SHARD_SYNC_SEND=1" if a.sync_send else ""
     renv = " SHARD_RECEIPTS=1" if a.receipts else ""
     smpl = f" --temp {a.temp} --top-p {a.top_p} --top-k {a.top_k} --seed {a.seed}" if a.temp > 0 else ""
-    cmd = (f"cd /root && SHARD_TRANSPORT=libp2p{sync}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
+    # M4: pipefail — without it the pipeline's rc is the trailing grep's and a crashed coord exits 0
+    cmd = (f"set -o pipefail; cd /root && SHARD_TRANSPORT=libp2p{sync}{renv} python3 specpipe.py --coordinator --nstages {nstages} "
            f"--model {a.model} --ngram-draft --ngram-n {a.ngram_n} --pipe --depth {a.depth} --K {a.K} "
            f"--next 127.0.0.1:{ENG_IN} --direct-return --tail 127.0.0.1:{FWD_RET} --prompt-file {a.prompt_file} "
            f"--prefill-chunk {a.prefill_chunk} --max-ctx {a.max_ctx} --max-new {a.max_new}{smpl} "
@@ -193,6 +200,9 @@ def main():
     print(r.stdout[-3000:], flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-800:], flush=True)
+    if r.returncode != 0:
+        print(f"[abort] coordinator FAILED (rc={r.returncode})", flush=True)
+        sys.exit(1)
     print("\n[done] ring still up; teardown: vastai destroy instance <id>", flush=True)
 
 

@@ -116,7 +116,10 @@ class Drive:
 
         def fake_sh(host, port, cmd, timeout=120):
             self.sh_cmds.append((host, cmd))
-            return _res("GPU\n" if "nvidia-smi" in cmd else "")
+            r = _res("GPU\n" if "nvidia-smi" in cmd else "")
+            if "m25_pipe.py coord" in cmd:
+                r.returncode = sh_rc
+            return r
 
         monkeypatch.setattr(msp, "vinst", fake_vinst)
         monkeypatch.setattr(msp, "push_code", lambda h, p: None)
@@ -220,6 +223,60 @@ def test_swarm_token_reaches_oneshot_coord(monkeypatch):
 def test_warm_only_stays_tokenless(monkeypatch):
     d = Drive(monkeypatch, ORDER3 + ["--warm-only"])
     assert all(k.get("token") is None for _, k in d.stage_calls)
+
+
+# ---------------------------------------------------------------- M4: fail loud, fresh readiness
+
+def test_sidecar_failure_exits_nonzero(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"], sidecar_ok=False)
+    assert d.exit_code not in (None, 0)
+
+
+def test_warm_failure_exits_nonzero(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"], warm_ok=False)
+    assert d.exit_code not in (None, 0)
+
+
+def test_coord_failure_propagates_rc(monkeypatch):
+    d = Drive(monkeypatch, ORDER3, sh_rc=1)
+    assert d.exit_code not in (None, 0)
+    assert d.coord_cmd().startswith("set -o pipefail;")   # engine rc survives the tee|grep pipeline
+
+
+def test_gateway_failure_exits_nonzero(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"], sh_rc=1)  # fresh_count stub reports never-up
+    assert d.exit_code not in (None, 0)
+
+
+def test_success_exits_zero(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"])
+    assert d.exit_code in (None, 0)
+    d = Drive(monkeypatch, ORDER3)
+    assert d.exit_code in (None, 0)
+
+
+@pytest.mark.parametrize("mod", [msp, msc])
+def test_readiness_checks_are_nonce_gated(mod, monkeypatch):
+    """the readiness probe must refuse a matching log line unless THIS launch's nonce is on the box
+    — a stale log from a previous run (launch ssh flaked before the rm) can no longer read WARM."""
+    seen = []
+    monkeypatch.setattr(mod, "sh", lambda h, p, cmd, t=20: (seen.append(cmd), _res("7"))[1])
+    assert mod.fresh_count("h", 22, "/root/stage.nonce", "abcd1234", "/root/stage.log", "WARM") == "7"
+    q = seen[0]
+    assert '[ "$(cat /root/stage.nonce 2>/dev/null)" = "abcd1234" ] &&' in q
+
+
+@pytest.mark.parametrize("mod", [msp, msc])
+def test_launch_cmds_write_nonce_after_log_reset(mod):
+    if mod is msp:
+        sc = mod.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "", [], nonce="n1")
+        st = mod.stage_cmd(0, 3, 0, 20, False, nonce="n2")
+    else:
+        sc = mod.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "", "", nonce="n1")
+        st = None
+    assert "rm -f /root/sidecar.log; echo n1 > /root/sidecar.nonce; " in sc
+    if st is not None:
+        assert "rm -f /root/stage.log; echo n2 > /root/stage.nonce; " in st
 
 
 def test_sidecar_cmd_benign_values_unchanged():
