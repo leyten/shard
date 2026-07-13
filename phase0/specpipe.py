@@ -133,12 +133,16 @@ class _AsyncSender:
         self.sock = sock
         self.q = queue.Queue(maxsize=64)
         self.error = None
+        self.closed = threading.Event()
         self.t = threading.Thread(target=self._run, daemon=True)
         self.t.start()
 
     def _run(self):
-        while True:
-            obj = self.q.get()
+        while not self.closed.is_set():
+            try:
+                obj = self.q.get(timeout=0.25)   # bounded wait: a lost wake can never strand the worker
+            except queue.Empty:
+                continue
             if obj is None:
                 return
             if self.error is not None:
@@ -149,13 +153,22 @@ class _AsyncSender:
                 self.error = e
 
     def put(self, obj):
+        if self.closed.is_set():
+            raise RuntimeError("_AsyncSender closed")
         if self.error is not None:
             raise self.error
         self.q.put(obj)
 
-    def close(self):
-        try: self.q.put_nowait(None)
-        except Exception: pass
+    def close(self, timeout=5.0):
+        """Idempotent shutdown. The EVENT stops the worker, not a droppable sentinel: the old
+        put_nowait(None) silently lost the sentinel when the queue was FULL (exactly the wedged-link
+        case close() runs in), stranding the daemon worker forever. Queued frames are discarded --
+        close() only runs on edge teardown, where they're already dead. The join is BOUNDED so a
+        send stalled inside the kernel can never wedge the serve loop's reset path."""
+        self.closed.set()
+        try: self.q.put_nowait(None)           # fast wake if there's room; the event is the guarantee
+        except queue.Full: pass
+        self.t.join(timeout)
 
 
 def serve_spec(parts, stage, nstages, listen_port, nxt, timeout, dev, direct=False):
