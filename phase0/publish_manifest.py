@@ -23,6 +23,7 @@ import sys
 import urllib.request
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from shard import fetch as _fetch  # noqa: E402 — its urlopen never leaks the bearer cross-origin
 from shard import manifest as mf  # noqa: E402
 
 TOKENIZER_FILES = {
@@ -43,12 +44,12 @@ def _hdr():
 
 def _hf_get(repo, path):
     url = f"https://huggingface.co/{repo}/resolve/main/{path}"
-    return urllib.request.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60).read()
+    return _fetch.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60).read()
 
 
 def _hf_tree(repo):
     url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=1"
-    return json.load(urllib.request.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60))
+    return json.load(_fetch.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60))
 
 
 def _kind(path):
@@ -94,7 +95,7 @@ def build_from_hf(repo, tokenizer_repo):
                        "sha256": sha, "size": size, "kind": kind})
 
     for path, (_, e) in sorted(tok_entries.items()):
-        blob = urllib.request.urlopen(
+        blob = _fetch.urlopen(
             urllib.request.Request(f"https://huggingface.co/{tokenizer_repo}/resolve/main/{path}",
                                    headers=_hdr()), timeout=60).read()
         sha = hashlib.sha256(blob).hexdigest()
