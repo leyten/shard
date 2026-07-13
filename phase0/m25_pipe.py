@@ -454,6 +454,31 @@ def _eagle_aux_range_b(aux, b, lo, hi):
     return _t.stack([aux[str(li)][b, lo:hi] for li in S.EAGLE_AUX_LAYER_IDS], 1)
 
 
+def _pf_len(toks, aux):
+    """Chunk length of a PREFILL reply. The tail projects logits only at the chunk's FINAL position
+    (P1 — the full [1,s,vocab] prefill projection was a ~1.6GB tail transient the coordinator threw
+    away), so len(toks) is 1 on current stages and the full chunk length on old ones. The aux
+    tensors still carry EVERY chunk position (the drafter needs them all) — derive the length from
+    them, so the EAGLE prefill context is never truncated whichever build the tail runs. No aux
+    (plain n-gram ring) -> len(toks); nothing consumes the length there."""
+    if aux:
+        for li in S.EAGLE_AUX_LAYER_IDS:
+            v = aux.get(str(li))
+            if torch.is_tensor(v):
+                return v.shape[0]
+    return len(toks)
+
+
+def _pf_pair(gen_ids, start, toks, n):
+    """eagle_draft.prefill_pair_tokens with the chunk length `n` passed EXPLICITLY (len(toks) no
+    longer equals it — see _pf_len): the chunk's aux positions [start, start+n) each predicted the
+    NEXT prompt token (tokens[i] = gen_ids[start+1+i]); the LAST chunk's final position predicted
+    the first generated token = toks[-1] (the tail's final-position argmax, returned by old and new
+    tails alike). Invariant: concatenated over all chunks == gen_ids[1:] + [first_gen_token]."""
+    nxt = list(gen_ids[start + 1: start + n + 1])
+    return nxt if len(nxt) == n else nxt + [toks[-1]]
+
+
 def _aux_local_handshake(sock, token, wait_s=2.0):
     """Confirm the head's per-job aux_local opt-in on the (localhost) pipe socket. `token` is the
     job's UNIQUE nonce (minted per job — job_id defaults to "job" everywhere, so it can NOT
@@ -734,15 +759,17 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         t_pf = time.time()
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
-            from eagle_draft import prefill_pair_tokens
             local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
         def _pf_extend(start_i, toks_i, aux_i):
             """Feed ONE prefill chunk's aux into the EAGLE context as it arrives, so the drafter sees the
             WHOLE prompt (the old code kept only the LAST chunk -> the drafter attended ~prefill_chunk
-            tokens of context on long prompts) and the extend compute hides in the next chunk's WAN wait."""
+            tokens of context on long prompts) and the extend compute hides in the next chunk's WAN wait.
+            Chunk length comes from the AUX shape, never len(toks_i) — the tail returns only the final
+            position's argmax since P1 (see _pf_len)."""
             if eagle_on and aux_i is not None:
-                local_draft.extend(prefill_pair_tokens(gen_ids, start_i, toks_i),
-                                   _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
+                n_i = _pf_len(toks_i, aux_i)
+                local_draft.extend(_pf_pair(gen_ids, start_i, toks_i, n_i),
+                                   _eagle_aux_range(aux_i, 0, n_i), base_pos=start_i)
         if prefill_chunk and len(gen_ids) > prefill_chunk:
             starts = list(range(0, len(gen_ids), prefill_chunk))
             def _send_pf(i): kw.send({"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
@@ -917,13 +944,15 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
         kw.send(rop); _check_reset_ack(rop, recv_data(rx))  # kw lock; recv_data skips noops; raises on refused graph
         t_pf = time.time()                                  # ---- prefill: IDENTICAL to coordinate_pipe ----
         eg.reset()                                          # fresh EAGLE context per job (drafter is a shared singleton)
-        from eagle_draft import prefill_pair_tokens
         def _pf_extend(start_i, toks_i, aux_i):
             """Feed ONE prefill chunk's aux into the EAGLE context as it arrives (whole-prompt drafter
-            context — the accept lever the serial-path A/B proved on rag-quote, 13->44%)."""
+            context — the accept lever the serial-path A/B proved on rag-quote, 13->44%). Chunk length
+            from the AUX shape, never len(toks_i) — the tail slices prefill logits to the final
+            position since P1 (see _pf_len)."""
             if aux_i is not None:
-                eg.extend(prefill_pair_tokens(gen_ids, start_i, toks_i),
-                          _eagle_aux_range(aux_i, 0, len(toks_i)), base_pos=start_i)
+                n_i = _pf_len(toks_i, aux_i)
+                eg.extend(_pf_pair(gen_ids, start_i, toks_i, n_i),
+                          _eagle_aux_range(aux_i, 0, n_i), base_pos=start_i)
         if prefill_chunk and len(gen_ids) > prefill_chunk:
             starts = list(range(0, len(gen_ids), prefill_chunk))
             def _send_pf(i): kw.send({"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
@@ -1142,7 +1171,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
     t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None; per_stage = {}
     eagle_on = S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters)
     if eagle_on:
-        from eagle_draft import prefill_pair_tokens, fetch_b
+        from eagle_draft import fetch_b
         for d in drafters:
             d.reset()                                    # fresh per-stream EAGLE context per job
     job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
@@ -1183,9 +1212,10 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
                     loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
                     if loc:
                         aux = {**(aux or {}), **loc}     # all-empty stays None -> the no-aux path fails loud
-                if eagle_on and aux is not None:         # whole-prompt drafter context, chunk by chunk
-                    drafters[b].extend(prefill_pair_tokens(gen, i, rr),
-                                       _eagle_aux_range(aux, 0, len(rr)), base_pos=i)
+                if eagle_on and aux is not None:         # whole-prompt drafter context, chunk by chunk;
+                    n_i = _pf_len(rr, aux)               # chunk length from the AUX shape (P1: prefill
+                    drafters[b].extend(_pf_pair(gen, i, rr, n_i),   # toks are final-position-only)
+                                       _eagle_aux_range(aux, 0, n_i), base_pos=i)
             cur[b] = rr[-1]
             pos[b] = len(gen); out[b] = [cur[b]]
             if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
@@ -1322,7 +1352,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     trunk, a chain frame as its causal prefix (accept offset len-1). After any chain commit the only
     dirty token is cur (correction/bonus was never an input), so pending_path collapses to [cur] and
     the frame IS the standard [anchor]+draft. GREEDY/LOSSLESS by construction on both routes."""
-    from eagle_draft import prefill_pair_tokens, fetch_b, fetch_tree_b, HybridDrafter
+    from eagle_draft import fetch_b, fetch_tree_b, HybridDrafter
     from collections import deque
     B = len(messages_list)
     rx = ret_sock if ret_sock is not None else pipe_sock
@@ -1395,8 +1425,9 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
                     if loc:
                         aux = {**(aux or {}), **loc}
                 if aux is not None:
-                    drafters[b].extend(prefill_pair_tokens(gen, i, rr),
-                                       _eagle_aux_range(aux, 0, len(rr)), base_pos=i)
+                    n_i = _pf_len(rr, aux)               # chunk length from the AUX shape (P1)
+                    drafters[b].extend(_pf_pair(gen, i, rr, n_i),
+                                       _eagle_aux_range(aux, 0, n_i), base_pos=i)
             cur[b] = rr[-1]
             pos[b] = len(gen); out[b] = [cur[b]]
             if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
@@ -2001,7 +2032,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 h = S.run_block_prefill_b(layers, msg["stream"], msg["start"], x, vcfg)
                                 if RECEIPTS and signer is not None:
                                     signer.observe(_act_digest(x), _act_digest(h))
-                                toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                                # P1: only the FINAL position's argmax is consumed by the coordinator
+                                # (chunk length rides the aux shape) — projecting the whole chunk
+                                # materialized a [1,s,vocab] transient (~1.6GB at s=4096)
+                                toks = _tail_logits(h[:, -1:], parts).argmax(-1)[0].tolist()
                                 _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
                             if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
                                 b = msg["stream"]                            # tree-masked block against KV row b —
@@ -2049,7 +2083,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                             if RECEIPTS and signer is not None:   # attest this block's input->output transform
                                 signer.observe(_act_digest(x), _act_digest(h))
-                            toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
+                            # P1: a PREFILL chunk's logits are consumed only at the final position (the
+                            # coordinator derives the chunk length from the aux shape) — slicing frees
+                            # the [1,s,vocab] projection transient (~1.6GB at s=4096). Decode/verify
+                            # frames keep every position: the accept walk reads them all.
+                            toks = _tail_logits(h[:, -1:] if msg.get("prefill") else h,
+                                                parts).argmax(-1)[0].tolist()
                             o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
                             if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                 o = o if isinstance(o, dict) else {"toks": o}
