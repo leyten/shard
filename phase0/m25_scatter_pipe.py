@@ -33,6 +33,7 @@ ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAG
            "M25_TREE", "M25_TREE_M", "M25_TREE_TOPB", "M25_TREE_DEPTH",   # tree-verify: stages need M25_TREE (tree kernel), the coordinator all four
            "M25_CWND_KEEPWARM_MS", "M25_KEEPWARM_JOB",                    # cwnd keep-warm: stage senders keep idle legs warm (default-ON for --serve interactive)
            "M25_STAGE_TIMING",                                            # per-stage [span,compute] stamps -> coordinator transport split
+           "M25_FRAME_TIMEOUT",                                           # absolute per-frame recv deadline (H4); the sidecar gets the SAME number via -frame-timeout
            "SHARD_RECEIPT_DUMP"]                                          # coordinator exports the signed receipt set for the c0mpute settle seam
 
 
@@ -103,7 +104,7 @@ def fresh_count(host, port, nonce_file, nonce, log, pattern):
     return (r.stdout.strip().splitlines() or ["0"])[-1].strip()
 
 
-def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None, nonce=""):
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None, nonce="", frame_timeout=60):
     """Pure builder (unit-testable): every remote-influenced value (multiaddrs carry PeerIds from
     remote stdout) is shlex-quoted, and the whole inner command is quoted ONCE for the bash -c
     level — correct two-level quoting, byte-identical to the old literal form for legit values."""
@@ -116,16 +117,21 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allo
     # C2: cryptographic neighbour allowlist — the sidecar Reset()s inbound streams whose
     # Noise-authenticated RemotePeer isn't one of these PeerIds (empty = open, legacy).
     al = " ".join(f"-allow {shlex.quote(p)}" for p in (allow or []))
+    # H4: absolute per-frame deadline for the tunnel pipe — 60s default clears the worst legit
+    # frame (multi-MB bf16 prefill chunk on a ~5MB/s residential uplink ~5-10s) and sits far under
+    # the 600s stage timeout; the engine keys off the same number (M25_FRAME_TIMEOUT). 0 disables.
+    ft = f"-frame-timeout {int(frame_timeout)}"
     nn = f"echo {nonce} > /root/sidecar.nonce; " if nonce else ""
     inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} > /root/sidecar.log 2>&1")
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} {ft} > /root/sidecar.log 2>&1")
     return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; {nn}"
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
 def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
     nonce = secrets.token_hex(8)
-    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow, nonce=nonce)
+    ft = int(os.environ.get("M25_FRAME_TIMEOUT", "60") or 0)   # operator override reaches BOTH the sidecar flag and (via ENG_ENV) the engine
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow, nonce=nonce, frame_timeout=ft)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):

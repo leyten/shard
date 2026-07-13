@@ -279,6 +279,32 @@ def test_launch_cmds_write_nonce_after_log_reset(mod):
         assert "rm -f /root/stage.log; echo n2 > /root/stage.nonce; " in st
 
 
+# ---------------------------------------------------------------- H4: frame-timeout config
+
+def test_sidecar_cmd_frame_timeout():
+    cmd = msp.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "", [])
+    assert "-frame-timeout 60" in _bash_c_payload(cmd)          # defaults ON at 60s
+    cmd = msp.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "", [], frame_timeout=0)
+    assert "-frame-timeout 0" in _bash_c_payload(cmd)           # 0 = explicit opt-out
+
+
+def test_frame_timeout_env_forwarded_to_engines(monkeypatch):
+    assert "M25_FRAME_TIMEOUT" in msp.ENG_ENV                   # stages+gateway+coord get the same number
+    monkeypatch.setenv("M25_FRAME_TIMEOUT", "45")
+    assert "M25_FRAME_TIMEOUT=45 " in msp.eng_env()
+
+
+def test_launch_sidecar_reads_operator_frame_timeout(monkeypatch):
+    seen = []
+    monkeypatch.setattr(msp, "sh", lambda h, p, cmd, t=30: (seen.append(cmd), _res(""))[1])
+    monkeypatch.setattr(msp, "fresh_count",
+                        lambda h, p, nf, n, log, pattern: "1" if "tunnel" in pattern else "0")
+    monkeypatch.setattr(msp.time, "sleep", lambda s: None)
+    monkeypatch.setenv("M25_FRAME_TIMEOUT", "45")
+    assert msp.launch_sidecar("h", 22, "/ip4/1.2.3.4/tcp/29600", "", [])
+    assert "-frame-timeout 45" in seen[0]
+
+
 def test_sidecar_cmd_benign_values_unchanged():
     """for legit values the built command is the same shape as the old literal one-quote form."""
     fwd = f"127.0.0.1:29611=/ip4/5.6.7.8/tcp/29600/p2p/{VALID_PID}"
