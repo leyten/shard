@@ -104,6 +104,7 @@ class Drive:
         self.sh_cmds = []            # (host, cmd) of every sh() the launcher runs
         self.stage_calls = []        # (args, kwargs) per launch_stage
         self.sidecar_calls = []      # (args, kwargs) per launch_sidecar
+        self.pushed_assignments = None
         self.exit_code = None
         pids = {}
 
@@ -130,6 +131,10 @@ class Drive:
         monkeypatch.setattr(msp, "launch_stage",
                             lambda *a, **k: (self.stage_calls.append((a, k)), "stubnonce")[1])
         monkeypatch.setattr(msp, "warm", lambda *a, **k: warm_ok)
+        if hasattr(msp, "collect_assignments"):
+            monkeypatch.setattr(msp, "collect_assignments", lambda nodes: {"PUB=": [0, 62]})
+            monkeypatch.setattr(msp, "push_assignments",
+                                lambda head, m: setattr(self, "pushed_assignments", (head["host"], m)))
         monkeypatch.setattr(msp.time, "sleep", lambda s: None)
         if hasattr(msp, "fresh_count"):
             monkeypatch.setattr(msp, "fresh_count", lambda *a, **k: "1" if sh_rc == 0 else "0")
@@ -303,6 +308,47 @@ def test_launch_sidecar_reads_operator_frame_timeout(monkeypatch):
     monkeypatch.setenv("M25_FRAME_TIMEOUT", "45")
     assert msp.launch_sidecar("h", 22, "/ip4/1.2.3.4/tcp/29600", "", [])
     assert "-frame-timeout 45" in seen[0]
+
+
+# ---------------------------------------------------------------- H2: assignment-map plumbing
+
+def _pub(i):
+    return "A" * 42 + f"k{i}="                                  # base64-shaped, distinct per node
+
+
+def test_collect_assignments(monkeypatch):
+    monkeypatch.setattr(msp, "sh", lambda h, p, cmd, t=60: _res(f"{_pub(h)}\n"))
+    nodes = [{"region": "A", "host": 1, "port": 22, "lo": 0, "hi": 31},
+             {"region": "B", "host": 2, "port": 22, "lo": 31, "hi": 62}]
+    assert msp.collect_assignments(nodes) == {_pub(1): [0, 31], _pub(2): [31, 62]}
+
+
+def test_collect_assignments_rejects_hostile_pubkey(monkeypatch):
+    monkeypatch.setattr(msp, "sh", lambda h, p, cmd, t=60: _res("PUB'; id #\n"))
+    with pytest.raises(RuntimeError, match="bad receipt pubkey"):
+        msp.collect_assignments([{"region": "A", "host": 1, "port": 22, "lo": 0, "hi": 62}])
+
+
+def test_collect_assignments_rejects_duplicate_signer(monkeypatch):
+    monkeypatch.setattr(msp, "sh", lambda h, p, cmd, t=60: _res(f"{_pub(0)}\n"))
+    nodes = [{"region": "A", "host": 1, "port": 22, "lo": 0, "hi": 31},
+             {"region": "B", "host": 2, "port": 22, "lo": 31, "hi": 62}]
+    with pytest.raises(RuntimeError, match="duplicate receipt pubkey"):
+        msp.collect_assignments(nodes)
+
+
+def test_receipts_run_pins_settlement(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve", "--receipts"])
+    assert d.pushed_assignments == ("h1", {"PUB=": [0, 62]})    # map lands on the HEAD box
+    assert "SHARD_ASSIGNMENTS=/root/assignments.json " in d.gw_cmd()
+    d = Drive(monkeypatch, ORDER3 + ["--receipts"])
+    assert "SHARD_ASSIGNMENTS=/root/assignments.json " in d.coord_cmd()
+
+
+def test_no_receipts_run_stays_unpinned(monkeypatch):
+    d = Drive(monkeypatch, ORDER3 + ["--serve"])
+    assert d.pushed_assignments is None
+    assert "SHARD_ASSIGNMENTS" not in d.gw_cmd()
 
 
 def test_sidecar_cmd_benign_values_unchanged():
