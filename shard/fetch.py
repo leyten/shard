@@ -28,8 +28,10 @@ import shutil
 import subprocess
 import sys
 import time
+import urllib.request
 from abc import ABC, abstractmethod
-from urllib.request import Request, urlopen
+from urllib.parse import urlsplit
+from urllib.request import Request
 
 from . import manifest as mf
 
@@ -69,6 +71,38 @@ def _copy_capped(src, dst, limit: int, bufsize: int = 1 << 20) -> None:
             break
         dst.write(chunk)
         remaining -= len(chunk)
+
+
+class _SafeRedirectHandler(urllib.request.HTTPRedirectHandler):
+    """urllib's default redirect handler carries EVERY header — including Authorization —
+    to the redirect target, so a mirror 302ing to another origin exfiltrates the bearer
+    token (e.g. an HF_TOKEN). Rules: a redirect target must be https; crossing an origin
+    (scheme or authority change) strips Authorization; if SHARD_REDIRECT_ALLOW is set
+    (comma-separated hostnames), a cross-origin target must be on it."""
+
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        new = super().redirect_request(req, fp, code, msg, headers, newurl)
+        if new is None:
+            return None
+        old_u, new_u = urlsplit(req.full_url), urlsplit(new.full_url)
+        if new_u.scheme != "https":
+            raise FetchError(f"insecure redirect to {new.full_url!r} refused")
+        if (old_u.scheme.lower(), old_u.netloc.lower()) != (new_u.scheme.lower(), new_u.netloc.lower()):
+            allow = [h.strip() for h in os.environ.get("SHARD_REDIRECT_ALLOW", "").split(",") if h.strip()]
+            if allow and new_u.hostname not in allow:
+                raise FetchError(
+                    f"cross-origin redirect to {new_u.netloc!r} not in SHARD_REDIRECT_ALLOW")
+            new.remove_header("Authorization")  # never leak the bearer to another origin
+        return new
+
+
+_OPENER = urllib.request.build_opener(_SafeRedirectHandler())
+
+
+def urlopen(req, timeout=None):
+    """All engine HTTP goes through the redirect-hardened opener above (never the module
+    default, whose redirect handler forwards Authorization cross-origin)."""
+    return _OPENER.open(req, timeout=timeout)
 
 
 # ── providers (the source seam) ───────────────────────────────────────────────

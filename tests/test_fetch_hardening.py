@@ -5,11 +5,14 @@ these are the adversarial regressions from the external audit:
   M8  — _safe_rel's lexical check let a pre-existing SYMLINK component (or a symlink at
         the destination itself) redirect a shard write outside the model root; the
         publisher key was written world-readable (0644 under umask 022).
+  M9  — python's default redirect handler forwards Authorization to the redirect target,
+        so a mirror 302ing cross-origin exfiltrates the bearer (e.g. an HF_TOKEN).
 
 Run: python3 -m pytest tests/test_fetch_hardening.py -q
 """
 import os
 import sys
+import urllib.request
 
 import pytest
 
@@ -17,6 +20,7 @@ _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 sys.path.insert(0, _REPO)
 sys.path.insert(0, os.path.join(_REPO, "phase0"))
 
+from shard import fetch as F                         # noqa: E402
 from shard import manifest as mf                     # noqa: E402
 from shard.fetch import FetchError, _safe_rel        # noqa: E402
 
@@ -103,3 +107,47 @@ def test_load_key_rejects_exposed_perms(tmp_path):
     os.chmod(path, 0o644)
     with pytest.raises(mf.ManifestError, match="group/world"):
         mf.load_key(path)
+
+
+# ---- M9: Authorization must never cross an origin on redirect ---------------------------------------
+
+def _redirect(from_url, to_url, headers=None):
+    req = urllib.request.Request(from_url, headers=headers or {})
+    h = F._SafeRedirectHandler()
+    return h.redirect_request(req, None, 302, "Found", {}, to_url)
+
+
+def test_cross_origin_redirect_strips_authorization():
+    new = _redirect("https://huggingface.co/org/model/resolve/main/f.safetensors",
+                    "https://evil.example.com/f.safetensors",
+                    {"Authorization": "Bearer hf_secret", "User-Agent": "shard/1"})
+    assert not new.has_header("Authorization"), "bearer leaked across origins"
+    assert new.has_header("User-agent")                    # benign headers still carried
+
+
+def test_same_origin_redirect_keeps_authorization():
+    new = _redirect("https://huggingface.co/a", "https://huggingface.co/b",
+                    {"Authorization": "Bearer hf_secret"})
+    assert new.has_header("Authorization")                 # same origin: auth is fine
+
+
+def test_insecure_redirect_refused():
+    with pytest.raises(FetchError, match="insecure"):
+        _redirect("https://huggingface.co/a", "http://huggingface.co/a")
+
+
+def test_redirect_allowlist_enforced_when_set(monkeypatch):
+    monkeypatch.setenv("SHARD_REDIRECT_ALLOW", "cdn-lfs.huggingface.co")
+    new = _redirect("https://huggingface.co/a", "https://cdn-lfs.huggingface.co/b",
+                    {"Authorization": "Bearer x"})
+    assert not new.has_header("Authorization")             # allowed host, auth still stripped
+    with pytest.raises(FetchError, match="SHARD_REDIRECT_ALLOW"):
+        _redirect("https://huggingface.co/a", "https://elsewhere.example.com/b")
+
+
+def test_engine_http_uses_hardened_opener():
+    """MirrorProvider and publish_manifest both resolve HTTP through shard.fetch.urlopen,
+    whose opener carries the auth-stripping handler — not urllib's module default."""
+    assert any(isinstance(h, F._SafeRedirectHandler) for h in F._OPENER.handlers)
+    import publish_manifest as pub
+    assert pub._fetch is F
