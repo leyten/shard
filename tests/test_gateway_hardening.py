@@ -179,6 +179,58 @@ def test_health_reports_negotiated_max_ctx():
     assert _json_reply(h)["max_ctx"] == gw.A.max_ctx
 
 
+# ---- H5: bounded intake (body cap, in-flight cap, read deadline) ------------------------------------
+
+def test_oversized_body_rejected_413(monkeypatch):
+    monkeypatch.setattr(gw, "MAX_BODY", 100)
+    h = _handler(body={"messages": [{"role": "user", "content": "y" * 500}]})
+    h.do_POST()
+    r = _json_reply(h)
+    assert h.statuses == [413]
+    assert r["error"]["code"] == "request_too_large"
+
+
+def test_over_capacity_rejected_429(monkeypatch):
+    monkeypatch.setattr(gw, "MAX_INFLIGHT", 1)
+    gw._INFLIGHT["n"] = 1                                # someone already in flight
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}]})
+    h.do_POST()
+    r = _json_reply(h)
+    gw._INFLIGHT["n"] = 0
+    assert h.statuses == [429]
+    assert r["error"]["code"] == "gateway_overloaded"
+
+
+def test_inflight_released_after_request():
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}]})
+    h.do_POST()
+    assert h.statuses == [200]
+    assert gw._INFLIGHT["n"] == 0, "in-flight slot must be released"
+
+
+def test_inflight_released_on_engine_error(monkeypatch):
+    def boom(*a, **k):
+        raise RuntimeError("ring fell over")
+    monkeypatch.setattr(gw, "run_request", boom)
+    h = _handler(body={"messages": [{"role": "user", "content": "hi"}]})
+    h.do_POST()
+    assert gw._INFLIGHT["n"] == 0, "slot must be released on failure too"
+
+
+def test_handler_read_deadline_armed():
+    assert gw.H.timeout == gw.REQ_TIMEOUT and gw.REQ_TIMEOUT > 0, \
+        "header/body reads must carry a socket deadline (slow-loris guard)"
+
+
+def test_body_read_timeout_drops_connection():
+    h = _handler()
+    h.rfile = types.SimpleNamespace(read=lambda n: (_ for _ in ()).throw(TimeoutError("stalled")))
+    h.headers = {"Content-Length": "10"}
+    h.do_POST()
+    assert h.statuses == [], "a stalled body read must drop, not crash the handler thread"
+    assert h.close_connection
+
+
 # ---- H6: identity-bound greetings from _connect ---------------------------------------------------------
 
 class _FS:
