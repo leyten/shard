@@ -21,7 +21,7 @@ import argparse, json, os, socket, sys, threading, time, itertools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m25_tools import parse_completion, to_openai_message, TOOLCALL_BEGIN, THINK_BEGIN, THINK_END
+from m25_tools import parse_completion, render_ids, to_openai_message, TOOLCALL_BEGIN, THINK_BEGIN, THINK_END
 
 MOCK = bool(os.environ.get("M25_GATEWAY_MOCK"))
 MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
@@ -84,6 +84,26 @@ def _class_k(cls, B=1):
     return K_CTX                                       # context + reasoning at wide B
 
 
+def negotiated_max_ctx(operator_max_ctx: int, stage_kv_caps: list[int]) -> int:
+    """H1 single source of truth: the ring's effective context limit is the MIN of the operator's
+    ceiling and every stage's KV cap (zero/absent caps are unknown, not infinite — filtered out).
+    The launcher computes this once and passes it as --max-ctx; the gateway rejects above it."""
+    return min([int(operator_max_ctx)] + [int(c) for c in stage_kv_caps if c and int(c) > 0])
+
+
+def spec_headroom(k_max: int, tree: bool = False, tree_m: int = 0) -> int:
+    """Speculative decode may run the KV up to K (or the tree's M) slots past the committed frontier;
+    +16 matches coordinate_pipe's existing safety margin (m25_pipe reserves gen+16)."""
+    return (max(int(k_max), int(tree_m)) if tree else int(k_max)) + 16
+
+
+class JobRejected(Exception):
+    """A stage refused the job with a structured per-job error (e.g. kv_overflow) — the job is dead
+    but the ring is healthy. Deliberately NOT an OSError so neither coordinate_pipe's EDGE_ERRORS
+    recovery nor generate()'s reconnect-retry ever eats it: a rejected job must never be re-run.
+    Rebound to m25_pipe.JobRejected by _engine_init so gateway excepts match the coordinator's."""
+
+
 class ClientGone(Exception):
     """The HTTP client's socket died or stalled mid-stream (write failed / timed out). NOT a ring
     fault — so generate() must NEVER retry or re-run the generation (the old behaviour: a client
@@ -93,6 +113,12 @@ class ClientGone(Exception):
 
 A = None
 tok = None
+# speculative headroom defaults; _configure() derives the real values from the parsed args (K_MAX
+# spans every K content routing may pick — a routed job must never out-run the reserved margin).
+K_MAX = 8
+TREE = False
+TREE_M = 0
+HEADROOM = spec_headroom(K_MAX)
 coordinate_pipe = None
 coordinate_pipe_batch = None
 make_drafter = None
@@ -100,14 +126,31 @@ make_drafters_b = None
 SOCKS = {}
 
 
+def _configure(args):
+    """Bind the parsed args + derived speculative headroom. A.max_ctx IS the negotiated effective
+    limit at runtime — the launcher (m25_scatter_pipe) computes negotiated_max_ctx over the stage
+    KV caps and passes it as --max-ctx; a hand-launched gateway keeps the operator default."""
+    global A, K_MAX, TREE, TREE_M, HEADROOM
+    A = args
+    K_MAX = max(A.K, K_CTX, K_NOVEL)
+    TREE = bool(int(os.environ.get("M25_TREE", "0") or 0))
+    TREE_M = int(os.environ.get("M25_TREE_M", "0") or 0)
+    HEADROOM = spec_headroom(K_MAX, TREE, TREE_M)
+
+
 def _engine_init():
     """Import the M2.5 engine + tokenizer and resolve head/tail endpoints (real mode only)."""
-    global tok, coordinate_pipe, coordinate_pipe_batch, make_drafter, make_drafters_b
+    global tok, coordinate_pipe, coordinate_pipe_batch, make_drafter, make_drafters_b, JobRejected
     import m25_stage as S
     from m25_pipe import (coordinate_pipe as cp, coordinate_pipe_batch as cpb,
                           make_drafter as md, make_drafters_b as mdb)
     from transformers import AutoTokenizer
     coordinate_pipe = cp; coordinate_pipe_batch = cpb; make_drafter = md; make_drafters_b = mdb
+    try:                                                # coordinator's class wins so excepts match
+        from m25_pipe import JobRejected as _jr
+        JobRejected = _jr
+    except ImportError:
+        pass
     tok = AutoTokenizer.from_pretrained(S.DIR, trust_remote_code=True)
 
 
@@ -154,6 +197,9 @@ def generate(messages, tools, max_new, on_commit, timeout=1800, reasoning=True):
         except ClientGone:
             _drop_socks()   # the client died mid-decode -> stale in-flight replies on the ring; drop the
             raise           # (now desynced) sockets and abort. NEVER retry: re-running wastes a full ring pass
+        except JobRejected:
+            _drop_socks()   # the stage refused THIS job (kv_overflow etc): the ring is fine but the
+            raise           # request is invalid — never burn a retry re-submitting a rejected job
         except Exception:
             _drop_socks()
             if attempt == 2:
@@ -239,6 +285,9 @@ def _run_batch(reqs):
                 if rq.dead:
                     rq.error = ClientGone("client left mid-stream (batch completed without it)")
             return
+        except JobRejected:
+            _drop_socks()                               # rejected job: report, never retry (see generate)
+            raise
         except Exception as e:  # noqa: BLE001 — one retry with fresh sockets, then report to every caller
             _drop_socks()
             if attempt == 2:
@@ -357,7 +406,8 @@ class H(BaseHTTPRequestHandler):
             return self._json({"object": "list", "data": [
                 {"id": MODEL_ID, "object": "model", "created": 0, "owned_by": "shard"}]})
         if self.path in ("/health", "/"):
-            return self._json({"status": "ok", "model": MODEL_ID, "engine": "mock" if MOCK else "ring"})
+            return self._json({"status": "ok", "model": MODEL_ID, "engine": "mock" if MOCK else "ring",
+                               "max_ctx": A.max_ctx if A else None})
         self._json({"error": {"message": "not found", "type": "invalid_request_error"}}, 404)
 
     def do_POST(self):
@@ -382,6 +432,21 @@ class H(BaseHTTPRequestHandler):
             reasoning = body.get("reasoning_effort") != "none"
         else:
             reasoning = DEFAULT_REASONING
+        # H1: the request must fit the NEGOTIATED context (A.max_ctx = min of the operator ceiling
+        # and every stage's KV cap, computed by the launcher) plus speculative headroom — reject
+        # BEFORE anything is enqueued, so an over-limit prompt never reaches the ring. MOCK keeps
+        # the rejection path testable without a GPU (chars//4 estimate).
+        if MOCK:
+            n_prompt = sum(len(str(m.get("content") or "")) for m in messages) // 4
+        else:
+            n_prompt = len(render_ids(tok, messages, tools=tools, reasoning=reasoning))
+        if n_prompt + HEADROOM >= A.max_ctx:
+            return self._json({"error": {
+                "message": f"prompt is {n_prompt} tokens; negotiated max_ctx for this ring is "
+                           f"{A.max_ctx} (min stage KV cap) with {HEADROOM} tokens speculative headroom",
+                "type": "invalid_request_error", "code": "context_length_exceeded",
+                "prompt_tokens": n_prompt, "max_ctx": A.max_ctx, "headroom": HEADROOM}}, 400)
+        max_new = min(max_new, A.max_ctx - n_prompt - HEADROOM)   # silent clamp (OpenAI convention)
         cid = f"chatcmpl-{next(_ids)}"; created = int(time.time())
         try:
             # no ring lock here: the dispatcher owns the ring; handlers enqueue and wait, so a burst
@@ -392,6 +457,10 @@ class H(BaseHTTPRequestHandler):
                 self._complete(cid, created, messages, tools, max_new, reasoning)
         except (BrokenPipeError, ClientGone):
             pass                                          # client is gone — nothing to send, ring already released
+        except JobRejected as e:
+            try: self._json({"error": {"message": str(e), "type": "invalid_request_error",
+                                       "code": "job_rejected"}}, 400)
+            except Exception: pass
         except Exception as e:
             err = {"error": {"message": f"{type(e).__name__}: {str(e)[:200]}", "type": "engine_error"}}
             try: self._json(err, 500)
@@ -462,8 +531,9 @@ if __name__ == "__main__":
     ap.add_argument("--port", type=int, default=29600)
     ap.add_argument("--K", type=int, default=8); ap.add_argument("--depth", type=int, default=4)   # K=8 = the measured sweet spot (2026-06-27 sweep)
     ap.add_argument("--ngram-n", type=int, default=3, dest="ngram_n")
-    ap.add_argument("--max-ctx", type=int, default=131072, dest="max_ctx")
-    A = ap.parse_args()
+    ap.add_argument("--max-ctx", type=int, default=131072, dest="max_ctx",
+                    help="negotiated context ceiling; the launcher passes min(operator, stage KV caps)")
+    _configure(ap.parse_args())
     if not MOCK:
         _engine_init()
         threading.Thread(target=_dispatcher, daemon=True).start()
