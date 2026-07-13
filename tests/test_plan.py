@@ -73,6 +73,33 @@ def test_head_is_most_central():
     assert plan["head"] == "node2"
 
 
+def test_disconnected_node_never_heads_the_ring():
+    """A node with NO usable path to anyone summed centrality 0 (unreachable edges were omitted,
+    not penalized) and won mandatory head — an undeployable ring anchored on a partitioned box.
+    Unreachable edges must count AGAINST a candidate, so the plan heads a connected node and
+    drops the partitioned one entirely."""
+    nodes, rtt = _pool(7)
+    for j in range(7):
+        if j != 4:
+            rtt[4][j] = rtt[j][4] = 9000.0       # node4 is partitioned from the whole pool
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    assert plan["head"] != "node4"
+    assert "node4" not in plan["order"]
+    _assert_tiles_simple(plan, 62)
+
+
+def test_fully_partitioned_pool_returns_none():
+    """Every pairwise path at the sentinel: no node can REACH enough capacity to serve, so the
+    honest answer is None — not a 'ring' of unreachable hops with whoever scored centrality 0."""
+    nodes, rtt = _pool(6)
+    for i in range(6):
+        for j in range(6):
+            if i != j:
+                rtt[i][j] = 9000.0
+    assert plan_ring(nodes, rtt) is None
+
+
 def test_cli_roundtrip():
     """`python3 -m shard.plan` reads a JSON request on stdin and prints the plan on stdout."""
     nodes, rtt = _pool(6)
