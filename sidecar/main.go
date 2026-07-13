@@ -173,6 +173,8 @@ func main() {
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
 	var forwards stringList
 	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
+	var allowPeers stringList
+	flag.Var(&allowPeers, "allow", "PeerId allowed to open inbound activation streams (repeatable; none = allow all)")
 	size := flag.Int("size", 1<<20, "self-test frame size in bytes (default 1 MiB)")
 	relaySvc := flag.Bool("relay", false, "run as a circuit-relay-v2 server (public rendezvous for NAT'd nodes)")
 	relaysCSV := flag.String("relays", "", "comma-separated relay /p2p multiaddrs to use when behind NAT")
@@ -218,6 +220,20 @@ func main() {
 	priv, err := loadOrCreateKey(*keyPath)
 	if err != nil {
 		log.Fatalf("key: %v", err)
+	}
+
+	// Inbound allowlist: the launcher pins exactly which PeerIds may open activation
+	// streams to this node (its assigned predecessor, plus the coordinator's return path
+	// on the tail). RemotePeer() is Noise-authenticated by libp2p, so this is a
+	// cryptographic identity check, not an IP filter. No -allow flags = open (legacy).
+	// A malformed PeerId is a launcher config bug: fail at boot, not at first stream.
+	allow := map[peer.ID]bool{}
+	for _, a := range allowPeers {
+		pid, err := peer.Decode(a)
+		if err != nil {
+			log.Fatalf("bad -allow %q: %v", a, err)
+		}
+		allow[pid] = true
 	}
 
 	// Identity-binding proof: sign a challenge nonce with the node key. The node-agent
@@ -350,7 +366,7 @@ func main() {
 	// right ring neighbour over libp2p. This is what replaces wire.py's TCP.
 	if *inbound != "" || len(forwards) > 0 {
 		if *inbound != "" {
-			runInbound(h, *inbound)
+			runInbound(h, *inbound, allow)
 		}
 		for _, f := range forwards {
 			pp := strings.SplitN(f, "=", 2)
@@ -515,9 +531,16 @@ func runForward(h host.Host, listenAddr, peerMaddr string) {
 }
 
 // runInbound pipes each inbound libp2p stream to a fresh connection to the local
-// engine — so the engine accepts on localhost, fed by its ring neighbours.
-func runInbound(h host.Host, engineAddr string) {
+// engine — so the engine accepts on localhost, fed by its ring neighbours. When an
+// allowlist is set, a stream from any other PeerId is reset BEFORE the engine is
+// dialed: an unassigned peer never gets a byte of reach into the engine.
+func runInbound(h host.Host, engineAddr string, allow map[peer.ID]bool) {
 	h.SetStreamHandler(activationProto, func(s network.Stream) {
+		if len(allow) > 0 && !allow[s.Conn().RemotePeer()] {
+			log.Printf("DENY inbound stream from %s (not in -allow)", s.Conn().RemotePeer())
+			s.Reset()
+			return
+		}
 		c, err := net.Dial("tcp", engineAddr)
 		if err != nil {
 			log.Printf("inbound -> engine %s: %v", engineAddr, err)
