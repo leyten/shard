@@ -92,7 +92,18 @@ def peerid(host, port):
     raise RuntimeError(f"no PeerId {host}:{port}: {r.stdout[-200:]}{r.stderr[-200:]}")
 
 
-def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
+def fresh_count(host, port, nonce_file, nonce, log, pattern):
+    """count PATTERN matches in LOG only when the box's nonce file matches THIS launch (M4): the
+    launch command writes the nonce right after truncating the log, so a stale log left by a
+    previous run — e.g. after a flaked/timed-out ssh that never ran the launch — can never satisfy
+    a readiness check. Returns the count as a string ('0' when the nonce is absent/stale)."""
+    q = (f"[ \"$(cat {nonce_file} 2>/dev/null)\" = \"{nonce}\" ] && "
+         f"grep -cE {shlex.quote(pattern)} {log} 2>/dev/null || echo 0")
+    r = sh(host, port, q, 20)
+    return (r.stdout.strip().splitlines() or ["0"])[-1].strip()
+
+
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None, nonce=""):
     """Pure builder (unit-testable): every remote-influenced value (multiaddrs carry PeerIds from
     remote stdout) is shlex-quoted, and the whole inner command is quoted ONCE for the bash -c
     level — correct two-level quoting, byte-identical to the old literal form for legit values."""
@@ -105,28 +116,29 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allo
     # C2: cryptographic neighbour allowlist — the sidecar Reset()s inbound streams whose
     # Noise-authenticated RemotePeer isn't one of these PeerIds (empty = open, legacy).
     al = " ".join(f"-allow {shlex.quote(p)}" for p in (allow or []))
+    nn = f"echo {nonce} > /root/sidecar.nonce; " if nonce else ""
     inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
              f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} > /root/sidecar.log 2>&1")
-    return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; "
+    return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; {nn}"
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
 
 def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
-    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow)
+    nonce = secrets.token_hex(8)
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow, nonce=nonce)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):
             time.sleep(3)
-            up = sh(host, port, "grep -cE 'tunnel up|listening' /root/sidecar.log 2>/dev/null || echo 0", 20)
-            bad = sh(host, port, "grep -c 'address already in use' /root/sidecar.log 2>/dev/null || echo 0", 20)
-            if (up.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0") and \
-               (bad.stdout.strip().splitlines() or ["0"])[-1].strip() in ("", "0"):
+            up = fresh_count(host, port, "/root/sidecar.nonce", nonce, "/root/sidecar.log", "tunnel up|listening")
+            bad = fresh_count(host, port, "/root/sidecar.nonce", nonce, "/root/sidecar.log", "address already in use")
+            if up not in ("", "0") and bad in ("", "0"):
                 return True
         print(f"  sidecar {host} retry {attempt+1}", flush=True)
     return False
 
 
-def stage_cmd(stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False, token=None):
+def stage_cmd(stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False, token=None, nonce=""):
     nxt = "" if is_tail else f"--next 127.0.0.1:{FWD_RING}"
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     kv = f"M25_KV_MAXLEN={kv_maxlen} " if kv_maxlen else ""   # cap batched-KV buffer (B*MAXLEN can OOM the tail at MAXLEN=40960)
@@ -139,8 +151,9 @@ def stage_cmd(stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxle
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
     # C2: in libp2p mode the only legitimate dialer is the LOCAL sidecar (and the local coordinator
     # on the head) — bind the engine hop to loopback so raw TCP can't bypass the sidecar allowlist.
+    nn = f"echo {nonce} > /root/stage.nonce; " if nonce else ""
     return (f"nvidia-smi --query-compute-apps=pid --format=csv,noheader | xargs -r kill -9 2>/dev/null; "
-            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; cd /root && "
+            f"fuser -k {ENG_IN}/tcp 2>/dev/null; sleep 4; rm -f /root/stage.log; {nn}cd /root && "
             f"{rc}{tk}SHARD_TRANSPORT=libp2p M25_ENGINE_BIND=127.0.0.1 M25_BATCH={batch} {eng_env()}{goff}"
             f"{kv}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True setsid bash -c "
             f"'/root/venv/bin/python /root/m25_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
@@ -148,22 +161,22 @@ def stage_cmd(stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxle
 
 
 def launch_stage(host, port, stage, nstages, lo, hi, is_tail, receipts=False, batch=1, kv_maxlen=0, graph_off=False, token=None):
+    nonce = secrets.token_hex(8)
     cmd = stage_cmd(stage, nstages, lo, hi, is_tail, receipts=receipts, batch=batch,
-                    kv_maxlen=kv_maxlen, graph_off=graph_off, token=token)
+                    kv_maxlen=kv_maxlen, graph_off=graph_off, token=token, nonce=nonce)
     try:
         sh(host, port, cmd, 25)
     except subprocess.TimeoutExpired:
         pass
+    return nonce
 
 
-def warm(host, port, label, tries=80):
+def warm(host, port, label, nonce, tries=80):
     for _ in range(tries):
         time.sleep(8)
-        r = sh(host, port, "grep -c WARM /root/stage.log 2>/dev/null || echo 0", 20)
-        if (r.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0"):
+        if fresh_count(host, port, "/root/stage.nonce", nonce, "/root/stage.log", "WARM") not in ("", "0"):
             return True
-        e = sh(host, port, "grep -cE 'Traceback|Error|CUDA out' /root/stage.log 2>/dev/null || echo 0", 20)
-        if (e.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0"):
+        if fresh_count(host, port, "/root/stage.nonce", nonce, "/root/stage.log", "Traceback|Error|CUDA out") not in ("", "0"):
             print(f"  {label} ERROR:\n" + sh(host, port, "tail -12 /root/stage.log", 20).stdout, flush=True)
             return False
     return False
@@ -268,16 +281,18 @@ def main():
         ok = launch_sidecar(nd["host"], nd["port"], announce, inbound, forwards, seed=seed, dht_bootstrap=bsp, allow=allow)
         print(f"  {'OK' if ok else 'FAIL'} {nd['region']}", flush=True)
         if not ok:
-            print(sh(nd["host"], nd["port"], "tail -4 /root/sidecar.log", 20).stdout); return
+            print(sh(nd["host"], nd["port"], "tail -4 /root/sidecar.log", 20).stdout)
+            sys.exit(1)                       # M4: a failed launch must FAIL the launcher
 
     print("[pipe] stages tail-first ...", flush=True)
+    nonces = {}
     for k in range(n - 1, -1, -1):
-        launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False), token=swarm_token)
+        nonces[k] = launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False), token=swarm_token)
     for k in range(n - 1, -1, -1):
-        ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}")
+        ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}", nonces[k])
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
         if not ok:
-            return
+            sys.exit(1)
 
     head = nodes[0]
     if a.warm_only:                               # warm + STOP: run the measurement as the sole coordinator on the head (nxt_sock breaks if anything connects first)
@@ -291,29 +306,40 @@ def main():
         rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
         bt = f"M25_BATCH={a.batch} " if a.batch > 1 else ""   # gateway micro-batches up to the ring's KV rows
         tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
-        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; cd /root && {rc}{tk}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
+        gnonce = secrets.token_hex(8)
+        gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; rm -f /root/gateway.log; echo {gnonce} > /root/gateway.nonce; "
+              f"cd /root && {rc}{tk}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
               f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
-        sh(head["host"], head["port"], gw, 30); time.sleep(4)
-        up = sh(head["host"], head["port"], "grep -c 'm25-gateway' /root/gateway.log 2>/dev/null || echo 0", 20)
-        ok = (up.stdout.strip().splitlines() or ["0"])[-1].strip() not in ("", "0")
-        print(f"[pipe] gateway {'UP' if ok else 'starting (check /root/gateway.log)'} on head, 127.0.0.1:{GW} (OpenAI /v1, single-stream)", flush=True)
+        sh(head["host"], head["port"], gw, 30)
+        ok = False                            # M4: poll the REAL startup banner of THIS launch (nonce-gated), not any historical log line
+        for _ in range(15):
+            time.sleep(4)
+            if fresh_count(head["host"], head["port"], "/root/gateway.nonce", gnonce, "/root/gateway.log", "m25-gateway") not in ("", "0"):
+                ok = True; break
+        print(f"[pipe] gateway {'UP' if ok else 'FAILED (see /root/gateway.log)'} on head, 127.0.0.1:{GW} (OpenAI /v1, single-stream)", flush=True)
         print(f"[pipe] reach it:  ssh -i {KEY} -p {head['port']} -L 8000:127.0.0.1:{GW} root@{head['host']}   then POST http://localhost:8000/v1/chat/completions", flush=True)
         if not ok:
             print(sh(head["host"], head["port"], "tail -5 /root/gateway.log", 20).stdout, flush=True)
+            sys.exit(1)
         return
     pf = f"--prompt-file {a.prompt_file}" if a.prompt_file else f'--prompt "{a.prompt}"'
     sw = (f"--sweep {a.sweep} " if a.sweep else "") + (f"--sweep-depth {a.sweep_depth} " if a.sweep_depth else "") + ("--validate " if a.validate else "")
     rc = "SHARD_RECEIPTS=1 " if a.receipts else ""
     tk = f"SHARD_SWARM_TOKEN={swarm_token} " if swarm_token else ""
     print("[pipe] coordinator (pipelined) on head ...", flush=True)
-    cmd = (f"cd /root && {rc}{tk}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
+    # M4: pipefail — without it the pipeline's rc is the trailing grep's, and a crashed coordinator
+    # still exits 0 (an orchestrator above this launcher would read the run as green).
+    cmd = (f"set -o pipefail; cd /root && {rc}{tk}SHARD_TRANSPORT=libp2p {eng_env()}CUDA_VISIBLE_DEVICES=0 M25_DIR=/root/m25 /root/venv/bin/python /root/m25_pipe.py coord "
            f"--head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} "
            f"--max-new {a.max_new} --prefill-chunk {a.prefill_chunk} --max-ctx {eff_max_ctx} {sw}{pf} 2>&1 | tee /root/coord.log | grep -vE 'INFO|WARNING|warn|instantiate'")
     r = sh(head["host"], head["port"], cmd, timeout=1800 if (a.sweep or a.sweep_depth or a.validate) else 1200)
     print(r.stdout, flush=True)
     if r.stderr.strip():
         print("[stderr]", r.stderr[-700:], flush=True)
+    if r.returncode != 0:
+        print(f"[pipe] coordinator FAILED (rc={r.returncode})", flush=True)
+        sys.exit(1)
 
 
 if __name__ == "__main__":
