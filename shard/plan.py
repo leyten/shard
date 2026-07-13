@@ -131,7 +131,18 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
         return None                                          # pinning on, but no trusted node can hold a block
 
     def centrality(i):
-        return sum(rtt[i][j] for j in range(n) if j != i and rtt[i][j] < _UNREACHABLE)
+        # clamp each edge at the sentinel instead of OMITTING unreachable ones — omission summed a
+        # fully-disconnected node to 0, which won min() and made it the mandatory head (undeployable)
+        return sum(min(float(rtt[i][j]), _UNREACHABLE) for j in range(n) if j != i)
+
+    def _connected_cap(i):
+        # layers reachable from i: its own budget + every capable peer with a finite path BOTH ways
+        return int(free[i] // per_layer[i]) + sum(
+            int(free[j] // per_layer[j]) for j in cap_ok
+            if j != i and rtt[i][j] < _UNREACHABLE and rtt[j][i] < _UNREACHABLE)
+    head_pool = [i for i in head_pool if _connected_cap(i) >= int(m["n_layers"])]
+    if not head_pool:
+        return None                              # no candidate head can REACH enough capacity to serve
     head = min(head_pool, key=centrality)
     free[head] = max(free[head] - float(m["head_reserve_mb"]), 0.0)
 
@@ -199,6 +210,13 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     else:
         return None                              # no tail placement converged: the reserve fits nowhere
     assert spec["order"][0] == head, "select_ring must return a head-first (deployable) order"
+    # a deployable ring never traverses an unreachable (sentinel) edge: the forward hops and the
+    # tail -> head coordinator return must all be measured, finite paths — if feasibility forced
+    # one in, there IS no usable ring, so say so instead of shipping a dead hop
+    _o = spec["order"]
+    if (any(rtt[a][b] >= _UNREACHABLE for a, b in zip(_o, _o[1:]))
+            or (_o[-1] != head and rtt[_o[-1]][head] >= _UNREACHABLE)):
+        return None
     # belt-and-braces: every stage's block must fit the node's ORIGINAL budget (the tail
     # including its reserve) — a violation here is a planner bug, never a deployable answer
     for i in spec["order"]:
