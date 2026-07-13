@@ -1,11 +1,15 @@
 package main
 
 import (
+	"bytes"
+	"context"
 	"crypto/sha256"
 	"encoding/json"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/ipfs/go-cid"
 	mh "github.com/multiformats/go-multihash"
@@ -124,5 +128,130 @@ func TestManifestShardsSkipsSymlinkEscape(t *testing.T) {
 	}
 	if _, ok := held[testCid(t, honest)]; !ok {
 		t.Fatalf("honest sibling shard was not held")
+	}
+}
+
+// --- fetch-side integration: two in-process hosts, seeder <-> fetcher ---
+
+// seedFetch stands up a seeder over modelDir/manifest and a fetcher, optionally
+// tampers with the model dir AFTER the seeder scanned it, then runs a one-shot fetch
+// of cidStr. Returns the fetch error and the output path.
+func seedFetch(t *testing.T, modelDir, manifestPath, cidStr string, size int64, tamper func()) (string, error) {
+	t.Helper()
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+
+	seeder := newTestHost(t)
+	fetcher := newTestHost(t)
+
+	dSeed, _, err := setupDHT(ctx, seeder, nil)
+	if err != nil {
+		t.Fatalf("seed dht: %v", err)
+	}
+	if err := runSeeder(ctx, seeder, dSeed, manifestPath, modelDir); err != nil {
+		t.Fatalf("runSeeder: %v", err)
+	}
+	if tamper != nil {
+		tamper()
+	}
+
+	seedMaddr := seeder.Addrs()[0].String() + "/p2p/" + seeder.ID().String()
+	dFetch, known, err := setupDHT(ctx, fetcher, []string{seedMaddr})
+	if err != nil {
+		t.Fatalf("fetch dht: %v", err)
+	}
+	out := filepath.Join(t.TempDir(), "out.bin")
+	return out, runFetchCid(ctx, fetcher, dFetch, known, cidStr, out, size, 30*time.Second)
+}
+
+// TestFetchHappyPath: an honest seeder's bytes verify against the CID in Go and land
+// at the output path, mode 0600 (unverified-peer bytes stay private).
+func TestFetchHappyPath(t *testing.T) {
+	content := []byte("the-real-shard-bytes-0123456789")
+	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "w.bin"), content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cs := testCid(t, content)
+	mp := writeManifest(t, t.TempDir(), cs, "w.bin", int64(len(content)))
+
+	out, err := seedFetch(t, modelDir, mp, cs, int64(len(content)), nil)
+	if err != nil {
+		t.Fatalf("fetch: %v", err)
+	}
+	got, err := os.ReadFile(out)
+	if err != nil {
+		t.Fatalf("read out: %v", err)
+	}
+	if !bytes.Equal(got, content) {
+		t.Fatalf("fetched bytes differ")
+	}
+	st, _ := os.Stat(out)
+	if st.Mode().Perm() != 0o600 {
+		t.Fatalf("fetched file mode %v, want 0600", st.Mode().Perm())
+	}
+}
+
+// TestFetchRejectsWrongBytes: a size-complete transfer whose bytes don't hash to the
+// CID is rejected INSIDE Go — the fetch fails (with only this provider) instead of
+// accepting the poison and leaving Python to discover it after Go gave up.
+func TestFetchRejectsWrongBytes(t *testing.T) {
+	real := []byte("the-real-shard-bytes-0123456789")
+	poison := []byte("EVIL-bytes-same-length-01234567")
+	if len(real) != len(poison) {
+		t.Fatalf("test setup: sizes must match")
+	}
+	modelDir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(modelDir, "w.bin"), poison, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cs := testCid(t, real) // manifest names the REAL bytes; the seeder holds poison
+	mp := writeManifest(t, t.TempDir(), cs, "w.bin", int64(len(real)))
+
+	out, err := seedFetch(t, modelDir, mp, cs, int64(len(real)), nil)
+	if err == nil {
+		t.Fatalf("size-complete wrong bytes were accepted")
+	}
+	if !strings.Contains(err.Error(), "sha256") {
+		t.Fatalf("want a content-hash error, got: %v", err)
+	}
+	if _, serr := os.Stat(out); serr == nil {
+		t.Fatalf("poison bytes were renamed into place")
+	}
+}
+
+// TestServeRefusesPostScanSymlinkSwap (TOCTOU): the file passes the scan as a regular
+// file, then is swapped for a symlink to an OUTSIDE file with the exact bytes the
+// manifest promises. The pre-os.Root seeder followed the link and served it happily;
+// the root-confined open must refuse, so the fetch fails instead of leaking a read
+// path outside the model dir.
+func TestServeRefusesPostScanSymlinkSwap(t *testing.T) {
+	content := []byte("the-real-shard-bytes-0123456789")
+	outer := t.TempDir()
+	modelDir := filepath.Join(outer, "model")
+	if err := os.Mkdir(modelDir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	inside := filepath.Join(modelDir, "w.bin")
+	if err := os.WriteFile(inside, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(outer, "outside.bin")
+	if err := os.WriteFile(outside, content, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cs := testCid(t, content)
+	mp := writeManifest(t, t.TempDir(), cs, "w.bin", int64(len(content)))
+
+	_, err := seedFetch(t, modelDir, mp, cs, int64(len(content)), func() {
+		if err := os.Remove(inside); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Symlink(outside, inside); err != nil {
+			t.Skipf("symlink: %v", err)
+		}
+	})
+	if err == nil {
+		t.Fatalf("seeder served through an escaping symlink swapped in after the scan")
 	}
 }
