@@ -42,13 +42,26 @@ def _hdr():
     return h
 
 
-def _hf_get(repo, path):
-    url = f"https://huggingface.co/{repo}/resolve/main/{path}"
+def _hf_revision(repo):
+    """Pin the repo's current commit sha — every byte hashed and every map parsed for a
+    manifest must come from ONE immutable revision, never a moving branch. Publishing
+    from `main` lets an upstream push land between two fetches, so the signed index
+    bytes and the weight_map they were parsed from could disagree."""
+    url = f"https://huggingface.co/api/models/{repo}"
+    info = json.load(_fetch.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60))
+    sha = info.get("sha")
+    if not sha:
+        raise ValueError(f"cannot pin an immutable revision for {repo}: no sha in the HF API response")
+    return sha
+
+
+def _hf_get(repo, path, rev):
+    url = f"https://huggingface.co/{repo}/resolve/{rev}/{path}"
     return _fetch.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60).read()
 
 
-def _hf_tree(repo):
-    url = f"https://huggingface.co/api/models/{repo}/tree/main?recursive=1"
+def _hf_tree(repo, rev):
+    url = f"https://huggingface.co/api/models/{repo}/tree/{rev}?recursive=1"
     return json.load(_fetch.urlopen(urllib.request.Request(url, headers=_hdr()), timeout=60))
 
 
@@ -63,20 +76,34 @@ def _kind(path):
     return None  # README, .gitattributes, bf16 dupes, etc. — not loaded
 
 
+def _check_coverage(weight_map, shards):
+    """Every file the weight_map references must have a shard entry — a map pointing at
+    files the manifest can never verify would make nodes load unverifiable weights."""
+    have = {s["path"] for s in shards if s["kind"] == "weights"}
+    missing = sorted(set(weight_map.values()) - have)
+    if missing:
+        raise ValueError(f"weight_map references files with no shard entry: {missing[:5]}")
+
+
 def build_from_hf(repo, tokenizer_repo):
-    entries = {e["path"]: e for e in _hf_tree(repo)
+    rev = _hf_revision(repo)  # ONE immutable revision for every fetch below
+    entries = {e["path"]: e for e in _hf_tree(repo, rev)
                if e.get("type") == "file" and not any(e["path"].startswith(d) for d in SKIP_DIRS)}
-    cfg = json.loads(_hf_get(repo, "config.json"))
-    index = json.loads(_hf_get(repo, "model.safetensors.index.json"))
-    weight_map = index["weight_map"]
+    # Fetch the small metadata ONCE and hash the SAME bytes we parse: signing a second,
+    # separate fetch of the index could cover different bytes than the weight_map came from.
+    small = {"config.json": _hf_get(repo, "config.json", rev),
+             "model.safetensors.index.json": _hf_get(repo, "model.safetensors.index.json", rev)}
+    cfg = json.loads(small["config.json"])
+    weight_map = json.loads(small["model.safetensors.index.json"])["weight_map"]
     wanted_weights = set(weight_map.values())  # only canonical safetensors, not dupes
 
     # gpt-oss ships its own tokenizer; some quant repos borrow the base repo's — allow override.
-    tok_entries = {}
+    tok_rev, tok_entries = None, {}
     if tokenizer_repo and tokenizer_repo != repo:
-        for e in _hf_tree(tokenizer_repo):
+        tok_rev = _hf_revision(tokenizer_repo)
+        for e in _hf_tree(tokenizer_repo, tok_rev):
             if e.get("type") == "file" and os.path.basename(e["path"]) in TOKENIZER_FILES:
-                tok_entries[e["path"]] = ("__TOK__", e)
+                tok_entries[e["path"]] = e
 
     shards = []
     for path, e in sorted(entries.items()):
@@ -85,23 +112,27 @@ def build_from_hf(repo, tokenizer_repo):
             continue
         if kind == "weights" and path not in wanted_weights:
             continue  # a stray safetensors not in the index (e.g. a duplicate) — skip
-        lfs = e.get("lfs")
-        if lfs and lfs.get("oid"):
+        if kind == "tokenizer" and tok_entries:
+            continue  # the declared tokenizer repo overrides this repo's copies
+        if path in small:
+            blob = small[path]  # the exact bytes parsed above
+            sha, size = hashlib.sha256(blob).hexdigest(), len(blob)
+        elif (lfs := e.get("lfs")) and lfs.get("oid"):
             sha, size = lfs["oid"], int(lfs.get("size", e["size"]))  # oid == sha256, free
         else:
-            blob = _hf_get(repo, path)  # small file — hash it (KB–MB)
+            blob = _hf_get(repo, path, rev)  # small file — hash it (KB–MB)
             sha, size = hashlib.sha256(blob).hexdigest(), len(blob)
-        shards.append({"shard_id": mf.cidv1_raw(sha), "path": path,
-                       "sha256": sha, "size": size, "kind": kind})
+        shards.append({"shard_id": mf.cidv1_raw(sha), "path": path, "sha256": sha,
+                       "size": size, "kind": kind, "repo": repo, "revision": rev})
 
-    for path, (_, e) in sorted(tok_entries.items()):
-        blob = _fetch.urlopen(
-            urllib.request.Request(f"https://huggingface.co/{tokenizer_repo}/resolve/main/{path}",
-                                   headers=_hdr()), timeout=60).read()
+    for path, e in sorted(tok_entries.items()):
+        blob = _hf_get(tokenizer_repo, path, tok_rev)
         sha = hashlib.sha256(blob).hexdigest()
         shards.append({"shard_id": mf.cidv1_raw(sha), "path": path,
-                       "sha256": sha, "size": len(blob), "kind": "tokenizer"})
+                       "sha256": sha, "size": len(blob), "kind": "tokenizer",
+                       "repo": tokenizer_repo, "revision": tok_rev})
 
+    _check_coverage(weight_map, shards)
     return cfg, weight_map, shards
 
 
@@ -123,6 +154,7 @@ def build_from_dir(path):
             sha, size = mf.sha256_file(full)
             shards.append({"shard_id": mf.cidv1_raw(sha), "path": rel,
                            "sha256": sha, "size": size, "kind": kind})
+    _check_coverage(weight_map, shards)
     return cfg, weight_map, shards
 
 
