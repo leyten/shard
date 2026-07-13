@@ -24,14 +24,18 @@ import numpy as np
 import torch
 
 
-def _read_exact(sock: socket.socket, n: int) -> bytes:
-    buf = bytearray()
-    while len(buf) < n:
-        chunk = sock.recv(n - len(buf))
-        if not chunk:
+def _read_exact(sock: socket.socket, n: int) -> bytearray:
+    # preallocate + recv_into: no bytearray growth copies, no final bytes() copy — callers
+    # (struct.unpack, _unpack) only need a buffer, not bytes
+    buf = bytearray(n)
+    view = memoryview(buf)
+    got = 0
+    while got < n:
+        r = sock.recv_into(view[got:], n - got)
+        if not r:
             raise ConnectionError("sidecar closed the connection")
-        buf += chunk
-    return bytes(buf)
+        got += r
+    return buf
 
 
 # ── message codec (engine protocol): JSON header + raw tensor blobs ──
@@ -49,13 +53,17 @@ _DSIZE = {d: torch.empty(0, dtype=d).element_size() for d in set(_DTYPES.values(
 MAX_FRAME = int(os.environ.get("M25_MAX_FRAME") or 256 * 1024 * 1024)
 
 
-def _pack(obj) -> bytes:
+def _pack_parts(obj) -> list:
+    """encode one message as a list of wire segments (bytes-likes) whose concatenation IS the
+    frame body — byte-identical to the historical _pack output. Kept segmented so send_msg can
+    hand the pieces straight to sendmsg() with zero concatenation copies; tensor blobs are
+    memoryviews over the (contiguous, CPU) tensor storage, so they aren't copied here either."""
     blobs = []
 
     def encode(o):
         if torch.is_tensor(o):
             t = o.detach().cpu().contiguous()
-            blobs.append(t.reshape(-1).view(torch.uint8).numpy().tobytes())
+            blobs.append(memoryview(t.reshape(-1).view(torch.uint8).numpy()))
             return {"__t__": len(blobs) - 1, "dtype": str(t.dtype), "shape": list(t.shape)}
         if isinstance(o, dict):
             return {k: encode(v) for k, v in o.items()}
@@ -66,19 +74,25 @@ def _pack(obj) -> bytes:
         raise TypeError(f"transport cannot encode {type(o).__name__}")
 
     head = json.dumps(encode(obj)).encode()
-    out = bytearray(struct.pack("!I", len(head)) + head)
+    parts = [struct.pack("!I", len(head)) + head]
     for b in blobs:
-        out += struct.pack("!Q", len(b)) + b
-    return bytes(out)
+        parts.append(struct.pack("!Q", len(b)))
+        parts.append(b)
+    return parts
 
 
-def _unpack(buf: bytes):
-    (hlen,) = struct.unpack_from("!I", buf, 0)
-    head = json.loads(buf[4:4 + hlen])
+def _pack(obj) -> bytes:
+    return b"".join(_pack_parts(obj))
+
+
+def _unpack(buf):
+    mv = memoryview(buf)                    # zero-copy blob slices (a bytes slice copies)
+    (hlen,) = struct.unpack_from("!I", mv, 0)
+    head = json.loads(bytes(mv[4:4 + hlen]))
     blobs, off = [], 4 + hlen
-    while off < len(buf):
-        (blen,) = struct.unpack_from("!Q", buf, off); off += 8
-        blobs.append(buf[off:off + blen]); off += blen
+    while off < len(mv):
+        (blen,) = struct.unpack_from("!Q", mv, off); off += 8
+        blobs.append(mv[off:off + blen]); off += blen
 
     def decode(node):
         if isinstance(node, dict):
@@ -107,12 +121,32 @@ def _unpack(buf: bytes):
     return decode(head)
 
 
+_IOV_CAP = 512      # segments per sendmsg() call, safely under the kernel's UIO_MAXIOV (1024)
+
+
+def _sendall_vectored(sock: socket.socket, parts: list) -> None:
+    """sendall for a list of bytes-like segments via scatter/gather sendmsg — the segments are
+    never concatenated (the old path copied every blob into one frame buffer, then copied that
+    again for the length prefix: ~2× the message in transient memcpy per hop per direction)."""
+    if not hasattr(sock, "sendmsg"):        # non-POSIX / wrapped socket: fall back to one join
+        sock.sendall(b"".join(parts))
+        return
+    bufs = [memoryview(p) for p in parts if len(p)]
+    while bufs:
+        sent = sock.sendmsg(bufs[:_IOV_CAP])
+        while bufs and sent >= len(bufs[0]):
+            sent -= len(bufs.pop(0))
+        if sent:                            # partial segment: advance within it
+            bufs[0] = bufs[0][sent:]
+
+
 def send_msg(sock: socket.socket, obj) -> int:
     """pack + send one message over a (sidecar-tunneled) socket; returns bytes on the wire.
     drop-in for phase0/wire.send_msg minus the SHARD_PSK seal (libp2p encrypts the link)."""
-    frame = _pack(obj)
-    sock.sendall(struct.pack("!Q", len(frame)) + frame)
-    return 8 + len(frame)
+    parts = _pack_parts(obj)
+    n = sum(len(p) for p in parts)
+    _sendall_vectored(sock, [struct.pack("!Q", n)] + parts)
+    return 8 + n
 
 
 def recv_msg(sock: socket.socket):
