@@ -17,6 +17,7 @@ with a synthetic signed manifest + LocalDirProvider (no network):
 Run: python3 -m pytest tests/test_fetch.py -q
 """
 import io
+import json
 import os
 import sys
 
@@ -47,13 +48,6 @@ def _repo(tmp_path, priv, layer_count=4, mutate=None):
     signing, so a bad claimed size/CID rides a VALID signature (exercising _verify, not the sig check)."""
     src = str(tmp_path / "src")
     os.makedirs(src, exist_ok=True)
-    shards = [
-        _shard(src, "model-00001.safetensors", b"weights-file-one-" + b"A" * 200),
-        _shard(src, "model-00002.safetensors", b"weights-file-two-" + b"B" * 200),
-        _shard(src, "config.json", b'{"model_type":"minimax_m2"}', kind="config"),
-        _shard(src, "model.safetensors.index.json", b'{"weight_map":{}}', kind="config"),
-        _shard(src, "tokenizer.json", b'{"tok":1}', kind="tokenizer"),
-    ]
     weight_map = {}
     for j in (0, 1):
         weight_map[f"model.layers.{j}.self_attn.q_proj.weight"] = "model-00001.safetensors"
@@ -62,6 +56,16 @@ def _repo(tmp_path, priv, layer_count=4, mutate=None):
     weight_map["model.embed_tokens.weight"] = "model-00001.safetensors"
     weight_map["model.norm.weight"] = "model-00002.safetensors"
     weight_map["lm_head.weight"] = "model-00002.safetensors"
+    shards = [
+        _shard(src, "model-00001.safetensors", b"weights-file-one-" + b"A" * 200),
+        _shard(src, "model-00002.safetensors", b"weights-file-two-" + b"B" * 200),
+        _shard(src, "config.json", b'{"model_type":"minimax_m2"}', kind="config"),
+        # the on-disk index must carry the SAME weight_map as the manifest — the fetch
+        # refuses a mismatched pair (the runtime loader trusts the downloaded index)
+        _shard(src, "model.safetensors.index.json",
+               json.dumps({"weight_map": weight_map}).encode(), kind="config"),
+        _shard(src, "tokenizer.json", b'{"tok":1}', kind="tokenizer"),
+    ]
     manifest = {"schema": mf.SCHEMA, "model_id": "test/m2.5", "layer_count": layer_count,
                 "weight_map": weight_map, "shards": shards}
     if mutate is not None:

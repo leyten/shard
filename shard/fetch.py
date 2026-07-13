@@ -22,6 +22,7 @@ content-verified from day one, so swapping the source changes nothing about trus
 Per the boundary law: pure engine. Knows about manifests, shards, and bytes — nothing
 about c0mpute's catalog or accounts (the caller passes the pinned publisher pubkey in).
 """
+import json
 import os
 import re
 import shutil
@@ -120,13 +121,26 @@ class MirrorProvider(Provider):
     5 GB download continues instead of restarting; the full-file hash in fetch_block
     catches any bad resume."""
 
+    _RESOLVE_RE = re.compile(r"^(?P<origin>https?://[^/]+)/(?P<repo>.+?)/resolve/(?P<rev>[^/]+)/$")
+
     def __init__(self, base_url: str, headers: dict | None = None, retries: int = 6):
         self.base = base_url.rstrip("/") + "/"
         self.headers = headers or {}
         self.retries = retries
 
+    def _url(self, shard: dict) -> str:
+        """Route by the shard's SIGNED source repo/revision when the mirror is an
+        HF-style `<origin>/<repo>/resolve/<rev>/` base: a manifest may declare its
+        tokenizer shards from a different repo, and each shard pins the immutable
+        revision it was hashed at — resolving them against the base repo's branch
+        fetches the wrong (or a moved) file."""
+        m = self._RESOLVE_RE.match(self.base)
+        if m and shard.get("repo") and shard.get("revision"):
+            return f"{m.group('origin')}/{shard['repo']}/resolve/{shard['revision']}/{shard['path']}"
+        return self.base + shard["path"]
+
     def fetch(self, shard: dict, dest: str) -> None:
-        url = self.base + shard["path"]
+        url = self._url(shard)
         part = dest + ".part"
         for attempt in range(self.retries):
             try:
@@ -358,6 +372,50 @@ def _cached(path: str, shard: dict) -> bool:
         return False
 
 
+def _check_map_coverage(manifest: dict) -> None:
+    """Every file the signed weight_map references must have a shard entry, or the map
+    points at bytes the manifest can never verify."""
+    have = {s["path"] for s in manifest["shards"]}
+    missing = sorted(set(manifest["weight_map"].values()) - have)
+    if missing:
+        raise FetchError(f"manifest weight_map references files with no shard entry: {missing[:5]}")
+
+
+def _check_index_matches_map(manifest: dict, paths: list[str]) -> None:
+    """The runtime loader trusts model.safetensors.index.json on disk while the fetch
+    selects via the SIGNED weight_map. If the two maps differ, a weight file only the
+    index knows about would load without ever being verified — refuse the pair."""
+    for p in paths:
+        if not p.endswith(".index.json"):
+            continue
+        try:
+            with open(p) as f:
+                idx = json.load(f)
+        except (OSError, ValueError) as e:
+            os.remove(p)
+            raise FetchError(f"unparseable weight index {os.path.basename(p)}: {e}")
+        if idx.get("weight_map") != manifest["weight_map"]:
+            os.remove(p)
+            raise FetchError("downloaded index weight_map differs from the signed manifest weight_map")
+
+
+def _quarantine_stray_weights(manifest: dict, model_dir: str) -> None:
+    """Rename any *.safetensors under model_dir that the signed manifest does not list:
+    the runtime's index-driven loader would otherwise pick up a stale, never-verified
+    file left by an earlier manifest or a hostile writer."""
+    known = {s["path"] for s in manifest["shards"]}
+    for r, _, files in os.walk(model_dir):
+        for name in files:
+            if not name.endswith(".safetensors"):
+                continue
+            full = os.path.join(r, name)
+            rel = os.path.relpath(full, model_dir).replace(os.sep, "/")
+            if rel in known:
+                continue
+            os.replace(full, full + ".quarantined")
+            _log(f"  QUARANTINED stray weight file {rel} (not in the signed manifest)")
+
+
 def fetch_block_range(manifest: dict, model_dir: str, lo: int, hi: int, *,
                       is_head: bool, is_tail: bool, role: str, provider: Provider,
                       expected_pubkey: str | None = None, tied: bool = False) -> list[str]:
@@ -370,6 +428,7 @@ def fetch_block_range(manifest: dict, model_dir: str, lo: int, hi: int, *,
     (the self-optimizer's `select_ring` picks variable per-stage blocks, e.g. 10/13/13/13/13, not an
     even n/nstages split), so the puller passes the stage's actual [lo:hi] rather than a stage index."""
     mf.verify_manifest(manifest, expected_pubkey)
+    _check_map_coverage(manifest)
     os.makedirs(model_dir, exist_ok=True)
     want_tok = role == "coordinator" or is_head
     shards = shards_for_block(manifest, lo, hi, is_head=is_head, is_tail=is_tail,
@@ -392,6 +451,8 @@ def fetch_block_range(manifest: dict, model_dir: str, lo: int, hi: int, *,
         if not getattr(provider, "verifies", False):   # a self-verifying provider (ChainProvider)
             _verify(dest, s)                            # already re-hashed; don't hash 100+ GB twice
         paths.append(dest)
+    _check_index_matches_map(manifest, paths)
+    _quarantine_stray_weights(manifest, model_dir)
     _log(f"block verified: {len(paths)} files in {model_dir}")
     return paths
 
