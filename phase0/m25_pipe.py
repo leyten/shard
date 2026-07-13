@@ -2081,8 +2081,6 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             x = msg["h"].to(dev)
                             h = _block(graph_runners, layers, msg["start"], x, vcfg)
                             t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                            if RECEIPTS and signer is not None:   # attest this block's input->output transform
-                                signer.observe(_act_digest(x), _act_digest(h))
                             # P1: a PREFILL chunk's logits are consumed only at the final position (the
                             # coordinator derives the chunk length from the aux shape) — slicing frees
                             # the [1,s,vocab] projection transient (~1.6GB at s=4096). Decode/verify
@@ -2094,6 +2092,11 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 o = o if isinstance(o, dict) else {"toks": o}
                                 o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
                             _ret_send(o)
+                            if RECEIPTS and signer is not None:   # attest this block's input->output transform
+                                signer.observe(_act_digest(x), _act_digest(h))   # AFTER the send: the
+                                                                  # .cpu() sync + hash overlaps the WAN
+                                                                  # return leg (same digests, same order —
+                                                                  # the loop is single-threaded)
                         except RuntimeError as e:
                             # H1 stage backstop: a KV overflow (or any per-job compute failure) is a JOB
                             # error, never a process exit — serve()'s entrypoint is unwrapped, and a
@@ -2311,8 +2314,6 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         x = h
                         h = _block(graph_runners, layers, msg["start"], h, vcfg)
                         t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
-                        if RECEIPTS and signer is not None:         # attest this block's input->output transform
-                            signer.observe(_act_digest(x), _act_digest(h))
                         fwd = {"op": "verify", "h": h, "start": msg["start"]}
                         if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
                             fwd["aux"] = _merge_aux(msg.get("aux"))
@@ -2320,6 +2321,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if S.M25_STAGE_TIMING:
                             fwd["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
                         nxt_kw.send(fwd)
+                        if RECEIPTS and signer is not None:         # attest this block's input->output transform
+                            signer.observe(_act_digest(x), _act_digest(h))   # AFTER the send: the .cpu()
+                                                                    # sync + hash overlaps the WAN hop
+                                                                    # (same digests — h is the pre-_hsend
+                                                                    # bf16 tensor; order preserved by the
+                                                                    # single-threaded loop)
                     except RuntimeError as e:
                         # H1 stage backstop, head/middle half: a per-job compute failure (KV overflow)
                         # must never escape serve()'s unwrapped entrypoint and kill the warm stage.
