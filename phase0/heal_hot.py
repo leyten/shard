@@ -113,7 +113,9 @@ def main():
 
     # 5. RESUME: re-prefill prompt+committed on the healed ring (predecessor->spare->successor->...), continue
     healed_tail_ep = tail_ep                                    # tail unchanged (we kill a middle stage)
-    rssh(head, "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps({"output_ids": committed}) + "\nEOF", 30)
+    # pass the FULL checkpoint (versioned envelope) through: the resume coordinator validates its
+    # job/prompt/model/settings binding + token digest and refuses a stale/foreign checkpoint
+    rssh(head, "cat > /root/ft2_in.json <<'EOF'\n" + json.dumps(d1) + "\nEOF", 30)
     resume_max = len(committed) + 24                            # short continuation: isolate the failover blip, not a long decode
     fire(head, "rm -f /root/ft.json /root/coord.log; " +
          coord_cmd(nstages, healed_tail_ep, a.prompt_file, resume_max, a.max_ctx, "/root/ft.json",
