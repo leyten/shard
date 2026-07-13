@@ -10,9 +10,16 @@ these are the adversarial regressions from the external audit:
   L1  — a provider claiming success without leaving a readable file raised a raw
         FileNotFoundError from _verify, which ChainProvider does not catch — one broken
         peer blocked a valid later mirror instead of falling back.
+  M7  — publish fetched the mutable `main` ref TWICE (weight_map parsed from one fetch,
+        the signed index hash taken from another), the index a manifest references could
+        thus disagree with its own weight_map, and a declared separate tokenizer repo was
+        not encoded for fetch routing.
 
 Run: python3 -m pytest tests/test_fetch_hardening.py -q
 """
+import hashlib
+import io
+import json
 import os
 import sys
 import urllib.request
@@ -183,3 +190,99 @@ def test_verify_missing_file_is_fetcherror(tmp_path):
     shard = {"path": "x.bin", "sha256": "00" * 32, "size": 4, "shard_id": mf.cidv1_raw("00" * 32)}
     with pytest.raises(FetchError, match="unreadable"):
         F._verify(str(tmp_path / "nope.bin"), shard)
+
+
+# ---- M7 (publish): one immutable revision, metadata fetched once, coverage enforced -----------------
+
+def _fake_hf(monkeypatch, repos):
+    """Serve a fake HF: repos = {repo: {"sha": rev, "tree": [...], "files": {path: blob}}}.
+    Any URL outside the pinned revisions (e.g. the old mutable /main fetches) is an error.
+    Returns a log of index fetch counts per repo."""
+    counts = {}
+
+    def fake(req, timeout=None):
+        url = req.full_url
+        for repo, r in repos.items():
+            if url == f"https://huggingface.co/api/models/{repo}":
+                return io.BytesIO(json.dumps({"sha": r["sha"]}).encode())
+            if url == f"https://huggingface.co/api/models/{repo}/tree/{r['sha']}?recursive=1":
+                return io.BytesIO(json.dumps(r["tree"]).encode())
+            prefix = f"https://huggingface.co/{repo}/resolve/{r['sha']}/"
+            if url.startswith(prefix):
+                path = url[len(prefix):]
+                counts[(repo, path)] = counts.get((repo, path), 0) + 1
+                blobs = r["files"][path]
+                blob = blobs[min(counts[(repo, path)], len(blobs)) - 1] if isinstance(blobs, list) else blobs
+                return io.BytesIO(blob)
+        raise AssertionError(f"unexpected URL (mutable ref or wrong repo?): {url}")
+
+    monkeypatch.setattr(F, "urlopen", fake)
+    return counts
+
+
+def test_publish_hf_pins_revision_and_fetches_index_once(monkeypatch):
+    """The weight_map and the SIGNED index hash must come from the SAME single fetch at a
+    pinned revision. The old code hit mutable /main twice: an upstream push in between
+    signed index bytes whose weight_map differs from the one the manifest carries."""
+    import publish_manifest as pub
+    repo = "org/model"
+    wm = {"model.layers.0.q.weight": "model-00001.safetensors"}
+    idx_v1 = json.dumps({"weight_map": wm}).encode()
+    idx_v2 = json.dumps({"weight_map": {"model.layers.0.q.weight": "model-00002.safetensors"}}).encode()
+    cfg = json.dumps({"num_hidden_layers": 1, "architectures": ["X"]}).encode()
+    counts = _fake_hf(monkeypatch, {repo: {"sha": "rev1", "tree": [
+        {"type": "file", "path": "config.json", "size": len(cfg)},
+        {"type": "file", "path": "model.safetensors.index.json", "size": len(idx_v1)},
+        {"type": "file", "path": "model-00001.safetensors", "size": 8,
+         "lfs": {"oid": "ab" * 32, "size": 8}},
+        {"type": "file", "path": "tokenizer.json", "size": 2},
+    ], "files": {"config.json": cfg,
+                 "model.safetensors.index.json": [idx_v1, idx_v2],  # a 2nd fetch sees v2
+                 "tokenizer.json": b"{}"}}})
+    _, weight_map, shards = pub.build_from_hf(repo, repo)
+    assert weight_map == wm
+    idx = next(s for s in shards if s["path"] == "model.safetensors.index.json")
+    assert idx["sha256"] == hashlib.sha256(idx_v1).hexdigest(), \
+        "signed index bytes differ from the bytes the weight_map was parsed from"
+    assert counts[(repo, "model.safetensors.index.json")] == 1, "index fetched more than once"
+    for s in shards:                                       # per-shard immutable source
+        assert s["repo"] == repo and s["revision"] == "rev1"
+
+
+def test_publish_tokenizer_repo_encoded_per_shard(monkeypatch):
+    import publish_manifest as pub
+    repo, tok = "org/model", "org/tok"
+    wm = {"model.layers.0.q.weight": "model-00001.safetensors"}
+    idx = json.dumps({"weight_map": wm}).encode()
+    cfg = json.dumps({"num_hidden_layers": 1, "architectures": ["X"]}).encode()
+    _fake_hf(monkeypatch, {
+        repo: {"sha": "rev1", "tree": [
+            {"type": "file", "path": "config.json", "size": len(cfg)},
+            {"type": "file", "path": "model.safetensors.index.json", "size": len(idx)},
+            {"type": "file", "path": "model-00001.safetensors", "size": 8,
+             "lfs": {"oid": "cd" * 32, "size": 8}},
+            {"type": "file", "path": "tokenizer.json", "size": 4},   # base repo's own copy
+        ], "files": {"config.json": cfg, "model.safetensors.index.json": idx,
+                     "tokenizer.json": b"base"}},
+        tok: {"sha": "trev", "tree": [
+            {"type": "file", "path": "tokenizer.json", "size": 10},
+        ], "files": {"tokenizer.json": b'{"tok": 42}'}},
+    })
+    _, _, shards = pub.build_from_hf(repo, tok)
+    toks = [s for s in shards if s["kind"] == "tokenizer"]
+    assert len(toks) == 1, "tokenizer override must not duplicate the base repo's copy"
+    assert toks[0]["repo"] == tok and toks[0]["revision"] == "trev"
+    assert toks[0]["sha256"] == hashlib.sha256(b'{"tok": 42}').hexdigest()
+
+
+def test_publish_dir_refuses_index_referencing_missing_files(tmp_path):
+    import publish_manifest as pub
+    d = tmp_path / "ckpt"
+    d.mkdir()
+    (d / "model-00001.safetensors").write_bytes(b"w1")
+    json.dump({"num_hidden_layers": 1, "architectures": ["X"]}, open(d / "config.json", "w"))
+    json.dump({"weight_map": {"model.layers.0.q.weight": "model-00001.safetensors",
+                              "model.layers.0.k.weight": "model-00099.safetensors"}},  # absent
+              open(d / "model.safetensors.index.json", "w"))
+    with pytest.raises(ValueError, match="no shard entry"):
+        pub.build_from_dir(str(d))
