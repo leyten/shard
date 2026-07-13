@@ -73,6 +73,25 @@ def test_head_is_most_central():
     assert plan["head"] == "node2"
 
 
+def test_upload_aware_placement_prices_real_bytes():
+    """M25_PROFILE never carried prefill_bytes/decode_bytes/decode_steps, so upload-aware placement
+    (all nodes announcing up_mbps) optimized against ZERO byte cost — pure latency, uplinks ignored.
+    With the measured payloads ((K+1)*H*2 decode, chunk*H*2 prefill) a 1 Mbps straggler must land
+    the TAIL (the only upload-exempt prefill seat) and prefill_ms must reflect moving ~25 MB/hop."""
+    from shard.plan import M25_PROFILE
+    assert M25_PROFILE["decode_bytes"] == 9 * 3072 * 2.0      # (K+1)*H*2, K=8
+    assert M25_PROFILE["prefill_bytes"] == 4096 * 3072 * 2.0  # chunk*H*2, prefill_chunk=4096
+    assert M25_PROFILE["decode_steps"] >= 1
+    nodes, rtt = _pool(6)
+    for i, nd in enumerate(nodes):
+        nd["up_mbps"] = 1.0 if i == 1 else 100.0   # node1: residential-cable-class uplink
+    plan = plan_ring(nodes, rtt)
+    assert plan is not None
+    _assert_tiles_simple(plan, 62)
+    assert plan["prefill_ms"] > 500                # ~2 s/hop at 100 Mbps; was ~121 ms (latency only)
+    assert plan["order"][-1] == "node1"            # the slow uplink is spent on the exempt tail seat
+
+
 def test_disconnected_node_never_heads_the_ring():
     """A node with NO usable path to anyone summed centrality 0 (unreachable edges were omitted,
     not penalized) and won mandatory head — an undeployable ring anchored on a partitioned box.

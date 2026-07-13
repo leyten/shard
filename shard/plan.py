@@ -35,7 +35,23 @@ M25_PROFILE = {
     "cap_layers": 12,            # 32 GB ceiling by MEASURED footprint ((32768-1500)/2480 = 12.6);
                                  # 13 ran warm but at 31.5/32.6 GiB — brim-riding, not a plan target
     "head_layer_ms_mult": 1.3,   # the head box also runs the coordinator
+    # per-hop activation payloads for upload-aware placement (bf16 wire, hidden 3072 — see
+    # phase0/m25_stage.py). Without these the residential objective priced every byte at ZERO and
+    # upload-aware placement decayed to pure latency. Nominal request unit: a one-chunk (4096-tok)
+    # prefill + 256 decode traversals of a (K+1)-token draft bundle (K=8, the measured sweet spot);
+    # callers with a real workload override (fp8 wire => halve bytes, long prompts => S*H*2 and
+    # prefill_chunks = ceil(S/4096)).
+    "prefill_bytes": 4096 * 3072 * 2.0,   # chunk*H*2 — one [chunk,H] prefill hop (~25 MB)
+    "decode_bytes": 9 * 3072 * 2.0,       # (K+1)*H*2 — one draft round's hidden bundle (~54 KB)
+    "decode_steps": 256,                  # nominal decode traversals per request (~600 tok @ g~2.5)
+    "prefill_chunks": 1,
 }
+
+_SLACK = 3                       # default pool headroom for the exact subset search: k_min..k_min+3.
+                                 # slack=len(nodes) made select_ring's exact search range over EVERY
+                                 # k up to the pool size (combinatorial in a wide pool), defeating
+                                 # the trim funnel; select_ring still widens past this on its own
+                                 # when co-location forces a bigger ring, so feasibility is intact.
 
 _UNREACHABLE = 9000.0            # RTT sentinel: treat >= this as "no usable path" when ranking centrality
 
@@ -66,7 +82,8 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
              "layer_ms": float|None}]          # measured decode ms/layer (overrides base*cpu_factor)
     rtt:   NxN one-way ms matrix, row/col order aligned to `nodes` (rtt[i][i] ignored).
     model: profile dict (see M25_PROFILE); defaults to M2.5.
-    slack: select_ring pool headroom; defaults to len(nodes) (let it drop any weak/co-located box).
+    slack: select_ring pool headroom; defaults to min(len(nodes), 3) — enough to drop weak/co-located
+           boxes without letting the exact subset search range over every k up to the pool size.
     privacy: {"boundary_in": int, "boundary_out": int} — turn on BOUNDARY-LAYER PINNING: the ring's
              head/tail (they handle raw prompt / output tokens) and every stage holding a boundary
              layer must be `trusted` nodes; strangers hold only deep-middle layers. The head is the
@@ -195,7 +212,7 @@ def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
     for _ in range(n + 1):
         spec = select_ring(range(n), rtt, c_out, c_in, free_vram_mb=free, layer_ms=layer_ms,
                            subnet=subnet, n_layers=int(m["n_layers"]), layer_vram_mb=lv,
-                           kv_mb_per_layer=kv, slack=n if slack is None else int(slack),
+                           kv_mb_per_layer=kv, slack=min(n, _SLACK) if slack is None else int(slack),
                            require=head, **extra)
         if spec is None:
             return None
