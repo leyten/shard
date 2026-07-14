@@ -496,3 +496,51 @@ def run_coordinator(T, prompt_len, drafter, *, K=8, depth=4, max_new=160, prefil
     if ring.error is not None:
         raise AssertionError(f"fake ring crashed: {type(ring.error).__name__}: {ring.error}")
     return res, ring
+
+
+def run_coordinator_twoturn(T, prompt_len_a, prompt_len_b, cached_prefix, drafter_a, drafter_b, *,
+                            K=8, depth=4, max_new_a=160, max_new_b=120, prefill_chunk=4096, timeout=30,
+                            **ring_kw):
+    """Two coordinate_pipe jobs on ONE persistent FakeRing — the multi-turn prefix-cache path. Job A
+    (turn 1) prefills [0:prompt_len_a] and decodes max_new_a tokens, warming KV [0:prompt_len_a+max_new_a].
+    The fake ring's `reset` is a logical no-op (like real static-KV), so that KV survives into job B
+    (turn 2): job B's prompt is T[:prompt_len_b] and it passes cached_prefix, so it skips re-prefilling
+    [0:cached_prefix] and reads the resident rows. The ring's KV-GAP / KV-CONTENT asserts fire loudly if
+    job B reads a slot never written or since clobbered — a green run proves the cache reused only
+    legitimately-resident, correct KV. Returns (res_a, res_b, ring); ring.log is both turns' wire trace."""
+    c_pipe, r_pipe = socket.socketpair()
+    c_ret, r_ret = socket.socketpair()
+    c_ret.settimeout(timeout)
+    ring = FakeRing(r_pipe, r_ret, T, **ring_kw)
+    ring.tail_slack = depth
+    ring.start()
+    try:
+        try:
+            res_a = MP.coordinate_pipe(c_pipe, FakeTok(T[:prompt_len_a]),
+                                       [{"role": "user", "content": "turn1"}], K, max_new_a, timeout,
+                                       depth, c_ret, drafter_a, prefill_chunk=prefill_chunk)
+            res_b = MP.coordinate_pipe(c_pipe, FakeTok(T[:prompt_len_b]),
+                                       [{"role": "user", "content": "turn2"}], K, max_new_b, timeout,
+                                       depth, c_ret, drafter_b, prefill_chunk=prefill_chunk,
+                                       cached_prefix=cached_prefix)
+        except Exception:
+            ring.join(2)
+            if ring.error is not None:
+                raise AssertionError(
+                    f"fake ring crashed: {type(ring.error).__name__}: {ring.error}") from None
+            raise
+    finally:
+        for s_ in (c_pipe, c_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+        ring.join(10)
+        for s_ in (r_pipe, r_ret):
+            try:
+                s_.close()
+            except OSError:
+                pass
+    if ring.error is not None:
+        raise AssertionError(f"fake ring crashed: {type(ring.error).__name__}: {ring.error}")
+    return res_a, res_b, ring

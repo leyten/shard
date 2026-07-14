@@ -379,3 +379,31 @@ def test_extend_pairing_through_divergence(path, monkeypatch):
         assert base == cur, f"extend base_pos {base} != expected {cur} — gap/overlap across a divergence"
         cur += len(toks); all_toks += toks
     assert all_toks == T[1:1 + len(all_toks)]
+
+
+# ---- 8. CROSS-REQUEST PREFIX-KV CACHE -------------------------------------------------------------
+
+@pytest.mark.parametrize("prefill_chunk", [24, 4096])       # chunked suffix / whole-suffix prefill
+def test_prefix_cache_multiturn(prefill_chunk):
+    """A follow-up turn that reuses the resident KV of the shared prefix (cached_prefix) must produce
+    byte-identical output to running that turn cold. Two coordinate_pipe jobs share ONE FakeRing — turn 1
+    warms KV [0:260], turn 2 reuses [0:250] and prefills only its 50-token suffix. Correctness rests on
+    the ring's own KV model: if turn 2 read a slot the ring never wrote (KV GAP) or one since clobbered
+    (KV CONTENT), the fake ring raises — so a green run PROVES the cache reused only legitimately-resident,
+    correct KV, not that the assertion was skipped."""
+    T = fr.novel_T(560)
+    La, Pfx, Lb = 100, 250, 300     # turn-1 prompt / shared-prefix boundary / turn-2 prompt (prefix + new user turn)
+    cold, _ = fr.run_coordinator(T, Lb, _ngram(), K=8, depth=4, max_new=120,     # control: turn 2, full re-prefill
+                                 prefill_chunk=prefill_chunk, eagle_ring=False)
+    _a, b, ring = fr.run_coordinator_twoturn(T, La, Lb, Pfx, _ngram(), _ngram(), K=8, depth=4,
+                                             max_new_a=160, max_new_b=120, prefill_chunk=prefill_chunk)
+    assert cold["ok"] and b["ok"], (cold, b)
+    assert b["output_ids"] == cold["output_ids"], "prefix-cache output diverged from a cold re-prefill"
+    assert b["output_ids"] == T[Lb:Lb + len(b["output_ids"])]       # and both equal the oracle continuation
+    # turn 2 must actually SKIP the prefix: split the shared log at turn 2's job-open reset; its first
+    # verify frame must start at the cache boundary, proving KV reuse rather than a silent full re-prefill.
+    resets = [i for i, e in enumerate(ring.log) if e["op"] == "reset"]
+    assert len(resets) == 2, "expected two job-open resets (one per turn)"
+    turn2 = ring.log[resets[1]:]
+    first_v = next(e for e in turn2 if e["op"] == "verify")
+    assert first_v["start"] == Pfx, f"turn 2 re-prefilled from {first_v['start']}, expected cache boundary {Pfx}"
