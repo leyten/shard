@@ -142,7 +142,8 @@ def fresh_count(host, port, nonce_file, nonce, log, pattern):
     return (r.stdout.strip().splitlines() or ["0"])[-1].strip()
 
 
-def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None, nonce="", frame_timeout=60):
+def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None, nonce="", frame_timeout=60,
+                quic=False, relay=False, relays=None):
     """Pure builder (unit-testable): every remote-influenced value (multiaddrs carry PeerIds from
     remote stdout) is shlex-quoted, and the whole inner command is quoted ONCE for the bash -c
     level — correct two-level quoting, byte-identical to the old literal form for legit values."""
@@ -159,9 +160,16 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allo
     # frame (multi-MB bf16 prefill chunk on a ~5MB/s residential uplink ~5-10s) and sits far under
     # the 600s stage timeout; the engine keys off the same number (M25_FRAME_TIMEOUT). 0 disables.
     ft = f"-frame-timeout {int(frame_timeout)}"
+    # NAT traversal (home/residential GPUs behind NAT/CGNAT): -quic ALSO listens on udp/quic-v1 derived
+    # from the tcp listen port (hole-punches more reliably on lossy/CGNAT links); -relays <csv> reserves
+    # a circuit on public relays so a NAT'd node stays dialable while DCUtR punches a direct hole; -relay
+    # makes THIS (public) node a relay + AutoNAT server for others. All three are additive to the tcp path.
+    qc = "-quic" if quic else ""
+    rl = "-relay" if relay else ""
+    rs = f"-relays {shlex.quote(relays)}" if relays else ""
     nn = f"echo {nonce} > /root/sidecar.nonce; " if nonce else ""
     inner = (f"/tmp/sidecar -key /root/node.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} "
-             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} {ft} > /root/sidecar.log 2>&1")
+             f"-announce {shlex.quote(announce)} {inb} {fw} {sd} {bs} {al} {ft} {qc} {rl} {rs} > /root/sidecar.log 2>&1")
     return (f"pkill -9 -x sidecar 2>/dev/null; fuser -k {LIBP2P}/tcp {FWD_RING}/tcp {FWD_RET}/tcp 2>/dev/null; sleep 2; rm -f /root/sidecar.log; {nn}"
             f"setsid bash -c {shlex.quote(inner)} </dev/null >/dev/null 2>&1 &")
 
@@ -169,7 +177,11 @@ def sidecar_cmd(announce, inbound, forwards, seed=None, dht_bootstrap=None, allo
 def launch_sidecar(host, port, announce, inbound, forwards, seed=None, dht_bootstrap=None, allow=None):
     nonce = secrets.token_hex(8)
     ft = int(os.environ.get("M25_FRAME_TIMEOUT", "60") or 0)   # operator override reaches BOTH the sidecar flag and (via ENG_ENV) the engine
-    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow, nonce=nonce, frame_timeout=ft)
+    quic = os.environ.get("SHARD_QUIC", "") not in ("", "0")            # udp/quic-v1 listener for NAT'd / lossy residential links
+    relay = os.environ.get("SHARD_RELAY", "") not in ("", "0")          # run THIS (public) node as a circuit-relay + AutoNAT server
+    relays = os.environ.get("SHARD_RELAYS", "").strip() or None         # csv of relay multiaddrs a NAT'd node reserves on
+    cmd = sidecar_cmd(announce, inbound, forwards, seed=seed, dht_bootstrap=dht_bootstrap, allow=allow,
+                      nonce=nonce, frame_timeout=ft, quic=quic, relay=relay, relays=relays)
     for attempt in range(5):
         sh(host, port, cmd, 30)
         for _ in range(4):
