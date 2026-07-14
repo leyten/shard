@@ -727,7 +727,8 @@ def _check_reset_ack(op, ack):
 
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
-                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
+                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True,
+                    cached_prefix=0):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -779,8 +780,15 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 n_i = _pf_len(toks_i, aux_i)
                 local_draft.extend(_pf_pair(gen_ids, start_i, toks_i, n_i),
                                    _eagle_aux_range(aux_i, 0, n_i), base_pos=start_i)
-        if prefill_chunk and len(gen_ids) > prefill_chunk:
-            starts = list(range(0, len(gen_ids), prefill_chunk))
+        # cached_prefix: the KV of the first N tokens is already resident on this ring (an earlier turn of
+        # THIS session decoded them here — static-KV keeps KV across the job-open reset, which is a logical
+        # no-op). Skip re-prefilling [0:N]; prefill only the suffix at start=N and read the resident rows.
+        # Token-exact: greedy verify commits the same tokens whether [0:N] was just written or reused, as
+        # long as those rows hold the SAME prompt prefix — the caller's session-pinning contract. N is
+        # clamped below len(gen_ids) so there is always a final position whose argmax seeds decode.
+        pf_start = max(0, min(cached_prefix, len(gen_ids) - 1))
+        if prefill_chunk and (len(gen_ids) - pf_start) > prefill_chunk:
+            starts = list(range(pf_start, len(gen_ids), prefill_chunk))
             def _send_pf(i): kw.send({"op": "verify", "token_ids": gen_ids[i:i + prefill_chunk], "start": i, "prefill": True})
             d = min(max(prefill_depth, 1), len(starts)); sent = 0; toks = None
             while sent < d: _send_pf(starts[sent]); sent += 1
@@ -790,8 +798,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
-            kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
-            _pf_extend(0, toks, aux)
+            kw.send({"op": "verify", "token_ids": gen_ids[pf_start:], "start": pf_start}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
+            _pf_extend(pf_start, toks, aux)
         prefill_s = time.time() - t_pf
         rx.settimeout(_reply_timeout(timeout))              # F6: tighten the per-reply deadline for decode — a mid-decode ring blip fails over in seconds, not up to the full timeout
         pos = len(gen_ids); out = resume_ids + [cur]        # preserve recovered tokens; cur = next after them
