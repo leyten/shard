@@ -202,6 +202,21 @@ def test_sidecar_cmd_renders_allow_flags():
     assert "-allow" not in cmd                            # unset = open (legacy)
 
 
+def test_sidecar_cmd_renders_nat_flags():
+    """Home/NAT'd-GPU reach: -quic (udp/quic-v1 listener), -relay (be a public relay), -relays <csv>
+    (reserve on relays when NAT'd) surface only when asked. Token-exact checks (split, not substring)
+    so -relays never masquerades as -relay; an untouched call stays the legacy tcp-only form."""
+    toks = lambda **kw: _bash_c_payload(
+        msp.sidecar_cmd("/ip4/1.2.3.4/tcp/29600", "", [], **kw)).split()
+    assert "-quic" in toks(quic=True)
+    assert "-relay" in toks(relay=True) and "-relays" not in toks(relay=True)
+    relays = "/ip4/9.9.9.9/tcp/29600/p2p/12D3KooWrelay,/ip4/8.8.8.8/tcp/29600/p2p/12D3KooWx"
+    t = toks(relays=relays)
+    assert "-relays" in t and t[t.index("-relays") + 1] == relays and "-relay" not in t
+    base = toks()
+    assert "-quic" not in base and "-relay" not in base and "-relays" not in base
+
+
 def test_stage_cmd_token_and_loopback_bind():
     cmd = msp.stage_cmd(1, 3, 20, 41, False, token="deadbeef")
     assert "SHARD_SWARM_TOKEN=deadbeef " in cmd
