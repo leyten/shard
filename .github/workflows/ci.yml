@@ -1,0 +1,45 @@
+name: CI
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+
+# Required checks. GPU / Apple-MLX equivalence jobs need self-hosted runners and
+# are tracked separately (see docs/audits/repository-audit-2026-07-13.md §5);
+# this covers the CPU pytest suite and the Go sidecar, which is what the audit
+# flagged as missing (a sidecar build failure must fail CI, not silently skip).
+jobs:
+  python:
+    name: python tests (CPU)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: install deps (CPU torch + declared runtime deps)
+        run: |
+          python -m pip install -U pip
+          pip install torch --index-url https://download.pytorch.org/whl/cpu
+          pip install -e .
+          pip install pytest transformers safetensors
+      - name: collect-only must be side-effect free (no network/subprocess/import work)
+        run: pytest tests/ --collect-only -q
+      - name: pytest
+        run: pytest tests/ -q
+
+  go-sidecar:
+    name: go sidecar build + test
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sidecar/go.mod
+      - name: build + test (a build failure fails CI — never a silent skip)
+        working-directory: sidecar
+        run: |
+          go build ./...
+          go test ./...
