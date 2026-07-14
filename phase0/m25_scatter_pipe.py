@@ -357,8 +357,8 @@ def main():
         gnonce = secrets.token_hex(8)
         gw = (f"fuser -k {GW}/tcp 2>/dev/null; sleep 1; rm -f /root/gateway.log; echo {gnonce} > /root/gateway.nonce; "
               f"cd /root && {rc}{tk}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
-              f"setsid nohup /root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
-              f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1 </dev/null & echo SERVING")
+              f"setsid bash -c '/root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
+              f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1' </dev/null >/dev/null 2>&1 & echo SERVING")
         sh(head["host"], head["port"], gw, 30)
         ok = False                            # M4: poll the REAL startup banner of THIS launch (nonce-gated), not any historical log line
         for _ in range(15):
