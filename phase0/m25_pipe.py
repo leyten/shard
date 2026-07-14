@@ -488,6 +488,64 @@ def _pf_pair(gen_ids, start, toks, n):
     return nxt if len(nxt) == n else nxt + [toks[-1]]
 
 
+def _prefill_streams(kw, rx, pipe_sock, prompts, prefill_chunk, prefill_depth, drafters, K,
+                     eos_set, mx, cur, pos, out, done, on_commits, eagle_on,
+                     aux_local, aux_token, lseq_tx):
+    """PIPELINED per-stream prefill, shared by the batch + rows coordinators (both used a serial
+    send -> blocking-recv per (stream, chunk) — B*chunks sequential ring round-trips of pure TTFT).
+    Fire `prefill_depth` verify(prefill) ops in flight across all (stream, chunk) pairs, recv in FIFO
+    order. TOKEN-IDENTICAL to the serial path: the single-threaded stage applies ops in send order,
+    so a stream's chunk i still reads its own 0..i-1 KV before projecting — only the WAN wait is
+    hidden. Mutates cur/pos/out/done in place, grows each stream's drafter context (whole-prompt,
+    chunk by chunk), issues its first request(). Send order == recv order == pf_jobs order, so the
+    aux_local lane's seq stays matched; returns the advanced (lseq_tx, lseq_rx)."""
+    B = len(prompts)
+    pf_jobs = []                                             # flat (stream, start, chunk, last_of_stream)
+    for b in range(B):
+        gen = prompts[b]
+        sb = list(range(0, len(gen), prefill_chunk)) if prefill_chunk else [0]
+        for ci, i in enumerate(sb):
+            pf_jobs.append((b, i, gen[i:i + prefill_chunk] if prefill_chunk else gen, ci == len(sb) - 1))
+    tx = [lseq_tx]
+
+    def _send(job):
+        jb, ji, jc, _ = job
+        op = {"op": "verify", "stream": jb, "token_ids": jc, "start": ji, "prefill": True}
+        if aux_local:
+            op["seq"] = tx[0]; tx[0] += 1
+        kw.send(op)
+
+    depth = min(max(prefill_depth, 1), len(pf_jobs))
+    last_rr = [None] * B
+    lseq_rx = lseq_tx
+    sent = 0
+    while sent < depth:
+        _send(pf_jobs[sent]); sent += 1
+    for jn in range(len(pf_jobs)):
+        jb, ji, _jc, jlast = pf_jobs[jn]
+        rr, aux = _unpack(_reply_ok(recv_data(rx)))
+        if sent < len(pf_jobs):                              # refill BEFORE the extend/finalize work so it
+            _send(pf_jobs[sent]); sent += 1                  # overlaps the next chunk's ring traversal
+        if aux_local:
+            loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
+            if loc:
+                aux = {**(aux or {}), **loc}
+        if eagle_on and aux is not None:                     # whole-prompt drafter context, chunk by chunk
+            n_i = _pf_len(rr, aux)
+            drafters[jb].extend(_pf_pair(prompts[jb], ji, rr, n_i),
+                                _eagle_aux_range(aux, 0, n_i), base_pos=ji)
+        last_rr[jb] = rr
+        if jlast:                                            # stream jb's last chunk landed -> finalize it
+            cur[jb] = last_rr[jb][-1]
+            pos[jb] = len(prompts[jb]); out[jb] = [cur[jb]]
+            if cur[jb] in eos_set or len(out[jb]) >= mx[jb]:
+                done[jb] = True
+            drafters[jb].request(prompts[jb] + [cur[jb]], K)
+            if on_commits and on_commits[jb]:
+                on_commits[jb](out[jb], 0.0)
+    return tx[0], lseq_rx
+
+
 def _aux_local_handshake(sock, token, wait_s=2.0):
     """Confirm the head's per-job aux_local opt-in on the (localhost) pipe socket. `token` is the
     job's UNIQUE nonce (minted per job — job_id defaults to "job" everywhere, so it can NOT
@@ -1134,10 +1192,10 @@ def _sdpa_backend_probe(stage):
 
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
                           depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
-                          on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+                          on_commits=None, tools_b=None, swarm_id="swarm", job_id="job", prefill_depth=8):
     if M25_DELOCKSTEP and S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters):
         return coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock,
-                                    drafters, tools=tools, prefill_chunk=prefill_chunk,
+                                    drafters, tools=tools, prefill_chunk=prefill_chunk, prefill_depth=prefill_depth,
                                     max_ctx=max_ctx, reasoning=reasoning, on_commits=on_commits,
                                     tools_b=tools_b, swarm_id=swarm_id, job_id=job_id)
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
@@ -1207,29 +1265,9 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
             aux_local = _aux_local_handshake(pipe_sock, aux_token)   # also drains a dead job's stale frames
             if not aux_local:
                 print("[batch] aux_local asked but the head never acked — ridden-ring aux (old head?)", flush=True)
-        for b in range(B):                                   # PER-STREAM prefill into row b (variable length)
-            gen = prompts[b]
-            starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
-            for i in starts_b:
-                chunk = gen[i:i + prefill_chunk] if prefill_chunk else gen
-                pf = {"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True}
-                if aux_local:
-                    pf["seq"] = lseq_tx; lseq_tx += 1
-                kw.send(pf)
-                rr, aux = _unpack(_reply_ok(recv_data(rx)))   # stream-b prefill reply is solo-shaped ({toks, aux})
-                if aux_local:                            # the head's own aux layers arrive on the local lane
-                    loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
-                    if loc:
-                        aux = {**(aux or {}), **loc}     # all-empty stays None -> the no-aux path fails loud
-                if eagle_on and aux is not None:         # whole-prompt drafter context, chunk by chunk;
-                    n_i = _pf_len(rr, aux)               # chunk length from the AUX shape (P1: prefill
-                    drafters[b].extend(_pf_pair(gen, i, rr, n_i),   # toks are final-position-only)
-                                       _eagle_aux_range(aux, 0, n_i), base_pos=i)
-            cur[b] = rr[-1]
-            pos[b] = len(gen); out[b] = [cur[b]]
-            if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
-            drafters[b].request(prompts[b] + [cur[b]], K)
-            if on_commits and on_commits[b]: on_commits[b](out[b], 0.0)   # stream: first token from prefill
+        lseq_tx, lseq_rx = _prefill_streams(kw, rx, pipe_sock, prompts, prefill_chunk, prefill_depth,
+                                            drafters, K, eos_set, mx, cur, pos, out, done, on_commits,
+                                            eagle_on, aux_local, aux_token, lseq_tx)
         prefill_s = time.time() - t_pf; t0 = time.time()        # start the DECODE-rate timer after prefill (matches coordinate_pipe; agg_tok_s is steady-state decode, not TTFT-polluted)
         # PIPELINED: keep `depth` batched verify-rounds in flight so the WAN is HIDDEN (the synchronous depth=1 path
         # paid full ring latency L every round -> B/L; this restores depth-pipelining -> aggregate ~ B x single-stream).
@@ -1340,7 +1378,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
 
 def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
                          tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
-                         on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+                         on_commits=None, tools_b=None, swarm_id="swarm", job_id="job", prefill_depth=8):
     """DE-LOCKSTEP coordinator (M25_DELOCKSTEP): B independent per-stream spec-decode chains whose
     [1,K+1] solo-style frames INTERLEAVE on the ring — no shared round, no lockstep barrier. Each
     stream is exactly solo depth-1 EAGLE (draft from the verified hidden -> send -> commit on reply,
@@ -1419,29 +1457,9 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
             aux_local = _aux_local_handshake(pipe_sock, aux_token)
             if not aux_local:
                 print("[rows] aux_local asked but the head never acked — ridden-ring aux (old head?)", flush=True)
-        for b in range(B):                               # per-stream prefill, exactly the lockstep path
-            gen = prompts[b]
-            starts_b = range(0, len(gen), prefill_chunk) if prefill_chunk else [0]
-            for i in starts_b:
-                chunk = gen[i:i + prefill_chunk] if prefill_chunk else gen
-                pf = {"op": "verify", "stream": b, "token_ids": chunk, "start": i, "prefill": True}
-                if aux_local:
-                    pf["seq"] = lseq_tx; lseq_tx += 1
-                kw.send(pf)
-                rr, aux = _unpack(_reply_ok(recv_data(rx)))
-                if aux_local:
-                    loc = _pull_aux_local(pipe_sock, aux_token, lseq_rx); lseq_rx += 1
-                    if loc:
-                        aux = {**(aux or {}), **loc}
-                if aux is not None:
-                    n_i = _pf_len(rr, aux)               # chunk length from the AUX shape (P1)
-                    drafters[b].extend(_pf_pair(gen, i, rr, n_i),
-                                       _eagle_aux_range(aux, 0, n_i), base_pos=i)
-            cur[b] = rr[-1]
-            pos[b] = len(gen); out[b] = [cur[b]]
-            if cur[b] in eos_set or len(out[b]) >= mx[b]: done[b] = True
-            drafters[b].request(prompts[b] + [cur[b]], K)
-            if on_commits and on_commits[b]: on_commits[b](out[b], 0.0)
+        lseq_tx, lseq_rx = _prefill_streams(kw, rx, pipe_sock, prompts, prefill_chunk, prefill_depth,
+                                            drafters, K, eos_set, mx, cur, pos, out, done, on_commits,
+                                            True, aux_local, aux_token, lseq_tx)
         prefill_s = time.time() - t_pf; t0 = time.time()
         rx.settimeout(_reply_timeout(timeout))           # decode replies fail over in seconds, like solo
         dprefix = [prompts[b] + [cur[b]] for b in range(B)]
