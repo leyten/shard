@@ -359,7 +359,13 @@ def main():
               f"cd /root && {rc}{tk}{bt}SHARD_TRANSPORT=libp2p {eng_env()}M25_DIR=/root/m25 "
               f"setsid bash -c '/root/venv/bin/python /root/m25_gateway.py --head 127.0.0.1:{ENG_IN} --tail 127.0.0.1:{FWD_RET} "
               f"--port {GW} --K {a.K} --depth {a.depth} --ngram-n {a.ngram_n} --max-ctx {eff_max_ctx} > /root/gateway.log 2>&1' </dev/null >/dev/null 2>&1 & echo SERVING")
-        sh(head["host"], head["port"], gw, 30)
+        # the setsid gateway detaches, but its outer `bash -c` stays on the ssh channel, so this ssh
+        # doesn't return promptly (this is why the plain detach wasn't enough). Don't block or crash
+        # on it — the gateway IS launched; real readiness is the nonce-gated poll below (M4).
+        try:
+            sh(head["host"], head["port"], gw, 8)
+        except subprocess.TimeoutExpired:
+            pass
         ok = False                            # M4: poll the REAL startup banner of THIS launch (nonce-gated), not any historical log line
         for _ in range(15):
             time.sleep(4)
