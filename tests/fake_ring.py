@@ -376,7 +376,7 @@ class FakeTokB:
 
 
 def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill_chunk=24, timeout=30,
-                         **ring_kw):
+                         prefill_depth=8, **ring_kw):
     """One coordinate_pipe_rows job against a fresh FakeRingB. S.M25_TREE (monkeypatched by the
     caller) arms the per-stream tree route, same as production. ring_kw reaches FakeRingB (the
     version-mix strip_* arms). Returns (result, ring)."""
@@ -390,7 +390,7 @@ def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill
     try:
         try:
             res = MP.coordinate_pipe_rows(c_pipe, tok, msgs, K, max_new, timeout, c_ret, drafters,
-                                          prefill_chunk=prefill_chunk)
+                                          prefill_chunk=prefill_chunk, prefill_depth=prefill_depth)
         except Exception:
             ring.join(2)
             if ring.error is not None:

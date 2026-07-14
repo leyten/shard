@@ -93,6 +93,24 @@ def test_rows_tree_equals_solo_tree_per_stream(monkeypatch):
             f" of {len(rows_frames)}/{len(solo_frames)}")
 
 
+def test_rows_prefill_depth_invariant(monkeypatch):
+    """PIPELINED prefill (prefill_depth>1) is byte-identical to the serial send->recv path
+    (prefill_depth=1). The single-threaded stage applies verify(prefill) ops in SEND order no matter
+    how many are in flight, so each stream's chunk i still reads its own 0..i-1 KV — firing a window
+    ahead only hides WAN latency. Deeply multi-chunk (prefill_chunk=24 over 460-tok prompts) x B=4,
+    so a bug in the (stream,chunk) FIFO / drafter-extend ordering would diverge immediately."""
+    _tree_env(monkeypatch)
+    Ts, PLs = _mixed_Ts()
+    base = _base()                                          # base.fork() = independent clean states, so the
+    serial, _ = fr.run_rows_coordinator(                    # two runs' drafters start byte-identical and the
+        Ts, PLs, [HybridDrafter(_ngram(), base.fork()) for _ in Ts],   # ONLY difference is prefill_depth
+        K=K, max_new=80, prefill_chunk=24, prefill_depth=1)
+    piped, _ = fr.run_rows_coordinator(
+        Ts, PLs, [HybridDrafter(_ngram(), base.fork()) for _ in Ts],
+        K=K, max_new=80, prefill_chunk=24, prefill_depth=8)
+    assert [s["output_ids"] for s in serial["streams"]] == [s["output_ids"] for s in piped["streams"]]
+
+
 def test_rows_tree_interleaves_streams(monkeypatch):
     """The de-lockstep property survives the tree route: frames from different streams interleave on
     the wire (the streams ARE the pipeline) — never B sequential solo runs."""
