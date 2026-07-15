@@ -49,7 +49,7 @@ try:                                                    # PROVE: opt-in signed p
 except Exception:
     ReceiptSigner = None
 RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
-NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
+NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", os.path.expanduser("~/.shard_node_key"))
 
 # C2 activation authorization, engine layer: a per-swarm/epoch token minted ONCE per launch by the
 # launcher (SHARD_SWARM_TOKEN env, never printed/committed). Set -> every ring connection must open
@@ -1853,6 +1853,11 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((_engine_bind_addr(), port)); srv.listen(2)
     print(f"[s{stage}] WARM, listening :{port}", flush=True)
+    # machine-readable half of the WARM signal — the ready contract python -m shard.stage's
+    # supervisor (the node daemon) waits on; the human line above stays for operator greps
+    print("SHARD_STAGE_READY " + json.dumps({"stage": stage, "nstages": nstages, "lo": lo, "hi": hi,
+                                             "port": port, "pid": os.getpid(),
+                                             "tail": bool(parts["tail"])}), flush=True)
 
     if parts["tail"]:
         node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
