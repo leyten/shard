@@ -16,9 +16,15 @@ from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 # SHARD_TRANSPORT=libp2p swaps the trusted-wire (ChaCha+PSK over raw TCP) for the libp2p sidecar
 # transport (shard/transport.py, pushed flat as transport.py): identity+encryption are the sidecar's
 # job, so send_msg/recv_msg drop the seal. The engine is otherwise unchanged — same call sites.
+# The flat import serves the single-dir box layout; off it (repo checkout, python -m shard.stage)
+# the module lives at shard.transport — fall back instead of demanding a hand-set PYTHONPATH.
 if os.environ.get("SHARD_TRANSPORT") == "libp2p":
-    import transport as wire
-    from transport import send_msg, recv_msg
+    try:
+        import transport as wire
+        from transport import send_msg, recv_msg
+    except ImportError:
+        from shard import transport as wire
+        from shard.transport import send_msg, recv_msg
 else:
     import wire
     from wire import send_msg, recv_msg   # authenticated + encrypted + pickle-free wire (was raw pickle here)
