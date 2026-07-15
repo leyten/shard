@@ -20,6 +20,42 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-15 (LATER) — LEG 7 SELF-SERVE JOIN WORKS END-TO-END LOCALLY: one command, zero env vars
+**The user's test is now `clone → one command`.** Shipped this block: c0mpute **#29 #30 #31**.
+- **Mock orchestrator harness (c0mpute #29, `scripts/shard-daemon-sim.ts`):** the missing test tool — real
+  `verifyBindingProof` + real `decideRole`/`shard.probe` + the real `attachSwarmLoop` control plane; only
+  PLACEMENT stubbed (`SimSeam`), `swarm-loop` gained an injectable `seam`. Lets the full daemon lifecycle run
+  with zero cloud (`--once` exits 0 on serving = CI-able).
+- **Self-provision + forward-leg addressing (c0mpute #30):** `shard-setup.ts` = enroll step 0 installs the
+  engine checkout + a pinned python venv + the sidecar (sha256-pinned release download, go-build fallback) +
+  probe slice, ZERO env vars, idempotent. Forward-leg: `swarm:assign` now carries each peer's dialable sidecar
+  multiaddrs (`NodeCapabilities.addrs`, captured from the sidecar ADDR lines at enroll); a non-tail stage dials
+  its successor (`-forward`) + pins inbound to its predecessor PeerId (`-allow`). Sidecar is now a daemon-scoped
+  fixture (standby→ring-legs→restored, generation-guarded). **2-node libp2p ring PROVEN** — probe crossed both
+  sidecars over a DIRECT hole-punched conn (`SHIM_FORWARD_ROUNDTRIP` + `SHIM_INBOUND`, both stages READY).
+  **This lifted the tail-only restriction — multi-stage rings form.**
+- **One-command test (c0mpute #31): `npm run try-shard`** boots the sim + a daemon and streams enroll →
+  announce → assign → pull → READY → serving. GPU box = real self-provisioned stage; GPU-less = shim. Doc:
+  `c0mpute-worker/SHARD_QUICKSTART.md`. Sidecar release CI: shard **#106** (`sidecar-release.yml`, operator-
+  triggered; publish v0.1.0 via workflow_dispatch, then bump the sha pin in `shard-setup.ts`).
+- **Live bug found + fixed:** the sidecar's framed tunnel uses an **8-byte** BE length prefix
+  (`shard/transport.py` `send_msg`), not 4 — a 4-byte guess is read as a garbage length and dies at the 60s
+  frame deadline. (Harness shim only; the real engine already speaks 8-byte.)
+- **Decentralization stance (leyten asked):** PoC launches **M1 verifiable-centralized** (one orchestrator,
+  but every decision is a replayable artifact — admission=`shard.probe`, placement=`shard.plan`, settlement=
+  signed receipts; data plane already P2P). Decentralized orchestration = post-launch staged migration
+  (`c0mpute/PLACEMENT_AS_PROTOCOL.md` M0→M4, "swarm forms with orchestrator DEAD" = the milestone). The trap to
+  avoid is UNVERIFIABLE centralization, not centralization. Gateway/demand layer stays centralized+replaceable.
+
+**⇒ NEXT — finish Leg 7 (ranked; forward-leg + self-provision DONE):**
+1. **Peers-first verified fetch CLI** — promote `shard.fetch.fetch_block_range` + ChainProvider to a CLI the
+   daemon's `pullRange` calls (torrent path, live-proven in-engine); today it's the HF mirror.
+2. **Runtime artifact (§8-3)** — signed content-addressed sm120 bundle over block-exchange (kills the pip term).
+3. **Node-side `swarm:challenge` sketch** (until then NEVER drive startSpotCheck on shard swarms — silence =
+   spot_check_fail = reputation death spiral) + **RTT-mesh round** (probe --net-only vs assigned peers).
+4. **Warm re-join ≤3min acceptance receipt** + the Ink/blessed-contrib **map UI** (P1-#1, the launch face).
+_(Parallel: EAGLE offline fix P0-#5. Perf PRs #100/#101 + tree-graph = P2.)_
+
 ### ⇒ 2026-07-15 — LEG 7 STARTED: shard.stage CLI + P0-#2 landmines DEAD + the daemon skeleton MERGED
 **Shipped (all merged same-session):** shard **#103** (yesterday's stranded local commits — `--external-tail`
 + LAUNCH.md were never pushed into #102; caught + landed), shard **#104**, c0mpute **#27 #28**.
