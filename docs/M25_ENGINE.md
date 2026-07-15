@@ -11,7 +11,45 @@
 
 ---
 
+## 🚀 WHAT'S LEFT BEFORE LAUNCH → **`docs/LAUNCH.md`** (THE single, severity-ordered list)
+> Legs 1–6 are ✅ BANKED (incl. residential home-GPU serving, 2026-07-14). The remaining launch blockers
+> live in ONE place now — `docs/LAUNCH.md`. The rule: **all P0 + P1 checked → good to launch.** Stop
+> tracking scattered "NEXT" lists in your head; if it's not in LAUNCH.md, it's not a launch blocker.
+
+---
+
 ## RESUME HERE  (the one next action)
+
+### ⇒ 2026-07-14/15 (tonight) — RESIDENTIAL RING SERVED + LAUNCH LIST + PACKAGE DECISION → tomorrow = START LEG 7
+**Tonight's outcomes:**
+- **Residential home GPU SERVED M2.5 (leg 6 residential half, BANKED).** leyten's Ghent 4090 (consumer, WSL2,
+  double-NAT, mid-game) joined a 5×EU-5090 vast ring as the tail via a relay hole-punch, torrented its 14 GB
+  tail layers from a peer seeder, served coherent output. ~2 tok/s g=1 (no drafter). Built
+  `--external-tail MADDR:LO:HI` + `--swarm-token` in `m25_scatter_pipe.py` (skip-SSH external tail wired via
+  its relay circuit maddr; on branch `feat/sidecar-nat-flags`). Memory: [[residential-reachability-proven-via-relay]].
+- **THE LAUNCH LIST → `docs/LAUNCH.md`** — ONE severity-ordered "what's left before launch" (6 P0 + 4 P1).
+  Stop tracking scattered NEXT lists. Rule: **all P0+P1 checked → launch.** Launch = "no wizard" (a stranger
+  runs one command, joins on its own) + a live map.
+- **PACKAGE DECISION (leyten, tonight):** the node daemon (Leg 7 / P0-#1) = **`--mode shard` inside the
+  EXISTING `@c0mpute/worker`**, NOT a new package. The worker (~1850 LOC TS, at `workspace/c0mpute/c0mpute-worker`)
+  already has a mode system (`max`/`image`) + real plumbing — KEEP it: the CLI shell, the socket.io
+  control-plane + auth + infinite-reconnect (`worker.ts`), `setup.ts` (394 LOC), benchmark→register,
+  `update.ts` auto-update, `config.ts`. WRITE FRESH: `shard-worker.ts` (enroll → layer-range role → torrent
+  weights → drive `python -m shard.stage` + sidecar subprocess → serve → self-heal) + the Ink/blessed-contrib
+  terminal map UI (all greenfield) + a shard-flavored probe (VRAM/uplink/RTT). The ollama/image workload code
+  is NOT reusable (wrong shape) — you're adding a mode, not reusing that.
+- **P0 BUGS found live (now in LAUNCH.md):** EAGLE silently hangs the coordinator on the residential-tail ring
+  (P0-#5; fix OFFLINE — reproduce on a controlled 2-box datacenter ring, it does NOT repro on the CPU fake-ring
+  where EAGLE works); portability landmines — `m25_pull_range.py` hardcodes `/root/.hf_token`, `node_kv`'s flat
+  `import transport` needs `PYTHONPATH=phase0:shard` off the flat vast layout (P0-#2).
+
+**⇒ TOMORROW — THE ONE NEXT ACTION: start the PoC finish = BUILD LEG 7 (the self-serve shard-mode daemon).**
+1. Pull up `NODE_DAEMON.md` (c0mpute branch `docs/node-daemon-spec`, unmerged) and reconcile it against the
+   real worker code above.
+2. Scaffold `--mode shard` in `@c0mpute/worker` per the keep/write-fresh split.
+3. Kill the P0-#2 portability bugs in shard (the `/root/.hf_token` hardcode + the `import transport` PYTHONPATH)
+   — they block any stranger's box.
+_(Parallel track: the EAGLE offline fix. Perf-lever PRs #100/#101 + tree-graph #4 = P2, post-launch.)_
 
 ### ⇒ PoC DEFINITION-OF-DONE (agreed with leyten 2026-07-11) — the legs, status + owner
 The betanet PoC = a permissionless network where any GPU joins, gets measured, gets a role, serves
