@@ -258,6 +258,13 @@ def main():
                     help="torrent seeding lifecycle: every stage's sidecar also SEEDS its verified layer range "
                          "on the shard DHT (/root/m25_manifest.json=/root/m25, neighbours as bootstrap) so "
                          "joiners can pull from peers instead of the mirror")
+    ap.add_argument("--external-tail", default=None,
+                    help="attach a NON-SSH tail (home/NAT'd GPU the operator can't SSH) via its relay CIRCUIT "
+                         "multiaddr: 'MADDR:LO:HI'. Its stage+sidecar are hand-launched on that box; the vast "
+                         "head+predecessor forward to the circuit addr, everything else is unchanged.")
+    ap.add_argument("--swarm-token", default=None,
+                    help="use this pre-shared C2 epoch token (hex) instead of generating one, so a hand-launched "
+                         "external-tail stage can carry the SAME SHARD_SWARM_TOKEN.")
     a = ap.parse_args()
     # Interactive deploy (--serve = the OpenAI gateway) defaults cwnd keep-warm ON: single-stream legs
     # idle between tokens long enough to trip TCP slow-start-after-idle (cwnd collapse -> the next frame
@@ -284,6 +291,12 @@ def main():
         nodes.append(dict(region=region, iid=iid, host=j["ssh_host"], port=int(j["ssh_port"]),
                           pip=(j.get("public_ipaddr") or "").strip(), pport=m[0]["HostPort"] if m else None,
                           lo=int(lo), hi=int(hi), forced_eager=forced_eager))
+    if a.external_tail:                               # a NON-SSH tail (home GPU): pre-set its circuit maddr + pid,
+        maddr, elo, ehi = a.external_tail.rsplit(":", 2)   # the vast head+predecessor forward to it, we never SSH it
+        epid = maddr.rsplit("/p2p/", 1)[-1]           # the tail PeerId = last /p2p/ hop of the circuit addr
+        nodes.append(dict(region="EXT", iid=None, host=None, port=None, pip=None, pport=None,
+                          lo=int(elo), hi=int(ehi), forced_eager=True, external=True, maddr=maddr,
+                          pid=epid, gpu="external-tail", graph_off=True))
     n = len(nodes)
     # H1: ONE negotiated context limit. Pin the stage KV cap explicitly (40960 = m25_stage.py's
     # M25_KV_MAXLEN default) so the negotiated ctx is REAL config, not a guessed default; the
@@ -295,9 +308,12 @@ def main():
     # C2: one per-launch swarm/epoch token, injected as env into every stage + the gateway/coord
     # (never printed). --warm-only stays token-less: its whole point is an EXTERNAL measurement
     # coordinator on the head box, which predates the greeting protocol — legacy classification.
-    swarm_token = None if a.warm_only else secrets.token_hex(16)
+    swarm_token = a.swarm_token or (None if a.warm_only else secrets.token_hex(16))
     print("[pipe] push code + PeerIds ...", flush=True)
     for nd in nodes:
+        if nd.get("external"):                        # hand-launched home tail: pid+maddr already set, never SSHed
+            print(f"  EXT external-tail [{nd['lo']},{nd['hi']}) {nd['pid'][:14]}.. (via relay circuit)", flush=True)
+            continue
         push_code(nd["host"], nd["port"])
         nd["pid"] = peerid(nd["host"], nd["port"])
         nd["maddr"] = f"/ip4/{nd['pip']}/tcp/{nd['pport']}/p2p/{nd['pid']}"
@@ -319,6 +335,8 @@ def main():
 
     print("[pipe] sidecars (direct-return: head forwards ring+ret) ...", flush=True)
     for k, nd in enumerate(nodes):
+        if nd.get("external"):                        # the home tail's sidecar is hand-launched; the vast
+            continue                                  # head+predecessor already forward to nd['maddr'] (its circuit)
         announce = f"/ip4/{nd['pip']}/tcp/{nd['pport']}"
         inbound = f"127.0.0.1:{ENG_IN}" if k > 0 else ""           # head's predecessor is the local coord
         forwards = []
@@ -347,13 +365,26 @@ def main():
     print("[pipe] stages tail-first ...", flush=True)
     nonces = {}
     for k in range(n - 1, -1, -1):
+        if nodes[k].get("external"):                  # the home tail's stage is hand-launched (no SSH); it must be
+            continue                                  # already up so the coordinator's first job reaches it
         nonces[k] = launch_stage(nodes[k]["host"], nodes[k]["port"], k, n, nodes[k]["lo"], nodes[k]["hi"], k == n - 1, a.receipts, a.batch, kv_eff, graph_off=nodes[k].get("graph_off", False), token=swarm_token)
     for k in range(n - 1, -1, -1):
+        if nodes[k].get("external"):
+            continue
         ok = warm(nodes[k]["host"], nodes[k]["port"], f"s{k} {nodes[k]['region']}", nonces[k])
         print(f"  {'WARM' if ok else 'FAIL'} s{k} {nodes[k]['region']}", flush=True)
         if not ok:
             sys.exit(1)
 
+    if a.external_tail:                           # the home tail is hand-launched — echo the exact commands + wiring
+        et = nodes[-1]; pred = nodes[-2]; head0 = nodes[0]
+        relay = et["maddr"].split("/p2p-circuit")[0]
+        print("[pipe] EXTERNAL TAIL — the home box must ALREADY be running these (no SSH from here):", flush=True)
+        print(f"  sidecar: ~/sidecar -key ~/.shard_reach.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} -quic -relays {relay} -inbound 127.0.0.1:{ENG_IN}", flush=True)
+        print(f"  stage:   cd ~/shard && PYTHONPATH=$HOME/shard/phase0:$HOME/shard/shard SHARD_TRANSPORT=libp2p "
+              f"M25_ENGINE_BIND=127.0.0.1 M25_MOE_BACKEND=auto M25_CUDA_GRAPH=0 M25_DIR=$HOME/m25 "
+              f"SHARD_SWARM_TOKEN={swarm_token} python phase0/m25_pipe.py stage --stage {n-1} --nstages {n} --lo {et['lo']} --hi {et['hi']} --port {ENG_IN}", flush=True)
+        print(f"  wired -> predecessor s{n-2} ({pred['pid'][:12]}..) sends the ring, head s0 ({head0['pid'][:12]}..) sends the return, both to {et['maddr'][:44]}..", flush=True)
     head = nodes[0]
     if a.warm_only:                               # warm + STOP: run the measurement as the sole coordinator on the head (nxt_sock breaks if anything connects first)
         print(f"[pipe] WARM-ONLY — ring up. Drive it as the SOLE coordinator ON the head box:", flush=True)
