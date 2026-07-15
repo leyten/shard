@@ -1,0 +1,42 @@
+# Build + publish the static sidecar binary as a GitHub release. Operator-triggered
+# (workflow_dispatch or a sidecar-v* tag push) — publishing a runnable artifact is a
+# deliberate act, never automatic. The daemon's self-provision (c0mpute shard-setup.ts)
+# downloads this asset and verifies it against a sha256 PINNED in code — after cutting a
+# new release, update that pin in the same breath (no auto-update by design).
+name: sidecar release
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: release tag (e.g. sidecar-v0.1.0)
+        required: true
+  push:
+    tags: ['sidecar-v*']
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version-file: sidecar/go.mod
+      - name: build (static, reproducible flags)
+        working-directory: sidecar
+        run: |
+          CGO_ENABLED=0 go build -trimpath -buildvcs=false -ldflags="-s -w -buildid=" \
+            -o sidecar-linux-amd64 .
+          sha256sum sidecar-linux-amd64 | tee sidecar-linux-amd64.sha256
+      - name: publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ inputs.tag || github.ref_name }}
+        working-directory: sidecar
+        run: |
+          gh release create "$TAG" sidecar-linux-amd64 sidecar-linux-amd64.sha256 \
+            --title "$TAG (linux-amd64)" \
+            --notes "Static libp2p sidecar for the @c0mpute/worker shard-mode daemon. Verify: $(cat sidecar-linux-amd64.sha256)" \
+            || gh release upload "$TAG" sidecar-linux-amd64 sidecar-linux-amd64.sha256 --clobber
