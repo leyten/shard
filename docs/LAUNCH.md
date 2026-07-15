@@ -32,11 +32,17 @@ You have a working decentralized inference network. What's left is turning "I ca
    torrents its weight range, and serves — **zero operator in the loop.** (Spec: c0mpute `NODE_DAEMON.md`;
    ships inside `@c0mpute/worker`; needs the `python -m shard.stage` entrypoint + the runtime shipped as a
    signed content-addressed artifact so there's no fragile `pip` step.)
+   _Progress 2026-07-15: `python -m shard.stage` SHIPPED (shard #104, ready/fatal stdout contract +
+   `--check`); the `--mode shard` daemon skeleton MERGED (c0mpute #28: enroll→announce→assign→supervised
+   stage→ready→self-heal, adversarially reviewed). Remaining for the checkmark: forward-leg peer addressing
+   (assign carries no multiaddrs — only tail stages can serve), the runtime artifact, the challenge sketch,
+   warm re-join acceptance. Auto-update REMOVED from the worker (leyten call, c0mpute #27)._
 
 2. **Kill the portability landmines** — every "works only on a vast /root box" assumption. Found live
-   today: `m25_pull_range.py` hardcodes `/root/.hf_token`; `node_kv`'s flat `import transport` needs
-   `PYTHONPATH` off the flat layout. Plus the whole SSH + `/root`-flat-layout premise. A stranger's box
-   (home dir, non-root, weird paths, WSL2) must Just Work with none of today's hand-patches.
+   today: ~~`m25_pull_range.py` hardcodes `/root/.hf_token`~~ ✅, ~~`node_kv`'s flat `import transport` needs
+   `PYTHONPATH` off the flat layout~~ ✅ (both dead in shard #104, pinned by a clean-env no-PYTHONPATH
+   subprocess gate). Plus the whole SSH + `/root`-flat-layout premise (that half = the daemon, P0-#1).
+   A stranger's box (home dir, non-root, weird paths, WSL2) must Just Work with none of today's hand-patches.
 
 3. **Relay / NAT infrastructure, automated.** NAT'd home nodes reach the network via a public relay +
    DCUtR hole-punch — *proven today* — but someone must RUN public relays and the daemon must auto-discover

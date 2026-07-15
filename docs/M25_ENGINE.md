@@ -20,7 +20,41 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-14/15 (tonight) — RESIDENTIAL RING SERVED + LAUNCH LIST + PACKAGE DECISION → tomorrow = START LEG 7
+### ⇒ 2026-07-15 — LEG 7 STARTED: shard.stage CLI + P0-#2 landmines DEAD + the daemon skeleton MERGED
+**Shipped (all merged same-session):** shard **#103** (yesterday's stranded local commits — `--external-tail`
++ LAUNCH.md were never pushed into #102; caught + landed), shard **#104**, c0mpute **#27 #28**.
+- **`python -m shard.stage` (shard #104)** — the operator SSH launch string promoted into the CLI the daemon
+  execs (NODE_DAEMON §4/§8-2): assignment as flags, engine env derived in-process, machine-readable stdout
+  contract **SHARD_STAGE_OK / SHARD_STAGE_READY (emitted by serve()) / SHARD_STAGE_FATAL + nonzero exit**,
+  `--check` preflight. Secrets env-only. **P0-#2's two named landmines are DEAD** — `/root/.hf_token` → env →
+  `~/.hf_token` → hf login chain; `node_kv`'s flat `import transport` → `shard.transport` fallback (no
+  hand-set PYTHONPATH); receipt-key default `~`-relative. Pinned by a clean-env no-PYTHONPATH subprocess gate
+  (tests/test_shard_stage.py); suite 554 passed.
+- **AUTO-UPDATE REMOVED from `@c0mpute/worker` (c0mpute #27, leyten call 2026-07-15):** the worker never
+  self-updates — §7 fork #1 RESOLVED as "no auto-update"; upgrades = explicit npm install.
+- **THE DAEMON SKELETON (c0mpute #28): `--mode shard` is REAL** — `shard-worker.ts` (enroll: sidecar-proved
+  node-bind + probe-measured cap → announce → standby; on `swarm:assign`: pull range → sidecar → supervised
+  `shard.stage` → `swarm:ready`; self-heal restart budget; teardown recycles the socket so `onNodeGone` frees
+  the lease) + `shard-runner.ts` (subprocess seams). 3-file recon (worker plumbing + the REAL server protocol)
+  + adversarial review pre-ship (6 MAJORs found+fixed — the worst: node-bind's `model` field must be a profile
+  DICT or the role verdict silently never lands; non-tail assignments are a guaranteed boot-crash loop until
+  peer addressing exists → refused loudly).
+- **Protocol truth (recon, vs the spec's guesses):** events in code TODAY = `node:announce` / `swarm:assign` /
+  `swarm:ready {swarmId}` / `swarm:challenge(_result)` / `swarm:job_complete`; **no heartbeat, no swarmToken,
+  no peer multiaddrs in assign** (sidecar out-of-band), announce-TTL + RTT-mesh collection + auto-form trigger
+  = DOC-ONLY (formSwarm is never called by the running server; demo-driven only).
+
+**⇒ NEXT — finish Leg 7 (the ranked gaps, all named as TODOs in the code):**
+1. **Forward-leg peer addressing** — THE blocker: `swarm:assign` carries no multiaddrs, so only tail stages
+   can serve. Thread dialable addrs (announce them, or DHT lookup) into the assign payload + sidecar
+   `-forward` wiring in the daemon. Server + daemon change.
+2. **Runtime artifact (§8-3)** — the signed content-addressed sm120 bundle over the block-exchange (kills pip).
+3. **Node-side `swarm:challenge` sketch** (until then: do NOT drive startSpotCheck on shard swarms — silence
+   = spot_check_fail = reputation death spiral) + **RTT-mesh round** (probe --net-only vs assigned peers).
+4. **Warm re-join ≤3 min acceptance** + the Ink/blessed-contrib map UI (P1-#1, the launch face).
+_(Parallel track unchanged: the EAGLE offline fix (P0-#5). Perf PRs #100/#101 + tree-graph = P2.)_
+
+### ⇒ 2026-07-14/15 — RESIDENTIAL RING SERVED + LAUNCH LIST + PACKAGE DECISION → tomorrow = START LEG 7
 **Tonight's outcomes:**
 - **Residential home GPU SERVED M2.5 (leg 6 residential half, BANKED).** leyten's Ghent 4090 (consumer, WSL2,
   double-NAT, mid-game) joined a 5×EU-5090 vast ring as the tail via a relay hole-punch, torrented its 14 GB
