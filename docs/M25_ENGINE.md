@@ -44,15 +44,27 @@
   no peer multiaddrs in assign** (sidecar out-of-band), announce-TTL + RTT-mesh collection + auto-form trigger
   = DOC-ONLY (formSwarm is never called by the running server; demo-driven only).
 
-**⇒ NEXT — finish Leg 7 (the ranked gaps, all named as TODOs in the code):**
-1. **Forward-leg peer addressing** — THE blocker: `swarm:assign` carries no multiaddrs, so only tail stages
-   can serve. Thread dialable addrs (announce them, or DHT lookup) into the assign payload + sidecar
-   `-forward` wiring in the daemon. Server + daemon change.
-2. **Runtime artifact (§8-3)** — the signed content-addressed sm120 bundle over the block-exchange (kills pip).
-3. **Node-side `swarm:challenge` sketch** (until then: do NOT drive startSpotCheck on shard swarms — silence
+**⇒ NEXT — finish Leg 7 (DONE this session: forward-leg addressing, self-provision, one-command test,
+verified peers-first fetch. Remaining ranked gaps, TODO'd in code):**
+1. **Weight SEEDING at standby** — the daemon holds verified ranges but doesn't `sidecar -seed` them, so
+   peers-first fetch (wired, shard #108 + c0mpute #32) finds 0 providers and always falls to the mirror.
+   Wire standby seeding → the torrent path goes live (bootstrap addrs already flow in the assign payload).
+2. **Network signed-manifest resolution** — today the daemon LOCALLY publishes a manifest (integrity only,
+   no publisher trust). Resolve the network's signed manifest + pinned publisher pubkey from `manifestRef`
+   (the catalog seam) so `--pubkey` pins a real publisher.
+3. **Runtime artifact (§8-3)** — signed content-addressed sm120 bundle over block-exchange (kills the pip term).
+4. **Node-side `swarm:challenge` sketch** (until then: do NOT drive startSpotCheck on shard swarms — silence
    = spot_check_fail = reputation death spiral) + **RTT-mesh round** (probe --net-only vs assigned peers).
-4. **Warm re-join ≤3 min acceptance** + the Ink/blessed-contrib map UI (P1-#1, the launch face).
+5. **Warm re-join ≤3 min acceptance receipt** + **the live map UI (P1-#1, the launch face — leyten's fork:
+   framing/aesthetics worth his input before building).**
 _(Parallel track unchanged: the EAGLE offline fix (P0-#5). Perf PRs #100/#101 + tree-graph = P2.)_
+
+### ⇒ 2026-07-15 (LATEST) — VERIFIED PEERS-FIRST FETCH wired end to end
+Shipped shard **#108** (`python -m shard.fetch` CLI — signed manifest + [lo:hi] → verified selective pull,
+LocalDir>libp2p>mirror chain, SHARD_FETCH_DONE/FATAL contract; 4 tests) + c0mpute **#32** (daemon pullRange
+calls it; manifest built from HF metadata at enroll — LFS oids ARE sha256, no weight DL; bootstrap = ringmate
+sidecar addrs from the assign payload; raw-snapshot fallback). Closes the daemon↔"every byte CID-verified"
+gap. Verified on the one-command demo. NEXT-1 (seeding) makes the peer sourcing actually fire.
 
 ### ⇒ 2026-07-14/15 — RESIDENTIAL RING SERVED + LAUNCH LIST + PACKAGE DECISION → tomorrow = START LEG 7
 **Tonight's outcomes:**
