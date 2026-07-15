@@ -470,7 +470,90 @@ def fetch_block(manifest: dict, model_dir: str, *, stage: int, nstages: int,
                              expected_pubkey=expected_pubkey, tied=tied)
 
 
-if __name__ == "__main__":  # tiny smoke check of the pure logic, no network
-    print("shard.fetch loaded; providers:",
-          [c.__name__ for c in (MirrorProvider, LocalDirProvider, Libp2pProvider, ChainProvider)],
-          file=sys.stderr)
+def build_chain_provider(*, mirror: str | None, bootstrap: list[str] | None,
+                         sidecar_bin: str | None, key: str | None,
+                         local_dir: str | None = None) -> Provider:
+    """The daemon's default source chain: PEERS first (libp2p content routing), then the
+    HTTP mirror — the torrent property with a guaranteed fallback. Every source is re-hashed
+    against the signed manifest per shard, so ordering is a speed/cost choice, never a trust
+    one. A lone provider is returned bare; an empty chain is a caller error."""
+    chain: list[Provider] = []
+    if local_dir:
+        chain.append(LocalDirProvider(local_dir))
+    if bootstrap:
+        chain.append(Libp2pProvider(bootstrap=bootstrap, sidecar_bin=sidecar_bin, key=key))
+    if mirror:
+        chain.append(MirrorProvider(mirror))
+    if not chain:
+        raise ValueError("no providers: give --mirror and/or --bootstrap")
+    return chain[0] if len(chain) == 1 else ChainProvider(chain)
+
+
+def _hf_headers() -> dict:
+    """HF auth, portable (same order as m25_pull_range): env HF_TOKEN, else ~/.hf_token,
+    else anonymous (public repos need none)."""
+    tok = os.environ.get("HF_TOKEN")
+    if not tok:
+        p = os.path.expanduser("~/.hf_token")
+        if os.path.isfile(p):
+            tok = open(p).read().strip()
+    return {"Authorization": f"Bearer {tok}"} if tok else {}
+
+
+def _default_mirror(manifest: dict) -> str | None:
+    """An HF-style resolve base for the manifest's source repo, so `--mirror` is optional
+    when the shards pin an HF repo/revision (MirrorProvider routes per-shard from there)."""
+    for s in manifest.get("shards", []):
+        if s.get("repo") and s.get("revision"):
+            return f"https://huggingface.co/{s['repo']}/resolve/{s['revision']}/"
+    return None
+
+
+def _main() -> int:
+    """`python -m shard.stage`'s sibling: the daemon's verified weight-pull entrypoint. Reads a
+    signed manifest, fetches layers [lo:hi) PEERS-FIRST then mirror, re-hashing every byte, into
+    --dir. Machine-readable stdout contract so the supervising daemon can wait on it:
+        SHARD_FETCH_DONE {files, bytes, dir}   / SHARD_FETCH_FATAL {error}."""
+    import argparse
+    ap = argparse.ArgumentParser(prog="python -m shard.fetch",
+                                 description="verified peers-first weight fetch for a layer range")
+    ap.add_argument("--manifest", required=True, help="signed shard-manifest/1 JSON (path)")
+    ap.add_argument("--dir", required=True, help="model dir to fetch into")
+    ap.add_argument("--lo", type=int, required=True)
+    ap.add_argument("--hi", type=int, required=True)
+    ap.add_argument("--head", action="store_true", help="also pull embed + tokenizer (stage 0 / coord)")
+    ap.add_argument("--tail", action="store_true", help="also pull norm + lm_head (last stage)")
+    ap.add_argument("--role", default="stage", choices=["stage", "coordinator"])
+    ap.add_argument("--bootstrap", default="", help="comma-separated ringmate sidecar multiaddrs (peers-first)")
+    ap.add_argument("--mirror", default=None, help="HTTP mirror base (default: the manifest's HF repo)")
+    ap.add_argument("--local-dir", default=None, help="a same-host seed dir tried before peers (self-test)")
+    ap.add_argument("--sidecar", default=None, help="sidecar binary for the libp2p provider")
+    ap.add_argument("--key", default=None, help="node key for the libp2p provider")
+    ap.add_argument("--pubkey", default=None, help="pin the manifest publisher pubkey (base64)")
+    a = ap.parse_args()
+    try:
+        manifest = json.load(open(a.manifest))
+        provider = build_chain_provider(
+            mirror=a.mirror or _default_mirror(manifest),
+            bootstrap=[b.strip() for b in a.bootstrap.split(",") if b.strip()],
+            sidecar_bin=a.sidecar, key=a.key, local_dir=a.local_dir)
+        if isinstance(provider, MirrorProvider) or (
+                isinstance(provider, ChainProvider)
+                and any(isinstance(p, MirrorProvider) for p in provider.providers)):
+            # MirrorProvider doesn't carry auth headers itself; inject HF auth via the env it reads
+            for p in ([provider] if isinstance(provider, MirrorProvider) else provider.providers):
+                if isinstance(p, MirrorProvider):
+                    p.headers = {**_hf_headers(), **p.headers}
+        paths = fetch_block_range(manifest, a.dir, a.lo, a.hi, is_head=a.head, is_tail=a.tail,
+                                  role=a.role, provider=provider, expected_pubkey=a.pubkey)
+        total = sum(os.path.getsize(p) for p in paths)
+        print("SHARD_FETCH_DONE " + json.dumps({"files": len(paths), "bytes": total, "dir": a.dir}),
+              flush=True)
+        return 0
+    except Exception as e:  # noqa: BLE001 — the daemon reads this as the failure signal
+        print("SHARD_FETCH_FATAL " + json.dumps({"error": f"{type(e).__name__}: {e}"}), flush=True)
+        return 1
+
+
+if __name__ == "__main__":
+    sys.exit(_main())
