@@ -8,9 +8,19 @@ covering its layer range [lo,hi); the head/coord node additionally pulls the bou
 import os, re, json, argparse
 
 
+def _hf_token_env():
+    """HF auth, portable: an already-set HF_TOKEN wins; else ~/.hf_token (the box convention —
+    /root/.hf_token on vast, which this used to hardcode); else leave auth to huggingface_hub's
+    own login chain (public/cached repos need none)."""
+    if not os.environ.get("HF_TOKEN"):
+        p = os.path.expanduser("~/.hf_token")
+        if os.path.isfile(p):
+            os.environ["HF_TOKEN"] = open(p).read().strip()
+
+
 def main(lo, hi, head, tail, repo, DIR):
     os.environ["HF_HUB_ENABLE_HF_TRANSFER"] = "1"
-    os.environ["HF_TOKEN"] = open("/root/.hf_token").read().strip()
+    _hf_token_env()
     from huggingface_hub import snapshot_download, hf_hub_download
     for f in ["config.json", "hf_quant_config.json", "model.safetensors.index.json", "generation_config.json"]:
         hf_hub_download(repo, f, local_dir=DIR)
