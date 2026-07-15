@@ -50,9 +50,12 @@ You have a working decentralized inference network. What's left is turning "I ca
    DCUtR hole-punch — *proven today* — but someone must RUN public relays and the daemon must auto-discover
    + reserve on them. Today I ran the relay by hand on one box.
 
-4. **OpenAI-API correctness** (audit M2). Token caps / stop sequences / earliest-EOS / tool-choice
-   semantics don't match the OpenAI spec — real users' API calls will silently misbehave. Public serving
-   needs this correct.
+4. ~~**OpenAI-API correctness** (audit M2)~~ ✅ **DONE** (verified 2026-07-15; was remediated in the
+   audit fix, PR #96 — LAUNCH.md was stale). `phase0/m25_gateway.py`: strict `max_tokens`/`max_completion_tokens`
+   cap separated from context headroom + truncated via `_cap_output`; earliest-EOS enforced on BOTH the
+   streaming (`_cap_output` before `detok.feed`) and final paths; `tool_choice` none/named/required validated
+   AND enforced (errors if a required tool call is missing); non-greedy `temperature`/`top_p`/`top_k` rejected
+   400 (decoding is greedy). 61 gateway contract tests green.
 
 5. **The g-lever (EAGLE) reliable on home-node topologies.** EAGLE speculative decode is what lifts a
    scattered ring past its ~2 tok/s transport floor. It works on datacenter rings but **silently hung the
