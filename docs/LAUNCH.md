@@ -32,11 +32,13 @@ You have a working decentralized inference network. What's left is turning "I ca
    torrents its weight range, and serves — **zero operator in the loop.** (Spec: c0mpute `NODE_DAEMON.md`;
    ships inside `@c0mpute/worker`; needs the `python -m shard.stage` entrypoint + the runtime shipped as a
    signed content-addressed artifact so there's no fragile `pip` step.)
-   _Progress 2026-07-15: `python -m shard.stage` SHIPPED (shard #104, ready/fatal stdout contract +
-   `--check`); the `--mode shard` daemon skeleton MERGED (c0mpute #28: enroll→announce→assign→supervised
-   stage→ready→self-heal, adversarially reviewed). Remaining for the checkmark: forward-leg peer addressing
-   (assign carries no multiaddrs — only tail stages can serve), the runtime artifact, the challenge sketch,
-   warm re-join acceptance. Auto-update REMOVED from the worker (leyten call, c0mpute #27)._
+   _Progress 2026-07-15: `python -m shard.stage` SHIPPED (shard #104); the `--mode shard` daemon MERGED
+   (c0mpute #28 skeleton, #29 mock-orchestrator harness, #30 self-provision + forward-leg addressing, #31
+   one-command test). **A stranger's box now: `npm run try-shard` → self-provisions (engine+venv+sidecar+
+   weights, ZERO env vars) → enroll → announce → assign → pull → stage READY → serving.** Multi-stage rings
+   FORM (forward-leg peer multiaddrs ride in swarm:assign; 2-node libp2p ring proven, bytes across both
+   sidecars). Auto-update REMOVED (leyten call, c0mpute #27). Remaining for the checkmark: peers-first
+   verified fetch CLI, node-side challenge sketch, warm re-join ≤3min acceptance receipt, the map UI (P1-#1)._
 
 2. **Kill the portability landmines** — every "works only on a vast /root box" assumption. Found live
    today: ~~`m25_pull_range.py` hardcodes `/root/.hf_token`~~ ✅, ~~`node_kv`'s flat `import transport` needs
