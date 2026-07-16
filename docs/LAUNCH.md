@@ -5,7 +5,7 @@
 > lights up on a live map, and it works — with nobody (no operator, no SSH, no hand-holding) in the loop.
 >
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
-> _Last synced: 2026-07-14._
+> _Last synced: 2026-07-16._
 
 ---
 
@@ -32,13 +32,15 @@ You have a working decentralized inference network. What's left is turning "I ca
    torrents its weight range, and serves — **zero operator in the loop.** (Spec: c0mpute `NODE_DAEMON.md`;
    ships inside `@c0mpute/worker`; needs the `python -m shard.stage` entrypoint + the runtime shipped as a
    signed content-addressed artifact so there's no fragile `pip` step.)
-   _Progress 2026-07-15: `python -m shard.stage` SHIPPED (shard #104); the `--mode shard` daemon MERGED
+   _Progress 2026-07-15/16 — LARGELY DONE: `python -m shard.stage` (shard #104) + the `--mode shard` daemon
    (c0mpute #28 skeleton, #29 mock-orchestrator harness, #30 self-provision + forward-leg addressing, #31
-   one-command test). **A stranger's box now: `npm run try-shard` → self-provisions (engine+venv+sidecar+
-   weights, ZERO env vars) → enroll → announce → assign → pull → stage READY → serving.** Multi-stage rings
-   FORM (forward-leg peer multiaddrs ride in swarm:assign; 2-node libp2p ring proven, bytes across both
-   sidecars). Auto-update REMOVED (leyten call, c0mpute #27). Remaining for the checkmark: peers-first
-   verified fetch CLI, node-side challenge sketch, warm re-join ≤3min acceptance receipt, the map UI (P1-#1)._
+   one-command test, #32 verified peers-first fetch via `python -m shard.fetch` shard #108). **A stranger's
+   box: `npm run try-shard` → self-provisions (engine+venv+sidecar+weights, ZERO env vars) → enroll → announce
+   → assign → pull (verified) → stage READY → serving.** Multi-stage rings FORM (forward-leg peer multiaddrs in
+   swarm:assign; 2-node libp2p ring proven, bytes across both sidecars). Auto-update REMOVED (c0mpute #27).
+   Sidecar release CI = shard #106. **Remaining for the checkmark:** node-side challenge sketch (P0-#1/verifiable
+   edge; never spot-check shard swarms until it exists), warm re-join ≤3min acceptance receipt, standby seeding
+   (`sidecar -seed`) to light up the wired torrent path, network signed-manifest resolution from `manifestRef`._
 
 2. **Kill the portability landmines** — every "works only on a vast /root box" assumption. Found live
    today: ~~`m25_pull_range.py` hardcodes `/root/.hf_token`~~ ✅, ~~`node_kv`'s flat `import transport` needs
@@ -70,14 +72,32 @@ You have a working decentralized inference network. What's left is turning "I ca
 
 ## 🟠 P1 — NEEDED FOR A CREDIBLE LAUNCH (technically works, but weak/risky without these)
 
-1. **The live map + chat UI — the visible layer.** Dots lighting up (Ghent, Sofia, a kid's 3090 in
-   Brazil), a chat window watching one prompt stream across five strangers' GPUs. This is what makes people
-   *believe* it's real and want their dot on it — and your eyes on the network. **This is the launch itself,
-   not decoration.**
+1. ~~**The live map — the visible layer.**~~ ✅ **DONE + DEPLOYED (2026-07-15/16): https://shard.c0mpute.ai.**
+   A DoubleZero-style spinnable 3D globe (pure-canvas dotted sphere, no libs) is the whole page: real Natural
+   Earth land + country borders projected on the sphere, glowing green serving nodes, raised great-circle arcs
+   with token pulses. It's a NETWORK EXPLORER — click a node → detail panel (role, layer range held, up/down,
+   RTT, uptime, receipts). Locks onto the visitor's continent on load (timezone-based), then drag-only. Stats
+   flank it (gpus online, countries, rings, throughput, tokens served). Built in c0mpute's own design system
+   (data.c0mpute.ai: pure black / white-graded / argent-pixel numerals / green live dot; links the SAME Typekit
+   kit so the font is real). Source: c0mpute repo `data-site/network.html` (c0mpute #33), deployed via nginx on
+   the kloot box (`/var/www/shard.c0mpute.ai/`; see memory `shard-demo-deployment`). **STILL A SIMULATION** —
+   wiring it to the orchestrator's live node+swarm feed is the follow-on (now unblocked: rings auto-form). The
+   "chat window watching one prompt stream" is a SEPARATE surface (inference stays private per leyten; the map
+   is network-view only).
 
 2. **Control plane + settlement (Leg 8 wiring).** Requests in → streams out → who-served-what → payment.
-   Includes the **assignment-EPOCH fix** (a healed/re-placed job must not settle as fraud — flagged in the
-   Leg 7/8 plan as a correctness bomb).
+   Includes the **assignment-EPOCH fix** (a healed/re-placed job must not settle as fraud — a correctness bomb).
+   _Progress 2026-07-15/16 — SERVER HALF DONE: (c0mpute #34) the live server AUTO-FORMS rings from real
+   announces (`attachSwarmLoop` `resolveModel` + debounced form-from-free-candidates; was never called on the
+   running server — demo-only); (c0mpute #35) `serveRequest` DISPATCHES a request to a ready swarm's coordinator
+   (`swarm:job` + nonce), relays `swarm:job_token`/`swarm:job_complete` back to the client, and settles — the
+   orchestrator routes sharded-model requests to it. Proven no-GPU end-to-end (`scripts/leg8-serve-test.ts`,
+   10/10): auto-form → dispatch → stream → complete → settlement credits both stages. **Remaining = the
+   NODE/ENGINE half:** the DAEMON coordinator handler (on `swarm:job` drive `coordinate_pipe` → stream
+   `swarm:job_token` → emit `swarm:job_complete`), a `python -m shard.coordinate` entrypoint (thin wrapper over
+   coordinate_pipe, stdout contract, shim-fakeable), and the tail→coordinator RETURN TUNNEL on the head sidecar
+   (real-topology, like the forward-leg was). The pay-model $ credit mapping stays leyten's fork (`recordSwarm
+   StageEarning` stub). Assignment-epoch fix still TODO._
 
 3. **Windows / WSL2 turnkey.** Most home users. Proven workable today (WSL2 *mirrored* networking + CUDA),
    but the setup must be one step, not the manual dance we did.
