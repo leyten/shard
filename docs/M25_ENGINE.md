@@ -20,6 +20,49 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-15/16 (LATEST) — LEG 7 DONE (self-serve join), MAP LIVE, LEG 8 SERVER-HALF SHIPPED
+Big session. Three fronts advanced; launch list re-synced (`docs/LAUNCH.md`, 2026-07-16).
+
+**LEG 7 (node daemon) — effectively complete.** `npm run try-shard` (a stranger's box) self-provisions
+engine+venv+sidecar+weights with ZERO env vars → enroll → announce → assign → verified pull → READY → serving;
+multi-stage rings FORM (2-node libp2p ring proven). Shipped: shard **#103/#104/#106/#108**, c0mpute
+**#27/#28/#29/#30/#31/#32**. Verified peers-first fetch = `python -m shard.fetch` (#108) wired into the daemon
+(#32). Auto-update REMOVED (leyten, #27). **P0-#4 (OpenAI-API correctness) was ALREADY DONE** (audit #96;
+verified + ticked, shard #110). Remaining daemon edges: node-side challenge sketch, warm re-join receipt,
+standby `sidecar -seed`, network manifest resolution, relay auto-discovery (P0-#3).
+
+**THE MAP (P1-#1) — DONE + DEPLOYED: https://shard.c0mpute.ai** (c0mpute #33 = `data-site/network.html`,
+served via nginx on the kloot box `/var/www/shard.c0mpute.ai/`). A DoubleZero-style spinnable 3D dotted globe
+(pure canvas, no libs) that's a NETWORK EXPLORER — click a node → role/layers/up-down/RTT/receipts panel; locks
+onto the visitor's continent on load; c0mpute design system (real argent via the same Typekit kit). STILL A
+SIMULATION → wiring to live orchestrator state is the follow-on (now unblocked by auto-form). Rebuild:
+scratchpad/build_globe.py → cp to /var/www. Ops in memory [[shard-demo-deployment]].
+
+**LEG 8 (P1-#2 "make it serve") — SERVER HALF SHIPPED (leyten's pick), NODE/ENGINE half remains.**
+- c0mpute **#34**: the live server AUTO-FORMS rings from real announces (`attachSwarmLoop` gained `resolveModel`
+  + a debounced form-from-free-candidates loop; new `lib/orchestrator/model-profiles.ts` = M25 profile). This was
+  the headline gap — `formSwarm` was NEVER called on the running server (demo-only). Handle now captured (was
+  discarded). RTT = labelled uniform placeholder (measured N×N round = refinement).
+- c0mpute **#35**: `attachSwarmLoop.serveRequest(model,messages,params,{onToken,onDone,onError})` finds a ready
+  swarm, emits `swarm:job {swarmId,jobId,messages,nonce,maxNew,reasoning,tools}` to the coordinator, relays
+  `swarm:job_token` deltas + `swarm:job_complete` back (one complete event finishes the client stream AND
+  settles). Orchestrator `tryDispatchSwarm` routes sharded-model requests here (ollama/image untouched). PROVEN
+  no-GPU end-to-end: `scripts/leg8-serve-test.ts` 10/10 — auto-form→dispatch→stream→complete→settle credits both stages.
+
+**⇒ THE ONE NEXT ACTION — finish Leg 8 = the NODE/ENGINE serving half:**
+1. **DAEMON coordinator handler** (`c0mpute-worker/src/shard-worker.ts`): on `swarm:job` (only if `current`
+   assignment `isHead` + matching swarmId) drive generation → emit `swarm:job_token {jobId,delta}` per commit →
+   `swarm:job_complete {swarmId,jobId,nonce,tokensGenerated,response,receipts}`. Shim-fakeable (extend
+   `scripts/shard-python-shim.py` + `shard-runner.ts` `runCoordinator`).
+2. **`python -m shard.coordinate`** (shard): thin entrypoint over `phase0/m25_pipe.py coordinate_pipe` — job on
+   stdin (messages+params+swarm_id/job_id/nonce), stdout contract `SHARD_JOB_TOKEN/DONE/FATAL`, threads the
+   settlement nonce, sweeps receipts. (m25_gateway.py already does this over HTTP; make it socket-drivable.)
+3. **Return tunnel** tail→coordinator on the head sidecar (real-topology, like the forward-leg) — for the real
+   ring; the mock doesn't need it.
+Then extend the mock harness (sim `serveRequest` + shim coordinator) to prove request→served→settled with real
+daemons. THEN: wire the live map to real orchestrator state. Pay-model $ mapping = leyten's fork (stub).
+_(Deferred by leyten: EAGLE hang P0-#5 = real vast spend, do AFTER the no-spend code blockers.)_
+
 ### ⇒ 2026-07-15 (LATER) — LEG 7 SELF-SERVE JOIN WORKS END-TO-END LOCALLY: one command, zero env vars
 **The user's test is now `clone → one command`.** Shipped this block: c0mpute **#29 #30 #31**.
 - **Mock orchestrator harness (c0mpute #29, `scripts/shard-daemon-sim.ts`):** the missing test tool — real
