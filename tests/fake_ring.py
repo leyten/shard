@@ -163,7 +163,11 @@ class FakeRing(threading.Thread):
                 op = msg.get("op")
                 if op == "reset":
                     self._job_graph = msg.get("graph")      # per-job A/B toggle (None = absent)
-                    self.log.append({"op": "reset", "graph": self._job_graph, "keepwarm_ms": msg.get("keepwarm_ms")})
+                    self.log.append({"op": "reset", "graph": self._job_graph, "keepwarm_ms": msg.get("keepwarm_ms"),
+                                     # job identity + settlement-nonce threading (leg 8): what a real
+                                     # stage would sign into its receipt
+                                     "swarm_id": msg.get("swarm_id"), "job_id": msg.get("job_id"),
+                                     "nonce": msg.get("nonce")})
                     # mirror the tail's ack contract: a graph-stamped reset acks the APPLIED route +
                     # counters (the fake always applies as asked); plain resets keep the bare "ok"
                     send_msg(self.ret, "ok" if self._job_graph is None else
