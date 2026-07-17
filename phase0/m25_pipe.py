@@ -727,7 +727,8 @@ def _check_reset_ack(op, ack):
 
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
-                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
+                    swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True,
+                    job_nonce=None):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -736,7 +737,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         return coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                                     tools=tools, prefill_chunk=prefill_chunk, max_ctx=max_ctx, prefill_depth=prefill_depth,
                                     on_commit=on_commit, swarm_id=swarm_id, job_id=job_id, resume_ids=resume_ids,
-                                    resumable=resumable, reasoning=reasoning)
+                                    resumable=resumable, reasoning=reasoning, job_nonce=job_nonce)
     pipe_sock.settimeout(timeout)
     rx = ret_sock if ret_sock is not None else pipe_sock
     rx.settimeout(timeout)                       # full budget for reset-ack + prefill (a reused gateway socket may carry a prior job's decode heartbeat)
@@ -760,7 +761,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
     out = []; t_draft = t_recv = 0.0; prefill_s = 0.0; receipts = []; graph_arm = None
     t_trav = t_stage = t_stage_comp = 0.0; per_stage = {}   # traversal/transport split (see _timing_fields)
     try:
-        job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+        job_nonce = job_nonce or (os.urandom(16).hex() if RECEIPTS else None)   # per-job receipt freshness challenge (anti-replay; injectable = the settlement nonce, leg 8)
         rop = _reset_op(swarm_id, job_id, nonce=job_nonce)  # graph toggle field (if M25_GRAPH_JOB set)
         if kw_job not in (None, ""):                        # + keepwarm toggle (interleaved A/B), one reset
             rop["keepwarm_ms"] = int(kw_job)
@@ -900,7 +901,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
 
 def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                          tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
-                         swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True):
+                         swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True,
+                         job_nonce=None):
     """DEPTH-AWARE HYBRID coordinator (M25_TREE=1): per round, route by what the text is doing.
     * n-gram MATCHED (verbatim/draftable) -> a PLAIN pipelined chain frame, up to `depth` in flight —
       the flash kernel + the small payload + pipelining, exactly the regime that wins those cells.
@@ -946,7 +948,7 @@ def coordinate_pipe_tree(pipe_sock, tok, messages, K, max_new, timeout, depth, r
     if not hasattr(eg, "propose_tree"):
         raise RuntimeError("M25_TREE=1 needs the EAGLE drafter (set M25_EAGLE=1 + M25_EAGLE_DIR on the coordinator)")
     try:
-        job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+        job_nonce = job_nonce or (os.urandom(16).hex() if RECEIPTS else None)   # per-job receipt freshness challenge (anti-replay; injectable = the settlement nonce, leg 8)
         rop = _reset_op(swarm_id, job_id, nonce=job_nonce)  # graph toggle field (if M25_GRAPH_JOB set)
         if kw_job not in (None, ""):                        # + keepwarm toggle (interleaved A/B), one reset
             rop["keepwarm_ms"] = int(kw_job)
@@ -1134,12 +1136,14 @@ def _sdpa_backend_probe(stage):
 
 def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
                           depth=4, tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
-                          on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+                          on_commits=None, tools_b=None, swarm_id="swarm", job_id="job",
+                          job_nonce=None):
     if M25_DELOCKSTEP and S.M25_EAGLE and all(hasattr(d, "extend") for d in drafters):
         return coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock,
                                     drafters, tools=tools, prefill_chunk=prefill_chunk,
                                     max_ctx=max_ctx, reasoning=reasoning, on_commits=on_commits,
-                                    tools_b=tools_b, swarm_id=swarm_id, job_id=job_id)
+                                    tools_b=tools_b, swarm_id=swarm_id, job_id=job_id,
+                                    job_nonce=job_nonce)
     """CONTINUOUS-BATCHING coordinator: B independent spec-decode streams share ONE ring traversal per
     round, so the WAN round-trip is amortized across all B (aggregate-throughput lever). Each stream's
     output is byte-identical to a solo coordinate_pipe run (per-stream KV row + per-stream causal mask +
@@ -1183,7 +1187,7 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
         from eagle_draft import fetch_b
         for d in drafters:
             d.reset()                                    # fresh per-stream EAGLE context per job
-    job_nonce = os.urandom(16).hex() if RECEIPTS else None   # per-job receipt freshness challenge (anti-replay)
+    job_nonce = job_nonce or (os.urandom(16).hex() if RECEIPTS else None)   # per-job receipt freshness challenge (anti-replay; injectable = the settlement nonce, leg 8)
     # aux_local token = a per-job NONCE, not job_id: job_id defaults to "job" for every sweep/gateway
     # job, so it cannot disambiguate a dead job's lane residue from this job's (review F2). Counters
     # live OUTSIDE the try so the finally-drain (review F1) is always well-defined.
@@ -1340,7 +1344,8 @@ def coordinate_pipe_batch(pipe_sock, tok, messages_list, K, max_new, timeout, re
 
 def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret_sock, drafters,
                          tools=None, prefill_chunk=4096, max_ctx=0, reasoning=True,
-                         on_commits=None, tools_b=None, swarm_id="swarm", job_id="job"):
+                         on_commits=None, tools_b=None, swarm_id="swarm", job_id="job",
+                          job_nonce=None):
     """DE-LOCKSTEP coordinator (M25_DELOCKSTEP): B independent per-stream spec-decode chains whose
     [1,K+1] solo-style frames INTERLEAVE on the ring — no shared round, no lockstep barrier. Each
     stream is exactly solo depth-1 EAGLE (draft from the verified hidden -> send -> commit on reply,
@@ -1399,7 +1404,7 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
     t_recv = 0.0; t_pf = time.time(); receipts = []; graph_arm = None; per_stage = {}
     for d in drafters:
         d.reset()                                        # fresh per-stream EAGLE context per job
-    job_nonce = os.urandom(16).hex() if RECEIPTS else None
+    job_nonce = job_nonce or (os.urandom(16).hex() if RECEIPTS else None)
     aux_token = os.urandom(8).hex() if M25_AUX_LOCAL else None
     aux_local = False; lseq_tx = lseq_rx = 0
     rounds = 0
