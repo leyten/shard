@@ -20,7 +20,83 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-15/16 (LATEST) — LEG 7 DONE (self-serve join), MAP LIVE, LEG 8 SERVER-HALF SHIPPED
+### ⇒ 2026-07-17 EOD (LATEST) — LEVER GATES RUN TO THE NO-SPEND LIMIT; LEG 8 NODE HALF **DONE**
+**The lever stack was worked first (leyten's order) and every no-spend gate is now closed or blocked:**
+- **Gate 1 (suffix drafter): tooling BANKED, verdict CORPUS-BLOCKED.** The "replay existing receipt
+  traces" premise was FALSE — no receipt/log on disk carries full M2.5 generations (all head-truncated
+  100-400 chars, token ids never written; Explore-verified). Shipped **#113**: `research/suffix_replay.py`
+  (SuffixDecoding-faithful offline replay: local anchor-matcher + cross-request trie, honest opt/pess
+  multiplier band, acceptance-depth histogram → K graph buckets) + `SWEEP_TRACE_DUMP` in both bench
+  harnesses so ANY future warm-ring sweep banks a real corpus as a side effect. An API-proxy corpus path
+  (exact bench prompts + agentic tool-loop episodes, HF router) is built + pipeline-proven but stalled at
+  11/60 requests — **HF inference credits exhausted (402)**. Partial signal: reasoning/prose ≈×1.00-1.03
+  (as predicted); the θ-routing tradeoff is sharp (θ=4 routes 12-24% at acc 2-4 = LOSES to EAGLE; θ=12
+  accurate but ~2% of rounds). tools/code/agentic = the deciding arms, still unmeasured. **Unblock =
+  ~$2-5 HF credit top-up (~30 min to verdict) OR the next warm ring** (runbook:
+  `.claude/plans/suffix-replay-gate.md`).
+- **Gate 2 (draft_s): resolved NO-BUILD-NOW** — the 07-10 receipt already bounds drafting under the
+  25 ms bar (B1 round 212 ms INCLUDING drafting; B4 <150 ms / 4 streams). The confirming `draft_s`
+  timer read piggybacks on the next warm ring. PEARL-style async post-verify stays unbuilt.
+- **Gate 3 (REAP): NVFP4 prune path structurally VALIDATED, rest is spend-gated** — 62L × 256 experts,
+  top-8; every expert = a self-contained tensor group (w1/w2/w3 + weight_scale/_2 + input_scale), gates
+  unquantized bf16 → prune = drop expert groups + shrink gate rows + rewrite config. Saliency calibration
+  + τ²/BFCL-style agentic eval gate need a GPU (vast, $0 today).
+
+**LEG 8 NODE/ENGINE HALF — DONE + PROVEN (shard #114 + c0mpute #36):** request → served → settled works
+END-TO-END with real daemons, GPU-less. `python -m shard.coordinate` (#114) = the gateway's
+coordinate_pipe driving as a stdin/stdout CLI (SHARD_COORD_READY / SHARD_JOB_TOKEN / SHARD_JOB_DONE /
+SHARD_JOB_FATAL; ring-dial retries at boot). **Settlement-nonce threading was the correctness catch:**
+c0mpute's settleJob verifies receipts with `expected_nonce` = the swarm:job nonce, but coordinate_pipe
+self-minted — all four coordinators gained `job_nonce=None` so stages sign exactly what settlement
+checks (default self-mint unchanged; fake-ring-proven: nonce lands in the reset op verbatim, joined
+deltas == final response, job-fault isolation; 563 tests green). c0mpute #36: `CoordinatorProcess` seam
+(supervised, NDJSON stdin, complete-lines-only parsing), the RETURN TUNNEL closed exactly like
+m25_scatter_pipe's proven wiring (head sidecar -forwards RETURN_PORT=base+12 to the tail's sidecar; tail
+allows the head PeerId; ZERO tail-engine changes — hello_return classification already existed),
+`swarm:job` handler (fail-closed completes: no server error event exists), shim coordinator that PROBES
+the return tunnel with a framed roundtrip before READY, and `shard-daemon-sim --serve
+[--accept-receipts]` (+ `SERVE=1 npm run try-shard`). **2-daemon proof: auto-form → dispatch →
+return-tunnel roundtrip → streamed deltas (stream==response) → complete → settlement credits BOTH stages
+by layers.** leg8-serve-test still 10/10.
+
+**⇒ THE ONE NEXT ACTION: wire the live map (shard.c0mpute.ai) to real orchestrator state** — both
+blockers (auto-form #34, serving #35+#36) are gone; the map is still a simulation. Then: remaining
+daemon edges (challenge sketch, warm re-join receipt, `sidecar -seed`, manifest resolution, relay
+auto-discovery P0-#3) + P1-#4 hardening. **NEXT WARM RING checklist (whenever vast credit returns):**
+launch the sweep with `SWEEP_TRACE_DUMP` (suffix corpus) + read `draft_s` (gate 2) + validate leg-8
+serving on a real ring + EAGLE hang P0-#5 (leyten deferred). **leyten forks flagged:** ① ~$2-5 HF credit
+= the suffix verdict this week; ② vast top-up = REAP (the strongest lever) + live validation; ③
+assignment-EPOCH settlement fix still open (P1-#2 correctness bomb); ④ pay-model $ mapping (stub logs).
+
+### ⇒ 2026-07-17 (leyten's call: perf levers BEFORE every other leg) — THE VERIFIED LEVER STACK
+Source: the Inkling-spike 50-agent lever hunt, M2.5 subset corrected by a 3-lens adversarial panel →
+**`docs/research/m25-lever-stack-verified-20260716.md`** (in-repo; hunt provenance lives on branch
+`spike/inkling-5090`, clone `shard-inkling`, `docs/research/inkling-lever-hunt-20260716.md`). Memory:
+[[m25-lever-stack-verified]]. Projection (exact tier, vs the 07-12 K-tuned scorecard): **tools 29.7→34-42,
+code 23.2→29-36, reasoning 29→32-38, qa 21.1→24-28, prose 18.5→20-22 (bar ✓ from REAP alone),
+mix 17.9→19.5-21.5, B1 22.5→31-40; opt-in labeled cascade tier ~×1.6-2.0 total.** Zero training anywhere.
+Order (cheapest gate first; 1 is no-spend):
+1. **Suffix-tree drafter — OFFLINE trace replay first** (half-day, no engine change, no spend): replay
+   existing receipt traces through a suffix tree (SuffixDecoding, arXiv 2411.04975) → measures real match
+   lengths on OUR traffic and decides ×1.2 vs ×1.4 on tools/code. Build behind the HybridDrafter seam only
+   if ≥×1.2. It competes with EAGLE (chain g already 4.5-5.0) — NOT with n-gram (mix-B4-ngram g=0.01).
+   Depth must be ADAPTIVE (deep only on confident matches — the K8-dead-slot receipt is the warning).
+2. **`draft_s` check** (one warm-ring run, reads the existing coordinate_pipe timer): build async
+   post-verify drafting ONLY if the serial draft step ≥~25 ms/round (expected 8-16 ms → likely skip;
+   PEARL's ×1.3-1.5 does NOT transfer, our drafting tax is already dead).
+3. **REAP12 expert prune → 5-hop rings (×1.14 banked — the STRONGEST lever)**: method-general, published
+   ≤1.5-pt agentic deltas @25% on M2-family; hop→wire physics receipt-validated on our own ring (4-hop
+   measured ×1.33 vs ×1.32 predicted). Gate on τ²/BFCL-style AGENTIC evals (not ppl) + validate the NVFP4
+   prune path. **Closes the prose 20-bar by itself.** Stretch: REAP25 → 4 hops (~×1.3, zero-headroom fit).
+   Also a ÷1.2-1.5 fleet-cost lever.
+4. **Speculative cascades (top-k accept) = opt-in LABELED tier** (+×1.15-1.35, most value on prose):
+   env-gated accept mode; k=1 must reproduce greedy bit-exact; receipts carry the acceptance rule.
+DEAD — do not build (panel-confirmed): trellis sub-4-bit for resident M2.5 (wire is RTT-floor-dominated,
+compute penalty eats the win), trees (still, until tree-frame CUDA graphs), DFlash (≈EAGLE parity;
+half-day A/B at most). _(Leg 8 node/engine half = immediately after this stack; EAGLE hang P0-#5 still
+deferred by leyten — real vast spend. NOTE: vast credit is $0 — gate 1 needs none.)_
+
+### ⇒ 2026-07-15/16 — LEG 7 DONE (self-serve join), MAP LIVE, LEG 8 SERVER-HALF SHIPPED
 Big session. Three fronts advanced; launch list re-synced (`docs/LAUNCH.md`, 2026-07-16).
 
 **LEG 7 (node daemon) — effectively complete.** `npm run try-shard` (a stranger's box) self-provisions
@@ -49,7 +125,7 @@ scratchpad/build_globe.py → cp to /var/www. Ops in memory [[shard-demo-deploym
   settles). Orchestrator `tryDispatchSwarm` routes sharded-model requests here (ollama/image untouched). PROVEN
   no-GPU end-to-end: `scripts/leg8-serve-test.ts` 10/10 — auto-form→dispatch→stream→complete→settle credits both stages.
 
-**⇒ THE ONE NEXT ACTION — finish Leg 8 = the NODE/ENGINE serving half:**
+**⇒ THEN (second in line, after the 07-17 lever stack above) — finish Leg 8 = the NODE/ENGINE serving half:**
 1. **DAEMON coordinator handler** (`c0mpute-worker/src/shard-worker.ts`): on `swarm:job` (only if `current`
    assignment `isHead` + matching swarmId) drive generation → emit `swarm:job_token {jobId,delta}` per commit →
    `swarm:job_complete {swarmId,jobId,nonce,tokensGenerated,response,receipts}`. Shim-fakeable (extend
