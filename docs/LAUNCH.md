@@ -92,12 +92,15 @@ You have a working decentralized inference network. What's left is turning "I ca
    running server — demo-only); (c0mpute #35) `serveRequest` DISPATCHES a request to a ready swarm's coordinator
    (`swarm:job` + nonce), relays `swarm:job_token`/`swarm:job_complete` back to the client, and settles — the
    orchestrator routes sharded-model requests to it. Proven no-GPU end-to-end (`scripts/leg8-serve-test.ts`,
-   10/10): auto-form → dispatch → stream → complete → settlement credits both stages. **Remaining = the
-   NODE/ENGINE half:** the DAEMON coordinator handler (on `swarm:job` drive `coordinate_pipe` → stream
-   `swarm:job_token` → emit `swarm:job_complete`), a `python -m shard.coordinate` entrypoint (thin wrapper over
-   coordinate_pipe, stdout contract, shim-fakeable), and the tail→coordinator RETURN TUNNEL on the head sidecar
-   (real-topology, like the forward-leg was). The pay-model $ credit mapping stays leyten's fork (`recordSwarm
-   StageEarning` stub). Assignment-epoch fix still TODO._
+   10/10): auto-form → dispatch → stream → complete → settlement credits both stages. **NODE/ENGINE half DONE
+   2026-07-17 (shard #114 + c0mpute #36):** `python -m shard.coordinate` (stdin jobs, SHARD_JOB_TOKEN/DONE/FATAL,
+   settlement-nonce threaded into every stage's receipt — the correctness catch: settleJob verifies against the
+   swarm:job nonce), the daemon `CoordinatorProcess` + `swarm:job` handler (fail-closed completes), and the
+   tail→coordinator RETURN TUNNEL closed with m25_scatter_pipe's proven sidecar wiring (zero tail-engine
+   changes). Proven GPU-less with 2 real daemons: request → served → settled, both stages credited by layers
+   (`SERVE=1 npm run try-shard`). **Remaining for the checkmark:** live-ring validation (vast), the
+   assignment-EPOCH fix (still the correctness bomb), and the pay-model $ credit mapping (leyten's fork —
+   `recordSwarmStageEarning` stub)._
 
 3. **Windows / WSL2 turnkey.** Most home users. Proven workable today (WSL2 *mirrored* networking + CUDA),
    but the setup must be one step, not the manual dance we did.

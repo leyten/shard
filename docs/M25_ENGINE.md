@@ -20,7 +20,55 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-17 (NEXT, leyten's call: perf levers BEFORE every other leg) — THE VERIFIED LEVER STACK
+### ⇒ 2026-07-17 EOD (LATEST) — LEVER GATES RUN TO THE NO-SPEND LIMIT; LEG 8 NODE HALF **DONE**
+**The lever stack was worked first (leyten's order) and every no-spend gate is now closed or blocked:**
+- **Gate 1 (suffix drafter): tooling BANKED, verdict CORPUS-BLOCKED.** The "replay existing receipt
+  traces" premise was FALSE — no receipt/log on disk carries full M2.5 generations (all head-truncated
+  100-400 chars, token ids never written; Explore-verified). Shipped **#113**: `research/suffix_replay.py`
+  (SuffixDecoding-faithful offline replay: local anchor-matcher + cross-request trie, honest opt/pess
+  multiplier band, acceptance-depth histogram → K graph buckets) + `SWEEP_TRACE_DUMP` in both bench
+  harnesses so ANY future warm-ring sweep banks a real corpus as a side effect. An API-proxy corpus path
+  (exact bench prompts + agentic tool-loop episodes, HF router) is built + pipeline-proven but stalled at
+  11/60 requests — **HF inference credits exhausted (402)**. Partial signal: reasoning/prose ≈×1.00-1.03
+  (as predicted); the θ-routing tradeoff is sharp (θ=4 routes 12-24% at acc 2-4 = LOSES to EAGLE; θ=12
+  accurate but ~2% of rounds). tools/code/agentic = the deciding arms, still unmeasured. **Unblock =
+  ~$2-5 HF credit top-up (~30 min to verdict) OR the next warm ring** (runbook:
+  `.claude/plans/suffix-replay-gate.md`).
+- **Gate 2 (draft_s): resolved NO-BUILD-NOW** — the 07-10 receipt already bounds drafting under the
+  25 ms bar (B1 round 212 ms INCLUDING drafting; B4 <150 ms / 4 streams). The confirming `draft_s`
+  timer read piggybacks on the next warm ring. PEARL-style async post-verify stays unbuilt.
+- **Gate 3 (REAP): NVFP4 prune path structurally VALIDATED, rest is spend-gated** — 62L × 256 experts,
+  top-8; every expert = a self-contained tensor group (w1/w2/w3 + weight_scale/_2 + input_scale), gates
+  unquantized bf16 → prune = drop expert groups + shrink gate rows + rewrite config. Saliency calibration
+  + τ²/BFCL-style agentic eval gate need a GPU (vast, $0 today).
+
+**LEG 8 NODE/ENGINE HALF — DONE + PROVEN (shard #114 + c0mpute #36):** request → served → settled works
+END-TO-END with real daemons, GPU-less. `python -m shard.coordinate` (#114) = the gateway's
+coordinate_pipe driving as a stdin/stdout CLI (SHARD_COORD_READY / SHARD_JOB_TOKEN / SHARD_JOB_DONE /
+SHARD_JOB_FATAL; ring-dial retries at boot). **Settlement-nonce threading was the correctness catch:**
+c0mpute's settleJob verifies receipts with `expected_nonce` = the swarm:job nonce, but coordinate_pipe
+self-minted — all four coordinators gained `job_nonce=None` so stages sign exactly what settlement
+checks (default self-mint unchanged; fake-ring-proven: nonce lands in the reset op verbatim, joined
+deltas == final response, job-fault isolation; 563 tests green). c0mpute #36: `CoordinatorProcess` seam
+(supervised, NDJSON stdin, complete-lines-only parsing), the RETURN TUNNEL closed exactly like
+m25_scatter_pipe's proven wiring (head sidecar -forwards RETURN_PORT=base+12 to the tail's sidecar; tail
+allows the head PeerId; ZERO tail-engine changes — hello_return classification already existed),
+`swarm:job` handler (fail-closed completes: no server error event exists), shim coordinator that PROBES
+the return tunnel with a framed roundtrip before READY, and `shard-daemon-sim --serve
+[--accept-receipts]` (+ `SERVE=1 npm run try-shard`). **2-daemon proof: auto-form → dispatch →
+return-tunnel roundtrip → streamed deltas (stream==response) → complete → settlement credits BOTH stages
+by layers.** leg8-serve-test still 10/10.
+
+**⇒ THE ONE NEXT ACTION: wire the live map (shard.c0mpute.ai) to real orchestrator state** — both
+blockers (auto-form #34, serving #35+#36) are gone; the map is still a simulation. Then: remaining
+daemon edges (challenge sketch, warm re-join receipt, `sidecar -seed`, manifest resolution, relay
+auto-discovery P0-#3) + P1-#4 hardening. **NEXT WARM RING checklist (whenever vast credit returns):**
+launch the sweep with `SWEEP_TRACE_DUMP` (suffix corpus) + read `draft_s` (gate 2) + validate leg-8
+serving on a real ring + EAGLE hang P0-#5 (leyten deferred). **leyten forks flagged:** ① ~$2-5 HF credit
+= the suffix verdict this week; ② vast top-up = REAP (the strongest lever) + live validation; ③
+assignment-EPOCH settlement fix still open (P1-#2 correctness bomb); ④ pay-model $ mapping (stub logs).
+
+### ⇒ 2026-07-17 (leyten's call: perf levers BEFORE every other leg) — THE VERIFIED LEVER STACK
 Source: the Inkling-spike 50-agent lever hunt, M2.5 subset corrected by a 3-lens adversarial panel →
 **`docs/research/m25-lever-stack-verified-20260716.md`** (in-repo; hunt provenance lives on branch
 `spike/inkling-5090`, clone `shard-inkling`, `docs/research/inkling-lever-hunt-20260716.md`). Memory:
