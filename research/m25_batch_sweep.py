@@ -33,6 +33,7 @@ TAIL = ("localhost", int(os.environ.get("TAIL_PORT", "29612")))
 EAGLE_DIR = os.environ.get("M25_EAGLE_DIR", "/root/m25-eagle")
 MAX_NEW = int(os.environ.get("SWEEP_MAX_NEW", "96"))
 K = int(os.environ.get("SWEEP_K", "8"))
+TRACE_DUMP = os.environ.get("SWEEP_TRACE_DUMP", "")    # JSONL path: dump full per-stream token ids
 
 # ---- the use-case suite (the "different AI use cases") --------------------------------
 PASSAGE = (
@@ -111,6 +112,11 @@ def run_arm(name, prompts, kind):
     print("RESULT " + json.dumps(row), flush=True)
     for s in r["streams"][:2]:                          # eyeball coherence on the first two streams
         print(f"    [{name}] {s['text'][:100]!r}", flush=True)
+    if TRACE_DUMP:                                      # full greedy streams for offline drafter replay
+        with open(TRACE_DUMP, "a") as tf:               # (suffix-tree gate needs REAL token ids — every
+            for p, s in zip(prompts, r["streams"]):     # receipt before this truncated them away)
+                tf.write(json.dumps({"arm": name, "kind": kind, "prompt": p,
+                                     "output_ids": s.get("output_ids"), "g": s.get("g")}) + "\n")
     return row
 
 
