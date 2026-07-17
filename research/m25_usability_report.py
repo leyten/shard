@@ -25,6 +25,7 @@ P.send_msg(ret, {"op": "hello_return"}); P.recv_msg(ret)
 K = 8; DEPTH = 4
 ARM = ("tree-hybrid" if os.environ.get("M25_TREE") == "1" else
        "chain-EAGLE" if S.M25_EAGLE else "n-gram")
+TRACE_DUMP = os.environ.get("SWEEP_TRACE_DUMP", "")    # JSONL path: dump full token-id streams
 
 
 def _doc_tokens(path, n):
@@ -61,6 +62,10 @@ def row(name, messages, max_new=256):
                "traversal_s": r.get("traversal_s"), "transport_s": r.get("transport_s"),
                "stage_s": r.get("stage_s"), "per_stage_ms": r.get("per_stage_ms"),
                "answer": (p["content"] or "")[:400]}
+        if TRACE_DUMP:                                  # full greedy stream for offline drafter replay
+            with open(TRACE_DUMP, "a") as tf:
+                tf.write(json.dumps({"cell": name, "messages": messages,
+                                     "output_ids": r.get("output_ids")}) + "\n")
         print(f"| {name:<22} | {rec['prompt_tokens']:>6} | {rec['tok_s']:>5.1f} | {rec['g']:>4.1f} | "
               f"{rec['prefill_s']:>6.1f}s | {rec['ttft_s']:>5.1f}s | {rec['new_tokens']:>4} |", flush=True)
         return rec, p
