@@ -98,8 +98,10 @@ You have a working decentralized inference network. What's left is turning "I ca
    swarm:job nonce), the daemon `CoordinatorProcess` + `swarm:job` handler (fail-closed completes), and the
    tail→coordinator RETURN TUNNEL closed with m25_scatter_pipe's proven sidecar wiring (zero tail-engine
    changes). Proven GPU-less with 2 real daemons: request → served → settled, both stages credited by layers
-   (`SERVE=1 npm run try-shard`). **Remaining for the checkmark:** live-ring validation (vast), the
-   assignment-EPOCH fix (still the correctness bomb), and the pay-model $ credit mapping (leyten's fork —
+   (`SERVE=1 npm run try-shard`). **Live-ring validation DONE 2026-07-18** (warmring-20260718 receipt:
+   shard.coordinate served a real job on a real 6-box ring; 6 receipts tiling [0:62) verified under pinned
+   assignments, every stage signing the injected settlement nonce). **Remaining for the checkmark:** the
+   assignment-EPOCH fix (still the correctness bomb) and the pay-model $ credit mapping (leyten's fork —
    `recordSwarmStageEarning` stub)._
 
 3. **Windows / WSL2 turnkey.** Most home users. Proven workable today (WSL2 *mirrored* networking + CUDA),
