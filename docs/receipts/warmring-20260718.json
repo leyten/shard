@@ -1,0 +1,27 @@
+{
+  "what": "2026-07-18 warm-ring pass: three banked results from ONE 6x5090 EU ring - (1) the suffix-gate trace corpus (see suffix-replay-verdict-20260718.json), (2) the draft_s timer read = gate 2 CLOSED, (3) LEG 8 LIVE: python -m shard.coordinate served a real job on the real ring with settlement-nonce-signed receipts.",
+  "date": "2026-07-18",
+  "ring": "EE(head,[0:2]) HU[2:14] HU[14:26] FR[26:38] DK[38:50] SE[50:62]; 6x RTX 5090, EU, distinct /24s; M25_EAGLE=1 M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_FP8_WIRE=1 M25_FP8_AUX=1, receipts ON; batched passes at --batch 8 kv 8192, solo passes at kv 16384.",
+  "gate2_draft_s": {
+    "verdict": "NO-BUILD CONFIRMED with the live timer (was likely-skip from the 07-10 bounds): serial drafter compute is 10.6-12.7 ms/round across every cell - under half the 25 ms bar for async post-verify drafting.",
+    "rows_ms_per_round": {"reason-math": 12.7, "reason-logic": 11.2, "open-chat": 11.3, "code-edit": 11.3, "agentic-tool": 11.3, "turn-1": 10.6},
+    "source": "coordinate_pipe draft_s field, m25_usability_report on the head (solo path, EAGLE hybrid)"
+  },
+  "leg8_live": {
+    "claim": "The leg-8 engine half (shard #114) VALIDATED on real hardware: a stdin job with an injected settlement nonce drove the full 62-layer ring and came back settlement-ready.",
+    "evidence": "passC_out.log (archived scratchpad/suffix_gate_20260718/): SHARD_COORD_READY {eagle:true,receipts:true} -> 31 SHARD_JOB_TOKEN deltas -> SHARD_JOB_DONE {ok:true, tokensGenerated:97, receipts:6, receiptsOk:true}. All 6 receipts tile [0:62) exactly and EVERY stage signed the injected nonce c0ffee17d00d17c0ffee17d00d17beef (== what c0mpute settleJob would verify as expected_nonce); receipts_ok computed with PINNED assignments (SHARD_ASSIGNMENTS=/root/assignments.json).",
+    "remaining": "P1-#2 residue is control-plane only: assignment-EPOCH fix + pay-model $ mapping (both leyten-flagged)."
+  },
+  "sweep_reference_rows_pass1": {
+    "note": "K8 max_new=384 (4x longer than the 07-12 scorecard's 96 - NOT directly comparable to older receipts; corpus-first pass), agg tok/s + mean g per arm, all receipts valid",
+    "mix_bcurve_agg": {"B1": 13.5, "B2": 16.17, "B4": 26.77, "B8": 85.07},
+    "arms_B4_agg_g": {"code": [57.81, 2.633], "prose": [43.92, 2.016], "reasoning": [69.99, 3.36], "summarize": [63.77, 3.389], "tools": [70.24, 3.302], "qa": [44.08, 2.494]},
+    "drafting_ab_B4_mix": {"ngram_agg_g": [10.45, 0.118], "hybrid_agg_g": [35.75, 2.849]}
+  },
+  "ops": [
+    "2 of 8 rented boxes were torch-CUDA duds (nvidia-smi fine, torch.cuda.init dead) that passed the rent health-check - NEW PREFLIGHT RULE: run venv-torch cuda.init on every box BEFORE scatter launch (caught the would-be third failure at zero cost).",
+    "The overnight incident: the prior session process died right after kicking bootstrap; 6 boxes idled ~20h (~$60). Dead-man switch now installed on the workspace box (cron + heartbeat + pinned iids; worst case ~1h). See memory vast-deadman-switch.",
+    "kv-shape mismatch: usability/solo cells on a --batch 8 kv-8192 launch OOM the tail at ~1k ctx; relaunch solo-shaped (kv 16384) fixed all but the 30k cells (clean kv_overflow REJECT at the cap - correct fail-closed).",
+    "Session spend ~ $10.3 productive + ~$60 idle waste; teardown verified instances-v1 == 0."
+  ]
+}
