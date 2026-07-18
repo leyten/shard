@@ -1,0 +1,32 @@
+{
+  "what": "SUFFIX-TREE DRAFTER GATE VERDICT (lever A of the verified 07-16 stack): offline SuffixDecoding-style replay over REAL on-engine greedy traces. Decision bar: build behind HybridDrafter only if >=x1.2 on tools/code at deployment shape.",
+  "date": "2026-07-18",
+  "verdict": "NO-BUILD. Deployment-shaped traffic (unique + structurally-similar requests) shows x1.00-1.08 pessimistic across EVERY arm - far under the x1.2 bar. The two regimes where suffix matching wins are already covered or belong to a different lever: verbatim long-doc quoting (ctx-8k-quote x2.38 pess - the existing NgramDrafter prompt-lookup half of HybridDrafter already fires on exactly this traffic, so the marginal value vs the SHIPPED hybrid is far smaller than the row suggests) and byte-identical repeated requests (x1.3-2.9 - a response-cache feature at the gateway, not a per-round drafter).",
+  "method": "research/suffix_replay.py (#113): per-request local anchor-matcher (prompt+committed, no future leakage) + chronological cross-request suffix trie, frequency-greedy continuations; policy sweep theta in {4,6,8,12} x min_count {1,2}; commit accepted+1 per round (honest g); EAGLE counterfactual band = [pessimistic: EAGLE full-accepts K+1 on every routed round, optimistic: EAGLE at its flat measured mean]. Slices: self (per-request only), cross-dedup (exact-duplicate generations + identical-prompt repeats dropped = THE decision slice), cross-full (identical-repeat ceiling, labeled).",
+  "corpus": {
+    "engine_traces": "110 requests / ~40.9k generated tokens, bit-exact committed token ids via SWEEP_TRACE_DUMP (#113) on the 2026-07-18 6x5090 EU ring (EE head [0:2] + HU[2:14] HU[14:26] FR[26:38] DK[38:50] SE[50:62], M25_EAGLE=1 fp8 wire, receipts valid): m25_batch_sweep 2 passes x 12 arms (K8, max_new 384) + m25_usability_report full (workloads, ctx-8k cells, 8-turn history-carried conversation). ctx-30k cells rejected at kv 16384 (not in corpus).",
+    "proxy_traces": "11 requests MiniMaxAI/MiniMax-M2.5 via HF router (temp 0) - the code/prose/reasoning VARIANT prompts (same task class, different content); provider-nondeterministic, labeled proxy. tools/qa/summarize variant coverage is THIN (bench prompt only, n_dedup=1) - accepted because every arm with real variant diversity (code 4, prose 4, mix 6, conv 8, reasoning 2) shows the identical ~x1.0 collapse.",
+    "archive": "scratchpad/suffix_gate_20260718/ (corpus_final.jsonl, verdict_final.json, raw trace dumps, usability_report.json)"
+  },
+  "slices_pess_opt": {
+    "code":      {"n_dedup": 4, "self": "1.01/1.03", "cross_dedup": "1.01/1.03", "cross_full": "1.27/1.56"},
+    "tools":     {"n_dedup": 1, "self": "1.02/1.04", "cross_dedup": "1.02/1.04", "cross_full": "2.92/3.94"},
+    "conv_8turn":{"n_dedup": 8, "self": "1.02/1.07", "cross_dedup": "1.03/1.08", "cross_full": "1.03/1.08"},
+    "mix":       {"n_dedup": 6, "self": "1.01/1.04", "cross_dedup": "1.01/1.04", "cross_full": "2.16/3.42"},
+    "prose":     {"n_dedup": 4, "self": "1.00/1.01", "cross_dedup": "1.00/1.02", "cross_full": "1.33/1.77"},
+    "reasoning": {"n_dedup": 2, "self": "1.00/1.00", "cross_dedup": "1.00/1.00", "cross_full": "1.53/2.92"},
+    "summarize": {"n_dedup": 1, "self": "1.04/1.17", "cross_dedup": "1.04/1.17", "cross_full": "2.64/5.75"},
+    "qa":        {"n_dedup": 1, "self": "1.00/1.00", "cross_dedup": "1.00/1.00", "cross_full": "2.50/4.64"},
+    "ctx8k_quote":     {"n_dedup": 1, "self": "2.38/4.76", "note": "verbatim doc copy, routed 29% acc 40 - prompt-lookup home turf, largely covered by the shipped n-gram half"},
+    "ctx8k_summarize": {"n_dedup": 1, "self": "1.02/1.07"},
+    "rag_quote":       {"n_dedup": 1, "self": "1.03/1.12"},
+    "code_edit":       {"n_dedup": 1, "self": "1.00/1.02"}
+  },
+  "supporting_observations": [
+    "The 4 streams of every identical-prompt B4 batch are BIT-IDENTICAL (md5-equal) - cross_full multipliers are duplicate memorization, quantifying the repeated-request ceiling, not drafter value.",
+    "Fresh mix-B4-ngram g=0.118 vs mix-B4-hybrid g=2.849 on this ring - reconfirms n-gram-alone is dead and EAGLE carries the g; the suffix drafter's claimed edge over EAGLE never materializes outside verbatim-copy streaks.",
+    "The API-proxy partial (session 07-17) independently showed the same theta tradeoff: loose routing (theta=4) routes 12-24% of rounds at acc 2-4 and LOSES to EAGLE; strict routing is accurate (acc~10) but ~2% of rounds.",
+    "SuffixDecoding's AgenticSQL wins come from massively repetitive shared-scaffold pipelines; our serving traffic (diverse one-shot + evolving multi-turn) is not that regime. Revisit ONLY if deployment traffic becomes template-heavy (then prefer a gateway response/prefix cache first)."
+  ],
+  "stack_impact": "Lever A moves from 'x1.1-1.4 conditional' to DEAD at deployment shape. The verified-stack projection now rides on REAP (C, x1.14 banked, strongest) + cascades (D, opt-in labeled tier); lever B (async post-verify) was already no-build (draft_s receipt in warmring-20260718.json)."
+}

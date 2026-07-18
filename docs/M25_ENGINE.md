@@ -20,6 +20,29 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-18 (LATEST) — WARM-RING DAY: suffix gate = NO-BUILD, draft_s CLOSED, LEG 8 LIVE-VALIDATED
+One 6×5090 EU ring (~$10; + ~$60 idle-overnight incident → dead-man switch installed, memory
+[[vast-deadman-switch]]). Receipts: **suffix-replay-verdict-20260718.json + warmring-20260718.json**.
+- **Lever A (suffix drafter): DEAD at deployment shape.** 110 real on-engine traces (bit-exact ids via
+  SWEEP_TRACE_DUMP): unique+structural traffic ×1.00-1.08 pess on EVERY arm (conv-8turn 1.03/1.08,
+  code-w/-variants 1.01/1.03); the only wins are verbatim doc-quoting (shipped n-gram's turf) and
+  byte-identical repeats (a gateway response-cache feature, ×1.3-2.9 ceiling). Bench-identical B4
+  streams are bit-identical (md5) — cross-full numbers are memorization, labeled as such.
+- **Lever B (async post-verify): NO-BUILD confirmed live** — draft_s 10.6-12.7 ms/round (< half the bar).
+- **LEG 8 ENGINE HALF LIVE-VALIDATED:** `python -m shard.coordinate` served a real 97-token job on the
+  real ring — 31 streamed deltas, 6 receipts tiling [0:62), receipts_ok under PINNED assignments, and
+  EVERY stage signed the INJECTED settlement nonce (the #114 threading, proven on hardware). P1-#2
+  residue = control-plane only (assignment-EPOCH + pay-model $, both leyten's).
+- **The stack now rides on REAP (C) ×1.14 + opt-in cascades (D).** Fresh ring rows in the warmring
+  receipt (max_new=384, not comparable to the 07-12 scorecard); ngram-vs-hybrid A/B reconfirmed.
+- **NEW OPS RULES:** torch-CUDA preflight EVERY box before launch (2/8 rented duds passed nvidia-smi
+  but failed torch.cuda.init); the vast dead-man switch is standing (pin iids at rent, heartbeat in
+  monitors, empty pin at teardown).
+
+**⇒ THE ONE NEXT ACTION: wire the live map (shard.c0mpute.ai) to real orchestrator state** (unchanged
+from 07-17 — nothing ahead of it left in the lever queue; REAP is the next SPEND item when leyten
+greenlights the eval-gated prune run, balance ~$29.6).
+
 ### ⇒ 2026-07-17 EOD (LATEST) — LEVER GATES RUN TO THE NO-SPEND LIMIT; LEG 8 NODE HALF **DONE**
 **The lever stack was worked first (leyten's order) and every no-spend gate is now closed or blocked:**
 - **Gate 1 (suffix drafter): tooling BANKED, verdict CORPUS-BLOCKED.** The "replay existing receipt
