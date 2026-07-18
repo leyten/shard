@@ -40,3 +40,16 @@ Zero training anywhere; A+B+D are days-scale, C is weeks-scale (the quality gate
 3. Read `draft_s` from a warm run → build async post-verify only if the term is ≥25 ms.
 4. Cascades as the labeled fast tier, marketed where A didn't move (prose).
 Full skeptic verdicts: scratchpad m25_verdicts.json (session); lever provenance: inkling-lever-hunt-20260716.md.
+
+## ADDENDUM 2026-07-18 — gates measured on a live ring (receipts: suffix-replay-verdict-20260718.json, warmring-20260718.json)
+- **A (suffix drafter): DEAD at deployment shape.** Offline replay over 110 real on-engine traces
+  (bit-exact token ids, 2026-07-18 6×5090 ring): unique + structurally-similar traffic = ×1.00-1.08
+  pess EVERYWHERE (conv 8-turn 1.03/1.08; code-with-variants 1.01/1.03). The wins live in verbatim
+  doc-quoting (ctx-8k-quote 2.38 — already the shipped n-gram half's turf) and byte-identical repeats
+  (×1.3-2.9 — a gateway response-cache feature, not a drafter). Do not build; revisit only if traffic
+  becomes template-heavy.
+- **B (async post-verify): NO-BUILD confirmed by the live timer** — draft_s 10.6-12.7 ms/round,
+  under half the 25 ms bar.
+- **C (REAP) stays THE lever** (×1.14 banked; NVFP4 prune path structurally validated 07-17) and
+  **D (cascades)** stays the opt-in tier. **Revised composite: the exact-tier projection now rides on
+  C alone** (prose 20-bar still closed by REAP12); A's contribution is struck.
