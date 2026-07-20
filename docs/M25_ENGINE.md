@@ -20,6 +20,55 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-20 (LATEST-5) — P0-#1 LEG-7 RESIDUE 3/4 CLOSED IN ONE NO-SPEND DAY (5 PRs, all merged)
+**Manifest resolution + standby seeding + the node-side challenge probe are DONE on both sides;
+the torrent path and spot-checking are now mechanically real.** Method: recon fan-out → two-angle
+design panel → synthesis → build → independent adversarial verify (which found real bugs before
+they shipped). All offline/GPU-less; balance untouched (~$25).
+- **Manifest resolution (shard #125 + c0mpute #42):** `manifestRef` → `mf1:<name>@<cid>` — CID
+  normative, name advisory. `shard.fetch --manifest-cid` pins the manifest FILE BYTES to the
+  assignment's CID BEFORE parsing; `--expect-model-id/--expect-layer-count` kill right-key-wrong-
+  model; publish stamps a signed monotonic `version` (rollback guard). Daemon resolves the doc from
+  the orchestrator origin (`public/manifests/<name>.json`, static), pins the BAKED publisher key
+  (never assign-carried), drops mismatched caches (auto-migration proven in the sim), and the
+  self-published throwaway-key manifest + raw unverified serving pull are DELETED. Trust boundary =
+  the engine, fail-closed; TS checks are early-loud-failure only. Launch runbook residue (leyten,
+  one-time): publish with an OFFLINE key → check doc into `public/manifests/` → paste pubkey into
+  `MANIFEST_PUBKEY` → flip `MODEL_SPECS.manifestRef` to `mf1:…@<cid>` → set `SWARM_SEED_ADDRS`
+  (c0mpute LAUNCH_READINESS item 5 has the exact commands).
+- **Standby seeding (c0mpute #42):** Go `-seed` already existed (live-proven #68) — the gap was
+  ~20 lines of daemon TS. Every `bootSidecar` site now seeds complete shards (scan-once-at-boot ⇒
+  teardown-restore is when a served range enters the seed set; mid-serve bounce is ring-fatal,
+  avoided); `swarm:assign.seeders` hands joiners the free-candidate standby set + operator
+  `SWARM_SEED_ADDRS`; the fetcher direct-dials (no DHT-health dependency). GPU-less sim proved the
+  whole loop: stale-cache drop → resolve → verified probe slice → `-seed` no-op on empty dir →
+  full trust surface on the assign pull.
+- **Node-side challenge probe (shard #126/#127 + c0mpute #43):** the P0-#1 "never spot-check until
+  it exists" gate is CLOSED. #126 fixed a REAL pre-existing bug the adversarial pass confirmed:
+  `sketch()` drew projection indices on the tensor's device — CUDA Philox vs CPU MT19937 ⇒ a CPU
+  verifier vs a GPU suspect compared 256 unrelated coordinates ⇒ every honest node false-FAILS
+  (test-masked: all prior tests same-device). #127: a SEPARATE loopback-only probe door
+  (SHARD_PROBE_PORT = engine+3), serviced IN the serve thread at its select points (single-threaded
+  ⇒ no locks/races BY CONSTRUCTION; the adversarial pass killed both the hello_probe-as-pred
+  legacy hijack and a 60s-expiry false-idle that would have KV-poisoned paying jobs); mid-job =
+  instant `busy`, every job-termination path re-opens; fail-closed sans SHARD_PROBE_TOKEN
+  (daemon-local — the ring-wide swarm token can't distinguish supervisor from ringmate). c0mpute
+  #43: daemon mints token/port per stage spawn, answers `swarm:challenge` via the door (busy
+  retried to deadline, ALWAYS replies — silence is scored as cheating), orchestrator mints
+  crypto-random seeds + commit-first projSeed, busy = flake-never-fail. Suites: shard 606 green;
+  c0mpute challenge-node-test 13/13 + all regression scripts.
+- **Challenge residue (post-mechanism, not launch-blocking):** the chained-activation verification
+  bank (operator tooling; adversarial rule: ONE spend per chain — adjacent-range spends leak the
+  upstream answer) + shadow-mode cosine-threshold validation at max block depth on a real
+  cross-vendor pair BEFORE enforcement.
+
+**⇒ THE ONE NEXT ACTION: P0-#3 relay automation** (daemon auto-discovers + reserves on public
+relays; the FSN/AMS relay boxes exist — see [[doublezero-pilot-assessment]] for iids). Then the
+**P0-#6 ring session: churn-survival proof + the warm re-join ≤3min receipt** (one ring, two
+receipts — kill a stage mid-serve → re-form → next request serves; restart a warm daemon → time to
+READY; ~$3-5, dead-man switch discipline). Then P1-#4 hardening → P1-#3 WSL2 → rehearsal.
+Queued small c0mpute follow-up: daemon restarts a stall-killed coordinator with `M25_EAGLE=0`.
+
 ### ⇒ 2026-07-20 (LATEST-4) — P0-#5 RING-VALIDATED + KNOBS FORWARDED (PR #122); WEDGE FINDING BANKED
 **Controlled-ring validation done** (3×5090 Poland/Germany/Poland, ~$3.5, receipt
 `docs/receipts/eagle-watchdog-ring-20260720.json`; ring torn down, 0 boxes).
