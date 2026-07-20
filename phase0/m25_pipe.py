@@ -343,6 +343,23 @@ def _reply_timeout(timeout):
     return min(timeout, hb) if hb > 0 else timeout
 
 
+def _draft_budget():
+    """Per-draft-step budget (seconds) for the EAGLE watchdog (P0-#5). The serial EAGLE chain
+    (d_fetch on a novel-text round) is coordinator-LOCAL compute — the one leg of a decode round no
+    socket timeout can see. A wedged or pathologically slow drafter therefore crawls the job forever
+    while still streaming: the 2026-07-14 "silent hang" shape. When an eagle-routed draft step
+    exceeds this budget twice consecutively (first step of a job exempt — cublas autotune/allocator
+    warmup legitimately spikes it), or drafting eats most of the decode wall, the coordinator flips
+    to n-gram-only for the rest of the job: worst case slower, never dead. Default 1.0s (~75-100x
+    the healthy 10-13ms step); env M25_DRAFT_BUDGET_S; 0/empty disables (the _reply_timeout
+    convention)."""
+    try:
+        b = float(os.environ.get("M25_DRAFT_BUDGET_S", "1.0") or "0")
+    except ValueError:
+        b = 1.0
+    return b if b > 0 else None
+
+
 def _act_digest(t):
     """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
@@ -728,7 +745,7 @@ def _check_reset_ack(op, ack):
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True,
-                    job_nonce=None):
+                    job_nonce=None, on_progress=None):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -770,6 +787,20 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
             local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
+        # P0-#5 EAGLE watchdog: the serial draft chain is the one leg of a round no socket timeout
+        # sees. eagle_active gates depth (:cur_depth), extend, and the budget check; the trip flips
+        # it for the REST of the job (drafter latches n-gram-only via disable_eagle) — the job keeps
+        # its loop shape and the ring wire is unchanged, so the degrade is invisible to the stages.
+        eagle_active = eagle_on
+        draft_budget = _draft_budget() if (eagle_on and hasattr(local_draft, "disable_eagle")) else None
+        slow_drafts = n_eagle_drafts = 0; eagle_degraded_at = None
+
+        def _trip_degrade(why):
+            nonlocal eagle_active, eagle_degraded_at
+            eagle_active = False; eagle_degraded_at = len(out)
+            local_draft.disable_eagle()
+            print(f"[coord] EAGLE WATCHDOG: degraded to n-gram at token {len(out)} — {why} "
+                  f"(job continues plain; M25_DRAFT_BUDGET_S={draft_budget}s)", flush=True)
         def _pf_extend(start_i, toks_i, aux_i):
             """Feed ONE prefill chunk's aux into the EAGLE context as it arrives, so the drafter sees the
             WHOLE prompt (the old code kept only the LAST chunk -> the drafter attended ~prefill_chunk
@@ -787,11 +818,13 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
                 toks, aux = _unpack(_reply_ok(recv_data(rx)))
+                if on_progress: on_progress()                 # each prefill reply = liveness (a big chunk over a slow uplink is legitimately slow — the stall watchdog must see it moving)
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
             kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
+            if on_progress: on_progress()
             _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
         rx.settimeout(_reply_timeout(timeout))              # F6: tighten the per-reply deadline for decode — a mid-decode ring blip fails over in seconds, not up to the full timeout
@@ -803,14 +836,32 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
         d_request(dprefix, K)
         while not done:
-            cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
+            cur_depth = 1 if (S.M25_EAGLE and eagle_active) else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); degraded/plain = full depth
             while len(inflight) < cur_depth and not done:
-                td = time.time(); ds = d_fetch(); t_draft += time.time() - td
+                td = time.time(); ds = d_fetch(); dt_d = time.time() - td; t_draft += dt_d
+                if draft_budget and eagle_active and getattr(local_draft, "matched", True) is False:
+                    # only EAGLE-routED steps count (an n-gram hit is ~free; a GC hiccup on one must
+                    # not trip); the job's first eagle step is exempt (autotune/allocator warmup)
+                    n_eagle_drafts += 1
+                    if dt_d > draft_budget and n_eagle_drafts > 1:
+                        slow_drafts += 1
+                        if slow_drafts >= 2:                     # 2 consecutive breaches = pathology, not a blip
+                            _trip_degrade(f"draft step {dt_d*1e3:.0f}ms > budget x{slow_drafts}")
+                    else:
+                        slow_drafts = 0
+                    # boiled frog: steady sub-budget drafting that still dominates the decode wall.
+                    # BOTH conditions — the fraction alone is meaningless when the wall itself is
+                    # tiny (a fast ring's wall ~= its draft time by definition); pathology = real
+                    # seconds burned (>=20x the per-step budget) AND most of the wall.
+                    if (eagle_active and n_eagle_drafts >= 10 and t_draft > 20 * draft_budget
+                            and t_draft > 0.5 * (time.time() - t0)):
+                        _trip_degrade(f"drafting is {t_draft:.1f}s of {time.time() - t0:.1f}s decode wall")
                 t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
                 kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
             tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
+            if on_progress: on_progress()
             r, aux = _unpack(resp)
             sp, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
@@ -851,7 +902,7 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
-            if eagle_on and aux is not None:                 # grow the EAGLE context with the newly committed positions
+            if eagle_on and eagle_active and aux is not None:   # grow the EAGLE context with the newly committed positions (degraded: skip the stack+extend work too, not just the drafting)
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
@@ -896,6 +947,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
+            # P0-#5 watchdog: did this job degrade EAGLE->n-gram mid-stream, and at which output token
+            "eagle_degraded": eagle_degraded_at is not None, "eagle_degraded_at": eagle_degraded_at,
             "final_confidence": conf.confidence() if conf else None}
 
 
