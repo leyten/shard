@@ -90,7 +90,7 @@ Leg-7 residue → relay automation (P0-#3) → churn proof (P0-#6) → hardening
 Small c0mpute follow-up queued: daemon restarts a stall-killed coordinator with `M25_EAGLE=0`.
 
 ### ⇒ 2026-07-20 (LATEST-2) — PAY-MODEL BUILT + DECIDED; DEV-SAFETY LESSON; NEXT = EAGLE WATCHDOG
-**Pay-model (P1-#2 residue) DONE as code — c0mpute PR #41, OPEN, merges/deploys AT LAUNCH (not before).**
+**Pay-model (P1-#2 residue) DONE as code — c0mpute PR #41 (MERGED 07-20, on master, GATED OFF; the flag flips at launch).**
 leyten's economics applied: USDC via the EXISTING credits/revenue-share economy (NO points ledger, NO new
 token mechanics; farming unprofitable BY CONSTRUCTION via the 30%/20%-by-staking platform cut). A settled
 job's COLLECTED revenue splits **flat by layers**, then **each stage keeps its OWN `getWorkerRevenueShare`**
