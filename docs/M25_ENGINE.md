@@ -20,6 +20,50 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-20 (LATEST-3) — P0-#5 EAGLE WATCHDOG SHIPPED (PR #120); PAY-MODEL MERGED (c0mpute #41)
+**The mitigation ladder is on master — "worst case slower, or a clean fast fail; never a silent
+hang" on the deployment path.** Root cause of the 07-14 hang stays open by design (mitigation-first);
+the code audit crowned a prime suspect: **the tail's UNTIMED return socket** — one send wedged
+against a dead return path (relay/conntrack) parked the tail inside sendall forever, unable to
+select/re-accept/reset: the whole warm ring hung behind it (and loopback's infinite bandwidth is
+exactly why the CPU fake ring never reproduced it).
+- **L1 (coord):** `M25_DRAFT_BUDGET_S` (1.0s default, 0 off) — an eagle-routed draft step over
+  budget 2× consecutively (first exempt) or drafting dominating the wall flips the JOB to
+  n-gram-only in place (HybridDrafter.disable_eagle flag-latch; depth pipelining restored; result
+  carries `eagle_degraded`). The serial draft chain was the one round leg NO socket timeout sees.
+- **M1 (tail):** ret gets `M25_RET_STALL_S` (180s default, 0 = old untimed) — per-PROGRESS bound
+  (libp2p transport sends per-sendmsg call; slow-but-draining never trips; `sendall`'s
+  total-deadline semantics verified empirically and rejected). Trip → existing _ret_send EDGE
+  absorb: drop ret, keep pred+KV, re-adopt next hello_return.
+- **eagle:0 reset flag:** every stage silences aux for a degraded session — the degraded arm ==
+  the proven plain ring ON THE WIRE (aux ≈166KB/hop decode, ~75MB/chunk prefill = the payload
+  suspect). Absent field = old behavior; all builds interop.
+- **L2 (shard.coordinate):** EDGE fault while EAGLE armed → ONE degraded retry on a MANDATORY
+  fresh re-dial (the tail only goes stale on a fresh hello_return — a plain reset on old sockets
+  eats a late reply as its ack), resume_ids under the SAME settlement nonce, same delta state
+  (no dup/gap; receipts sweep once, on the surviving attempt). EAGLE/TREE sticky-off for the
+  process after (daemon restart re-arms from env); `SHARD_JOB_DONE.degraded`; `SHARD_JOB_RETRY`
+  emit (deployed daemons ignore unknown tags — verified). JobRejected never retries.
+- **L3 (backstop):** `M25_JOB_STALL_S` (auto = job timeout+60s) no-progress watchdog — prefill
+  replies COUNT as progress (thin-uplink chunks are legally slow) — best-effort FATAL +
+  UNCONDITIONAL os._exit → daemon restarts, fail-closed. Covers wedged-in-torch drafters and
+  stuck sends. (Adversarial verify found+fixed D1: the emit could block its own kill.)
+Verification: explore map → design panel (2) → build → independent adversarial pass. 22 new tests
+(fake-ring wedge knobs, real-os._exit subprocess, real serve() tail survives a wedged ret,
+losslessness across the retry); **suite 584 passed / 1 skipped**. Plan + controlled-ring runbook:
+`.claude/plans/eagle-watchdog-mitigation.md`.
+**Also this session: c0mpute PR #41 (pay-model) MERGED** (verified 11/11 at head first; inert
+behind `SWARM_PAYOUT_ENABLED` until launch; prod untouched). Balance $29.47.
+
+**⇒ THE ONE NEXT ACTION: the controlled-ring proof (P0-#5 residue).** Standard 4-5×5090 EU ring
+(supply healthy ~$0.44-0.53/box/hr, 16 unique-IP offers), three arms per the runbook: ① master
+build + mid-decode iptables DROP on the ret leg → EXPECT the 07-14 wedge (tail stuck, ring dead);
+② #120 build + same fault → tail trips the stall bound, ring survives, next job serves; ③ #120 +
+tc-throttled 2-5Mbps tail uplink + EAGLE → slow but never dead. Then pin the root cause on
+whichever arm reproduces. Dead-man switch standing (pin iids → heartbeat → empty pin). After:
+Leg-7 residue → relay automation (P0-#3) → churn proof (P0-#6) → hardening → WSL2 → rehearsal.
+Small c0mpute follow-up queued: daemon restarts a stall-killed coordinator with `M25_EAGLE=0`.
+
 ### ⇒ 2026-07-20 (LATEST-2) — PAY-MODEL BUILT + DECIDED; DEV-SAFETY LESSON; NEXT = EAGLE WATCHDOG
 **Pay-model (P1-#2 residue) DONE as code — c0mpute PR #41, OPEN, merges/deploys AT LAUNCH (not before).**
 leyten's economics applied: USDC via the EXISTING credits/revenue-share economy (NO points ledger, NO new
