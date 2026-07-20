@@ -71,11 +71,18 @@ fleet; env outranks), arms `-relays` every sidecar boot. Repo ships `relays.json
 IPs in git); launch deploy fills it. relay-resolve-test 12/12 + sim proof (unreachable relay =
 log, never fatal). Deferred: AutoNAT-gated reservation (harmless at launch scale).
 
-**⇒ THE ONE NEXT ACTION: the P0-#6 ring session — churn-survival proof + the warm re-join ≤3min
-receipt** (one ring, two receipts — kill a stage mid-serve → re-form → next request serves;
-restart a warm daemon → time to READY; ~$3-5, dead-man switch discipline). Then P1-#4 hardening →
-P1-#3 WSL2 → rehearsal. Queued small c0mpute follow-up: daemon restarts a stall-killed coordinator
-with `M25_EAGLE=0`.
+**P0-#6 SIM HALF: ALSO DONE same night — and it caught a real launch bug (c0mpute #45).**
+`churn-proof.sh` (3 real daemons, 2-stage ring + free spare, tail SIGKILLed mid-serve) ran RED
+first: `onNodeGone` freed the ring's slots and then NOTHING re-formed — auto-form's only trigger
+was an ANNOUNCE, so a churned network stayed down until fresh supply happened by. Fix: node death
+schedules a re-form for its swarm's model. GREEN: serve #1 → crash-kill → DEGRADED → auto re-form
+from survivor+spare in seconds → serve #2 → CHURN_PROOF COMPLETE (exit-code-gated). All eight
+c0mpute suites green.
+
+**⇒ THE ONE NEXT ACTION: the P0-#6 RING session — the churn kill once on real hardware + the warm
+re-join ≤3min receipt** (one ring, two receipts; restart a warm daemon → time to READY; ~$3-5,
+dead-man switch discipline; fold in the P11 stall-kill → `M25_EAGLE=0` restart follow-up so it's
+exercised, not reasoned). Then P1-#4 hardening → P1-#3 WSL2 → rehearsal.
 
 ### ⇒ 2026-07-20 (LATEST-4) — P0-#5 RING-VALIDATED + KNOBS FORWARDED (PR #122); WEDGE FINDING BANKED
 **Controlled-ring validation done** (3×5090 Poland/Germany/Poland, ~$3.5, receipt

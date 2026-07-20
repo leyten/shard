@@ -123,9 +123,16 @@ You have a working decentralized inference network. What's left is turning "I ca
    must survive dud/dropped nodes on its own. (Largely the daemon's job — pairs with P0-1.)
    _Progress 2026-07-20 — the MECHANISMS all landed: daemon self-heal restart budgets (c0mpute #28),
    lease-freeing on `onNodeGone` + auto-re-form from free candidates (#34), fail-closed jobs (#36), and
-   the assignment-EPOCH settlement fix so a healed/re-placed job pays correctly (#37). **Remaining = the
-   PROOF:** kill a stage mid-serve in the sim → swarm re-forms → the next request serves; then once on
-   the rehearsal ring. (Mid-job resume exists engine-side; that depth is post-launch polish.)_
+   the assignment-EPOCH settlement fix so a healed/re-placed job pays correctly (#37)._
+   _Progress 2026-07-20 night — **the SIM PROOF is DONE and it caught a real launch bug (c0mpute #45).**
+   `churn-proof.sh`: three REAL daemons, 2-stage ring + one free spare, the TAIL daemon SIGKILLed
+   mid-serve. RED first: `onNodeGone` freed the ring and then NOTHING — auto-form's only trigger was an
+   ANNOUNCE, so a churned network stayed down until fresh supply happened by (120s receipt in the run
+   log). Fix: node death schedules a re-form for its swarm's model. GREEN: form → serve+settle #1 →
+   crash-kill → DEGRADED/slots freed → auto re-form from survivor+spare within seconds → serve+settle
+   #2 → CHURN_PROOF COMPLETE, exit-code-gated. **Remaining for the checkmark:** the same kill once on
+   the rehearsal ring, plus the warm re-join ≤3min receipt (same ring session). (Mid-job resume exists
+   engine-side; that depth is post-launch polish.)_
 
 ---
 
