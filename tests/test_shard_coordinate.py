@@ -22,7 +22,7 @@ REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
 def _args(**kw):
-    d = dict(K=8, depth=4, ngram_n=3, max_ctx=0, timeout=30)
+    d = dict(K=8, depth=4, ngram_n=3, max_ctx=0, timeout=30, prefill_chunk=4096)
     d.update(kw)
     return argparse.Namespace(**d)
 

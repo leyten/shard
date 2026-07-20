@@ -111,12 +111,18 @@ class FakeRing(threading.Thread):
     per-message reply discipline. Exits on EOF (coordinator closed its ends). Fully deterministic."""
 
     def __init__(self, pipe_sock, ret_sock, T, eagle=False, aux_h=32, aux_layer_ids=None, stage_dt=None,
-                 stall_decode=None, stall_prefill=None, slice_prefill=False):
+                 stall_decode=None, stall_prefill=None, slice_prefill=False,
+                 mute_after_decode=None, reject_decode=None):
         super().__init__(daemon=True)
         self.pipe = pipe_sock
         self.ret = ret_sock
         self.stall_decode = stall_decode            # (n, seconds): sleep before the first n decode replies —
         self.stall_prefill = stall_prefill          # (n, seconds): sleep before the first n PREFILL replies —
+        self.mute_after_decode = mute_after_decode  # from the n-th DECODE frame on, consume verifies but NEVER
+        self.muted = 0                              # reply (the wedged-tail model: the coordinator's reply
+                                                    # heartbeat trips while its sends still land) — count in muted
+        self.reject_decode = reject_decode          # reply {"error": ...} to the n-th decode frame (the H1
+                                                    # structured job error -> _reply_ok raises JobRejected)
         self.slice_prefill = slice_prefill          # model the P1 tail: prefill toks = FINAL position only
         self.stalled_pf = 0                         # the F6 heartbeat exempts prefill, so this must NOT trip it
         self.stalled = 0                            # a pipelining coordinator fills its depth window during the
@@ -213,6 +219,15 @@ class FakeRing(threading.Thread):
                     if self.stall_prefill and msg.get("prefill") and self.stalled_pf < self.stall_prefill[0]:
                         self.stalled_pf += 1
                         time.sleep(self.stall_prefill[1])
+                    if not msg.get("prefill"):
+                        self._decodes = getattr(self, "_decodes", 0) + 1
+                        if self.mute_after_decode and self._decodes >= self.mute_after_decode:
+                            self.muted += 1          # wedged tail: consume, never reply (KV model above
+                            continue                 # already updated — the frame DID land ring-side)
+                        if self.reject_decode and self._decodes == self.reject_decode:
+                            send_msg(self.ret, {"error": {"code": "kv_overflow", "stage": "tail",
+                                                          "message": "synthetic reject"}})
+                            continue
                     if select.select([self.pipe], [], [], 0)[0]:
                         self.backlog += 1           # coordinator sent ahead: >1 frame in flight right now
                     self.log.append({"op": "verify", "start": int(msg["start"]),
