@@ -34,6 +34,9 @@ ENG_ENV = ["M25_BATCH_MOE", "M25_KV_FP8", "M25_EAGLE", "M25_EAGLE_AUX", "M25_EAG
            "M25_CWND_KEEPWARM_MS", "M25_KEEPWARM_JOB",                    # cwnd keep-warm: stage senders keep idle legs warm (default-ON for --serve interactive)
            "M25_STAGE_TIMING",                                            # per-stage [span,compute] stamps -> coordinator transport split
            "M25_FRAME_TIMEOUT",                                           # absolute per-frame recv deadline (H4); the sidecar gets the SAME number via -frame-timeout
+           "M25_RET_STALL_S",                                             # P0-#5 M1: TAIL-side per-progress stall bound on the coordinator-return socket
+           "M25_DRAFT_BUDGET_S", "M25_JOB_STALL_S",                       # P0-#5 L1/L3: coordinator-side draft-budget + job-stall backstop (the gateway coord reads them; forwarded so a --serve launch tunes them too)
+           "M25_REPLY_TIMEOUT",                                           # F6 per-reply decode heartbeat (coordinator) — forwardable for the gateway path
            "SHARD_RECEIPT_DUMP"]                                          # coordinator exports the signed receipt set for the c0mpute settle seam
 
 
