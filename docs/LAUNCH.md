@@ -7,12 +7,13 @@
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
 > _Last synced: 2026-07-20._
 >
-> **REMAINING BLOCKERS AT A GLANCE (2026-07-20 EOD):** P0-#3 relay automation · P0-#6
-> churn-survival PROOF (+ the warm re-join ≤3min receipt, folded into the same ring session) ·
-> P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day. DONE: P0-#1 residue
-> **3/4 in one day (manifest resolution shard #125 + c0mpute #42 · standby `sidecar -seed` wiring
-> c0mpute #42 · node-side challenge probe shard #126/#127 + c0mpute #43)**, P0-#2, P0-#4, P0-#5
-> EAGLE watchdog, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-20 night):** P0-#6 churn-survival PROOF (+ the warm
+> re-join ≤3min receipt, folded into the same ring session) · P1-#3 WSL2 turnkey · P1-#4 adversary
+> hardening → then the rehearsal day. DONE TODAY: P0-#1 residue **3/4** (manifest resolution shard
+> #125 + c0mpute #42 · standby `sidecar -seed` c0mpute #42 · challenge probe shard #126/#127 +
+> c0mpute #43) **and P0-#3 relay automation** (relays LIVE as systemd services + reservations
+> verified; daemon auto-discovery c0mpute #44). Earlier: P0-#2, P0-#4, P0-#5 EAGLE watchdog,
+> P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
 
 ---
 
@@ -66,9 +67,18 @@ You have a working decentralized inference network. What's left is turning "I ca
    subprocess gate). Plus the whole SSH + `/root`-flat-layout premise (that half = the daemon, P0-#1).
    A stranger's box (home dir, non-root, weird paths, WSL2) must Just Work with none of today's hand-patches.
 
-3. **Relay / NAT infrastructure, automated.** NAT'd home nodes reach the network via a public relay +
-   DCUtR hole-punch — *proven today* — but someone must RUN public relays and the daemon must auto-discover
-   + reserve on them. Today I ran the relay by hand on one box.
+3. ~~**Relay / NAT infrastructure, automated.**~~ ✅ **DONE 2026-07-20 (c0mpute #44 + live infra).**
+   NAT'd home nodes reach the network via a public relay + DCUtR hole-punch (proven 07-14; relay =
+   rendezvous only, the data path upgrades to direct). Now automated on both halves: **operator** —
+   `shard-relay.service` (sidecar `-relay -quic`, persistent key ⇒ stable PeerId, Restart=always)
+   runs on two existing paid public boxes, reservations verified end-to-end from a test sidecar;
+   **network** — the daemon resolves `/relays.json` off the orchestrator origin at enroll (cached,
+   offline-tolerant), VALIDATES every entry (a malformed `-relays` entry is sidecar-fatal — one bad
+   list push must never kill the fleet; operator env outranks), and arms `-relays` on every sidecar
+   boot so a NAT'd node announces its circuit addrs from first boot. The repo ships `relays.json`
+   EMPTY (no public IPs in git); the launch deploy fills it (addrs in the ops notes). _Deferred,
+   not launch-blocking: AutoNAT-gated reservation (today every node with a list reserves — harmless
+   at launch scale, circuit addrs rank below direct in dial order)._
 
 4. ~~**OpenAI-API correctness** (audit M2)~~ ✅ **DONE** (verified 2026-07-15; was remediated in the
    audit fix, PR #96 — LAUNCH.md was stale). `phase0/m25_gateway.py`: strict `max_tokens`/`max_completion_tokens`

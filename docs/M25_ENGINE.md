@@ -62,12 +62,20 @@ they shipped). All offline/GPU-less; balance untouched (~$25).
   upstream answer) + shadow-mode cosine-threshold validation at max block depth on a real
   cross-vendor pair BEFORE enforcement.
 
-**⇒ THE ONE NEXT ACTION: P0-#3 relay automation** (daemon auto-discovers + reserves on public
-relays; the FSN/AMS relay boxes exist — see [[doublezero-pilot-assessment]] for iids). Then the
-**P0-#6 ring session: churn-survival proof + the warm re-join ≤3min receipt** (one ring, two
-receipts — kill a stage mid-serve → re-form → next request serves; restart a warm daemon → time to
-READY; ~$3-5, dead-man switch discipline). Then P1-#4 hardening → P1-#3 WSL2 → rehearsal.
-Queued small c0mpute follow-up: daemon restarts a stall-killed coordinator with `M25_EAGLE=0`.
+**P0-#3 relay automation: ALSO DONE same night (c0mpute #44 + live infra).** `shard-relay.service`
+LIVE on the two existing paid public boxes (sidecar `-relay -quic`, stable PeerIds, DZ pilot
+untouched; reservations verified end-to-end from a test sidecar — addrs in the ops notes/memory
+[[launch-relays-live]]). Daemon resolves `/relays.json` off the orchestrator origin at enroll,
+VALIDATES entries (a malformed `-relays` entry is sidecar-fatal — one bad push must never kill the
+fleet; env outranks), arms `-relays` every sidecar boot. Repo ships `relays.json` EMPTY (no public
+IPs in git); launch deploy fills it. relay-resolve-test 12/12 + sim proof (unreachable relay =
+log, never fatal). Deferred: AutoNAT-gated reservation (harmless at launch scale).
+
+**⇒ THE ONE NEXT ACTION: the P0-#6 ring session — churn-survival proof + the warm re-join ≤3min
+receipt** (one ring, two receipts — kill a stage mid-serve → re-form → next request serves;
+restart a warm daemon → time to READY; ~$3-5, dead-man switch discipline). Then P1-#4 hardening →
+P1-#3 WSL2 → rehearsal. Queued small c0mpute follow-up: daemon restarts a stall-killed coordinator
+with `M25_EAGLE=0`.
 
 ### ⇒ 2026-07-20 (LATEST-4) — P0-#5 RING-VALIDATED + KNOBS FORWARDED (PR #122); WEDGE FINDING BANKED
 **Controlled-ring validation done** (3×5090 Poland/Germany/Poland, ~$3.5, receipt
