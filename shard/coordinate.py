@@ -116,10 +116,29 @@ class _StallWatchdog:
             time.sleep(min(max(self.stall_s / 4.0, 0.05), 2.0))
             job = self._job
             if job is not None and time.monotonic() - self._last > self.stall_s:
-                self.emit("SHARD_JOB_FATAL", jobId=job,
-                          error=f"stall-watchdog: no progress in {self.stall_s:.0f}s "
-                                f"(ring or drafter wedged) — exiting so the daemon restarts us")
-                _hard_exit(1)
+                # The kill must be UNCONDITIONAL — this is the last line of defense. The FATAL emit
+                # is best-effort: a bounded lock wait (the main thread may be wedged INSIDE a locked
+                # stdout write — the very stuck-write class this backstop covers), stderr fallback,
+                # and every exception swallowed so a dead stdout can never block or kill the exit.
+                err = (f"stall-watchdog: no progress in {self.stall_s:.0f}s "
+                       f"(ring or drafter wedged) — exiting so the daemon restarts us")
+                try:
+                    if self.emit is not _emit:               # injected emit (tests/collectors): no stdout lock
+                        self.emit("SHARD_JOB_FATAL", jobId=job, error=err)
+                    else:
+                        line = "SHARD_JOB_FATAL " + json.dumps({"jobId": job, "error": err}) + "\n"
+                        if _EMIT_LOCK.acquire(timeout=5.0):
+                            try:
+                                sys.stdout.write(line)
+                                sys.stdout.flush()
+                            finally:
+                                _EMIT_LOCK.release()
+                        else:                                # lock held by a wedged writer: bypass it
+                            os.write(2, line.encode())
+                except Exception:
+                    pass
+                finally:
+                    _hard_exit(1)
 
 
 def connect_ring(MP, head, tail, timeout, retry_s=300):

@@ -932,9 +932,14 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         d_cancel()
-        while inflight: recv_data(rx); inflight.pop(0)
+        while inflight:
+            recv_data(rx); inflight.pop(0)
+            if on_progress: on_progress()                   # drained replies are liveness too (several
+                                                            # sequential full-timeout waits must not sum
+                                                            # past the job stall budget)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)   # kw lock + noop-skip
+            if on_progress: on_progress()
             if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
                 graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
                 receipts = receipts.get("receipts", [])
