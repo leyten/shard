@@ -93,6 +93,21 @@ A node only needs *its* block, so it only fetches a fraction of the model.
 - **Catalog:** c0mpute's `MODEL_CATALOG` holds a pointer to the manifest (CID/URL +
   publisher pubkey). Adding a model = publish a manifest + add a catalog entry.
 
+**Manifest resolution (the ref seam, decided 2026-07-20):** the assignment carries
+`manifestRef = mf1:<name>@<cid>` — the CID (of the signed canonical manifest bytes, same
+`cidv1_raw` scheme as shard_ids) is normative, the name advisory. Trust splits into two
+required, independent layers: the **CID pins WHICH manifest** (substitution/rollback among
+validly-signed manifests dies on bytes, before parsing) and the **pinned publisher signature
+pins WHO published it** (`verify_manifest(expected_pubkey)`; the pin is a constant baked into
+the daemon's distribution, mirrored in these docs — NEVER carried by the assign channel it
+guards). `shard.fetch --manifest-cid <ref> --pubkey <pin> --expect-model-id/--expect-layer-count`
+enforces all gates in the engine, fail-closed; the control plane's checks are early-loud-failure
+hygiene, never the trust boundary. Manifests carry a signed monotonic `version` (resolvers
+refuse a decrease). Delivery is any untrusted transport (at launch: a static HTTPS file on the
+orchestrator origin — the ~100KB doc doesn't need the peer path the 115GB of weights use).
+This seam protects HONEST nodes from a poisoned supply chain; a malicious node can load
+anything — that stays receipts/auditor/reputation territory (§6).
+
 **Propagation seam:** the source is pluggable. Now → a seed **mirror is just the first
 provider**. Later → peers announce the shards they hold and **P2P takes over** — additive,
 zero rework, because the fetch was content-verified from day one.

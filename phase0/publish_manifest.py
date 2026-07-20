@@ -167,6 +167,9 @@ def main():
     ap.add_argument("--tokenizer-repo", help="repo holding tokenizer files (default: same as --hf)")
     ap.add_argument("--key", required=True, help="publisher ed25519 key (created if absent)")
     ap.add_argument("--out", required=True, help="where to write the signed manifest json")
+    ap.add_argument("--version", type=int, default=1,
+                    help="monotonic release number for this model's manifest (signed; a "
+                         "resolver that has seen version N refuses any N'<N — rollback guard)")
     a = ap.parse_args()
 
     repo = a.hf or a.dir
@@ -185,6 +188,7 @@ def main():
     manifest = {
         "schema": mf.SCHEMA,
         "model_id": model_id,
+        "version": a.version,
         "arch": arch,
         "layer_count": cfg["num_hidden_layers"],
         "tied_embeddings": bool(cfg.get("tie_word_embeddings", False)),
@@ -209,7 +213,8 @@ def main():
     total = sum(s["size"] for s in shards)
     mf.verify_manifest(signed, expected_pubkey=mf.pub_b64(priv))  # self-check, fail closed
     print(json.dumps({
-        "model_id": model_id, "arch": arch, "layer_count": cfg["num_hidden_layers"],
+        "model_id": model_id, "version": a.version, "arch": arch,
+        "layer_count": cfg["num_hidden_layers"],
         "shards": len(shards), "weights_shards": len(weights),
         "total_gb": round(total / 1e9, 2),
         "publisher_pubkey": mf.pub_b64(priv), "out": a.out,

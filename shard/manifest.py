@@ -15,6 +15,7 @@ Schema (`schema: "shard-manifest/1"`):
     {
       "schema": "shard-manifest/1",
       "model_id":   "openai/gpt-oss-120b",
+      "version":    1,          # monotonic per model_id; resolvers refuse a decrease (rollback guard)
       "arch":       "GptOssForCausalLM",
       "layer_count": 36,
       "tokenizer":  "openai/gpt-oss-120b",
