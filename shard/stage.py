@@ -8,6 +8,10 @@ shell prefix), and the process speaks a machine-readable stdout contract a super
     SHARD_STAGE_READY {...}   weights loaded, forward link up, listening (emitted by serve())
     SHARD_STAGE_FATAL {...}   unrecoverable error; the process exits nonzero
 
+READY carries `probe`: whether the loopback challenge door is up (SHARD_PROBE_TOKEN env minted by
+the supervisor -> the engine answers layer-block spot-checks on port+3 / SHARD_PROBE_PORT; unset ->
+fail-closed OFF, surfaced here so an unprobeable stage is loud, never silent).
+
 Layout-portable: works from a repo checkout (phase0/ beside shard/) AND the flat single-dir box
 layout — no PYTHONPATH hand-patching (the landmine that bit the first residential join). Secrets
 (SHARD_SWARM_TOKEN, SHARD_PSK) stay env-only: they must never appear in argv, which is world-
