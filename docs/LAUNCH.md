@@ -80,8 +80,12 @@ You have a working decentralized inference network. What's left is turning "I ca
    flank it (gpus online, countries, rings, throughput, tokens served). Built in c0mpute's own design system
    (data.c0mpute.ai: pure black / white-graded / argent-pixel numerals / green live dot; links the SAME Typekit
    kit so the font is real). Source: c0mpute repo `data-site/network.html` (c0mpute #33), deployed via nginx on
-   the kloot box (`/var/www/shard.c0mpute.ai/`; see memory `shard-demo-deployment`). **STILL A SIMULATION** —
-   wiring it to the orchestrator's live node+swarm feed is the follow-on (now unblocked: rings auto-form). The
+   the kloot box (`/var/www/shard.c0mpute.ai/`; see memory `shard-demo-deployment`). **WIRED TO LIVE STATE 2026-07-20**
+   (c0mpute #38/#39): loopback-gated `/api/network` (public shape identity-free — truncated PeerIds, no
+   IPs/pubkeys/accounts, test-enforced) → `network.json` generator (5-min systemd timer, server-side geo
+   via cached /24 lookups, jittered coords) → the page HOT-SWAPS the sim with any fresh non-empty feed
+   (sim stays the fallback so the globe is never empty pre-launch). Deployed + verified live; flips to
+   real data automatically when real nodes announce. The
    "chat window watching one prompt stream" is a SEPARATE surface (inference stays private per leyten; the map
    is network-view only).
 
@@ -100,9 +104,10 @@ You have a working decentralized inference network. What's left is turning "I ca
    changes). Proven GPU-less with 2 real daemons: request → served → settled, both stages credited by layers
    (`SERVE=1 npm run try-shard`). **Live-ring validation DONE 2026-07-18** (warmring-20260718 receipt:
    shard.coordinate served a real job on a real 6-box ring; 6 receipts tiling [0:62) verified under pinned
-   assignments, every stage signing the injected settlement nonce). **Remaining for the checkmark:** the
-   assignment-EPOCH fix (still the correctness bomb) and the pay-model $ credit mapping (leyten's fork —
-   `recordSwarmStageEarning` stub)._
+   assignments, every stage signing the injected settlement nonce). **Assignment-EPOCH fix DONE 2026-07-20** (c0mpute #37:
+   per-job settlement snapshot frozen at dispatch — churn can neither strand honest work unpaid nor frame
+   the coordinator as fraud; epoch-settle-test 9/9). **Remaining for the checkmark:** the pay-model $
+   credit mapping only (leyten's fork — `recordSwarmStageEarning` stub)._
 
 3. **Windows / WSL2 turnkey.** Most home users. Proven workable today (WSL2 *mirrored* networking + CUDA),
    but the setup must be one step, not the manual dance we did.

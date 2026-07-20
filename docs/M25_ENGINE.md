@@ -20,6 +20,29 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-20 (LATEST) — EPOCH BOMB DEFUSED + THE MAP IS WIRED LIVE (P1-#1 ✅, P1-#2 code-complete)
+- **Assignment-EPOCH fix (c0mpute #37):** settlement now runs against a per-job `JobSettleSnapshot`
+  frozen at dispatch — mid-job churn (even the daemon's own socket-recycle) can neither strand honest
+  work unpaid nor hand the coordinator a fraud mark; verify-fail = a TRUE fraud signal now. Proven by
+  a dedicated churn test (tail yanked mid-job, 9/9). P1-#2's residue = the pay-model $ fork ONLY.
+- **Map → live state (c0mpute #38 + #39, DEPLOYED):** loopback-gated `/api/network` (public shape
+  identity-free: truncated PeerIds, NO pubkeys/accounts/IPs — test-enforced, network-feed-test 19/19)
+  → `scripts/network-map.ts` generator (5-min systemd timer `c0mpute-networkmap`, server-side geo via
+  cached /24 lookups, jittered, IP-stripped) → `network.json` next to the page → `network.html`
+  HOT-SWAPS the sim with any fresh non-empty feed (sim = the pre-launch fallback; never an empty
+  globe). Live-verified on shard.c0mpute.ai; prod orchestrator restarted with #37/#38. The globe
+  flips to real state automatically (≤6 min) once real daemons announce to the prod orchestrator.
+- Settlement counters (per-node tokens/receipts, tokens-today, throughput window) now accumulate in
+  `recordSwarmStageEarning` — the pay-model $ mapping itself remains leyten's untouched fork.
+
+**⇒ THE ONE NEXT ACTION (per the CTO plan): EAGLE P0-#5, MITIGATION-FIRST** — build the coordinator
+watchdog + degrade-to-plain-decode offline (turns "silent hang on residential tails" into "worst case
+slower, never dead"), then validate on a cheap 2-3 box relay ring and only then chase root cause.
+After that, known-shape work in order: Leg-7 residue (manifest resolution, `sidecar -seed`, challenge
+sketch, warm re-join receipt) → relay automation (P0-#3) → churn-survival proof (P0-#6) → hardening
+(P1-#4) → WSL2 (P1-#3) → rehearsal day. Balance ~$29.6; the dead-man switch is standing (pin iids at
+rent, heartbeat in monitors, empty pin at teardown).
+
 ### ⇒ 2026-07-18 (LATEST) — WARM-RING DAY: suffix gate = NO-BUILD, draft_s CLOSED, LEG 8 LIVE-VALIDATED
 One 6×5090 EU ring (~$10; + ~$60 idle-overnight incident → dead-man switch installed, memory
 [[vast-deadman-switch]]). Receipts: **suffix-replay-verdict-20260718.json + warmring-20260718.json**.
