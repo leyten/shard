@@ -372,6 +372,35 @@ def _cached(path: str, shard: dict) -> bool:
         return False
 
 
+def check_manifest_cid(path: str, ref: str) -> None:
+    """Assert the manifest FILE BYTES hash to the content id the assignment carried
+    (`mf1:<name>@<cid>` — the CID part is normative, the name advisory; a bare CIDv1 is
+    accepted too). Runs BEFORE the JSON is parsed, so substitution among validly-signed
+    manifests, rollback to an older release, and a tampered local cache all die without
+    attacker bytes being trusted for anything. Both trust layers stay required: this CID
+    pins WHICH manifest, the pinned signature (verify_manifest) pins WHO published it."""
+    cid = ref.rsplit("@", 1)[-1] if ref.startswith("mf1:") else ref
+    if not cid.startswith("bafk"):
+        raise mf.ManifestError(f"manifest ref carries no content id: {ref!r}")
+    sha, _ = mf.sha256_file(path)
+    got = mf.cidv1_raw(sha)
+    if got != cid:
+        raise mf.ManifestError(f"manifest content id mismatch: ref pins {cid}, file hashes to {got}")
+
+
+def check_expected(manifest: dict, model_id: str | None = None,
+                   layer_count: int | None = None) -> None:
+    """Cross-check the resolved manifest against what the ASSIGNMENT said this node pulls
+    (the ref/manifest-mismatch defense): a validly-signed, correctly-addressed manifest for
+    the WRONG model must still refuse to drive a pull. Fail closed."""
+    if model_id is not None and manifest.get("model_id") != model_id:
+        raise mf.ManifestError(
+            f"manifest model_id {manifest.get('model_id')!r} != assignment's {model_id!r}")
+    if layer_count is not None and manifest.get("layer_count") != layer_count:
+        raise mf.ManifestError(
+            f"manifest layer_count {manifest.get('layer_count')!r} != assignment's {layer_count}")
+
+
 def _check_map_coverage(manifest: dict) -> None:
     """Every file the signed weight_map references must have a shard entry, or the map
     points at bytes the manifest can never verify."""
@@ -530,9 +559,19 @@ def _main() -> int:
     ap.add_argument("--sidecar", default=None, help="sidecar binary for the libp2p provider")
     ap.add_argument("--key", default=None, help="node key for the libp2p provider")
     ap.add_argument("--pubkey", default=None, help="pin the manifest publisher pubkey (base64)")
+    ap.add_argument("--manifest-cid", default=None,
+                    help="content id the manifest file must hash to (bare CIDv1, or the "
+                         "assignment's mf1:<name>@<cid> ref verbatim)")
+    ap.add_argument("--expect-model-id", default=None,
+                    help="refuse a manifest whose model_id differs (assignment cross-check)")
+    ap.add_argument("--expect-layer-count", type=int, default=None,
+                    help="refuse a manifest whose layer_count differs (assignment cross-check)")
     a = ap.parse_args()
     try:
+        if a.manifest_cid:
+            check_manifest_cid(a.manifest, a.manifest_cid)
         manifest = json.load(open(a.manifest))
+        check_expected(manifest, a.expect_model_id, a.expect_layer_count)
         provider = build_chain_provider(
             mirror=a.mirror or _default_mirror(manifest),
             bootstrap=[b.strip() for b in a.bootstrap.split(",") if b.strip()],
