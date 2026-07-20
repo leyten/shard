@@ -1,0 +1,34 @@
+{
+  "receipt": "eagle-watchdog-ring-20260720",
+  "what": "P0-#5 EAGLE watchdog (PR #120) + knob forwarding (PR #122): controlled-ring validation",
+  "ring": {
+    "topology": "3-stage WAN, Poland(head,0:6)+EAGLE-head -> Germany(mid,6:18) -> Poland(tail,18:30)",
+    "gpus": "3x RTX 5090 (vast)", "rtt_ms": {"head_mid": 216, "head_tail": 0, "note": "two Poland boxes same-DC (0ms); Germany ~216ms"},
+    "model": "MiniMax-M2.5 PARTIAL (30 of 62 layers) — transport/serving/receipt mechanics valid; token OUTPUT is garbage by construction",
+    "engine": "master @ #120 (M1+L1+L3) + #122 (knob forwarding); EAGLE on (aux 1,10,20 pinned in-range), M25_RET_STALL_S=20, M25_DRAFT_BUDGET_S=1.0, M25_JOB_STALL_S=45"
+  },
+  "integration_proof": {
+    "verdict": "PASS — shipped watchdog build serves M2.5 end-to-end over a real 3-region WAN ring",
+    "job": {"jobId": "integ-1", "ok": true, "tokensGenerated": 80, "degraded": false},
+    "watchdog_healthy_path": "degraded=false — L1 draft budget + L3 job-stall did NOT false-trip on a healthy job",
+    "knob_forwarding": "M25_RET_STALL_S=20 confirmed in the live tail stage process env (was dead pre-#122)",
+    "receipts": "3 signed stage receipts (0:6, 6:18, 18:30), one settlement nonce threaded into all three; hash chain intact (stage0.out_root==stage1.in_root, stage1.out_root==tail.in_root); receiptsOk=false is CORRECT fail-closed (verifier expects full-62-layer coverage on a 30-layer ring)",
+    "churn": "tail predecessor-edge-close / coord-return-reconnect machinery exercised across repeated coordinator connect/disconnect, stayed alive"
+  },
+  "m1_wedge_in_vivo": {
+    "verdict": "NOT REPRODUCIBLE on this datacenter ring — and that is the finding",
+    "why": [
+      "EAGLE runs depth-1 (no pipelining) -> never a backlog of returns to fill the socket buffer; the tail sends its one aux return (fits) then blocks in RECV waiting for the next verify, not in _ret_send",
+      "loopback socket buffers autotune to net.ipv4.tcp_wmem/rmem max = 4MB/6MB; one partial-model aux frame (~166KB at K=8) never fills them",
+      "the vast container lacks NET_ADMIN (no iptables / tc / ip route) so the tail uplink cannot be throttled to emulate the residential DRAIN that sustains the backpressure",
+      "sidecar-SIGSTOP freezes BOTH directions (pred delivery AND ret drain), so it cannot isolate a send-side-only stall"
+    ],
+    "significance": "This is exactly WHY the 2026-07-14 hang appeared ONLY on the residential home box and never in the datacenter: the M1 wedge is a SUSTAINED-backpressure phenomenon that needs a slow uplink sustaining a return backlog. A fast symmetric datacenter ring with depth-1 EAGLE and multi-MB buffers structurally cannot produce it.",
+    "socket_level_proof": "M1's settimeout(M25_RET_STALL_S) bound on the tail _ret_send sendall IS validated at the socket layer offline: tests/test_ret_stallguard.py drives the REAL serve() tail with rcvbuf=32KB + a 2MB aux frame -> a genuine buffer-fill sendall wedge -> the stall bound trips -> the tail drops ret, keeps predecessor+KV, re-adopts a fresh return channel and serves. The mechanism (a socket timeout bounding sendall on buffer-full) is transport-agnostic; the WAN ring cannot add to that guarantee without traffic shaping."
+  },
+  "ops": {
+    "spend_usd_approx": 3.5, "boxes": "3x5090 ~$1.46/hr",
+    "duds": "1 SSH-key-propagation dud rescued via fresh throwaway key (memory vast-key-propagation-dud-rescue); 2 HF 302-without-L false-alarms in preflight (fixed)",
+    "deadman": "iids pinned in /root/.local/share/vast_deadman_iids, heartbeat touched throughout, pin emptied at teardown"
+  }
+}

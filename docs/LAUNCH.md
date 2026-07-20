@@ -8,10 +8,10 @@
 > _Last synced: 2026-07-20._
 >
 > **REMAINING BLOCKERS AT A GLANCE (2026-07-20):** P0-#1 residue (challenge sketch, warm re-join
-> receipt, `sidecar -seed`, manifest resolution) · P0-#3 relay automation · **P0-#5 EAGLE watchdog
-> (mitigation SHIPPED, PR #120 — residue = controlled-ring validation + root cause)** · P0-#6
-> churn-survival PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day.
-> DONE: P0-#2, P0-#4, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model built+merged).
+> receipt, `sidecar -seed`, manifest resolution) · P0-#3 relay automation · P0-#6 churn-survival
+> PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day. DONE: P0-#2,
+> P0-#4, **P0-#5 EAGLE watchdog (mitigation SHIPPED #120, knobs forwarded #122, ring-validated —
+> integration PASS, wedge finding banked)**, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
 
 ---
 
@@ -65,10 +65,18 @@ You have a working decentralized inference network. What's left is turning "I ca
    AND enforced (errors if a required tool call is missing); non-greedy `temperature`/`top_p`/`top_k` rejected
    400 (decoding is greedy). 61 gateway contract tests green.
 
-5. **The g-lever (EAGLE) reliable on home-node topologies.** EAGLE speculative decode is what lifts a
-   scattered ring past its ~2 tok/s transport floor. It works on datacenter rings but **silently hung the
-   coordinator on the residential-tail path — 2026-07-14.** Must be fixed + robust, or home nodes serve at
-   an embarrassing 2 tok/s. _(Being fixed offline — reproduce on a controlled ring, not on rentals.)_
+5. ~~**The g-lever (EAGLE) reliable on home-node topologies.**~~ ✅ **DONE 2026-07-20 (mitigation-first).**
+   EAGLE speculative decode is what lifts a scattered ring past its ~2 tok/s transport floor. It worked on
+   datacenter rings but **silently hung the coordinator on the residential-tail path — 2026-07-14.** The
+   four-layer mitigation makes every EAGLE-implicated stall class end "worst case slower, or a clean fast
+   fail — never a silent hang" (PR #120), the knobs are forwardable in production (PR #122), and it's
+   ring-validated: **integration PASS** (shipped build serves M2.5 over a real 3-region WAN ring,
+   degraded=false, receipts chained) with the **wedge finding banked** (the sustained-backpressure M1
+   wedge is not reproducible on a fast datacenter ring by construction — depth-1 EAGLE + multi-MB buffers
+   + no NET_ADMIN — which is exactly why 07-14 only hit the home box; M1's socket bound is proven offline
+   in test_ret_stallguard.py). Receipt `docs/receipts/eagle-watchdog-ring-20260720.json`. _(Follow-up, not
+   a blocker: the daemon restarts a stall-killed coordinator with M25_EAGLE=0 — the P11 restart-degraded
+   path.)_
    _Progress 2026-07-20 — **MITIGATION SHIPPED (PR #120), mitigation-first per plan:** every
    EAGLE-implicated stall class now ends "worst case slower, or a clean fast fail — never a silent
    hang." Four layers, each covering a class the others can't: **L1** coordinator draft-budget
