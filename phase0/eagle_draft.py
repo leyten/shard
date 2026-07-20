@@ -603,14 +603,28 @@ class HybridDrafter:
 
     def __init__(self, ngram, eagle):
         self.ngram = ngram; self.eagle = eagle; self._pending = None; self.matched = True
+        self._eagle_off = False                         # P0-#5 watchdog degrade latch (disable_eagle)
+
+    def disable_eagle(self):
+        """P0-#5 watchdog degrade: from here on fetch() NEVER consults the EAGLE head (the n-gram
+        half already pads to k on a miss, so the fixed-K frame contract holds) and extend()/
+        set_hidden() become no-ops. Flag-based on purpose — swapping the drafter object mid-job
+        would orphan the coordinator's one outstanding request (_pending) and its fetch/cancel
+        pairing; the flag leaves all of that untouched. Irreversible for this drafter's lifetime
+        (a fresh job builds a fresh HybridDrafter around the shared EAGLE singleton)."""
+        self._eagle_off = True
 
     def reset(self):
         self.eagle.reset()
 
     def extend(self, tokens, auxes, base_pos):
+        if self._eagle_off:
+            return
         self.eagle.extend(tokens, auxes, base_pos)
 
     def set_hidden(self, aux):
+        if self._eagle_off:
+            return
         self.eagle.set_hidden(aux)
 
     def request(self, ids, k):
@@ -626,4 +640,6 @@ class HybridDrafter:
             self.matched = True
             return ng
         self.matched = False                            # novel -> EAGLE (depth~1) over its persistent context
+        if self._eagle_off:                             # degraded: ride the n-gram's padded k tokens instead
+            return ng
         return self.eagle.propose(ids, k)

@@ -343,6 +343,42 @@ def _reply_timeout(timeout):
     return min(timeout, hb) if hb > 0 else timeout
 
 
+def _draft_budget():
+    """Per-draft-step budget (seconds) for the EAGLE watchdog (P0-#5). The serial EAGLE chain
+    (d_fetch on a novel-text round) is coordinator-LOCAL compute — the one leg of a decode round no
+    socket timeout can see. A wedged or pathologically slow drafter therefore crawls the job forever
+    while still streaming: the 2026-07-14 "silent hang" shape. When an eagle-routed draft step
+    exceeds this budget twice consecutively (first step of a job exempt — cublas autotune/allocator
+    warmup legitimately spikes it), or drafting eats most of the decode wall, the coordinator flips
+    to n-gram-only for the rest of the job: worst case slower, never dead. Default 1.0s (~75-100x
+    the healthy 10-13ms step); env M25_DRAFT_BUDGET_S; 0/empty disables (the _reply_timeout
+    convention)."""
+    try:
+        b = float(os.environ.get("M25_DRAFT_BUDGET_S", "1.0") or "0")
+    except ValueError:
+        b = 1.0
+    return b if b > 0 else None
+
+
+def _ret_stall_s():
+    """Stall bound (seconds) for the tail's coordinator-return socket (P0-#5 / the M1 wedge). The
+    ret was untimed: a coordinator-side stall (dead conntrack, a full-forever buffer on a wedged
+    relay path) left the tail blocked INSIDE _ret_send's sendall — unable to select, accept a fresh
+    hello_return, or see the next reset: the whole ring wedged behind one send. With the libp2p
+    transport the send loop is per-sendmsg-call (shard/transport._sendall_vectored), so this timeout
+    means "ZERO bytes accepted for this long" — a slow-but-draining residential uplink resets the
+    clock with every accepted chunk and never trips, however big the aux frame. (PSK wire.py uses
+    one sendall = a TOTAL deadline per frame — fine for its LAN/bench use, not the deployment path.)
+    On trip: socket.timeout -> _ret_send's EDGE absorb drops ret, keeps predecessor+KV, marks the
+    job stale — the next coordinator re-adopts mid-session. Env M25_RET_STALL_S; default 180;
+    0/empty disables (the untimed master behavior)."""
+    try:
+        v = float(os.environ.get("M25_RET_STALL_S", "180") or "0")
+    except ValueError:
+        v = 180.0
+    return v if v > 0 else None
+
+
 def _act_digest(t):
     """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
@@ -698,7 +734,13 @@ def _reset_op(swarm_id, job_id, nonce=None):
     the coordinator's per-job receipt freshness challenge: it rides the reset to every stage so each
     stage signs it into its receipt (a replayed old receipt then carries a stale nonce)."""
     o = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-         "swarm_id": swarm_id, "job_id": job_id}
+         "swarm_id": swarm_id, "job_id": job_id,
+         # the coordinator's EAGLE arm rides every reset (P0-#5): eagle:0 makes each stage silence
+         # its aux payload for the session — the degraded arm then equals the proven plain ring on
+         # the WIRE too, not just coordinator-side. Old stages ignore the field; old coordinators
+         # omit it (stages default to their launch env). A plain-launched coordinator against
+         # eagle-launched stages stops paying for aux it never reads — strictly less traffic.
+         "eagle": 1 if S.M25_EAGLE else 0}
     if nonce is not None:
         o["nonce"] = nonce
     if M25_GRAPH_JOB is not None:
@@ -728,7 +770,7 @@ def _check_reset_ack(op, ack):
 def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_sock, local_draft,
                     tools=None, prefill_chunk=4096, max_ctx=0, prefill_depth=8, on_commit=None,
                     swarm_id="swarm", job_id="job", resume_ids=None, resumable=False, reasoning=True,
-                    job_nonce=None):
+                    job_nonce=None, on_progress=None):
     """PIPELINED coordinator copied verbatim from specpipe.coordinate_pipe (n-gram local_draft path,
     greedy, direct-return) — keep `depth` verify chunks in flight so throughput approaches the ring's
     per-chunk THROUGHPUT, not its full latency (the GLM 2.9->16.6 lever). Self-contained: only sockets
@@ -770,6 +812,20 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
             local_draft.reset()                                       # fresh EAGLE context per job (drafter is a shared singleton)
+        # P0-#5 EAGLE watchdog: the serial draft chain is the one leg of a round no socket timeout
+        # sees. eagle_active gates depth (:cur_depth), extend, and the budget check; the trip flips
+        # it for the REST of the job (drafter latches n-gram-only via disable_eagle) — the job keeps
+        # its loop shape and the ring wire is unchanged, so the degrade is invisible to the stages.
+        eagle_active = eagle_on
+        draft_budget = _draft_budget() if (eagle_on and hasattr(local_draft, "disable_eagle")) else None
+        slow_drafts = n_eagle_drafts = 0; eagle_degraded_at = None
+
+        def _trip_degrade(why):
+            nonlocal eagle_active, eagle_degraded_at
+            eagle_active = False; eagle_degraded_at = len(out)
+            local_draft.disable_eagle()
+            print(f"[coord] EAGLE WATCHDOG: degraded to n-gram at token {len(out)} — {why} "
+                  f"(job continues plain; M25_DRAFT_BUDGET_S={draft_budget}s)", flush=True)
         def _pf_extend(start_i, toks_i, aux_i):
             """Feed ONE prefill chunk's aux into the EAGLE context as it arrives, so the drafter sees the
             WHOLE prompt (the old code kept only the LAST chunk -> the drafter attended ~prefill_chunk
@@ -787,11 +843,13 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             while sent < d: _send_pf(starts[sent]); sent += 1
             for j in range(len(starts)):
                 toks, aux = _unpack(_reply_ok(recv_data(rx)))
+                if on_progress: on_progress()                 # each prefill reply = liveness (a big chunk over a slow uplink is legitimately slow — the stall watchdog must see it moving)
                 if sent < len(starts): _send_pf(starts[sent]); sent += 1
                 _pf_extend(starts[j], toks, aux)              # after the refill send: extend overlaps the ring
             cur = toks[-1]
         else:
             kw.send({"op": "verify", "token_ids": gen_ids, "start": 0}); toks, aux = _unpack(_reply_ok(recv_data(rx))); cur = toks[-1]
+            if on_progress: on_progress()
             _pf_extend(0, toks, aux)
         prefill_s = time.time() - t_pf
         rx.settimeout(_reply_timeout(timeout))              # F6: tighten the per-reply deadline for decode — a mid-decode ring blip fails over in seconds, not up to the full timeout
@@ -803,14 +861,32 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
                 if (ConfidenceScheduler and os.environ.get("M25_CONF_SCHED")) else None)  # K fixed (graph-safe); only in-flight depth adapts
         d_request(dprefix, K)
         while not done:
-            cur_depth = 1 if S.M25_EAGLE else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); else full depth
+            cur_depth = 1 if (S.M25_EAGLE and eagle_active) else (conf.value() if conf else depth)   # EAGLE needs the verified hidden -> can't pipeline (v1: depth 1); degraded/plain = full depth
             while len(inflight) < cur_depth and not done:
-                td = time.time(); ds = d_fetch(); t_draft += time.time() - td
+                td = time.time(); ds = d_fetch(); dt_d = time.time() - td; t_draft += dt_d
+                if draft_budget and eagle_active and getattr(local_draft, "matched", True) is False:
+                    # only EAGLE-routED steps count (an n-gram hit is ~free; a GC hiccup on one must
+                    # not trip); the job's first eagle step is exempt (autotune/allocator warmup)
+                    n_eagle_drafts += 1
+                    if dt_d > draft_budget and n_eagle_drafts > 1:
+                        slow_drafts += 1
+                        if slow_drafts >= 2:                     # 2 consecutive breaches = pathology, not a blip
+                            _trip_degrade(f"draft step {dt_d*1e3:.0f}ms > budget x{slow_drafts}")
+                    else:
+                        slow_drafts = 0
+                    # boiled frog: steady sub-budget drafting that still dominates the decode wall.
+                    # BOTH conditions — the fraction alone is meaningless when the wall itself is
+                    # tiny (a fast ring's wall ~= its draft time by definition); pathology = real
+                    # seconds burned (>=20x the per-step budget) AND most of the wall.
+                    if (eagle_active and n_eagle_drafts >= 10 and t_draft > 20 * draft_budget
+                            and t_draft > 0.5 * (time.time() - t0)):
+                        _trip_degrade(f"drafting is {t_draft:.1f}s of {time.time() - t0:.1f}s decode wall")
                 t_sent = time.monotonic()                       # traversal origin: includes the outbound serialize
                 kw.send({"op": "verify", "token_ids": [dprefix[-1]] + ds, "start": send_pos})
                 inflight.append((send_pos, ds, t_sent)); dprefix = dprefix + ds; send_pos += K
                 d_request(dprefix, K)
             tr = time.time(); resp = _reply_ok(recv_data(rx)); t_recv += time.time() - tr
+            if on_progress: on_progress()
             r, aux = _unpack(resp)
             sp, ds, t_sent = inflight.pop(0)
             t_trav += time.monotonic() - t_sent                 # count discarded chunks too — they traversed
@@ -851,14 +927,19 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             else:
                 committed = ds[:n] + [r[n]]; out.extend(committed); cur = r[n]; pos += n + 1
                 discard = len(inflight); d_cancel(); dprefix = prompt_ids + out; send_pos = pos; d_request(dprefix, K)
-            if eagle_on and aux is not None:                 # grow the EAGLE context with the newly committed positions
+            if eagle_on and eagle_active and aux is not None:   # grow the EAGLE context with the newly committed positions (degraded: skip the stack+extend work too, not just the drafting)
                 local_draft.extend(committed, _eagle_aux_range(aux, 0, len(committed)), base_pos=sp)   # committed[i] predicted by aux[i] (target hidden one pos earlier)
             if on_commit: on_commit(out, time.time() - t0)   # stream: this commit's running output
             if len(out) >= max_new or (cur in eos_set) or (eos_set & set(committed)): done = True
         d_cancel()
-        while inflight: recv_data(rx); inflight.pop(0)
+        while inflight:
+            recv_data(rx); inflight.pop(0)
+            if on_progress: on_progress()                   # drained replies are liveness too (several
+                                                            # sequential full-timeout waits must not sum
+                                                            # past the job stall budget)
         if RECEIPTS:                                        # PROVE: sweep the ring once for signed per-stage receipts
             kw.send({"op": "receipt", "receipts": []}); receipts = recv_data(rx)   # kw lock + noop-skip
+            if on_progress: on_progress()
             if isinstance(receipts, dict):              # graph-A/B job: tail promoted the reply with counters
                 graph_arm = {k: receipts.get(k) for k in ("graph", "graph_captured", "graph_skipped")}
                 receipts = receipts.get("receipts", [])
@@ -896,6 +977,8 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
             # commit/extend/serialize overhead — the profile that ranks the next serial-path fix.
             "decode_s": round(dt, 3), "draft_s": round(t_draft, 3), "ring_wait_s": round(t_recv, 3),
             **_timing_fields(t_trav, t_stage, t_stage_comp, per_stage),
+            # P0-#5 watchdog: did this job degrade EAGLE->n-gram mid-stream, and at which output token
+            "eagle_degraded": eagle_degraded_at is not None, "eagle_degraded_at": eagle_degraded_at,
             "final_confidence": conf.confidence() if conf else None}
 
 
@@ -1901,12 +1984,17 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 # fresh ret with no prior session starts un-stale (its coordinator hellos + resets anyway).
                 carried = ret is not None
                 ret, pred, queued = _tail_accept(srv, pending, ret=ret, timeout=timeout)
+                _rs = _ret_stall_s()             # M1: bound ret sends by PROGRESS (see _ret_stall_s);
+                if _rs is not None:              # disabled -> keep _tail_accept's greeting timeout as-is
+                    ret.settimeout(_rs)
                 ret_kw.attach(ret)               # after ret_ok went out — a noop can never precede the ack
                 pending = []                     # consumed (became ret/pred or were closed) — don't double-select
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
                 stale = carried                  # carried live ret -> drop its stale in-flight until reset
                 print("[tail] predecessor + coord-return connected", flush=True)
             signer = None; job_graph = None          # job_graph: the reset's APPLIED graph arm (None = plain job)
+            sess_eagle = True                        # per-session aux arm: a reset carrying eagle:0 (a degraded
+                                                     # coordinator, P0-#5) silences the aux payload ring-wide
             with torch.no_grad():
                 try:
                     while True:
@@ -1944,7 +2032,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                         stale = True       # in-flight traffic belongs to the dead job
                                     ret = spoke
                                     try:
-                                        send_msg(ret, "ret_ok"); ret.settimeout(None)   # ret is untimed, like bring-up
+                                        send_msg(ret, "ret_ok"); ret.settimeout(_ret_stall_s())   # M1 stall bound (None when disabled = the old untimed ret)
                                         ret_kw.attach(ret)                   # after ret_ok: noop never precedes the ack
                                         print("[tail] coord-return (re)connected mid-session", flush=True)
                                     except EDGE_ERRORS:    # reconnector died between hello and ack: not a pred event
@@ -1986,6 +2074,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                                                  # reset re-arms via the stale machinery
                         if msg["op"] == "reset":
                             job_graph = _reset_flags(msg)   # per-job runtime flags (graph A/B toggle)
+                            sess_eagle = bool(msg.get("eagle", 1))   # eagle:0 = degraded coordinator; field absent = old coordinator = aux as launched
                             for L in layers:
                                 L.reset()
                             if "keepwarm_ms" in msg:        # coordinator toggle rode the reset (interleaved A/B)
@@ -2017,6 +2106,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
                                 _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
                             job_graph = _reset_flags(msg)   # per-job graph arm, like solo's reset (also CLEARS a
+                            sess_eagle = bool(msg.get("eagle", 1))   # same honor as solo's reset
                             for L in layers: L.reset()      # stale solo job_graph when the field is absent)
                             if RECEIPTS:                    # batched jobs get a FRESH signer (a solo job's
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # stale signer
@@ -2034,7 +2124,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                     signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                                 toks = _tail_logits(h, parts).argmax(-1).tolist()
-                                if S.M25_EAGLE:
+                                if S.M25_EAGLE and sess_eagle:
                                     aux = _merge_aux(msg.get("aux"))
                                     if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
                                         aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
@@ -2044,7 +2134,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if S.M25_STAGE_TIMING:                # batched rounds get the same per-stage [span,
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)   # compute] stamps as solo — the
                                                                       # round-decomposition experiment's food
-                                _ret_send(o if (S.M25_EAGLE or S.M25_STAGE_TIMING) else toks)
+                                _ret_send(o if ((S.M25_EAGLE and sess_eagle) or S.M25_STAGE_TIMING) else toks)
                                 continue
                             if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                                 x = msg["h"].to(dev)
@@ -2055,7 +2145,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 # (chunk length rides the aux shape) — projecting the whole chunk
                                 # materialized a [1,s,vocab] transient (~1.6GB at s=4096)
                                 toks = _tail_logits(h[:, -1:], parts).argmax(-1)[0].tolist()
-                                _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                                _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks); continue
                             if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
                                 b = msg["stream"]                            # tree-masked block against KV row b —
                                 x = msg["h"].to(dev)                         # MUST route before the row branch (a
@@ -2066,7 +2156,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                                 o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
-                                if S.M25_EAGLE:                              # this frame as chain math replies
+                                if S.M25_EAGLE and sess_eagle:               # this frame as chain math replies
                                     o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
                                 if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
@@ -2080,7 +2170,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                                 o = {"toks": toks, "stream": b}              # stream tag = the coordinator's LOUD
-                                if S.M25_EAGLE:                              # FIFO-pairing guard
+                                if S.M25_EAGLE and sess_eagle:               # FIFO-pairing guard
                                     o["aux"] = _merge_aux(msg.get("aux"))
                                 if S.M25_STAGE_TIMING:
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
@@ -2092,7 +2182,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                                o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                                o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks
                                 if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                     o = o if isinstance(o, dict) else {"toks": o}
                                     o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
@@ -2106,7 +2196,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             # frames keep every position: the accept walk reads them all.
                             toks = _tail_logits(h[:, -1:] if msg.get("prefill") else h,
                                                 parts).argmax(-1)[0].tolist()
-                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks
                             if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                 o = o if isinstance(o, dict) else {"toks": o}
                                 o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
@@ -2178,6 +2268,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 continue
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
+        sess_eagle = True                             # per-session aux arm (reset eagle:0 = degraded coordinator, P0-#5)
         with torch.no_grad():
             try:
                 while True:
@@ -2189,6 +2280,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue          # backstop): relay it down to the tail untouched
                     if msg["op"] == "reset":
                         _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
+                        sess_eagle = bool(msg.get("eagle", 1))  # eagle:0 = degraded coordinator; absent = old coordinator
                         aux_local_job = None                    # a solo job takes over: the local lane closes
                         for L in layers:
                             L.reset()
@@ -2205,8 +2297,9 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
                         _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
+                        sess_eagle = bool(msg.get("eagle", 1))  # same honor as solo's reset
                         aux_local_job = (msg["aux_local"]   # the lane TOKEN: a per-job nonce (job_id is "job"
-                                         if parts["head"] and msg.get("aux_local") and S.M25_EAGLE else None)   # everywhere — it can't disambiguate residue)
+                                         if parts["head"] and msg.get("aux_local") and S.M25_EAGLE and sess_eagle else None)   # everywhere — it can't disambiguate residue)
                         if aux_local_job is not None:           # ack the local lane on the pipe BEFORE forwarding the
                             send_msg(conn, {"op": "aux_local_ok", "job": aux_local_job})   # reset — the coordinator's
                                                                 # handshake read is then causally satisfied
@@ -2227,7 +2320,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:     # attest batched rounds like solo
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
-                            if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
+                            if S.M25_EAGLE and sess_eagle:           # per-stream aux ([B,K+1,H] rows) to the tail
                                 if aux_local_job is None:            # armed head: its own aux goes on the LOCAL lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))   # (below), never onto the WAN legs
                                 tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
@@ -2256,7 +2349,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "tree": True, "stream": b, "h": h, "start": msg["start"],
                                    "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 if aux_local_job is None:                    # armed head: own aux on the local lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             if S.M25_STAGE_TIMING:
@@ -2278,7 +2371,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "stream": b, "h": h, "start": msg["start"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 if aux_local_job is None:                    # armed head: own aux on the local lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             if S.M25_STAGE_TIMING:
@@ -2299,7 +2392,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
-                            if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
+                            if S.M25_EAGLE and sess_eagle:           # stream-b prefill aux feeds that stream's drafter context
                                 if aux_local_job is None:            # armed head: own aux on the local lane (below)
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             nxt_kw.send(_hsend(fwd))
@@ -2320,7 +2413,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
                                    "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 fwd["aux"] = _merge_aux(msg.get("aux"))
                             fwd = _hsend(fwd)
                             if S.M25_STAGE_TIMING:
@@ -2334,7 +2427,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         h = _block(graph_runners, layers, msg["start"], h, vcfg)
                         t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         fwd = {"op": "verify", "h": h, "start": msg["start"]}
-                        if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
+                        if S.M25_EAGLE and sess_eagle:               # carry aux hidden states forward to the tail (EAGLE)
                             fwd["aux"] = _merge_aux(msg.get("aux"))
                         fwd = _hsend(fwd)
                         if S.M25_STAGE_TIMING:
