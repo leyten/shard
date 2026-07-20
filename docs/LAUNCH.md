@@ -7,11 +7,12 @@
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
 > _Last synced: 2026-07-20._
 >
-> **REMAINING BLOCKERS AT A GLANCE (2026-07-20):** P0-#1 residue (challenge sketch, warm re-join
-> receipt, `sidecar -seed`, manifest resolution) · P0-#3 relay automation · P0-#6 churn-survival
-> PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day. DONE: P0-#2,
-> P0-#4, **P0-#5 EAGLE watchdog (mitigation SHIPPED #120, knobs forwarded #122, ring-validated —
-> integration PASS, wedge finding banked)**, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-20 EOD):** P0-#3 relay automation · P0-#6
+> churn-survival PROOF (+ the warm re-join ≤3min receipt, folded into the same ring session) ·
+> P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day. DONE: P0-#1 residue
+> **3/4 in one day (manifest resolution shard #125 + c0mpute #42 · standby `sidecar -seed` wiring
+> c0mpute #42 · node-side challenge probe shard #126/#127 + c0mpute #43)**, P0-#2, P0-#4, P0-#5
+> EAGLE watchdog, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
 
 ---
 
@@ -44,9 +45,20 @@ You have a working decentralized inference network. What's left is turning "I ca
    box: `npm run try-shard` → self-provisions (engine+venv+sidecar+weights, ZERO env vars) → enroll → announce
    → assign → pull (verified) → stage READY → serving.** Multi-stage rings FORM (forward-leg peer multiaddrs in
    swarm:assign; 2-node libp2p ring proven, bytes across both sidecars). Auto-update REMOVED (c0mpute #27).
-   Sidecar release CI = shard #106. **Remaining for the checkmark:** node-side challenge sketch (P0-#1/verifiable
-   edge; never spot-check shard swarms until it exists), warm re-join ≤3min acceptance receipt, standby seeding
-   (`sidecar -seed`) to light up the wired torrent path, network signed-manifest resolution from `manifestRef`._
+   Sidecar release CI = shard #106.
+   _Progress 2026-07-20 EOD — residue 3/4 CLOSED: **network manifest resolution** (shard #125:
+   `mf1:<name>@<cid>` refs, `--manifest-cid` bytes-pin + `--expect-*` cross-checks + signed monotonic
+   version, all fail-closed engine-side; c0mpute #42: daemon resolves the network doc, pins the baked
+   publisher key, self-publish + raw serving pull DELETED — launch runbook residue in c0mpute
+   LAUNCH_READINESS item 5); **standby seeding** (c0mpute #42: `-seed` at every sidecar boot,
+   `swarm:assign.seeders` = free candidates + `SWARM_SEED_ADDRS`, GPU-less sim proof end-to-end);
+   **node-side challenge probe** (shard #126 sketch device-RNG fix + #127 loopback probe door — busy
+   refuses mid-job, every termination re-opens, fail-closed sans token; c0mpute #43: daemon answers
+   `swarm:challenge` via the door, crypto-random seeds + commit-first projSeed + busy=flake-not-fail;
+   spot-checking shard swarms is now MECHANICALLY possible — bank tooling + shadow-mode threshold
+   validation before enforcement). **Remaining for the checkmark:** warm re-join ≤3min acceptance
+   receipt — REAL-box measurement (weights-load dominated), folded into the P0-#6 churn-proof ring
+   session (one ring, two receipts)._
 
 2. **Kill the portability landmines** — every "works only on a vast /root box" assumption. Found live
    today: ~~`m25_pull_range.py` hardcodes `/root/.hf_token`~~ ✅, ~~`node_kv`'s flat `import transport` needs
