@@ -81,7 +81,10 @@ def derive_challenge(seed: str, n_tokens: int, hidden_size: int,
 def block_forward(parts, x, start: int = 0):
     """Run ONE forward of a node's loaded block (pipeline.load_stage parts) on input x at
     absolute position `start`, eager + causal, no cache write. Returns the block output hidden
-    states. This is exactly the transform a stage applies on the hot path, isolated for probing."""
+    states. This is exactly the transform a stage applies on the hot path, isolated for probing.
+    NOTE: targets the phase-0 `pipeline` runtime; a LIVE M2.5 stage answers challenges in-process
+    via its probe listener instead (the serving process holds the only loadable copy of the
+    weights — a second full load does not fit beside it in VRAM)."""
     import torch
     from pipeline import run_block
     from transformers import DynamicCache
@@ -107,11 +110,18 @@ def sketch(h, seed: str = None, full: bool = False) -> dict:
                 "full": True}
     if seed is None:
         seed = sketch_seed()
-    g = torch.Generator(device=hf.device if hf.is_cuda else "cpu")
+    # The sampled coordinates MUST be drawn on the CPU generator regardless of where the tensor
+    # lives: CUDA (Philox) and CPU (MT19937) produce DIFFERENT sequences for the same manual_seed,
+    # so a GPU-made sketch vs a CPU-made sketch of IDENTICAL tensors would compare 256 unrelated
+    # coordinates and false-FAIL every honest cross-device check — and a CPU verifier judging a
+    # GPU stage is exactly the production shape (probe grants recompute to CPU boxes). Draw on
+    # CPU, then move the index to the tensor's device for the gather.
+    g = torch.Generator()
     g.manual_seed(_proj_seed(seed))
     dim = min(256, hf.numel())
-    idx = torch.randint(0, hf.numel(), (dim,), generator=g, device=hf.device)
-    out = {"n": int(hf.numel()), "norm": float(hf.norm()), "proj": hf[idx].cpu().tolist()}
+    idx = torch.randint(0, hf.numel(), (dim,), generator=g)
+    out = {"n": int(hf.numel()), "norm": float(hf.norm()),
+           "proj": hf[idx.to(hf.device)].cpu().tolist()}
     if seed != LEGACY_SEED:
         out["seed"] = seed                             # legacy sketches keep their v0 shape
     return out

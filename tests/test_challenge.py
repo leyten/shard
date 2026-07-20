@@ -202,3 +202,33 @@ def test_full_sketch_ships_whole_activation():
     assert f["n"] == len(f["proj"]) == 32 and f.get("full") is True
     assert ch.compare_sketches(f, ch.sketch(h.clone(), full=True))["passed"]
     assert not ch.compare_sketches(f, ch.sketch(torch.randn(1, 4, 8), full=True))["passed"]
+
+
+# ---- 6. the projection index is DEVICE-INDEPENDENT (the cross-device false-FAIL regression) ---------
+
+def test_sketch_indices_come_from_the_cpu_generator():
+    """The sampled coordinates must derive from the CPU generator REGARDLESS of the tensor's
+    device: CUDA (Philox) and CPU (MT19937) draw different sequences for the same manual_seed,
+    so a device-conditional generator makes a GPU suspect vs a CPU verifier compare 256
+    UNRELATED coordinates of identical tensors — a guaranteed false FAIL of every honest node
+    (a CPU box granted recompute is a real verifier role). This pins sketch() to the CPU
+    reference sequence; a reintroduced device-conditional draw breaks it on any CUDA box, and
+    on CPU boxes it still pins the exact expected index stream."""
+    h = torch.randn(1, 8, 96)
+    seed = ch.sketch_seed()
+    sk = ch.sketch(h, seed=seed)
+    g = torch.Generator()                              # the reference: plain CPU generator
+    g.manual_seed(ch._proj_seed(seed))
+    hf = h.detach().to(torch.float32).flatten()
+    idx = torch.randint(0, hf.numel(), (min(256, hf.numel()),), generator=g)
+    assert sk["proj"] == hf[idx].tolist()
+
+
+def test_sketch_matches_across_simulated_hosts():
+    """Two sketches of byte-identical tensors made in separate passes (fresh generators each
+    time — the cross-host shape) must sample the SAME coordinates and pass compare."""
+    seed = ch.sketch_seed()
+    x = ch.derive_challenge(seed, 4, 32, device="cpu", dtype=torch.float32)
+    a, b = ch.sketch(x, seed=seed), ch.sketch(x.clone(), seed=seed)
+    assert a["proj"] == b["proj"]
+    assert ch.compare_sketches(a, b)["passed"]
