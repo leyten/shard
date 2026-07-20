@@ -9,8 +9,9 @@
 >
 > **REMAINING BLOCKERS AT A GLANCE (2026-07-20):** P0-#1 residue (challenge sketch, warm re-join
 > receipt, `sidecar -seed`, manifest resolution) · P0-#3 relay automation · **P0-#5 EAGLE watchdog
-> (NEXT)** · P0-#6 churn-survival PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the
-> rehearsal day. DONE: P0-#2, P0-#4, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model built).
+> (mitigation SHIPPED, PR #120 — residue = controlled-ring validation + root cause)** · P0-#6
+> churn-survival PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the rehearsal day.
+> DONE: P0-#2, P0-#4, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model built+merged).
 
 ---
 
@@ -68,6 +69,24 @@ You have a working decentralized inference network. What's left is turning "I ca
    scattered ring past its ~2 tok/s transport floor. It works on datacenter rings but **silently hung the
    coordinator on the residential-tail path — 2026-07-14.** Must be fixed + robust, or home nodes serve at
    an embarrassing 2 tok/s. _(Being fixed offline — reproduce on a controlled ring, not on rentals.)_
+   _Progress 2026-07-20 — **MITIGATION SHIPPED (PR #120), mitigation-first per plan:** every
+   EAGLE-implicated stall class now ends "worst case slower, or a clean fast fail — never a silent
+   hang." Four layers, each covering a class the others can't: **L1** coordinator draft-budget
+   watchdog (a slow/wedged drafter — the one leg no socket timeout sees — degrades the job to
+   n-gram IN PLACE, pipelining restored); **M1** the tail's untimed return socket got a
+   per-PROGRESS stall bound (one wedged send used to park the tail inside sendall forever and hang
+   the whole warm ring — the strongest root-cause candidate, and exactly why the CPU fake ring
+   never reproduced it); **eagle:0 on the reset wire** (a degraded session silences aux on every
+   stage — the degraded arm equals the proven plain ring ON THE WIRE); **L2** `shard.coordinate`
+   runs ONE degraded retry on a mandatory fresh re-dial, resuming committed tokens under the same
+   settlement nonce (receipts sweep once, deltas no dup/gap); **L3** a per-job stall backstop
+   (prefill replies count as progress) with an unconditional os._exit → daemon restart →
+   fail-closed complete. Design panel + independent adversarial verify (1 defect found+fixed);
+   22 new tests incl. a real-os._exit subprocess proof; suite 584 green. **Remaining for the
+   checkmark:** the controlled-ring proof (master arm reproduces the wedge, #120 arm survives it +
+   a tc-throttled thin-uplink arm — runbook in `.claude/plans/eagle-watchdog-mitigation.md`), root
+   cause pinned, and the small daemon follow-up (restart coordinator with M25_EAGLE=0 after a
+   stall-kill FATAL)._
 
 6. **Self-healing node lifecycle** (no operator babysitting). Nodes churn constantly in the wild — join,
    leave, die mid-serve. Today the launcher needed 3 relaunches + a reboot + a manual box-swap. The network
