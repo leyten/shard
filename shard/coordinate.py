@@ -27,12 +27,20 @@ import json
 import os
 import socket
 import sys
+import threading
 import time
 import traceback
 
+_EMIT_LOCK = threading.Lock()
+_hard_exit = os._exit          # injectable for tests; the stall watchdog runs on a THREAD, where
+                               # sys.exit only raises in that thread — os._exit is the real kill
+
 
 def _emit(tag, **fields):
-    print(tag + " " + json.dumps(fields), flush=True)
+    line = tag + " " + json.dumps(fields)
+    with _EMIT_LOCK:           # one atomic write: a watchdog FATAL racing a TOKEN emit must never
+        sys.stdout.write(line + "\n")   # splice mid-line (the complete-lines-only NDJSON contract)
+        sys.stdout.flush()
 
 
 def _fatal(msg, **fields):
@@ -63,6 +71,55 @@ def _hostport(s):
 
 
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+
+
+def _stall_budget(timeout):
+    """L3 stall budget (seconds). Unset/empty M25_JOB_STALL_S = AUTO: one full production recv
+    timeout + 60s slack — by construction no legitimate single wait (reset ack, a prefill chunk on
+    a thin uplink, a decode heartbeat) outlasts one recv timeout without producing a progress tick,
+    so auto never false-kills a slow-but-moving job. 0 disables."""
+    raw = os.environ.get("M25_JOB_STALL_S")
+    try:
+        v = float(raw) if raw not in (None, "") else float(timeout) + 60.0
+    except ValueError:
+        v = float(timeout) + 60.0
+    return v if v > 0 else None
+
+
+class _StallWatchdog:
+    """P0-#5 L3 backstop: a RUNNING job that makes no observable progress (no reply received, no
+    commit, no redial) for the stall budget gets a loud SHARD_JOB_FATAL and a hard process exit —
+    the daemon restarts the coordinator and fail-closed-completes the job. This is the only guard
+    for the classes nothing else bounds: a drafter wedged inside torch/CUDA, a send stuck against
+    a full buffer. Never a silent freeze."""
+
+    def __init__(self, stall_s, emit):
+        self.stall_s = stall_s
+        self.emit = emit
+        self._last = time.monotonic()
+        self._job = None
+        if stall_s:
+            threading.Thread(target=self._run, daemon=True, name="job-stall-watchdog").start()
+
+    def arm(self, job_id):
+        self._last = time.monotonic()
+        self._job = job_id
+
+    def tick(self):
+        self._last = time.monotonic()
+
+    def disarm(self):
+        self._job = None
+
+    def _run(self):
+        while True:
+            time.sleep(min(max(self.stall_s / 4.0, 0.05), 2.0))
+            job = self._job
+            if job is not None and time.monotonic() - self._last > self.stall_s:
+                self.emit("SHARD_JOB_FATAL", jobId=job,
+                          error=f"stall-watchdog: no progress in {self.stall_s:.0f}s "
+                                f"(ring or drafter wedged) — exiting so the daemon restarts us")
+                _hard_exit(1)
 
 
 def connect_ring(MP, head, tail, timeout, retry_s=300):
@@ -99,15 +156,25 @@ def connect_ring(MP, head, tail, timeout, retry_s=300):
     raise ConnectionError(f"ring not reachable after {retry_s}s: {type(last).__name__}: {last}")
 
 
-def run_job(MP, tok, eos_set, pipe, ret, a, job, emit=_emit):
-    """One job through coordinate_pipe: stream SHARD_JOB_TOKEN deltas per commit, return the
-    result dict. The delta stream is capped at the first EOS so joined deltas == the final
-    response text (coordinate_pipe trims post-EOS commits from the final text the same way)."""
+def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=None):
+    """One job through coordinate_pipe, with the P0-#5 mitigation ladder: attempt 1 runs as
+    configured; if it EDGE-faults while EAGLE was armed (the residential-tail wedge class), ONE
+    degraded retry on a FRESH ring dial — EAGLE off process-wide (sticky: this ring just proved
+    EAGLE-hostile; a daemon restart re-arms from env) so the retry's reset stamps eagle:0 and the
+    stages silence aux, resume_ids = the committed partial, the SAME nonce and the SAME delta
+    state so the token stream continues with no dup/gap. The re-dial is mandatory: a plain reset
+    on the old sockets would eat a late in-flight reply as its ack (the tail only goes stale on a
+    fresh hello_return). A retry that also fails returns its resumable-failure dict — serve_jobs
+    bails for a clean daemon restart. Deltas are capped at the first EOS so joined deltas == the
+    final response text."""
     job_id = job["jobId"]
     max_new = max(1, min(int(job.get("maxNew") or 512), 4096))
     state = {"text": "", "eos_at": None}
+    tick = watchdog.tick if watchdog is not None else None
 
     def on_commit(out, _dt):
+        if tick:
+            tick()
         # cap at the first EOS: a round can commit [tok, eos, tok2] but the final text ends at eos
         if state["eos_at"] is None:
             for i in range(len(out)):
@@ -121,21 +188,54 @@ def run_job(MP, tok, eos_set, pipe, ret, a, job, emit=_emit):
             state["text"] = text
             emit("SHARD_JOB_TOKEN", jobId=job_id, delta=delta)
 
-    drafter = MP.make_drafter(a.ngram_n)
-    r = MP.coordinate_pipe(
-        pipe, tok, job["messages"], a.K, max_new, a.timeout, a.depth,
-        ret_sock=ret, local_draft=drafter, tools=job.get("tools"),
-        prefill_chunk=4096, max_ctx=a.max_ctx, on_commit=on_commit,
-        swarm_id=job.get("swarmId") or "swarm", job_id=job_id,
-        reasoning=bool(job.get("reasoning", True)),
-        job_nonce=job.get("nonce") or None)
-    return r
+    def _attempt(resume_ids=None):
+        return MP.coordinate_pipe(
+            chans["pipe"], tok, job["messages"], a.K, max_new, a.timeout, a.depth,
+            ret_sock=chans["ret"], local_draft=MP.make_drafter(a.ngram_n), tools=job.get("tools"),
+            prefill_chunk=a.prefill_chunk, max_ctx=a.max_ctx, on_commit=on_commit,
+            swarm_id=job.get("swarmId") or "swarm", job_id=job_id,
+            reasoning=bool(job.get("reasoning", True)),
+            job_nonce=job.get("nonce") or None,
+            resume_ids=resume_ids, resumable=True, on_progress=tick)
+
+    eagle_arm = bool(MP.S.M25_EAGLE)
+    r = _attempt()
+    if r.get("ok") or not r.get("resumable") or not eagle_arm or redial is None:
+        return r
+    committed = list(r.get("output_ids") or [])
+    emit("SHARD_JOB_RETRY", jobId=job_id, reason=str(r.get("error", ""))[:200], committed=len(committed))
+    print(f"[coordinate] EAGLE-implicated edge fault on job {job_id} -> degraded retry "
+          f"(plain decode, eagle:0 on the wire, {len(committed)} tokens resumed)", file=sys.stderr, flush=True)
+    MP.S.M25_EAGLE = False
+    if getattr(MP.S, "M25_TREE", False):     # tree mode implies EAGLE: both off or the tree
+        MP.S.M25_TREE = False                # coordinator would reject the n-gram drafter
+    for s in (chans["pipe"], chans["ret"]):
+        try:
+            s.close()
+        except OSError:
+            pass
+    chans["pipe"], chans["ret"] = redial()   # fresh hello_return = the tail's stale gate arms
+    if tick:
+        tick()                               # the successful redial is progress
+    r2 = _attempt(resume_ids=committed)
+    r2["degraded_retry"] = True
+    return r2
 
 
-def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit):
-    """The stdin job loop, factored for tests: `lines` is any iterator of JSON job lines."""
+def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
+    """The stdin job loop, factored for tests: `lines` is any iterator of JSON job lines. `chans`
+    holds the ring channels so a mid-job degraded re-dial carries into the next job. The stall
+    watchdog (L3) is armed per job and ticked by every reply recv / commit / redial."""
     eos = tok.eos_token_id
     eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
+    chans = {"pipe": pipe, "ret": ret}
+    watchdog = _StallWatchdog(_stall_budget(a.timeout), emit)
+    if redial is None and getattr(a, "head", None) and getattr(a, "tail", None):
+        def redial():
+            # mid-job re-dial: cap the retry window well under the stall budget — a dead ring
+            # should fail the job to the daemon in about a minute, not park it for 5
+            return connect_ring(MP, a.head, a.tail, a.timeout,
+                                retry_s=min(getattr(a, "connect_retry", 60) or 60, 60))
     for line in lines:
         line = line.strip()
         if not line:
@@ -146,18 +246,30 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit):
         except (ValueError, KeyError) as e:
             emit("SHARD_JOB_FATAL", error=f"unparseable job line: {e}")
             continue
+        watchdog.arm(job_id)
         try:
-            r = run_job(MP, tok, eos_set, pipe, ret, a, job, emit=emit)
-            emit("SHARD_JOB_DONE", jobId=job_id, ok=bool(r.get("ok")),
-                 response=r.get("text", ""), tokensGenerated=int(r.get("n_tokens", 0)),
-                 receipts=r.get("receipts") or [], receiptsOk=r.get("receipts_ok"),
-                 nonce=job.get("nonce"))
+            r = run_job(MP, tok, eos_set, chans, a, job, emit=emit, watchdog=watchdog, redial=redial)
+            if r.get("ok"):
+                emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
+                     response=r.get("text", ""), tokensGenerated=int(r.get("n_tokens", 0)),
+                     receipts=r.get("receipts") or [], receiptsOk=r.get("receipts_ok"),
+                     nonce=job.get("nonce"),
+                     degraded=bool(r.get("eagle_degraded") or r.get("degraded_retry")))
+            else:
+                # an edge fault that survived the mitigation ladder (or the plain path's): the
+                # channels are poisoned — report the job dead and bail so the daemon restarts us
+                # clean (the control plane fail-closed-completes the job)
+                emit("SHARD_JOB_FATAL", jobId=job_id,
+                     error=str(r.get("error") or "ring edge fault")[:300])
+                return 1
         except Exception as e:                      # noqa: BLE001 — a job fault must not kill the loop
             traceback.print_exc(file=sys.stderr)
             emit("SHARD_JOB_FATAL", jobId=job_id, error=f"{type(e).__name__}: {e}")
             # socket faults poison the ring channels — bail so the daemon restarts us clean
             if isinstance(e, MP.EDGE_ERRORS) or isinstance(e, MP.TransportError):
                 return 1
+        finally:
+            watchdog.disarm()
     return 0
 
 
@@ -172,6 +284,8 @@ def main(argv=None):
     ap.add_argument("--depth", type=int, default=4, help="pipelined verify chunks in flight")
     ap.add_argument("--ngram-n", type=int, default=3, help="n-gram drafter anchor length")
     ap.add_argument("--max-ctx", type=int, default=131072, help="context cap")
+    ap.add_argument("--prefill-chunk", type=int, default=4096, dest="prefill_chunk",
+                    help="prompt prefill chunk length")
     ap.add_argument("--timeout", type=int, default=600, help="per-frame recv deadline, seconds")
     ap.add_argument("--connect-retry", type=int, default=300,
                     help="seconds to keep retrying the ring dial at boot (stages may still be pulling)")
