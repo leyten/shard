@@ -5,7 +5,12 @@
 > lights up on a live map, and it works — with nobody (no operator, no SSH, no hand-holding) in the loop.
 >
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
-> _Last synced: 2026-07-16._
+> _Last synced: 2026-07-20._
+>
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-20):** P0-#1 residue (challenge sketch, warm re-join
+> receipt, `sidecar -seed`, manifest resolution) · P0-#3 relay automation · **P0-#5 EAGLE watchdog
+> (NEXT)** · P0-#6 churn-survival PROOF · P1-#3 WSL2 turnkey · P1-#4 adversary hardening → then the
+> rehearsal day. DONE: P0-#2, P0-#4, P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model built).
 
 ---
 
@@ -67,6 +72,11 @@ You have a working decentralized inference network. What's left is turning "I ca
 6. **Self-healing node lifecycle** (no operator babysitting). Nodes churn constantly in the wild — join,
    leave, die mid-serve. Today the launcher needed 3 relaunches + a reboot + a manual box-swap. The network
    must survive dud/dropped nodes on its own. (Largely the daemon's job — pairs with P0-1.)
+   _Progress 2026-07-20 — the MECHANISMS all landed: daemon self-heal restart budgets (c0mpute #28),
+   lease-freeing on `onNodeGone` + auto-re-form from free candidates (#34), fail-closed jobs (#36), and
+   the assignment-EPOCH settlement fix so a healed/re-placed job pays correctly (#37). **Remaining = the
+   PROOF:** kill a stage mid-serve in the sim → swarm re-forms → the next request serves; then once on
+   the rehearsal ring. (Mid-job resume exists engine-side; that depth is post-launch polish.)_
 
 ---
 
@@ -106,8 +116,15 @@ You have a working decentralized inference network. What's left is turning "I ca
    shard.coordinate served a real job on a real 6-box ring; 6 receipts tiling [0:62) verified under pinned
    assignments, every stage signing the injected settlement nonce). **Assignment-EPOCH fix DONE 2026-07-20** (c0mpute #37:
    per-job settlement snapshot frozen at dispatch — churn can neither strand honest work unpaid nor frame
-   the coordinator as fraud; epoch-settle-test 9/9). **Remaining for the checkmark:** the pay-model $
-   credit mapping only (leyten's fork — `recordSwarmStageEarning` stub)._
+   the coordinator as fraud; epoch-settle-test 9/9). **PAY-MODEL BUILT 2026-07-20 (c0mpute PR #41, OPEN —
+   merges/deploys at launch):** leyten's decision applied — USDC via the EXISTING revenue-share economy;
+   a settled job's collected revenue splits FLAT BY LAYERS, then each stage keeps ITS OWN
+   `getWorkerRevenueShare` (per-worker cut AFTER the split — staked 80% / unstaked 70%, never blended);
+   one `recordEarning` per stage on the existing payout rails; swarm errors now refund. GATED behind
+   `SWARM_PAYOUT_ENABLED` (off) so it's inert until launch; swarm-payout-test 11/11. Price
+   `pricePerMTokensUsd = $0.50/M` staged on the model profile. **P1-#2 is CODE-COMPLETE.** Residue is
+   launch-time only: (a) flip the flag + deploy at go-live; (b) Phase-2 per-token BILLING (make $/M drive
+   the actual charge — reshapes the live submit path, its own reviewed deploy, POST/at-launch)._
 
 3. **Windows / WSL2 turnkey.** Most home users. Proven workable today (WSL2 *mirrored* networking + CUDA),
    but the setup must be one step, not the manual dance we did.
@@ -128,9 +145,12 @@ You have a working decentralized inference network. What's left is turning "I ca
 ---
 
 ## ⚪ NOT ENGINEERING — your call, decouple from the tech launch
-- **Market / economics (Leg 8 the-money-part).** Everything it needs *exists* (role verdicts,
-  pay-by-layers, settle seam). It's a product-direction decision (global-truth vs demand-artifact, staking,
-  emissions) — not a code blocker. Don't let it gate the tech launch.
+- **Market / economics (Leg 8 the-money-part).** ✅ **DECIDED + BUILT 2026-07-20** (leyten): USDC payouts
+  ride the EXISTING credits/revenue-share economy — no new token mechanics, no points ledger; farming is
+  unprofitable BY CONSTRUCTION because the platform keeps its 30%/20%-by-staking cut. Per-worker cut after
+  a flat-by-layers split; `$0.50/M` price (Kloot's call). Code = c0mpute PR #41 (open, gated off, deploys
+  at launch). Remaining money-side item = Phase-2 per-token billing (at/post-launch). See memory
+  [[c0mpute-economics-applied-to-shard]].
 - **Paper publish / announcement timing.** Yours.
 
 ---

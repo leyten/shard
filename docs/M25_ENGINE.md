@@ -20,6 +20,27 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-20 (LATEST-2) — PAY-MODEL BUILT + DECIDED; DEV-SAFETY LESSON; NEXT = EAGLE WATCHDOG
+**Pay-model (P1-#2 residue) DONE as code — c0mpute PR #41, OPEN, merges/deploys AT LAUNCH (not before).**
+leyten's economics applied: USDC via the EXISTING credits/revenue-share economy (NO points ledger, NO new
+token mechanics; farming unprofitable BY CONSTRUCTION via the 30%/20%-by-staking platform cut). A settled
+job's COLLECTED revenue splits **flat by layers**, then **each stage keeps its OWN `getWorkerRevenueShare`**
+(per-worker cut applied AFTER the split — staked 80% / unstaked 70%, never blended: a swarm is N independent
+operators). One `recordEarning` per stage on the existing payout rails; swarm errors now refund. GATED behind
+`SWARM_PAYOUT_ENABLED` (off) → inert until launch. `swarm-payout-test.ts` 11/11 (mixed ring pays $0.765 where
+a blended cut pays $0.750 — proves per-worker). Price `pricePerMTokensUsd=$0.50/M` staged on the profile
+(Kloot's call). Phase-2 per-token BILLING (make $/M drive the charge) = at/post-launch, its own deploy.
+Memory: [[c0mpute-economics-applied-to-shard]].
+
+**🛑 OPERATING LESSON (critical, leyten caught it): PROD RUNS `tsx` FROM THE WORKING DIR.** The live
+services (`c0mpute-orchestrator.service`, `c0mpute-web.service`) exec straight out of
+`/root/.openclaw/workspace/c0mpute` with `Restart=on-failure`. So ANY edit / branch checkout there is one
+crash away from being live. **NEVER develop in the prod c0mpute tree.** All c0mpute code work now happens in
+the clone **`/root/.openclaw/workspace/c0mpute-dev`** (own GitHub remote, shared `node_modules`, its OWN
+empty `data/` so no dev test touches the live SQLite) → PR → and prod is only ever touched (git pull +
+deliberate `systemctl restart`) in a window leyten okayed. The prod tree stays clean-on-master, always.
+**Nothing deploys before the PoC is finished — the pay-model + map-live-latch land at go-live, together.**
+
 ### ⇒ 2026-07-20 (LATEST) — EPOCH BOMB DEFUSED + THE MAP IS WIRED LIVE (P1-#1 ✅, P1-#2 code-complete)
 - **Assignment-EPOCH fix (c0mpute #37):** settlement now runs against a per-job `JobSettleSnapshot`
   frozen at dispatch — mid-job churn (even the daemon's own socket-recycle) can neither strand honest
