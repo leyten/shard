@@ -60,6 +60,18 @@ NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", os.path.expanduser("~/.shard_no
 # frames or logs; greetings are consumed before any signer exists and are never attested.
 SWARM_TOKEN = os.environ.get("SHARD_SWARM_TOKEN")
 GREET_TIMEOUT = float(os.environ.get("M25_GREET_TIMEOUT", "15") or 15)
+# Node-side challenge probe (P0-#1): the local daemon's door for layer-block spot-checks. Token
+# unset -> no probe listener at all (fail-closed). The token is DAEMON-LOCAL, deliberately distinct
+# from SWARM_TOKEN: the swarm token is shared ring-wide, so it cannot distinguish this node's own
+# supervisor from a ringmate reaching the engine port through the sidecar tunnel.
+PROBE_TOKEN = os.environ.get("SHARD_PROBE_TOKEN")
+try:                                                   # challenge primitives: flat layout first
+    from challenge import derive_challenge as _ch_derive, sketch as _ch_sketch
+except ImportError:
+    try:
+        from shard.challenge import derive_challenge as _ch_derive, sketch as _ch_sketch
+    except ImportError:                                # no primitives on this box -> probing disabled
+        _ch_derive = _ch_sketch = None
 
 
 def _greet_role(hello):
@@ -1819,15 +1831,24 @@ def _dt_row(msg, stage, t_rx, t_comp):
                                            round((t_comp - t_rx) * 1e3, 2)]]
 
 
-def _recv_pred(conn):
+def _recv_pred(conn, probe_srv=None, probe_cb=None):
     """Head/middle predecessor recv (H4). Pre-frame idle is UNLIMITED — a warm ring parks between
     jobs indefinitely, so the blocking wait happens in select, which ignores the socket timeout —
     and the socket's timeout (set at accept, mirroring the tail's pred.settimeout) then only bounds
     a MID-frame stall: a peer that wedges half-way through a frame surfaces as socket.timeout ->
     EDGE_ERRORS -> the existing edge recovery, instead of holding the stage's only loop forever
-    (the accepted socket used to have NO timeout at all)."""
-    select.select([conn], [], [])
-    return _hrecv(recv_msg(conn))
+    (the accepted socket used to have NO timeout at all).
+
+    probe_srv/probe_cb: the challenge-probe listener rides the SAME select (never a second compute
+    thread — probes run in the serve thread by construction, so a probe forward can never race a
+    job frame). A probe wakeup services the probe and re-selects; conn's semantics are untouched."""
+    while True:
+        ready, _, _ = select.select([conn] if probe_srv is None else [conn, probe_srv], [], [])
+        if probe_srv is not None and probe_srv in ready:
+            probe_cb()
+            if conn not in ready:
+                continue
+        return _hrecv(recv_msg(conn))
 
 
 def _tail_accept(srv, pending=None, ret=None, timeout=None):
@@ -1918,6 +1939,114 @@ def _tail_accept(srv, pending=None, ret=None, timeout=None):
     return ret, pred, first
 
 
+# ── node-side challenge probe (P0-#1, "never spot-check shard swarms until it exists") ────────
+# The serving process holds the ONLY loadable copy of its layer block (a second full load does not
+# fit beside it in VRAM), so it must answer challenges itself. Design (adversarially verified):
+#   * a SEPARATE loopback-only listener — never multiplexed onto the wedge-hardened pred socket's
+#     greeting classification (a hello_probe under legacy no-token mode would classify as a
+#     PREDECESSOR and hijack the ring), and unreachable through the sidecar's -inbound tunnel
+#     (which delivers ringmate streams to the ENGINE port only);
+#   * probes are serviced IN the serve thread at its select points — single-threaded by
+#     construction, so a probe forward can never race a job frame (no locks, no TOCTOU);
+#   * BUSY jobs refuse instantly: a mid-job probe forward writes KV at [0:n) and would silently
+#     poison a paying job that still emits valid receipts — the one unforgivable failure mode.
+#     Between jobs the residue is proven harmless (cat path: reset() nulls; static path: the next
+#     job writes contiguously from 0 and reads :total-bounded; graph path: the bucket mask kills
+#     residue columns) — pinned by the KV-hygiene audit of 2026-07-20.
+
+def _probe_listener(port):
+    """Bind the loopback-only probe door, or None when probing is disabled (no SHARD_PROBE_TOKEN
+    minted by the supervisor, or no challenge primitives on this box). Fail-closed by default —
+    and a bind failure DISABLES probing rather than killing a stage worth of warm weights (the
+    READY `probe` field surfaces it to the supervisor either way)."""
+    if PROBE_TOKEN is None or _ch_sketch is None:
+        return None
+    try:
+        ps = socket.socket()
+        ps.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        ps.bind(("127.0.0.1", port))                   # literal loopback, NEVER _engine_bind_addr()
+        ps.listen(2)
+        return ps
+    except OSError as e:
+        print(f"[probe] door disabled: bind :{port} failed ({e})", flush=True)
+        return None
+
+
+def _probe_forward(layers, x, vcfg):
+    """One EAGER forward of this stage's block on a challenge input at position 0 — bypasses the
+    graph runners on purpose (never captures a one-shot shape; eager IS the stage's reference
+    numerics). Isolated here so the CPU serve() harness can stub it."""
+    return S.run_block(layers, 0, x, vcfg)
+
+
+def _serve_probe(probe_srv, layers, vcfg, lo, hi, busy):
+    """Accept + answer ONE challenge request on the probe door, then close. Runs in the serve
+    thread. Every failure path replies (or silently closes) and returns — a malformed, half-sent
+    or hostile-local probe must never kill or wedge a warm stage; conn work is bounded by a 2s
+    socket timeout. Request: {op:"challenge", token, proj_seed, n_tokens, lo, hi, seed?|x?}.
+    Reply: {ok:1, lo, hi, sketch, t_ms} | {error: busy|bad_token|range_mismatch|bad_challenge...}."""
+    try:
+        c, _ = probe_srv.accept()
+    except OSError:
+        return
+    c.settimeout(2)
+    try:
+        try:
+            req = recv_msg(c)
+        except EDGE_ERRORS:
+            return
+        if not (isinstance(req, dict) and req.get("op") == "challenge"):
+            return                                     # junk greeter: adopt nothing, say nothing
+        if not hmac.compare_digest(str(req.get("token", "")), PROBE_TOKEN):
+            send_msg(c, {"error": "bad_token"})
+            return
+        if busy():
+            send_msg(c, {"error": "busy"})             # mid-job: refuse, the daemon retries later
+            return
+        if (req.get("lo"), req.get("hi")) != (lo, hi):
+            send_msg(c, {"error": "range_mismatch", "lo": lo, "hi": hi})
+            return
+        n, proj_seed = req.get("n_tokens"), req.get("proj_seed")
+        if not (isinstance(proj_seed, str) and proj_seed):
+            send_msg(c, {"error": "bad_challenge: proj_seed required"})   # commit-first seed is
+            return                                     # the verifier's, never node-chosen
+        if not (isinstance(n, int) and 1 <= n <= 64):
+            send_msg(c, {"error": "bad_challenge: n_tokens must be 1..64"})
+            return
+        t0 = time.monotonic()
+        if req.get("x") is not None:                   # bank mode: explicit input activation
+            x = torch.tensor(req["x"], dtype=torch.float32)
+            if x.dim() == 2:
+                x = x.unsqueeze(0)
+            if x.shape != (1, n, S.H):
+                send_msg(c, {"error": f"bad_challenge: x shape {list(x.shape)} != [1,{n},{S.H}]"})
+                return
+            x = x.to(device=dev, dtype=torch.bfloat16)
+        elif isinstance(req.get("seed"), str) and req["seed"]:
+            x = _ch_derive(req["seed"], n, S.H, device=dev)
+        else:
+            send_msg(c, {"error": "bad_challenge: need seed or x"})
+            return
+        h = _probe_forward(layers, x, vcfg)
+        sk = _ch_sketch(h, seed=proj_seed)
+        for L in layers:                               # KV hygiene: null the cat-path cache; the
+            L.reset()                                  # static-path residue is proven unreachable
+        send_msg(c, {"ok": 1, "lo": lo, "hi": hi, "sketch": sk,
+                     "t_ms": (time.monotonic() - t0) * 1000})
+    except EDGE_ERRORS:
+        pass                                           # prober vanished mid-exchange: not our problem
+    except Exception as e:  # noqa: BLE001 — a bad challenge is the prober's error, never stage death
+        try:
+            send_msg(c, {"error": f"bad_challenge: {type(e).__name__}: {str(e)[:120]}"})
+        except EDGE_ERRORS:
+            pass
+    finally:
+        try:
+            c.close()
+        except OSError:
+            pass
+
+
 def serve(stage, nstages, lo, hi, port, nxt, timeout):
     parts = _load(stage, nstages, lo, hi)
     layers = parts["layers"]
@@ -1940,12 +2069,23 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         print(f"[s{stage}] forward connected -> {nxt}", flush=True)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((_engine_bind_addr(), port)); srv.listen(2)
-    print(f"[s{stage}] WARM, listening :{port}", flush=True)
+    # the daemon's loopback-only challenge door (None unless SHARD_PROBE_TOKEN is minted —
+    # fail-closed; `probe` in READY surfaces the disablement loudly to the supervisor)
+    probe_port = int(os.environ.get("SHARD_PROBE_PORT", port + 3))
+    probe_srv = _probe_listener(probe_port)
+    job_active = False                                # single-threaded job gate for the probe door
+    def _probe_busy():
+        return job_active
+    def _probe():
+        _serve_probe(probe_srv, layers, vcfg, lo, hi, _probe_busy)
+    print(f"[s{stage}] WARM, listening :{port}"
+          + (f" (probe :{probe_port})" if probe_srv is not None else ""), flush=True)
     # machine-readable half of the WARM signal — the ready contract python -m shard.stage's
     # supervisor (the node daemon) waits on; the human line above stays for operator greps
     print("SHARD_STAGE_READY " + json.dumps({"stage": stage, "nstages": nstages, "lo": lo, "hi": hi,
                                              "port": port, "pid": os.getpid(),
-                                             "tail": bool(parts["tail"])}), flush=True)
+                                             "tail": bool(parts["tail"]),
+                                             "probe": probe_srv is not None}), flush=True)
 
     if parts["tail"]:
         node_key = load_or_make_node_key(NODE_KEY_PATH) if RECEIPTS else None
@@ -1965,7 +2105,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         def _ret_send(o):
             # Deliver a reply to the coordinator-return. On failure the RETURN channel is dead, not the
             # session: drop only ret (the next coordinator brings a fresh one) and mark the job stale.
-            nonlocal ret, stale
+            nonlocal ret, stale, job_active
             if ret is None:
                 return
             try:
@@ -1974,7 +2114,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 print(f"[tail] return edge died on send ({type(e).__name__}); keeping predecessor+KV", flush=True)
                 try: ret.close()
                 except OSError: pass
-                ret = None; stale = True; ret_kw.attach(None)
+                ret = None; stale = True; job_active = False; ret_kw.attach(None)
 
         while True:
             if pred is None:
@@ -1993,6 +2133,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 stale = carried                  # carried live ret -> drop its stale in-flight until reset
                 print("[tail] predecessor + coord-return connected", flush=True)
             signer = None; job_graph = None          # job_graph: the reset's APPLIED graph arm (None = plain job)
+            job_active = False                       # fresh session: no job until its first reset
             sess_eagle = True                        # per-session aux arm: a reset carrying eagle:0 (a degraded
                                                      # coordinator, P0-#5) silences the aux payload ring-wide
             with torch.no_grad():
@@ -2006,7 +2147,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if queued is not None:
                             msg, queued = _hrecv(queued), None
                         else:
-                            ready, _, _ = select.select([srv, pred] + pending, [], [])
+                            ready, _, _ = select.select(
+                                [srv, pred] + pending + ([probe_srv] if probe_srv is not None else []),
+                                [], [])
+                            if probe_srv is not None and probe_srv in ready:
+                                _probe()               # serviced HERE, in the serve thread — a probe
+                                continue               # can never race a job frame by construction
                             if srv in ready:
                                 c, _ = srv.accept(); c.setsockopt(*NODELAY); _keepalive(c); pending.append(c)
                                 if len(pending) > 8:       # reap silent junk before it grows the select set
@@ -2070,9 +2216,10 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             stale = False
                         if msg.get("op") == "job_error":   # an upstream stage rejected THIS job (H1
                             _ret_send({"error": msg["error"]})   # backstop): relay the structured error;
-                            stale = True; continue               # job dead, KV+process alive — the next
-                                                                 # reset re-arms via the stale machinery
+                            stale = True; job_active = False; continue   # job dead, KV+process alive — the
+                                                                 # next reset re-arms via the stale machinery
                         if msg["op"] == "reset":
+                            job_active = True           # probe door: refuse until this job ends
                             job_graph = _reset_flags(msg)   # per-job runtime flags (graph A/B toggle)
                             sess_eagle = bool(msg.get("eagle", 1))   # eagle:0 = degraded coordinator; field absent = old coordinator = aux as launched
                             for L in layers:
@@ -2092,6 +2239,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                       {"ok": 1, "graph": job_graph, "graph_captured": S._GRAPH_COUNT,
                                        "graph_skipped": S._GRAPH_SKIPPED}); continue
                         if msg["op"] == "receipt":          # job done: sign + return the full ring's receipts
+                            job_active = False              # probe door re-opens between jobs
                             if RECEIPTS and signer is not None:
                                 msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
                             # graph-A/B jobs: promote the reply to a dict carrying the tail's graph
@@ -2105,6 +2253,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         if msg["op"] == "reset_batch":      # continuous batching: logical reset of all rows
                             if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
                                 _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
+                            job_active = True               # probe door: refuse until this job ends
                             job_graph = _reset_flags(msg)   # per-job graph arm, like solo's reset (also CLEARS a
                             sess_eagle = bool(msg.get("eagle", 1))   # same honor as solo's reset
                             for L in layers: L.reset()      # stale solo job_graph when the field is absent)
@@ -2214,7 +2363,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             # the coordinator raises JobRejected (never retried as an edge fault).
                             _ret_send({"error": {"code": "kv_overflow", "stage": "tail",
                                                  "message": str(e)[:300]}})
-                            stale = True
+                            stale = True; job_active = False
                             continue
                 except EDGE_ERRORS as e:
                     # PREDECESSOR edge died (ret failures are absorbed in _ret_send, never here). This is
@@ -2235,7 +2384,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                     try:
                         if pred is not None: pred.close()
                     except OSError: pass
-                    pred = None; stale = True             # ret KEPT (ret_kw stays attached); `stale` drops in-flight until the reset
+                    pred = None; stale = True; job_active = False   # ret KEPT (ret_kw stays attached); `stale` drops in-flight until the reset
         return
 
     # head / middle: single predecessor connection, FIRE-FORWARD (direct mode, no relay-back)
@@ -2252,6 +2401,13 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 if tries % 60 == 0:                   # waiting than dead (downstream may be mid-restart)
                     print(f"[s{stage}] forward re-dial {nxt} still failing ({tries} tries)", flush=True)
                 time.sleep(0.5)
+        while True:                               # between sessions: no predecessor = idle by definition,
+            ready, _, _ = select.select(          # so the probe door stays answerable while we wait
+                [srv] + ([probe_srv] if probe_srv is not None else []), [], [])
+            if probe_srv is not None and probe_srv in ready:
+                _probe()
+                continue
+            break
         conn, _ = srv.accept(); conn.setsockopt(*NODELAY); _keepalive(conn)
         conn.settimeout(timeout)                  # bounds a MID-frame stall (H4); idle waits in _recv_pred's select
         if SWARM_TOKEN is not None:               # C2: the predecessor must greet with the swarm token
@@ -2269,16 +2425,19 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
         sess_eagle = True                             # per-session aux arm (reset eagle:0 = degraded coordinator, P0-#5)
+        job_active = False                            # fresh session: no job until its first reset
         with torch.no_grad():
             try:
                 while True:
-                    msg = _recv_pred(conn)
+                    msg = _recv_pred(conn, probe_srv, _probe)
                     if msg.get("op") == "noop":                 # predecessor keep-warm frame: leg-local,
                         continue                                # never forwarded/answered/attested/timed
                     t_rx = time.monotonic()               # stage-timing origin (cheap; used only under M25_STAGE_TIMING)
                     if msg.get("op") == "job_error":     # an upstream stage rejected the job (H1
+                        job_active = False                  # job dead here too — probe door re-opens
                         nxt_kw.send(msg); continue          # backstop): relay it down to the tail untouched
                     if msg["op"] == "reset":
+                        job_active = True                       # probe door: refuse until this job ends
                         _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
                         sess_eagle = bool(msg.get("eagle", 1))  # eagle:0 = degraded coordinator; absent = old coordinator
                         aux_local_job = None                    # a solo job takes over: the local lane closes
@@ -2292,10 +2451,12 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                                    nonce=msg.get("nonce"))   # sign the job freshness challenge in
                         nxt_kw.send(msg); continue              # propagate reset down chain UNCHANGED (carries 'graph' + 'keepwarm_ms')
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
+                        job_active = False                      # probe door re-opens between jobs
                         if RECEIPTS and signer is not None:
                             msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
+                        job_active = True                       # probe door: refuse until this job ends
                         _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
                         sess_eagle = bool(msg.get("eagle", 1))  # same honor as solo's reset
                         aux_local_job = (msg["aux_local"]   # the lane TOKEN: a per-job nonce (job_id is "job"
@@ -2444,6 +2605,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         # must never escape serve()'s unwrapped entrypoint and kill the warm stage.
                         # Signal a structured job_error down the ring — the tail relays it to the
                         # coordinator, which raises JobRejected. Ring alive, job dead.
+                        job_active = False                    # probe door re-opens: this job is over
                         nxt_kw.send({"op": "job_error", "stage": stage,
                                      "error": {"code": "kv_overflow", "message": str(e)[:300]}})
                         continue
