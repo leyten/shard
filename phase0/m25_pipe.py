@@ -360,6 +360,25 @@ def _draft_budget():
     return b if b > 0 else None
 
 
+def _ret_stall_s():
+    """Stall bound (seconds) for the tail's coordinator-return socket (P0-#5 / the M1 wedge). The
+    ret was untimed: a coordinator-side stall (dead conntrack, a full-forever buffer on a wedged
+    relay path) left the tail blocked INSIDE _ret_send's sendall — unable to select, accept a fresh
+    hello_return, or see the next reset: the whole ring wedged behind one send. With the libp2p
+    transport the send loop is per-sendmsg-call (shard/transport._sendall_vectored), so this timeout
+    means "ZERO bytes accepted for this long" — a slow-but-draining residential uplink resets the
+    clock with every accepted chunk and never trips, however big the aux frame. (PSK wire.py uses
+    one sendall = a TOTAL deadline per frame — fine for its LAN/bench use, not the deployment path.)
+    On trip: socket.timeout -> _ret_send's EDGE absorb drops ret, keeps predecessor+KV, marks the
+    job stale — the next coordinator re-adopts mid-session. Env M25_RET_STALL_S; default 180;
+    0/empty disables (the untimed master behavior)."""
+    try:
+        v = float(os.environ.get("M25_RET_STALL_S", "180") or "0")
+    except ValueError:
+        v = 180.0
+    return v if v > 0 else None
+
+
 def _act_digest(t):
     """Deterministic byte digest of an activation tensor for the receipt hash-chain (fp16 bytes)."""
     return t.detach().to(torch.float16).contiguous().cpu().numpy().tobytes()
@@ -1954,6 +1973,9 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 # fresh ret with no prior session starts un-stale (its coordinator hellos + resets anyway).
                 carried = ret is not None
                 ret, pred, queued = _tail_accept(srv, pending, ret=ret, timeout=timeout)
+                _rs = _ret_stall_s()             # M1: bound ret sends by PROGRESS (see _ret_stall_s);
+                if _rs is not None:              # disabled -> keep _tail_accept's greeting timeout as-is
+                    ret.settimeout(_rs)
                 ret_kw.attach(ret)               # after ret_ok went out — a noop can never precede the ack
                 pending = []                     # consumed (became ret/pred or were closed) — don't double-select
                 pred.settimeout(timeout)         # bounds a mid-frame stall; idle waiting happens in select below
@@ -1997,7 +2019,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                         stale = True       # in-flight traffic belongs to the dead job
                                     ret = spoke
                                     try:
-                                        send_msg(ret, "ret_ok"); ret.settimeout(None)   # ret is untimed, like bring-up
+                                        send_msg(ret, "ret_ok"); ret.settimeout(_ret_stall_s())   # M1 stall bound (None when disabled = the old untimed ret)
                                         ret_kw.attach(ret)                   # after ret_ok: noop never precedes the ack
                                         print("[tail] coord-return (re)connected mid-session", flush=True)
                                     except EDGE_ERRORS:    # reconnector died between hello and ack: not a pred event
