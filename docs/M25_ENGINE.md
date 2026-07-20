@@ -20,6 +20,31 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-20 (LATEST-4) — P0-#5 RING-VALIDATED + KNOBS FORWARDED (PR #122); WEDGE FINDING BANKED
+**Controlled-ring validation done** (3×5090 Poland/Germany/Poland, ~$3.5, receipt
+`docs/receipts/eagle-watchdog-ring-20260720.json`; ring torn down, 0 boxes).
+- **Integration PASS:** the shipped #120 build + forwarded knobs serve M2.5 END-TO-END over a real
+  3-region WAN ring, EAGLE on, **degraded=false** (L1/L3 don't false-trip a healthy job), 3 signed
+  stage receipts chained under ONE settlement nonce (hash chain intact; receiptsOk=false is CORRECT
+  fail-closed on a 30/62-layer partial ring). The Leg-8 settlement path + the watchdog code coexist
+  live.
+- **PR #122 MERGED (knob forwarding):** M25_RET_STALL_S / M25_DRAFT_BUDGET_S / M25_JOB_STALL_S /
+  M25_REPLY_TIMEOUT were NOT in the launcher's ENG_ENV → **dead in any real deployment** (a flag a
+  stage never receives does nothing). Added; verified M25_RET_STALL_S=20 reaches the live tail env.
+- **M1 wedge NOT reproducible on a datacenter ring — that IS the finding.** EAGLE runs depth-1 (no
+  return backlog), loopback buffers autotune to 4-6MB (one partial-model aux ~166KB never fills
+  them), and the vast container lacks NET_ADMIN (no tc/iptables to throttle the tail uplink). This
+  is exactly WHY 07-14 only hit the residential home box: the wedge is SUSTAINED backpressure that
+  needs a slow uplink. M1's socket-level bound is already proven offline (test_ret_stallguard.py:
+  real serve() tail, 32KB rcvbuf + 2MB aux → a genuine sendall wedge → recovers). No further ring
+  spend warranted; a true residential-drain repro needs NET_ADMIN (tc netem) or the full 62L model.
+
+**⇒ THE ONE NEXT ACTION: back to the no-spend launch queue** — P0-#1 Leg-7 residue (manifest
+resolution, `sidecar -seed`, node-side challenge sketch, warm re-join receipt) → P0-#3 relay
+automation → P0-#6 churn-survival PROOF (kill a stage mid-serve in the sim → re-form → next request
+serves) → P1-#4 hardening → P1-#3 WSL2 → rehearsal. Small c0mpute follow-up queued: the daemon
+restarts a stall-killed coordinator with `M25_EAGLE=0` (P11 restart-degraded path). Balance ~$26.
+
 ### ⇒ 2026-07-20 (LATEST-3) — P0-#5 EAGLE WATCHDOG SHIPPED (PR #120); PAY-MODEL MERGED (c0mpute #41)
 **The mitigation ladder is on master — "worst case slower, or a clean fast fail; never a silent
 hang" on the deployment path.** Root cause of the 07-14 hang stays open by design (mitigation-first);
