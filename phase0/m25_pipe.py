@@ -734,7 +734,13 @@ def _reset_op(swarm_id, job_id, nonce=None):
     the coordinator's per-job receipt freshness challenge: it rides the reset to every stage so each
     stage signs it into its receipt (a replayed old receipt then carries a stale nonce)."""
     o = {"op": "reset", "temp": 0.0, "top_p": 1.0, "top_k": 0, "seed": 0,
-         "swarm_id": swarm_id, "job_id": job_id}
+         "swarm_id": swarm_id, "job_id": job_id,
+         # the coordinator's EAGLE arm rides every reset (P0-#5): eagle:0 makes each stage silence
+         # its aux payload for the session — the degraded arm then equals the proven plain ring on
+         # the WIRE too, not just coordinator-side. Old stages ignore the field; old coordinators
+         # omit it (stages default to their launch env). A plain-launched coordinator against
+         # eagle-launched stages stops paying for aux it never reads — strictly less traffic.
+         "eagle": 1 if S.M25_EAGLE else 0}
     if nonce is not None:
         o["nonce"] = nonce
     if M25_GRAPH_JOB is not None:
@@ -1982,6 +1988,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 stale = carried                  # carried live ret -> drop its stale in-flight until reset
                 print("[tail] predecessor + coord-return connected", flush=True)
             signer = None; job_graph = None          # job_graph: the reset's APPLIED graph arm (None = plain job)
+            sess_eagle = True                        # per-session aux arm: a reset carrying eagle:0 (a degraded
+                                                     # coordinator, P0-#5) silences the aux payload ring-wide
             with torch.no_grad():
                 try:
                     while True:
@@ -2061,6 +2069,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                                                  # reset re-arms via the stale machinery
                         if msg["op"] == "reset":
                             job_graph = _reset_flags(msg)   # per-job runtime flags (graph A/B toggle)
+                            sess_eagle = bool(msg.get("eagle", 1))   # eagle:0 = degraded coordinator; field absent = old coordinator = aux as launched
                             for L in layers:
                                 L.reset()
                             if "keepwarm_ms" in msg:        # coordinator toggle rode the reset (interleaved A/B)
@@ -2092,6 +2101,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if int(msg.get("B", 1)) > S.M25_BATCH:   # nack a job wider than the launch-time KV
                                 _ret_send({"error": f"B={msg.get('B')} > ring M25_BATCH={S.M25_BATCH}"}); continue
                             job_graph = _reset_flags(msg)   # per-job graph arm, like solo's reset (also CLEARS a
+                            sess_eagle = bool(msg.get("eagle", 1))   # same honor as solo's reset
                             for L in layers: L.reset()      # stale solo job_graph when the field is absent)
                             if RECEIPTS:                    # batched jobs get a FRESH signer (a solo job's
                                 signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # stale signer
@@ -2109,7 +2119,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if RECEIPTS and signer is not None:   # batched rounds are attested like solo — the
                                     signer.observe(_act_digest(x), _act_digest(h))   # standard path must stay receipt-covered
                                 toks = _tail_logits(h, parts).argmax(-1).tolist()
-                                if S.M25_EAGLE:
+                                if S.M25_EAGLE and sess_eagle:
                                     aux = _merge_aux(msg.get("aux"))
                                     if M25_AUX_SLIM and msg.get("tids") is not None:   # slice the return-leg aux to
                                         aux = _slim_aux_b(aux, _aux_keep_lens(msg["tids"], toks))   # accepted prefixes
@@ -2119,7 +2129,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if S.M25_STAGE_TIMING:                # batched rounds get the same per-stage [span,
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)   # compute] stamps as solo — the
                                                                       # round-decomposition experiment's food
-                                _ret_send(o if (S.M25_EAGLE or S.M25_STAGE_TIMING) else toks)
+                                _ret_send(o if ((S.M25_EAGLE and sess_eagle) or S.M25_STAGE_TIMING) else toks)
                                 continue
                             if msg.get("prefill") and "stream" in msg:  # BATCHED prefill into row b (single-stream prefill has no 'stream' -> falls through to the normal path)
                                 x = msg["h"].to(dev)
@@ -2130,7 +2140,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 # (chunk length rides the aux shape) — projecting the whole chunk
                                 # materialized a [1,s,vocab] transient (~1.6GB at s=4096)
                                 toks = _tail_logits(h[:, -1:], parts).argmax(-1)[0].tolist()
-                                _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks); continue
+                                _ret_send({"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks); continue
                             if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
                                 b = msg["stream"]                            # tree-masked block against KV row b —
                                 x = msg["h"].to(dev)                         # MUST route before the row branch (a
@@ -2141,7 +2151,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                                 o = {"toks": toks, "stream": b, "tree": True}   # tree echo: an OLD stage that ran
-                                if S.M25_EAGLE:                              # this frame as chain math replies
+                                if S.M25_EAGLE and sess_eagle:               # this frame as chain math replies
                                     o["aux"] = _merge_aux(msg.get("aux"))    # without it -> the coordinator
                                 if S.M25_STAGE_TIMING:                       # aborts LOUD (version-mix guard)
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
@@ -2155,7 +2165,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
                                 o = {"toks": toks, "stream": b}              # stream tag = the coordinator's LOUD
-                                if S.M25_EAGLE:                              # FIFO-pairing guard
+                                if S.M25_EAGLE and sess_eagle:               # FIFO-pairing guard
                                     o["aux"] = _merge_aux(msg.get("aux"))
                                 if S.M25_STAGE_TIMING:
                                     o["stage_dt"] = _dt_row(msg, "tail", t_rx, t_comp)
@@ -2167,7 +2177,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 if RECEIPTS and signer is not None:   # attest tree blocks too — verification must not silently turn off under M25_TREE
                                     signer.observe(_act_digest(x), _act_digest(h))
                                 toks = _tail_logits(h, parts).argmax(-1)[0].tolist()
-                                o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                                o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks
                                 if S.M25_STAGE_TIMING:            # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                     o = o if isinstance(o, dict) else {"toks": o}
                                     o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
@@ -2181,7 +2191,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             # frames keep every position: the accept walk reads them all.
                             toks = _tail_logits(h[:, -1:] if msg.get("prefill") else h,
                                                 parts).argmax(-1)[0].tolist()
-                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if S.M25_EAGLE else toks
+                            o = {"toks": toks, "aux": _merge_aux(msg.get("aux"))} if (S.M25_EAGLE and sess_eagle) else toks
                             if S.M25_STAGE_TIMING:                # timing promotes a bare-list reply to a dict (coordinator _unpack handles both)
                                 o = o if isinstance(o, dict) else {"toks": o}
                                 o["stage_dt"] = _dt_row(msg, stage, t_rx, t_comp)
@@ -2253,6 +2263,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                 continue
         print(f"[s{stage}] predecessor connected", flush=True)
         signer = None; aux_local_job = None           # aux_local_job: this batched job's head-local aux lane
+        sess_eagle = True                             # per-session aux arm (reset eagle:0 = degraded coordinator, P0-#5)
         with torch.no_grad():
             try:
                 while True:
@@ -2264,6 +2275,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue          # backstop): relay it down to the tail untouched
                     if msg["op"] == "reset":
                         _reset_flags(msg)                       # per-job runtime flags (graph A/B toggle)
+                        sess_eagle = bool(msg.get("eagle", 1))  # eagle:0 = degraded coordinator; absent = old coordinator
                         aux_local_job = None                    # a solo job takes over: the local lane closes
                         for L in layers:
                             L.reset()
@@ -2280,8 +2292,9 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         nxt_kw.send(msg); continue
                     if msg["op"] == "reset_batch":              # continuous batching: propagate logical reset
                         _reset_flags(msg)                       # per-job graph arm applies on EVERY stage (tail acks)
+                        sess_eagle = bool(msg.get("eagle", 1))  # same honor as solo's reset
                         aux_local_job = (msg["aux_local"]   # the lane TOKEN: a per-job nonce (job_id is "job"
-                                         if parts["head"] and msg.get("aux_local") and S.M25_EAGLE else None)   # everywhere — it can't disambiguate residue)
+                                         if parts["head"] and msg.get("aux_local") and S.M25_EAGLE and sess_eagle else None)   # everywhere — it can't disambiguate residue)
                         if aux_local_job is not None:           # ack the local lane on the pipe BEFORE forwarding the
                             send_msg(conn, {"op": "aux_local_ok", "job": aux_local_job})   # reset — the coordinator's
                                                                 # handshake read is then causally satisfied
@@ -2302,7 +2315,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:     # attest batched rounds like solo
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify_batch", "h": h, "start_b": msg["start_b"]}
-                            if S.M25_EAGLE:                          # per-stream aux ([B,K+1,H] rows) to the tail
+                            if S.M25_EAGLE and sess_eagle:           # per-stream aux ([B,K+1,H] rows) to the tail
                                 if aux_local_job is None:            # armed head: its own aux goes on the LOCAL lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))   # (below), never onto the WAN legs
                                 tb = msg.get("token_ids_b") or msg.get("tids")   # drafted rows ride to the TAIL (tiny
@@ -2331,7 +2344,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "tree": True, "stream": b, "h": h, "start": msg["start"],
                                    "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 if aux_local_job is None:                    # armed head: own aux on the local lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             if S.M25_STAGE_TIMING:
@@ -2353,7 +2366,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "stream": b, "h": h, "start": msg["start"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 if aux_local_job is None:                    # armed head: own aux on the local lane
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             if S.M25_STAGE_TIMING:
@@ -2374,7 +2387,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "stream": msg["stream"], "h": h, "start": msg["start"], "prefill": True}
-                            if S.M25_EAGLE:                          # stream-b prefill aux feeds that stream's drafter context
+                            if S.M25_EAGLE and sess_eagle:           # stream-b prefill aux feeds that stream's drafter context
                                 if aux_local_job is None:            # armed head: own aux on the local lane (below)
                                     fwd["aux"] = _merge_aux(msg.get("aux"))
                             nxt_kw.send(_hsend(fwd))
@@ -2395,7 +2408,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                                 signer.observe(_act_digest(x), _act_digest(h))
                             fwd = {"op": "verify", "tree": True, "h": h, "start": msg["start"],
                                    "parents": msg["parents"], "pos_ids": msg["pos_ids"]}
-                            if S.M25_EAGLE:
+                            if S.M25_EAGLE and sess_eagle:
                                 fwd["aux"] = _merge_aux(msg.get("aux"))
                             fwd = _hsend(fwd)
                             if S.M25_STAGE_TIMING:
@@ -2409,7 +2422,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                         h = _block(graph_runners, layers, msg["start"], h, vcfg)
                         t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                         fwd = {"op": "verify", "h": h, "start": msg["start"]}
-                        if S.M25_EAGLE:                              # carry aux hidden states forward to the tail (EAGLE)
+                        if S.M25_EAGLE and sess_eagle:               # carry aux hidden states forward to the tail (EAGLE)
                             fwd["aux"] = _merge_aux(msg.get("aux"))
                         fwd = _hsend(fwd)
                         if S.M25_STAGE_TIMING:
