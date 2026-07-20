@@ -143,8 +143,8 @@ You have a working decentralized inference network. What's left is turning "I ca
    shard.coordinate served a real job on a real 6-box ring; 6 receipts tiling [0:62) verified under pinned
    assignments, every stage signing the injected settlement nonce). **Assignment-EPOCH fix DONE 2026-07-20** (c0mpute #37:
    per-job settlement snapshot frozen at dispatch — churn can neither strand honest work unpaid nor frame
-   the coordinator as fraud; epoch-settle-test 9/9). **PAY-MODEL BUILT 2026-07-20 (c0mpute PR #41, OPEN —
-   merges/deploys at launch):** leyten's decision applied — USDC via the EXISTING revenue-share economy;
+   the coordinator as fraud; epoch-settle-test 9/9). **PAY-MODEL BUILT + MERGED 2026-07-20 (c0mpute PR #41,
+   on master, GATED OFF — the flag flips at launch):** leyten's decision applied — USDC via the EXISTING revenue-share economy;
    a settled job's collected revenue splits FLAT BY LAYERS, then each stage keeps ITS OWN
    `getWorkerRevenueShare` (per-worker cut AFTER the split — staked 80% / unstaked 70%, never blended);
    one `recordEarning` per stage on the existing payout rails; swarm errors now refund. GATED behind
