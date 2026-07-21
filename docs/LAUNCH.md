@@ -64,9 +64,17 @@ You have a working decentralized inference network. What's left is turning "I ca
    refuses mid-job, every termination re-opens, fail-closed sans token; c0mpute #43: daemon answers
    `swarm:challenge` via the door, crypto-random seeds + commit-first projSeed + busy=flake-not-fail;
    spot-checking shard swarms is now MECHANICALLY possible — bank tooling + shadow-mode threshold
-   validation before enforcement). **Remaining for the checkmark:** warm re-join ≤3min acceptance
-   receipt — REAL-box measurement (weights-load dominated), folded into the P0-#6 churn-proof ring
-   session (one ring, two receipts)._
+   validation before enforcement).
+   _Progress 2026-07-21 — **the torrent stack is REAL-HARDWARE PROVEN** (receipt
+   `docs/receipts/torrent-stack-realhw-20260721.json`, ~$0.30, 2× 5090 PL+CZ, the REAL signed
+   MiniMax-M2.5 manifest `mf1:m25-nvfp4-v1@bafkreib5dd2vl3…`): ① verified mirror pull of layers
+   30-31 (10GB) with the FULL trust surface (CID + pubkey signature + model_id + layer_count — all
+   gates cleared, every shard re-hashed); ② `sidecar -seed` served the shards; ③ the CZ box pulled
+   all 10GB PEER-FIRST from PL with a DELIBERATELY BROKEN mirror → `block verified: 5 files`, so
+   the bytes came from the peer over libp2p and hash-verified, not a mirror fallback. The published
+   `sidecar-v0.1.0` also downloaded + sha-verified from both real boxes (the all-joins blocker fix,
+   confirmed on hardware)._ **Remaining for the checkmark:** the warm re-join ≤3min receipt (needs
+   the full daemon serve — npm-publish-gated), folded into the P0-#6 rehearsal ring._
 
 2. **Kill the portability landmines** — every "works only on a vast /root box" assumption. Found live
    today: ~~`m25_pull_range.py` hardcodes `/root/.hf_token`~~ ✅, ~~`node_kv`'s flat `import transport` needs

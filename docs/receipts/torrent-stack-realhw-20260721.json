@@ -1,0 +1,35 @@
+{
+  "receipt": "torrent stack on real hardware — verified manifest resolution + verified pull + standby seeding + verified peer pull",
+  "date": "2026-07-21",
+  "what_this_proves": "The P0-#1 launch story 'torrent from peers, not the mirror' works end-to-end on REAL cross-WAN hardware with REAL MiniMax-M2.5-NVFP4 weights (10GB / 2 layers), through the signed-manifest verification path. First real-hardware exercise of the 2026-07-20/21 manifest+seed stack (prior P2P proof #61 was 5GB synthetic, not through shard.fetch's signed-manifest gates).",
+  "manifest": {
+    "ref": "mf1:m25-nvfp4-v1@bafkreib5dd2vl33joywylkcya2f3bbqffpskaudnabh3xwwcokg7xox6si",
+    "publisher_pubkey": "7efZv8iiizNJITP3ZLzVUwGUpY0aZBme/92t5fFyXs0=",
+    "model_id": "nvidia/MiniMax-M2.5-NVFP4",
+    "layer_count": 62,
+    "signed_by": "session offline key (scratchpad/ring/session-publisher.key)"
+  },
+  "sidecar_release": {
+    "asset": "sidecar-v0.1.0/sidecar-linux-amd64",
+    "sha256": "4f88dd4c6c70be636af520b6fc239f6e27a8e45ca4b4ec3bcbe585f1e3a01153",
+    "verified_from_box": "both boxes downloaded the PUBLISHED release and sha-matched the baked pin — the all-joins blocker fix works from a real box"
+  },
+  "boxes": {
+    "A_seeder": {"vast_iid": 45457764, "gpu": "RTX 5090", "geo": "Poland", "ip": "185.17.42.82", "sidecar_peerid": "12D3KooWFzABLsxRkjWQ52jkaZTkNr9Q11ByNnAJNFqstZUWhGjq"},
+    "B_puller": {"vast_iid": 45457765, "gpu": "RTX 5090", "geo": "Czechia", "ip": "93.91.156.82"}
+  },
+  "stage1_verified_mirror_pull": {
+    "box": "A",
+    "range": "layers [30:32]",
+    "result": "SHARD_FETCH_DONE {files:5, bytes:9979547922}",
+    "trust_surface": "--manifest-cid (bytes==CID) + --pubkey (ed25519 signature) + --expect-model-id + --expect-layer-count — ALL gates cleared before any byte, then every shard re-hashed vs the manifest (0 .part remaining)"
+  },
+  "stage2_seed_and_verified_peer_pull": {
+    "seeder_A": "sidecar -seed manifest=dir -> 'SEEDING 5 shards'; SERVED bytes[0:4961488672] + bytes[0:4998528136] + bytes[0:19521473] to B over libp2p",
+    "puller_B": "shard.fetch --bootstrap <A addr> --mirror <DELIBERATELY BROKEN http://127.0.0.1:1/nope/> -> SHARD_FETCH_DONE {files:5, bytes:9979547922}; 'block verified: 5 files'",
+    "proof": "the broken mirror means all 10GB came from peer A over libp2p and hash-verified against the signed manifest — verified peer delivery, not a mirror fallback"
+  },
+  "not_covered_here": "full daemon integration (worker self-provision -> announce -> assign -> serve -> churn -> warm re-join) is npm-publish-gated (@c0mpute/worker still 2.8.2) + needs the full 62-layer model (6+ boxes); its control-plane logic is sim-proven (churn-proof.sh, p11-restart-test.sh, leg8-serve-test). Challenge-probe-on-GPU needs the sm_120 torch build (engine deps), skipped (the #126 sketch fix is test-proven by construction).",
+  "spend": "~$1-2 (2x RTX 5090 ~$0.5/hr, <1hr); balance was ~$25",
+  "boxes_torn_down": true
+}
