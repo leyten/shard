@@ -1,0 +1,41 @@
+{
+  "receipt": "launch-rehearsal ring — 6-box EU, real MiniMax-M2.5 on real 5090s via the stranger daemon path",
+  "date": "2026-07-21",
+  "goal": "mimic real strangers joining at launch as faithfully as possible on VAST; find pain points before real people do; measure real performance. Test orchestrator only — never prod, never npm.",
+  "spend": "~$8 total (1 preflight box + 6 ring boxes, ~1.5h); balance $16.83 after",
+  "method": "3-agent design panel (realism/perf/provisioning) -> build fixes -> 1-box engine preflight -> 6-box full ring. Faithful stranger path: built worker shipped as a tarball (scp not npx, the one deviation), self-provisions engine+venv+sidecar+manifest+pull with zero env beyond the manifest pubkey pin + announce.",
+
+  "bugs_found_and_fixed": [
+    {"id": 1, "severity": "FATAL", "found_by": "design panel (2 agents converged, pre-spend)", "bug": "daemon never passed sidecar -announce, so behind docker/NAT the sidecar advertised only its container-internal addr (172.17.x.x); ringmates dialed an unroutable private IP and the ring silently never formed", "fix": "c0mpute #51 — announce the detected public addr (C0MPUTE_SHARD_ANNOUNCE override for docker port-maps)", "validated": "the ring FORMED across 6 EU boxes; a box announced /ip4/<pub>/tcp/<mapped> and reached stage READY"},
+    {"id": 2, "severity": "perf", "found_by": "design panel (pre-spend)", "bug": "a stranger's --mode shard launched stage/coordinator WITHOUT graph-aux (CUDA-graph/static-KV/SDPA), so real rings would serve at the ~2x-slower no-graph floor", "fix": "c0mpute #51 — default the bit-exact graph trio on, operator env wins", "validated": "boxes launched with the defaults; tok/s effect UNMEASURED (see serve gap)"},
+    {"id": 3, "severity": "observability", "found_by": "design panel (pre-spend)", "bug": "the engine computes tok_s/mean_accept/g/transport-split then dropped them from SHARD_JOB_DONE — the daemon serve path was unmeasurable", "fix": "shard #133 — additive SHARD_JOB_METRICS line", "validated": "code sound; not exercised (0-token serve)"},
+    {"id": 4, "severity": "harness-blocker", "found_by": "design panel (pre-spend)", "bug": "the sim SimSeam.plan could not tile 62 layers across 6 stages (62=2x31: even split drops layers or overshoots to null)", "fix": "c0mpute #51 — --full remainder-aware split floor(i*L/n)", "validated": "ring formed with [0:10)[10:20)[20:31)[31:41)[41:51)[51:62)"},
+    {"id": 5, "severity": "FATAL", "found_by": "1-box preflight (real hardware)", "bug": "manifest must be served BYTE-VERBATIM (the mf1 CID is over exact bytes); the sim re-serialized it (JSON.parse->stringify) -> CID mismatch -> pull fail-closed", "fix": "c0mpute #51 — serve /manifests/ raw", "validated": "pull passed CID after the fix"},
+    {"id": 6, "severity": "FATAL (launch-breaker)", "found_by": "1-box preflight (real hardware)", "bug": "the daemon's OWN resolveManifest re-serialized the fetched doc (res.json()->JSON.stringify) before writing it, breaking the very --manifest-cid check it later runs. My CID pinning and my manifest resolver were mutually incompatible — EVERY launch pull would have failed closed", "fix": "c0mpute #51 — keep the raw bytes, parse only a copy for the pin/version guards, write verbatim", "validated": "manifest resolved verbatim -> 35GB verified pull -> stage loaded"},
+    {"id": 7, "severity": "launch-relevant", "found_by": "6-box ring (real hardware)", "bug": "a cold cohort all joining at once triggers a re-form STORM: eager auto-form fires the moment minStages announce, but boxes take ~30min to pull+load; any disconnect DEGRADES the swarm and re-forms, preempting every in-progress pull so nothing stabilizes", "fix": "PARTIAL — c0mpute #51 --debounce lets nodes settle before forming; a real mitigation (don't re-form while stages are mid-pull, formation cooldown) is a follow-up", "validated": "reproduced; the storm is what starved the serve"}
+  ],
+
+  "proven_green_on_real_hardware": [
+    "stranger self-provision: git-clone engine + pinned torch-2.11/vLLM/cutlass venv builds cleanly on a fresh 5090 box (zero env beyond the pubkey pin)",
+    "sidecar-v0.1.0 released binary downloads + sha-verifies from a real box",
+    "engine LOADS + RUNS on the 5090's sm_120: 'moe_backend auto -> cutlass (sm_120)', SHARD_STAGE_READY, 29.6GB/32.6GB VRAM (12 real layers)",
+    "network manifest resolution (verbatim) -> --manifest-cid + pubkey + expect-* all pass",
+    "verified pull of 35GB real weights (18 files, all hash-checked vs the signed manifest)",
+    "standby seeding + verified PEER pull: the seed box SERVED weight blocks over libp2p to the overlapping-range stage (torrent path, not HF)",
+    "the -announce fix: boxes advertise their real public addr; the ring FORMS across 6 EU boxes (SE/DK/CZ)",
+    "the full 62-layer tiling across 6 stages"
+  ],
+
+  "NOT_achieved": {
+    "end_to_end_serve_tokens": "The ring formed and the perf suite dispatched, but every job returned 0 TOKENS (warmup showed real 550ms/1350ms TTFT then empty; settlement rejected — no stage signed a receipt). Root cause: the ring never STABILIZED (the re-form storm, bug #7, meant stages/tunnels were still settling when the suite dispatched), and possibly a coordinator-drives-tokens-over-a-real-multi-hop-WAN-ring gap that needs isolating. So NO tok/s / TTFT / context numbers were captured.",
+    "why_stopped": "the sim relaunch fought a shell-env bug repeatedly while 7 boxes burned; the disciplined call was to bank the findings and tear down rather than chase a stable serve at negative return."
+  },
+
+  "fidelity": {
+    "faithful": "real self-provision, real measured admission (shard.probe on a real 5090), real signed-manifest verified pull, real libp2p transport + relay discovery + DHT/blockx seeding, real cross-EU ring formation, real sm_120 engine",
+    "approximated": "NAT ~ port-mapped VAST box (not residential CGNAT); strangers ~ boxes we rent (homogeneous 5090s); delivery ~ tarball not npx",
+    "cannot_test_here": "true residential/WSL2 (leyten's Ghent box); npx from the public registry (publish-gated); real human UX"
+  },
+
+  "next": "A focused follow-up: stabilize the ring (the debounce + a 'no re-form while pulling' guard), get all 6 stages solidly READY, then isolate the coordinator serve over the real multi-hop ring to produce the first real tok/s numbers. All the hard prerequisites (engine on sm_120, verified pull, seeding, formation) are now proven; the remaining gap is the leg-8 serve stability over a real WAN ring + the churn-storm mitigation."
+}
