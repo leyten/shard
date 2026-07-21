@@ -7,13 +7,20 @@
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
 > _Last synced: 2026-07-20._
 >
-> **REMAINING BLOCKERS AT A GLANCE (2026-07-20 night):** P0-#6 churn-survival PROOF (+ the warm
-> re-join ≤3min receipt, folded into the same ring session) · P1-#3 WSL2 turnkey · P1-#4 adversary
-> hardening → then the rehearsal day. DONE TODAY: P0-#1 residue **3/4** (manifest resolution shard
-> #125 + c0mpute #42 · standby `sidecar -seed` c0mpute #42 · challenge probe shard #126/#127 +
-> c0mpute #43) **and P0-#3 relay automation** (relays LIVE as systemd services + reservations
-> verified; daemon auto-discovery c0mpute #44). Earlier: P0-#2, P0-#4, P0-#5 EAGLE watchdog,
-> P1-#1 (map live), P1-#2 (Leg 8 + epoch + pay-model).
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-21):** the buildable launch list is DONE — what's left
+> is **one real-hardware ring session** (validates the whole new stack end-to-end: verified pull →
+> seeding → churn → warm re-join ≤3min receipt) plus **leyten-gated publish actions** (npm publish
+> `@c0mpute/worker` ≥2.8.3; the one-time offline-key manifest publish; the Ghent WSL smoke) → then
+> the rehearsal day.
+>
+> **DONE 2026-07-21 (one session, 10 PRs, no spend):** sidecar `v0.1.0` PUBLISHED + pinned (was a
+> hidden blocker for every Go-less join) · **P1-#4 adversary hardening COMPLETE** — reputation gate
+> + spot-check scheduler + auditors wired (c0mpute #47), ring-wide C2 `SHARD_SWARM_TOKEN` closes the
+> head allow-all hole (#46), metered OpenAI API routes the swarm model so it's sellable (#46) · **P11
+> restart-degraded** coordinator EAGLE-off after a stall-kill (#46) · **P1-#3 WSL2 turnkey** daemon
+> side — `wsl-setup.sh` + `WINDOWS.md` (#48) · **P0-#6 churn self-heal PROVEN in sim** + the real bug
+> it caught (#45) · **launch-day failure playbook** (#46). DONE 07-20: P0-#1 residue 3/4 (manifest
+> resolution, seeding, challenge probe), P0-#3 relays. Earlier: P0-#2/#4/#5, P1-#1/#2.
 
 ---
 
