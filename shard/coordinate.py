@@ -269,6 +269,17 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
         try:
             r = run_job(MP, tok, eos_set, chans, a, job, emit=emit, watchdog=watchdog, redial=redial)
             if r.get("ok"):
+                # Surface the PERF fields the engine computes (they were being dropped — the
+                # daemon serve path was unmeasurable: no tok/s, g, or transport split). Additive
+                # line; consumers that don't know it ignore it (the daemon logs unknown contract
+                # lines). Only the keys the run actually produced are emitted.
+                metrics = {k: r[k] for k in (
+                    "tok_s", "mean_accept", "toks_per_traversal", "prefill_s", "decode_s",
+                    "draft_s", "ring_wait_s", "n_tokens", "prompt_tokens", "graph_arm",
+                    "traversal_s", "stage_s", "stage_compute_s", "transport_s", "per_stage_ms",
+                ) if k in r}
+                if metrics:
+                    emit("SHARD_JOB_METRICS", jobId=job_id, **metrics)
                 emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
                      response=r.get("text", ""), tokensGenerated=int(r.get("n_tokens", 0)),
                      receipts=r.get("receipts") or [], receiptsOk=r.get("receipts_ok"),
