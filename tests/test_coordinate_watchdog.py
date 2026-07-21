@@ -56,6 +56,9 @@ def _factory(monkeypatch, flags):
         d, embed = _make_head(0)
         return HybridDrafter(ng, EagleDrafter(d, embed, device="cpu", next_hidden="prenorm"))
     monkeypatch.setattr(FR.MP, "make_drafter", make_drafter)
+    # the synthetic head stands in for a present /root/m25-eagle, so eagle_armed() (which the real
+    # coordinator gates its degraded-retry + wire flag on) must report armed whenever M25_EAGLE is set.
+    monkeypatch.setattr(FR.MP, "eagle_armed", lambda: bool(FR.MP.S.M25_EAGLE))
     return flags
 
 
@@ -260,7 +263,8 @@ def test_l3_watchdog_fires_on_wedged_coordinate_pipe(monkeypatch):
 
     MP = types.SimpleNamespace(S=types.SimpleNamespace(M25_EAGLE=False, M25_TREE=False),
                                EDGE_ERRORS=(OSError, EOFError), TransportError=ConnectionError,
-                               make_drafter=lambda n=3: object(), coordinate_pipe=wedged_pipe)
+                               make_drafter=lambda n=3: object(), eagle_armed=lambda: False,
+                               coordinate_pipe=wedged_pipe)
     emits = []
 
     def emit(tag, **fields):
@@ -352,3 +356,18 @@ def test_l3_real_exit_subprocess():
     assert r.returncode == 1, f"rc={r.returncode}\n{r.stdout}\n{r.stderr}"
     assert "stall-watchdog" in r.stdout, r.stdout
     assert dt < 45, f"child took {dt:.0f}s — it rode a recv timeout, not the watchdog"
+
+
+def test_eagle_requested_but_head_absent_degrades(monkeypatch, tmp_path):
+    """LAUNCH FAIL-SAFE: a stranger who self-provisions pulls the base-model shards but NOT the EAGLE
+    head, so M25_EAGLE=1 with no head checkpoint must build the n-gram drafter and stamp eagle:0 on the
+    wire — NEVER let _eagle_singleton() FileNotFoundError crash the coordinator into a 0-token restart
+    loop (the real bug the 07-21 rehearsal hit). The disable is process-latched, so it says so once."""
+    MP = FR.MP
+    monkeypatch.setattr(MP.S, "M25_EAGLE", True)
+    monkeypatch.setattr(MP, "_EAGLE_DISABLED", False)
+    monkeypatch.setenv("M25_EAGLE_DIR", str(tmp_path / "absent-head"))   # no config.json inside
+    assert MP.eagle_armed() is False
+    assert isinstance(MP.make_drafter(), NgramDrafter)
+    assert all(isinstance(d, NgramDrafter) for d in MP.make_drafters_b(3))
+    assert MP._reset_op("sw", "job")["eagle"] == 0, "a degraded coordinator must not ask stages for aux"

@@ -25,7 +25,15 @@ MP = fr.MP
 send_msg, recv_msg = fr.send_msg, fr.recv_msg
 
 
-def test_reset_op_stamps_the_coordinator_eagle_arm(monkeypatch):
+def test_reset_op_stamps_the_coordinator_eagle_arm(monkeypatch, tmp_path):
+    # eagle_armed() = requested AND the head checkpoint present; a present head makes the coordinator
+    # EFFECTIVELY armed, so the reset stamps eagle:1. (A headless M25_EAGLE=1 coordinator degrades to
+    # n-gram and stamps eagle:0 — covered by test_coordinate_watchdog's fail-safe test.)
+    head = tmp_path / "m25-eagle"
+    head.mkdir()
+    (head / "config.json").write_text("{}")
+    monkeypatch.setenv("M25_EAGLE_DIR", str(head))
+    monkeypatch.setattr(MP, "_EAGLE_DISABLED", False)
     monkeypatch.setattr(fr.S, "M25_EAGLE", True)
     assert MP._reset_op("s", "j")["eagle"] == 1
     monkeypatch.setattr(fr.S, "M25_EAGLE", False)
