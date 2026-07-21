@@ -20,6 +20,52 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-21 (LATEST-6) — THE BUILDABLE LAUNCH LIST IS DONE (10 PRs, one no-spend session)
+**P1-#4 hardening is COMPLETE, P1-#3 WSL2 daemon-side done, P11 done, the sidecar release is
+published — the only engineering left is the real-hardware ring capstone.** Method held: recon
+fan-out → build → red/green proof (caught real bugs again).
+- **Sidecar `v0.1.0` PUBLISHED + pinned** (shard release, c0mpute pin 4f88dd4c…). This was a HIDDEN
+  blocker for EVERY Go-less stranger join — the daemon downloaded a release that didn't exist,
+  falling back to a go-build strangers lack. Reproducible from the public workflow (go 1.25.7 per
+  go.mod). Verified: download → sha match → runs.
+- **P1-#4 adversary hardening COMPLETE (the audit's refuse-to-launch list):**
+  - **#7 reputation/spot-check/auditor (c0mpute #47):** GradedReputation was built + tested but the
+    live server wired NEITHER `trust:` NOR `auditors:` — rings formed with no sybil gate and no way
+    to spot-check a stranger. Now: reputation passed as `trust` (a proven cheater → `rejected` →
+    refused at announce), `auditors` from `SWARM_AUDITOR_PUBKEYS`, a probabilistic
+    `swarmSpotCheckSweep` (the stage-node analogue of canarySweep), reputation persisted to
+    `data/swarm-reputation.json` so a cheater can't rejoin by waiting for a deploy.
+    reputation-gate-test 9/9 (incl. verdict-survives-restart).
+  - **#6 transport auth (c0mpute #46):** orchestrator mints a per-swarm `SHARD_SWARM_TOKEN`,
+    distributed in `swarm:assign`, armed ring-wide — closes the head stage's allow-all sidecar hole
+    (a stranger who learns the head addr could inject activation frames; the engine gate now stops
+    them). Assign-channel only, never argv.
+  - **#4 metered API → swarm (c0mpute #46):** `mapModel` routes `c0mpute-swarm`/`minimax-m2.5` to the
+    ring, `/api/v1/models` lists it (availability via a new `swarmModels` stat). The swarm model is
+    now SELLABLE through the authed OpenAI-compatible endpoint (keys/rate-limit/credits/refund all
+    inherited). Per-token $/M billing stays Phase 2.
+  - Engine adversary surface (C1/H1/H2/H4/M7-M12) was already closed with tests — LAUNCH.md's
+    P1-#4 one-liner was STALE.
+- **P11 restart-degraded (c0mpute #46):** a stall-watchdog kill relaunches the coordinator
+  M25_EAGLE=0 (proven plain ring) instead of re-wedging. p11-restart-test.sh red→green (a 1-node
+  ring dials its own return, so head≠tail).
+- **P1-#3 WSL2 turnkey daemon side (c0mpute #48):** `scripts/wsl-setup.sh` (git+node20+py3.11 → npx
+  worker) + `c0mpute-worker/WINDOWS.md`. Sidecar release + relay auto-discovery already cleared the
+  hard blockers.
+- **Launch-day playbook (`c0mpute LAUNCH_PLAYBOOK.md`):** every foreseeable failure → symptom →
+  pre-staged fix + 3 one-line kill-switches; the deepest mitigation = everything swarm-side is
+  dormant behind flags, so a swarm bug's blast radius is contained to the swarm model.
+
+**⇒ THE ONE NEXT ACTION: the real-hardware RING SESSION (the capstone — needs the spend green-light).**
+It's the first time the whole new stack touches real GPUs: network manifest resolution → verified
+peers-first pull → standby seeding carrying real bytes → challenge probe on a real stage → churn kill
+→ warm re-join ≤3min receipt. Sim orchestrator on the kloot box serves the REAL signed manifest
+(`mf1:m25-nvfp4-v1@bafkreib5dd2vl3…`, pubkey `7efZv8ii…`) + the real relay list; the sim now has
+`--manifest-file`/`--relays-file`/`--churn`/`--p11` for exactly this. ~$10-15 for a 6-7 box EU ring;
+$25 balance is thin (dud margin) — a top-up gives runway + keep-warm. **Leyten-gated remainder:** npm
+publish `@c0mpute/worker` ≥2.8.3 (creds), the one-time offline-key manifest publish at go-live, the
+Ghent WSL smoke. Then the rehearsal day.
+
 ### ⇒ 2026-07-20 (LATEST-5) — P0-#1 LEG-7 RESIDUE 3/4 CLOSED IN ONE NO-SPEND DAY (5 PRs, all merged)
 **Manifest resolution + standby seeding + the node-side challenge probe are DONE on both sides;
 the torrent path and spot-checking are now mechanically real.** Method: recon fan-out → two-angle
