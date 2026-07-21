@@ -212,6 +212,110 @@ class EagleDrafter:
         return out
 
     @torch.no_grad()
+    def draft_topk(self, k, topk=4):
+        """M25_CORRHEDGE: _draft(k) with per-step top-`topk` TARGET-space candidate
+        recording. The chain follows rank-1 exactly like _draft (cands[i][0] == out[i]); the ranked
+        tail (ranks 2..topk) prices the correction-token hedge — the measured rank profile says the
+        verifier's correction lands there with mass q2+q3+q4 ≈ 0.19. Same scratch-tail contract as
+        _draft: the committed cache is never mutated."""
+        if self.ctx_len == 0 or self._last_h is None:
+            t = int(self._last_tok) if self._last_tok is not None else 0
+            return [t] * k, None
+        lin = torch.nn.functional.linear
+        self._ensure_cap(self.ctx_len + k)
+        T = self.ctx_len
+        out = []; cands = []
+        h = self._last_h; tok = self._last_tok; base = self._last_pos
+        for i in range(k):
+            en = _rms(self.embed[tok].unsqueeze(0), self.in_ln, self.eps)
+            hn = _rms(h, self.h_ln, self.eps)
+            x = torch.cat([en, hn], -1)
+            res = h
+            q = lin(x, self.qp).view(self.NH, self.HD)
+            p = min(base + i, self.cos.shape[0] - 1)
+            cos = self.cos[p].view(1, self.HD); sin = self.sin[p].view(1, self.HD)
+            q = q * cos + _rotate_half(q) * sin
+            if i > 0:
+                kk = lin(x, self.kp).view(self.NKV, self.HD)
+                vv = lin(x, self.vp).view(self.NKV, self.HD)
+                self.kbuf[T] = kk * cos + _rotate_half(kk) * sin
+                self.vbuf[T] = vv; T += 1
+            qg = q.view(self.NKV, self.GRP, 1, self.HD)
+            Kt = self.kbuf[:T].permute(1, 2, 0).unsqueeze(1)
+            att = torch.softmax((qg @ Kt).float() / (self.HD ** 0.5), -1).to(q.dtype)
+            Vt = self.vbuf[:T].permute(1, 0, 2).unsqueeze(1)
+            o = (att @ Vt).reshape(1, self.NH * self.HD)
+            res = lin(o, self.op) + res
+            hn2 = _rms(res, self.post_ln, self.eps)
+            res = lin(torch.nn.functional.silu(lin(hn2, self.gp)) * lin(hn2, self.upp), self.dp) + res
+            hf = _rms(res, self.norm, self.eps)
+            logits = lin(hf, self.lm)
+            dtop = logits.topk(min(topk, logits.shape[-1]), -1).indices[0].tolist()
+            ctop = [int(d) + int(self.d2t[d]) for d in dtop]
+            tok = ctop[0]
+            out.append(tok); cands.append(ctop)
+            h = hf if self.next_hidden == "final" else res
+        return out, cands
+
+    @torch.no_grad()
+    def propose_ahead(self, spec, k):
+        """Draft k tokens CONDITIONED on `spec` — hypothesis tokens beyond the committed context —
+        by running the _draft chain with the first len(spec) steps' OUTPUT tokens forced to spec
+        (own stale hidden carry), then emitting k free chain tokens. spec == [] reduces to _draft(k)
+        exactly (same loop, zero forced steps). Chain k/v go to the scratch tail like _draft — the
+        committed cache is never mutated, so a discarded hedge draft costs nothing to roll back.
+        (The hedge feeds it ds[:j-1]+[c], the correction-candidate hypothesis,
+        instead of the own-proposal tail.)"""
+        if self.ctx_len == 0 or self._last_h is None:
+            return [int(self._last_tok) if self._last_tok is not None else 0] * k
+        spec = list(spec)
+        a = len(spec)
+        lin = torch.nn.functional.linear
+        self._ensure_cap(self.ctx_len + a + k)
+        T = self.ctx_len
+        out = []
+        h = self._last_h; tok = self._last_tok; base = self._last_pos
+        for i in range(a + k):
+            en = _rms(self.embed[tok].unsqueeze(0), self.in_ln, self.eps)
+            hn = _rms(h, self.h_ln, self.eps)
+            x = torch.cat([en, hn], -1)
+            res = h
+            q = lin(x, self.qp).view(self.NH, self.HD)
+            p = min(base + i, self.cos.shape[0] - 1)
+            cos = self.cos[p].view(1, self.HD); sin = self.sin[p].view(1, self.HD)
+            q = q * cos + _rotate_half(q) * sin
+            if i > 0:
+                kk = lin(x, self.kp).view(self.NKV, self.HD)
+                vv = lin(x, self.vp).view(self.NKV, self.HD)
+                self.kbuf[T] = kk * cos + _rotate_half(kk) * sin
+                self.vbuf[T] = vv; T += 1
+            qg = q.view(self.NKV, self.GRP, 1, self.HD)
+            Kt = self.kbuf[:T].permute(1, 2, 0).unsqueeze(1)
+            att = torch.softmax((qg @ Kt).float() / (self.HD ** 0.5), -1).to(q.dtype)
+            Vt = self.vbuf[:T].permute(1, 0, 2).unsqueeze(1)
+            o = (att @ Vt).reshape(1, self.NH * self.HD)
+            res = lin(o, self.op) + res
+            hn2 = _rms(res, self.post_ln, self.eps)
+            res = lin(torch.nn.functional.silu(lin(hn2, self.gp)) * lin(hn2, self.upp), self.dp) + res
+            hf = _rms(res, self.norm, self.eps)
+            if i < a:
+                tok = int(spec[i])                    # forced: the hypothesis token
+            else:
+                did = int(lin(hf, self.lm).argmax(-1))
+                tok = did + int(self.d2t[did])
+                out.append(tok)
+            h = hf if self.next_hidden == "final" else res
+        return out
+
+    def fetch_hedge(self):
+        """M25_CORRHEDGE shim: fetch() that also returns the per-step top-4 candidate lists (None when
+        the drafter has no ranked candidates — the coordinator then hedges nothing, master path)."""
+        ids, k = self._pending
+        if self.ctx_len > 0:
+            return self.draft_topk(k)
+        return self.propose(ids, k), None
+
+    @torch.no_grad()
     def propose_tree(self, m, topb=3, max_depth=8):
         """Expand a speculative TREE over the persistent committed context: BEST-FIRST top-M selection
         (EAGLE-2 style) instead of fixed per-depth fan-out — the fleet-measured waste of a full 2^d tree
@@ -643,3 +747,23 @@ class HybridDrafter:
         if self._eagle_off:                             # degraded: ride the n-gram's padded k tokens instead
             return ng
         return self.eagle.propose(ids, k)
+
+    def fetch_hedge(self):
+        """M25_CORRHEDGE: fetch() that also returns per-step top-4 candidate lists.
+        n-gram MATCHED rounds have no candidate ranking (q2+ does not exist for the
+        n-gram drafter) -> cands=None, the coordinator hedges nothing (master behavior). Only the
+        EAGLE (novel) half records candidates; its rank-1 chain is _draft exactly."""
+        ids, k = self._pending
+        ng = self.ngram.fetch()
+        if getattr(self.ngram, "matched", False):
+            self.matched = True
+            return ng, None
+        self.matched = False
+        if self.eagle.ctx_len > 0:
+            return self.eagle.draft_topk(k)
+        return self.eagle.propose(ids, k), None
+
+    def propose_ahead(self, spec, k):
+        """M25_CORRHEDGE: forced-prefix continuation draft for a hedge branch (EAGLE half only —
+        hedges are only ever constructed on novel rounds, where cands existed)."""
+        return self.eagle.propose_ahead(spec, k)
