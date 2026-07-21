@@ -20,6 +20,38 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-21 (LATEST-7) — LAUNCH-REHEARSAL RING: 7 BUGS FOUND, ENGINE PROVEN ON sm_120, SERVE GAP OPEN
+**A 6-box EU rehearsal ring on real 5090s (~$8, receipt `docs/receipts/launch-rehearsal-20260721.json`)
+served MiniMax-M2.5 via the faithful stranger daemon path. It found 7 launch bugs and proved the
+hardest parts — but did NOT get tok/s numbers (the end-to-end serve returned 0 tokens).** Test
+orchestrator only; prod + npm untouched. Method: 3-agent design panel → fixes → 1-box engine
+preflight → 6-box full ring.
+- **7 bugs (all fixed; c0mpute #51, shard #133):** (1) FATAL no `-announce` → rings never form behind
+  NAT/docker; (2) graph-aux off by default → ~2× slow; (3) serve metrics dropped; (4) sim couldn't
+  tile 62=2×31; (5) FATAL manifest must be served byte-verbatim; (6) **FATAL — my OWN resolveManifest
+  re-serialized the doc (res.json()→stringify), breaking the --manifest-cid check it later runs →
+  EVERY launch pull would fail closed**; (7) cold-cohort re-form STORM (eager auto-form + boxes
+  30-min-pulling + any disconnect re-forms → preempts every pull). #1-4 caught pre-spend by the panel;
+  #5-7 only real hardware exposed.
+- **PROVEN GREEN on real 5090s:** stranger self-provision (torch-2.11/vLLM/cutlass venv), engine LOADS
+  on sm_120 (`moe_backend auto→cutlass`, SHARD_STAGE_READY, 29.6/32.6GB VRAM), verified 35GB pull
+  (18 files hash-checked), peer seeding (seed box SERVED blocks over libp2p), and RING FORMATION
+  across 6 EU boxes (the -announce fix — full 62-layer tiling `[0:10)…[51:62)`).
+- **NOT achieved — the tok/s numbers:** the ring formed + the suite dispatched but every job returned
+  0 TOKENS (warmup real 550/1350ms TTFT then empty; settlement rejected, no receipts). Cause = the
+  re-form storm (#7) meant stages/tunnels were still settling when the suite ran; possibly also a
+  coordinator-drives-tokens-over-a-real-multi-hop-WAN-ring gap to isolate. Stopped + torn down when
+  the sim relaunch fought a shell-env bug while boxes burned (disciplined: bank, don't chase at a loss).
+
+**⇒ THE ONE NEXT ACTION: a focused STABLE-SERVE follow-up** — stabilize the ring (the `--debounce`
+landed; add a "don't re-form while stages are mid-pull" guard / formation cooldown), get all 6 stages
+solidly READY, then isolate the leg-8 serve over the real multi-hop ring to produce the FIRST real
+tok/s / TTFT / context numbers. Every hard prerequisite (sm_120 engine, verified pull, seeding,
+formation) is proven — the serve stability is the last piece. Balance ~$16.8. Reusing the rehearsal
+harness (`scratchpad/ring/` provisioning scripts + the sim `--full/--suite/--debounce`) makes the
+next ring fast. Also still open (leyten-gated): npm publish, the go-live manifest publish, the Ghent
+WSL smoke.
+
 ### ⇒ 2026-07-21 (LATEST-6) — THE BUILDABLE LAUNCH LIST IS DONE (10 PRs, one no-spend session)
 **P1-#4 hardening is COMPLETE, P1-#3 WSL2 daemon-side done, P11 done, the sidecar release is
 published — the only engineering left is the real-hardware ring capstone.** Method held: recon
