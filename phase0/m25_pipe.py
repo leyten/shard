@@ -693,6 +693,36 @@ def _build_tree_msg(trunk, tree, vbase):
 
 
 _EAGLE = None
+_EAGLE_DISABLED = False        # latched on if EAGLE was requested but its head is absent/unloadable
+
+
+def _eagle_dir():
+    return os.environ.get("M25_EAGLE_DIR", "/root/m25-eagle")
+
+
+def _eagle_disable(why):
+    """Latch EAGLE off for the process and say so ONCE. Every subsequent make_drafter/reset then agrees
+    (n-gram drafter, eagle:0 on the wire) so no job re-hits the same missing head."""
+    global _EAGLE_DISABLED
+    if not _EAGLE_DISABLED:
+        _EAGLE_DISABLED = True
+        print(f"[eagle] M25_EAGLE set but EAGLE unavailable ({why}) — serving with the n-gram drafter "
+              f"(no speculative g-lever). Ship the EAGLE head to {_eagle_dir()} to enable it.",
+              file=sys.stderr, flush=True)
+
+
+def eagle_armed():
+    """The coordinator's EFFECTIVE EAGLE state: requested via M25_EAGLE *and* the 0.2B head checkpoint
+    actually present on this box. A stranger who self-provisions pulls the base-model shards but NOT the
+    EAGLE head, so M25_EAGLE=1 without weights must DEGRADE to the n-gram drafter and serve — never crash
+    the coordinator into a 0-token restart loop. Decided once (a missing/broken head latches off) so every
+    job and every reset frame agree on the wire."""
+    if not S.M25_EAGLE or _EAGLE_DISABLED:
+        return False
+    if not os.path.exists(os.path.join(_eagle_dir(), "config.json")):
+        _eagle_disable(f"no head checkpoint at {_eagle_dir()}")
+        return False
+    return True
 
 
 def _eagle_singleton():
@@ -703,7 +733,7 @@ def _eagle_singleton():
     global _EAGLE
     if _EAGLE is None:
         from eagle_draft import EagleDrafter
-        eagle_dir = os.environ.get("M25_EAGLE_DIR", "/root/m25-eagle")
+        eagle_dir = _eagle_dir()
         embed = S.raw("model.embed_tokens.weight").to(torch.bfloat16).to(dev)
         # next_hidden = which hidden the autoregressive draft chain carries forward. "prenorm" = the residual
         # stream (correct: the final norm is a readout-only transform for the lm_head); "final" = the
@@ -721,10 +751,14 @@ def make_drafter(ngram_n=3):
     is the shared singleton; the n-gram half is fresh per job (clean index)."""
     from ngram_draft import NgramDrafter
     ng = NgramDrafter(ng=ngram_n, min_match=int(os.environ.get("M25_NGRAM_MINMATCH", "1")))
-    if not S.M25_EAGLE:
+    if not eagle_armed():
         return ng
-    from eagle_draft import HybridDrafter
-    return HybridDrafter(ng, _eagle_singleton())
+    try:
+        from eagle_draft import HybridDrafter
+        return HybridDrafter(ng, _eagle_singleton())
+    except Exception as e:                              # noqa: BLE001 — a broken head must not brick serve
+        _eagle_disable(f"{type(e).__name__}: {e}")
+        return ng
 
 
 def make_drafters_b(B, ngram_n=3):
@@ -733,11 +767,15 @@ def make_drafters_b(B, ngram_n=3):
     shared EAGLE head (shared read-only weights/RoPE, own committed-context state)."""
     from ngram_draft import NgramDrafter
     mm = int(os.environ.get("M25_NGRAM_MINMATCH", "1"))
-    if not S.M25_EAGLE:
+    if not eagle_armed():
         return [NgramDrafter(ng=ngram_n, min_match=mm) for _ in range(B)]
-    from eagle_draft import HybridDrafter
-    base = _eagle_singleton()
-    return [HybridDrafter(NgramDrafter(ng=ngram_n, min_match=mm), base.fork()) for _ in range(B)]
+    try:
+        from eagle_draft import HybridDrafter
+        base = _eagle_singleton()
+        return [HybridDrafter(NgramDrafter(ng=ngram_n, min_match=mm), base.fork()) for _ in range(B)]
+    except Exception as e:                              # noqa: BLE001 — a broken head must not brick serve
+        _eagle_disable(f"{type(e).__name__}: {e}")
+        return [NgramDrafter(ng=ngram_n, min_match=mm) for _ in range(B)]
 
 
 def _reset_op(swarm_id, job_id, nonce=None):
@@ -752,7 +790,7 @@ def _reset_op(swarm_id, job_id, nonce=None):
          # the WIRE too, not just coordinator-side. Old stages ignore the field; old coordinators
          # omit it (stages default to their launch env). A plain-launched coordinator against
          # eagle-launched stages stops paying for aux it never reads — strictly less traffic.
-         "eagle": 1 if S.M25_EAGLE else 0}
+         "eagle": 1 if eagle_armed() else 0}
     if nonce is not None:
         o["nonce"] = nonce
     if M25_GRAPH_JOB is not None:

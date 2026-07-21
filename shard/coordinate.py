@@ -217,7 +217,7 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
             job_nonce=job.get("nonce") or None,
             resume_ids=resume_ids, resumable=True, on_progress=tick)
 
-    eagle_arm = bool(MP.S.M25_EAGLE)
+    eagle_arm = MP.eagle_armed()
     r = _attempt()
     if r.get("ok") or not r.get("resumable") or not eagle_arm or redial is None:
         return r
@@ -343,7 +343,7 @@ def main(argv=None):
 
     if a.check:
         _emit("SHARD_COORD_OK", dir=mdir, transport=os.environ["SHARD_TRANSPORT"],
-              eagle=bool(os.environ.get("M25_EAGLE")))
+              eagle=MP.eagle_armed())
         return 0
 
     from transformers import AutoTokenizer
@@ -355,7 +355,7 @@ def main(argv=None):
         return _fatal(f"ring connect failed: {type(e).__name__}: {e}", head=a.head, tail=a.tail)
 
     _emit("SHARD_COORD_READY", head=a.head, tail=a.tail,
-          eagle=bool(os.environ.get("M25_EAGLE")), receipts=bool(os.environ.get("SHARD_RECEIPTS")))
+          eagle=MP.eagle_armed(), receipts=bool(os.environ.get("SHARD_RECEIPTS")))
     try:
         return serve_jobs(MP, tok, pipe, ret, a, sys.stdin)
     except KeyboardInterrupt:
