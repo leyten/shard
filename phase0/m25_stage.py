@@ -1048,13 +1048,13 @@ class _TGraphState:
         self.wcp.copy_(start + self._ar)                 # real at [start,start+n), dummies contiguous after
         pid = torch.full((self.npad,), int(pos_ids[0]), dtype=torch.long)   # dummies ride node 0's position
         pid[:len(pos_ids)] = torch.as_tensor(pos_ids, dtype=torch.long)
-        pid = pid.to(dv, non_blocking=False)
+        pid = pid.to(dv)
         self.cos.copy_(full_cos[pid][None, None]); self.sin.copy_(full_sin[pid][None, None])
         depths = [int(p) - (start - 1) for p in pos_ids]              # pos_ids == (start-1)+depth (run_block_tree's rule)
         block, _ = build_tree_mask(parents, depths, 0, n)             # start=0 -> JUST the [1,1,n,n] tree block
         self.mask.fill_(float("-inf"))                                # pad rows/cols + bucket tail: blocked
         self.mask[0, 0, :n, :start] = 0.0                             # every real node attends the whole prefix
-        self.mask[0, 0, :n, start:start + n].copy_(block[0, 0].to(torch.bfloat16))   # the only H2D: [n,n]
+        self.mask[0, 0, :n, start:start + n].copy_(block[0, 0].to(torch.bfloat16))   # H2D: the [n,n] block (+ pid above)
         self.mask[0, 0, n:] = self.mask[0, 0, 0].clone()              # dummy rows = node 0's mask row (clone:
                                                                       # the source aliases the assign target)
 

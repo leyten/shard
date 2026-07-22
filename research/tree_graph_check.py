@@ -127,6 +127,38 @@ def main():
     vram = (free0 - torch.cuda.mem_get_info()[0]) / 1e9
     print(f"captured {len(gr.graphs)} tree graphs, pool cost {vram:.2f} GB total", flush=True)
 
+    # gate 1c — GPU static-composition readback (adversarial residue ii): the live replay statics,
+    # read back, must equal an independent CPU-composed _TGraphState for the same frame. Catches a
+    # device-side compose bug (fill_/copy_ semantics) that gate 1 can't see (both its arms share the
+    # GPU statics) and gate 2's cosine would only catch grossly.
+    n, row, start = cases[-1][0], cases[-1][1], cases[-1][2]
+    x, parents, pos_ids = frame(n, start, seed=100 + len(cases) - 1)
+    alen = gr._bucket(start + n)
+    live = gr.graphs[alen][2]
+    ref = S._TGraphState(npad, alen, gr.rd, "cpu", gr.aux_ids)
+    ref.set(row, start, n, parents, pos_ids, gr.cos.cpu(), gr.sin.cpu())
+    g1c_ok = all(torch.equal(getattr(live, b).cpu(), getattr(ref, b))
+                 for b in ("rows", "wcp", "cos", "sin", "mask", "cols"))
+    print(f"gate1c static readback vs CPU compose: {'PASS' if g1c_ok else 'FAIL'}", flush=True)
+    g1_ok &= g1c_ok
+
+    # gate 1d — near-cap DEGRADE (adversarial residue i): a frame that only overflows because of
+    # PADDING (start+n fits, start+npad does not) must fall back to eager, never raise or capture.
+    n, row = 13, 1
+    start = S.M25_KV_MAXLEN - npad + 1
+    seed_row(layers, row, start, seed=61)
+    x, parents, pos_ids = frame(n, start, seed=601)
+    skipped0, graphs0 = S._GRAPH_SKIPPED, len(gr.graphs)
+    try:
+        got = gr.run(row, start, x, parents, pos_ids)
+        g1d_ok = (S._GRAPH_SKIPPED == skipped0 + 1 and len(gr.graphs) == graphs0
+                  and torch.isfinite(got).all().item())
+    except RuntimeError as e:
+        g1d_ok = False
+        print(f"gate1d RAISED (must degrade): {e}", flush=True)
+    print(f"gate1d near-cap padding degrade -> eager: {'PASS' if g1d_ok else 'FAIL'}", flush=True)
+    g1_ok &= g1d_ok
+
     # ---- GATE 2: padded vs UNPADDED numerics class + dummy-magnitude probe ------------------------
     worst_cos, worst_abs = 1.0, 0.0
     for i, (n, row, start) in enumerate([(13, 0, 300), (17, 1, 1900), (21, 2, 300)]):
