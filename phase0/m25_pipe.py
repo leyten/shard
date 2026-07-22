@@ -1528,8 +1528,10 @@ def coordinate_pipe_rows(pipe_sock, tok, messages_list, K, max_new, timeout, ret
         tree_depth = int(os.environ.get("M25_TREE_DEPTH", "8"))
         # a tree frame spans trunk (<= tree_depth+1 re-fed committed) + tree_m nodes — the fixed
         # 16 headroom only covers K<=15 chains, and attn_tree_row's MAXLEN bound is a stage-killing
-        # RuntimeError, not an EDGE error (review: M25_TREE_M>=17 near the cap kills a warm stage)
-        hd = max(16, tree_m + tree_depth + 1)
+        # RuntimeError, not an EDGE error (review: M25_TREE_M>=17 near the cap kills a warm stage).
+        # M25_TREE_PAD: a graphed stage pads tree frames to the template, so the runner needs
+        # start+npad headroom too (it degrades to eager past it — headroom keeps it on the graph).
+        hd = max(16, tree_m + tree_depth + 1, S.M25_TREE_PAD)
     mx = [max(16, min(mxnew_b[b], max_ctx - len(p) - hd)) if max_ctx else mxnew_b[b]
           for b, p in enumerate(prompts)]
     out = [[] for _ in range(B)]; pos = [0] * B; cur = [0] * B; done = [False] * B
@@ -1818,6 +1820,29 @@ def _block_row(grs_r, layers, row, start, x, vcfg):
     return S.run_block_decode_row(layers, row, start, x, vcfg)
 
 
+def _block_tree_row(grs_t, layers, row, start, x, vcfg, parents, pos_ids):
+    """De-lockstep TREE-verify router (mirrors _block_row): pad the frame's N nodes to the fixed
+    M25_TREE_PAD template and route through the TreeRowGraphRunner when graphs are active — the
+    eager tree tax (154ms vs 45ms graphed chains) is what killed per-stream trees at B. Tree graphs
+    spend their OWN budget (M25_TREE_GRAPH_MAX) so the variable-s chain shapes can't starve them.
+    N past the template, hatch off (M25_TREE_GRAPH=0), over-budget, or failed capture -> the eager
+    tree path, counted, never fatal."""
+    if S.M25_CUDA_GRAPH_ACTIVE and M25_BATCH_GRAPH and S.M25_TREE_GRAPH and S.M25_BATCH > 1 \
+            and x.shape[1] <= S.M25_TREE_PAD:
+        gr = grs_t.get(S.M25_TREE_PAD)
+        if gr is None:
+            grs_t[S.M25_TREE_PAD] = gr = S.TreeRowGraphRunner(layers, vcfg, S.M25_TREE_PAD)
+        alen = gr._bucket(start + x.shape[1])
+        if alen in gr.graphs or S._TREE_GRAPH_COUNT < S.M25_TREE_GRAPH_MAX:
+            return gr.run(row, start, x, parents, pos_ids)
+        S._GRAPH_SKIPPED += 1
+        if ("tree", alen) not in _GRAPH_CAP_LOGGED:
+            _GRAPH_CAP_LOGGED.add(("tree", alen))
+            print(f"[graph] cap: tree npad={S.M25_TREE_PAD} bucket={alen} -> eager "
+                  f"({S._TREE_GRAPH_COUNT}/{S.M25_TREE_GRAPH_MAX} tree graphs captured)", flush=True)
+    return S.run_block_tree_row(layers, row, start, x, vcfg, parents, pos_ids)
+
+
 def _reset_flags(msg):
     """Stage-side per-job flags off a reset frame, applied BEFORE the reset is ack'd/propagated:
     'graph' flips the runtime CUDA-graph route (S.set_graph — refused loudly, 'GRAPH REFUSED' in the
@@ -2092,6 +2117,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
     graph_runners = {}                                # opt-in CUDA-graph cache (M25_CUDA_GRAPH); persists across jobs
     graph_runners_b = {}                              # batched-decode graph cache, keyed (B, s) — same lifetime
     graph_runners_r = {}                              # de-lockstep row-decode graph cache, keyed s
+    graph_runners_t = {}                              # de-lockstep tree-verify graph cache, keyed npad
     def _dial_fwd():
         host, p = nxt.rsplit(":", 1)
         s = socket.socket(); s.settimeout(timeout); s.connect((host, int(p))); s.setsockopt(*NODELAY)
@@ -2336,8 +2362,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             if msg.get("tree") and "stream" in msg:          # DE-LOCKSTEP tree-verify: one stream's
                                 b = msg["stream"]                            # tree-masked block against KV row b —
                                 x = msg["h"].to(dev)                         # MUST route before the row branch (a
-                                h = S.run_block_tree_row(layers, b, msg["start"], x, vcfg,   # chain-math tree frame
-                                                         msg["parents"], msg["pos_ids"])     # = silent KV corruption
+                                h = _block_tree_row(graph_runners_t, layers, b, msg["start"], x, vcfg,   # chain-math tree frame
+                                                    msg["parents"], msg["pos_ids"])          # = silent KV corruption
                                 t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0           # with valid receipts)
                                 if RECEIPTS and signer is not None:
                                     signer.observe(_act_digest(x), _act_digest(h))
@@ -2542,7 +2568,8 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             else:
                                 h = msg["h"].to(dev)
                             x = h
-                            h = S.run_block_tree_row(layers, b, msg["start"], h, vcfg, msg["parents"], msg["pos_ids"])
+                            h = _block_tree_row(graph_runners_t, layers, b, msg["start"], h, vcfg,
+                                                msg["parents"], msg["pos_ids"])
                             t_comp = _dt_sync() if S.M25_STAGE_TIMING else 0.0
                             if RECEIPTS and signer is not None:
                                 signer.observe(_act_digest(x), _act_digest(h))
