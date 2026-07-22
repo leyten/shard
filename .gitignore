@@ -30,3 +30,6 @@ RESUME_B.md
 # transport secret — never commit
 .shard_psk
 *.psk
+
+# Claude Code session workspace — internal notes, never public
+.claude/
