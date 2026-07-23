@@ -357,7 +357,14 @@ def main():
         if k < n - 1:
             forwards.append(f"127.0.0.1:{FWD_RING}={nodes[k+1]['maddr']}")
         if k == 0:
-            forwards.append(f"127.0.0.1:{FWD_RET}={nodes[-1]['maddr']}")   # head also tunnels coord-return -> tail
+            # SHARD_RET_MADDR: explicit coord-return target override. Proven need (2026-07-23): a
+            # consumer-ISP peering hole made the tail's direct addr unreachable FROM THE HEAD ONLY
+            # (reachable from everywhere else); the forward dial set is exactly this one maddr, so
+            # the fix is dialing the tail's /p2p-circuit addr via a launch relay — DCUtR then
+            # upgrades to direct where the hole allows. RemotePeer stays the head through a circuit,
+            # so the tail's allowlist is unaffected.
+            ret_maddr = os.environ.get("SHARD_RET_MADDR", "").strip() or nodes[-1]["maddr"]
+            forwards.append(f"127.0.0.1:{FWD_RET}={ret_maddr}")   # head also tunnels coord-return -> tail
         seed = "/root/m25_manifest.json=/root/m25" if a.seed_shards else None
         # bootstrap through the PREDECESSOR's sidecar only — it launched before us (k asc), so the
         # DHT link is up when we dial; the successor reciprocates when it launches. k=0 seeds solo.
