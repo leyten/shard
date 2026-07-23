@@ -291,7 +291,18 @@ def main():
         j = vinst(iid)
         ports = j.get("ports") or {}
         m = ports.get(f"{LIBP2P}/tcp")
-        nodes.append(dict(region=region, iid=iid, host=j["ssh_host"], port=int(j["ssh_port"]),
+        host, port = j["ssh_host"], int(j["ssh_port"])
+        # SHARD_SSH_OVERRIDE="iid=host:port,...": route around a BROKEN vast ssh-proxy mapping.
+        # Proven failure (2026-07-23): the API returned ONE proxy endpoint for two different
+        # instances, so every ssh op (bootstrap, code push, key collect) silently hit the same box
+        # twice — caught only by the duplicate-receipt-pubkey guard. The direct '22/tcp' port map
+        # on public_ipaddr keeps working; this pins it explicitly, per iid.
+        ov = dict(kv.split("=") for kv in os.environ.get("SHARD_SSH_OVERRIDE", "").split(",") if "=" in kv)
+        if iid in ov:
+            host, port = ov[iid].rsplit(":", 1)
+            port = int(port)
+            print(f"[pipe] ssh override {region} {iid} -> {host}:{port}", flush=True)
+        nodes.append(dict(region=region, iid=iid, host=host, port=port,
                           pip=(j.get("public_ipaddr") or "").strip(), pport=m[0]["HostPort"] if m else None,
                           lo=int(lo), hi=int(hi), forced_eager=forced_eager))
     if a.external_tail:                               # a NON-SSH tail (home GPU): pre-set its circuit maddr + pid,
