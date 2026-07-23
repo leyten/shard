@@ -1143,6 +1143,8 @@ class TreeRowGraphRunner:
                 L.bkc[0, :, lo:alen] = kb; L.bvc[0, :, lo:alen] = vb
         self.graphs[alen] = (g, h, st, out)
         _TREE_GRAPH_COUNT += 1                           # tree graphs' own budget (M25_TREE_GRAPH_MAX)
+        print(f"[graph] tree capture OK (npad={self.npad}, alen={alen}) — "
+              f"{_TREE_GRAPH_COUNT}/{M25_TREE_GRAPH_MAX} tree graphs", flush=True)   # the A/B's fired-or-not proof
 
     def run(self, row, start, x, parents, pos_ids):
         """One padded tree-verify block: x [1,N,H] off the wire (N <= npad, enforced by the router),
