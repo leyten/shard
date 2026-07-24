@@ -20,7 +20,7 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-24 (LATEST-8) — TREE-FRAME GRAPHS BUILT + RING-VERDICTED; fp8-aux CHAIN WIN FOUND
+### ⇒ 2026-07-24 (LATEST-8) — TREE-FRAME GRAPHS BUILT + RING-VERDICTED; SCOREBOARD CORRECTION (fp8 aux)
 **PR #138: the padded-template tree-graph capture is CORRECT (bit-exact on-box, captures PROVEN
 firing live on a 6×5090 EU ring A/B) — and the B-mode tree verdict is now nailed three layers deep
 (receipts tree-graph-onbox-20260723 + tree-graph-ring-ab-20260724):** the g lever reproduces
@@ -29,9 +29,16 @@ flat ~207ms sync-round cost (naked ring traversal; the round drains the pipeline
 keep-warm-hidden chain rounds — NOT compute (fixed by the graphs), NOT bytes (an fp8-aux control
 pass moved trees 0%).** Next tree lever = coordinator scheduling (pipeline tree rounds across
 streams), not kernel work. Solo trees (+18% banked) unaffected; kill criterion stands for B-mode.
-- **DISCOVERED WIN: M25_FP8_AUX=1 lifts CHAIN per-stream +20..+125% at B≥4 on consumer-uplink
-  rings** (code 13.2→20.3, qa 12.3→14.9, mix-B8 5.2→11.6; g held, receipts valid) — candidate
-  B-mode serve default after a fast-DC-ring accept re-check.
+- **RECEIPT CORRECTION (not a new lever — READ THIS BEFORE QUOTING THE SCORECARD): the 07-11/07-12
+  per-stream numbers were measured with fp8 aux FORCED OFF.** `M25_FP8_AUX` already defaults to 1
+  under `M25_FP8_WIRE=1` (m25_pipe.py); the 07-12 trees receipt env pinned `M25_FP8_AUX=0`
+  (contradicting its own runbook line, which said 1), and this A/B copied that env for
+  apples-to-apples with the killed-trees measurement. Running the DEFAULT measured chains
+  **+14..+54%/stream at B=4** (code 13.2→20.3, summarize 7.1→10.6, reasoning 17.2→20.1; +125% at
+  B=8, mix 5.2→11.6), g held, receipts valid ⇒ **the banked B=4 scorecard is likely UNDERSTATED.**
+  Caveat: that comparison is cross-launch + single-rep (the tree A/B was interleaved, 3 reps) —
+  confirm with an interleaved `SWEEP_FP8AUX_ARMS` arm (offline, ~10 lines) riding the next warm
+  ring at zero extra spend. Do not re-quote the scorecard as final until that lands.
 - Launcher hardening from real WAN failures: `SHARD_SSH_OVERRIDE` (vast proxy aliased two iids to
   ONE endpoint — fingerprint boxes by hostname+GPU UUID), `SHARD_RET_MADDR` (consumer-ISP peering
   hole: tail unreachable from the head ONLY; relay-circuit return + DCUtR upgrade PROVEN live —
