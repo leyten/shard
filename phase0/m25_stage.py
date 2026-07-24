@@ -171,6 +171,34 @@ if M25_CUDA_GRAPH:
 M25_GRAPH_MAX = int(os.environ.get("M25_GRAPH_MAX", "16"))
 _GRAPH_COUNT = 0        # graphs captured so far, across ALL GraphRunners in this process
 _GRAPH_SKIPPED = 0      # blocks run eager because the cap was hit or the bucket's capture failed
+# Tree-frame CUDA graphs (M25_TREE_GRAPH=0 = escape hatch): the per-stream tree frames (M25_TREE at
+# B>1) ran EAGER stage-side — 154ms summed stage compute vs 45ms for graph-replayed chains (3.4x,
+# receipt perstream-trees-ab-20260712, the measured kill reason for trees at B) — because a tree's
+# node count N (= re-fed trunk + M drafted nodes) varies per round and defeats fixed-shape capture.
+# The unlock: PAD each tree frame to ONE fixed template Npad (M25_TREE_PAD, default derived from the
+# drafting config: trunk_max + M rounded up to 8 — 24 at the M=12/depth=8 defaults), capture one
+# graph per context bucket in a TreeRowGraphRunner, and carry the per-round tree (row, start,
+# parents, pos_ids, n) through _TGraphState's static buffers exactly like _RGraphState carries
+# (row, start). THE DUMMY-NODE RULES (the two silent-corruption traps, designed out):
+#   * KV: dummy nodes write their k/v CONTIGUOUSLY at [start+n, start+npad) — beyond the frame's
+#     read window and exactly the speculative-junk-past-the-frontier class every chain verify frame
+#     already leaves at its rejected slots; the dirty-frontier contract overwrites junk before any
+#     later frame can read it, so padding adds NO new corruption class. (A sacrificial-column scheme
+#     was rejected: it collides with legal live KV at the context cap and needs a cross-cutting
+#     bound change.)
+#   * VALUES: dummy rows CLONE node 0 (input row, mask row, RoPE position), so their 62-layer hidden
+#     trajectory is a real token's — bounded by construction. Zero/garbage dummies are off-manifold:
+#     an eventual bf16 overflow -> inf -> _rms -> NaN k/v in the junk slots, and a masked read of NaN
+#     poisons every real row (0 * NaN = NaN in probs@V) with valid receipts.
+# ONE template (not a ladder): every tree frame verifies in the same kernel/numerics context and the
+# graph count stays a priori bounded — tree graphs get their OWN budget (M25_TREE_GRAPH_MAX, default
+# 4 = the bucket count at the 16k deploy cap) so lazily-captured chain shapes (variable refeed s)
+# can't starve the shapes that pay the 154ms tax. N > Npad falls back eager (counted, never fatal).
+M25_TREE_GRAPH = os.environ.get("M25_TREE_GRAPH", "1") != "0"
+_TREE_NPAD_DEFAULT = -(-(int(os.environ.get("M25_TREE_M", "12")) + int(os.environ.get("M25_TREE_DEPTH", "8")) + 1) // 8) * 8
+M25_TREE_PAD = int(os.environ.get("M25_TREE_PAD", str(_TREE_NPAD_DEFAULT)))
+M25_TREE_GRAPH_MAX = int(os.environ.get("M25_TREE_GRAPH_MAX", "4"))
+_TREE_GRAPH_COUNT = 0   # tree graphs captured so far (own budget, separate from _GRAPH_COUNT's chain shapes)
 # RUNTIME toggle (the per-job A/B lever): the hot path (m25_pipe._block) consults M25_CUDA_GRAPH_ACTIVE,
 # not the env constant, so ONE warm ring can interleave graph-on/graph-off arms per job — a stage
 # relaunch per arm would reintroduce the time-of-day drift the interleaved methodology exists to kill.
@@ -600,27 +628,43 @@ class Layer:
         attn_decode_row's flat-view row addressing on the shared [B,NKV,MAXLEN,HD] buffers (fp8 bytes
         under M25_KV_FP8, like every batched-KV op). A tree node's k/v at start+i overwrites any prior
         speculative slot there — the same crop-to-start semantics as attn_tree — and only row `row` is
-        touched. ALWAYS eager: mask/pos_ids change shape per round and N is tiny (attn_tree's
-        manual-kernel rationale, verbatim); never routed through a _GR capture."""
+        touched. Eager builds cp/RoPE/mask per round; under a TreeRowGraphRunner capture (_GR is a
+        _TGraphState — the ONLY state class with `wcp`) the varying (row, start, tree shape) come in
+        through STATIC buffers refreshed by set() before every replay: wcp writes the frame's Npad
+        rows CONTIGUOUSLY at [start, start+npad) (real nodes at their exact eager slots, dummies as
+        speculative junk past the read window — see the M25_TREE_GRAPH module comment), the padded
+        mask blocks the pad/bucket-tail columns for every real row, and the read spans the fixed
+        bucket alen (masked past total) instead of the exact total."""
         from tree_spec import _gqa_masked_attend, _rope_gather
         _, N, _ = x.shape
         lin = torch.nn.functional.linear
-        cos, sin = get_pe(); rd = cos.shape[-1]
         q = self._rms(lin(x, self.q_proj), self.q_norm).view(1, N, NH, HD).transpose(1, 2)
         k = self._rms(lin(x, self.k_proj), self.k_norm).view(1, N, NKV, HD).transpose(1, 2)
         v = lin(x, self.v_proj).view(1, N, NKV, HD).transpose(1, 2)
-        q = _rope_gather(q, cos, sin, pos_ids, rd); k = _rope_gather(k, cos, sin, pos_ids, rd)
-        total = start + N
-        if total > M25_KV_MAXLEN:                      # clean error, never an OOB put that kills the stage
-            raise RuntimeError(f"tree row context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN}")
-        cp = torch.arange(start, total, device=dev)
-        rows_i = row * NKV + torch.arange(NKV, device=dev)
+        gr = _GR
+        if gr is not None and hasattr(gr, "wcp"):      # tree-graph capture/replay: statics carry row/start/tree
+            rows_i, wcp, cols, mask = gr.rows, gr.wcp, gr.cols, gr.mask
+            cu, su = gr.cos, gr.sin                    # [1,1,Npad,rd] pre-gathered per-node RoPE rows
+            rd = cu.shape[-1]
+            tr, tp = q[..., :rd], q[..., rd:]          # _rope_gather's exact partial-RoPE math on the
+            q = torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)   # static rows (bit-equal ops)
+            tr, tp = k[..., :rd], k[..., rd:]
+            k = torch.cat([tr * cu + _rotate_half(tr) * su, tp], -1)
+        else:
+            gr = None                                  # a foreign capture state never routes this path
+            cos, sin = get_pe(); rd = cos.shape[-1]
+            q = _rope_gather(q, cos, sin, pos_ids, rd); k = _rope_gather(k, cos, sin, pos_ids, rd)
+            total = start + N
+            if total > M25_KV_MAXLEN:                  # clean error, never an OOB put that kills the stage
+                raise RuntimeError(f"tree row context {total} exceeds M25_KV_MAXLEN {M25_KV_MAXLEN}")
+            wcp = torch.arange(start, total, device=dev)
+            rows_i = row * NKV + torch.arange(NKV, device=dev)
+            cols = torch.arange(total, device=dev)
         kf = self.bkc.view(-1, M25_KV_MAXLEN, HD)      # [B*NKV, MAXLEN, HD] flat views (dtype-preserving)
         vf = self.bvc.view(-1, M25_KV_MAXLEN, HD)
-        kf[rows_i[:, None], cp[None, :]] = _kv_enc(k[0])   # k[0] is [NKV,N,HD] already (attn_decode_row's
-        vf[rows_i[:, None], cp[None, :]] = _kv_enc(v[0])   # MAJOR-2-proofed write, same op)
-        cols = torch.arange(total, device=dev)
-        kcur = _kv_view(kf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16).unsqueeze(0)   # [1,NKV,total,HD]
+        kf[rows_i[:, None], wcp[None, :]] = _kv_enc(k[0])   # k[0] is [NKV,N,HD] already (attn_decode_row's
+        vf[rows_i[:, None], wcp[None, :]] = _kv_enc(v[0])   # MAJOR-2-proofed write, same op)
+        kcur = _kv_view(kf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16).unsqueeze(0)   # [1,NKV,total|alen,HD]
         vcur = _kv_view(vf)[rows_i[:, None], cols[None, :]].to(torch.bfloat16).unsqueeze(0)
         o = _gqa_masked_attend(q, kcur, vcur, mask, GRP)
         o = o.transpose(1, 2).reshape(1, N, NH * HD)
@@ -966,6 +1010,198 @@ class RowGraphRunner:
         for li in self.aux_ids:                        # solo-shaped [s,H] aux, consumed synchronously
             _AUX[li] = st.aux[li]
         return out
+
+
+class _TGraphState:
+    """Static buffers for the de-lockstep TREE graph (_RGraphState's tree analog): row index `rows`,
+    KV write columns `wcp` [Npad] = start + arange(npad) — real node i at its exact eager slot
+    start+i, dummy pad nodes CONTIGUOUSLY after at [start+n, start+npad) (speculative junk past the
+    frame's read window, the class the dirty-frontier contract already overwrites-before-read) —
+    pre-gathered per-node RoPE rows cos/sin [1,1,Npad,rd] (siblings share a position), the fixed
+    read-column index cols [alen], and the PADDED additive mask [1,1,Npad,alen]: rows/cols [:n]
+    carry build_tree_mask's values VERBATIM (composed ON DEVICE: prefix zeros + the H2D'd [n,n] tree
+    block — never a CPU build of the full [Npad,alen] mask, which costs ms on exactly the contended-
+    CPU stages graphs exist for), every real row blocks the pad/unwritten-bucket columns (-inf), and
+    each DUMMY row clones row 0's mask row — dummies also clone row 0's input and RoPE position
+    (TreeRowGraphRunner.run), so their computation IS a real token's: bounded through all layers, no
+    all--inf softmax row (NaN), no off-manifold overflow. set(row, start, n, parents, pos_ids)
+    refreshes everything IN PLACE — one captured graph serves every KV row, start, and tree TOPOLOGY
+    within a bucket; only the node COUNT is padded, the structure lives in mask/RoPE values."""
+    def __init__(self, npad, alen, rd, dv, aux_ids=()):
+        self.npad, self.alen = npad, alen
+        self.rows = torch.zeros(NKV, dtype=torch.long, device=dv)
+        self.wcp = torch.zeros(npad, dtype=torch.long, device=dv)
+        self.cos = torch.zeros(1, 1, npad, rd, dtype=torch.bfloat16, device=dv)
+        self.sin = torch.zeros(1, 1, npad, rd, dtype=torch.bfloat16, device=dv)
+        self.mask = torch.zeros(1, 1, npad, alen, dtype=torch.bfloat16, device=dv)
+        self.cols = torch.arange(alen, device=dv)
+        self.aux = {li: torch.zeros(npad, H, dtype=torch.bfloat16, device=dv) for li in aux_ids}
+        self._nkv = torch.arange(NKV, device=dv)
+        self._ar = torch.arange(npad, device=dv)
+
+    def set(self, row, start, n, parents, pos_ids, full_cos, full_sin):
+        """row/start/n are host ints, parents/pos_ids HOST lists off the wire — no device sync
+        anywhere in the refresh. n = the frame's REAL node count (<= npad); [n:npad) are dummies."""
+        from tree_spec import build_tree_mask            # tree-path-only dep, like attn_tree
+        dv = self.rows.device
+        self.rows.copy_(row * NKV + self._nkv)
+        self.wcp.copy_(start + self._ar)                 # real at [start,start+n), dummies contiguous after
+        pid = torch.full((self.npad,), int(pos_ids[0]), dtype=torch.long)   # dummies ride node 0's position
+        pid[:len(pos_ids)] = torch.as_tensor(pos_ids, dtype=torch.long)
+        pid = pid.to(dv)
+        self.cos.copy_(full_cos[pid][None, None]); self.sin.copy_(full_sin[pid][None, None])
+        depths = [int(p) - (start - 1) for p in pos_ids]              # pos_ids == (start-1)+depth (run_block_tree's rule)
+        block, _ = build_tree_mask(parents, depths, 0, n)             # start=0 -> JUST the [1,1,n,n] tree block
+        self.mask.fill_(float("-inf"))                                # pad rows/cols + bucket tail: blocked
+        self.mask[0, 0, :n, :start] = 0.0                             # every real node attends the whole prefix
+        self.mask[0, 0, :n, start:start + n].copy_(block[0, 0].to(torch.bfloat16))   # H2D: the [n,n] block (+ pid above)
+        self.mask[0, 0, n:] = self.mask[0, 0, 0].clone()              # dummy rows = node 0's mask row (clone:
+                                                                      # the source aliases the assign target)
+
+
+class TreeRowGraphRunner:
+    """Capture + replay the de-lockstep TREE-verify block at a fixed PADDED node count [1, Npad], one
+    graph per context bucket — the eager-tax unlock for per-stream trees (tree frames measured 154ms
+    summed stage compute vs 45ms graphed chains; the g lever worked (+15-70% committed/round), the
+    eager tax killed it). A frame's N real nodes are padded to Npad in the static input buffer (pad
+    rows clone row 0); _TGraphState carries (row, start, tree, n) through per-replay set(). Output
+    and EAGLE aux are sliced [:n] on return, so the wire/coordinator contract is shaped exactly like
+    eager. Same safety contract as RowGraphRunner: host-side bounds check, free-VRAM pre-check,
+    live-row-0 KV save/restore around capture (MAJOR-3), side-stream drain before any eager
+    fallback, capture failure -> LOUD permanent-eager. Budget: M25_TREE_GRAPH_MAX (own counter —
+    see the M25_TREE_GRAPH module comment).
+
+    NUMERICS CLASS: replay is bit-identical to the same-shape eager-padded forward (run_eager_ref —
+    the capture-faithfulness gate), but padded-vs-UNPADDED differs in low bits: the NVFP4 MoE is
+    token-count NON-invariant (padding changes per-expert token counts -> grouped-GEMM schedule) and
+    the bucketed read changes the softmax reduction length. Same accepted-kernel-numerics class as
+    chain graphs vs eager SDPA-flash / fp8 wire; the per-frame gate is ARGMAX agreement (all the
+    coordinator consumes — tree_greedy_walk commits identically if argmax agrees), the ring A/B
+    judges accept/g. See research/tree_graph_check.py for the full gate hierarchy."""
+    def __init__(self, layers, vcfg, npad, dv=dev):
+        assert M25_BATCH > 1, "tree row graphs need the launch-time [B,...] KV rows"
+        self.layers, self.vcfg, self.npad, self.dv = layers, vcfg, npad, dv
+        self.cos, self.sin = get_pe(); self.rd = self.cos.shape[-1]
+        self.graphs = {}                                 # bucket alen -> (graph, h_static, state, out_static)
+        self.eager = set()                               # buckets whose capture FAILED -> permanently eager
+        self.aux_ids = [L.li for L in layers if M25_EAGLE and L.li in EAGLE_AUX_LAYER_IDS]
+
+    def _bucket(self, total):
+        for b in DECODE_BUCKETS:
+            if b >= total:
+                return min(b, M25_KV_MAXLEN)
+        return M25_KV_MAXLEN
+
+    def _manual_ok(self, alen):                          # kk/vv gathers + broadcast-GQA fp32 scores must fit
+        return 2 * NKV * alen * HD * 2 + NKV * GRP * self.npad * alen * 4 <= 1_400_000_000
+
+    def _layers(self, h):
+        st = _GR                                         # the _TGraphState being captured
+        for L in self.layers:                            # run_block_tree_row's loop; attn reads _GR statics
+            h = h + L.attn_tree_row(L._rms(h, L.in_ln), 0, 0, None, None)   # row/start/pos/mask unused in graph mode
+            h = h + L.mlp(L._rms(h, L.post_ln))
+            if L.li in st.aux:                           # EAGLE aux: device-side copy into the static
+                st.aux[L.li].copy_(h[0])                 # buffer, CAPTURED -> every replay refreshes it
+        return h
+
+    def _capture(self, alen):
+        from vllm.forward_context import set_forward_context
+        global _GR, _TREE_GRAPH_COUNT
+        # Free-VRAM pre-check (RowGraphRunner's discipline, tree-shaped): the broadcast-GQA kernel has
+        # NO NH-wide repeat_interleave, so the estimate is NKV-based — kk/vv gathers [NKV,alen,HD] bf16
+        # + score/softmax transients [NKV,GRP,npad,alen] (bf16 + fp32 + fp32 + bf16 ~ 2.5x fp32) + margin.
+        need = 2 * NKV * alen * HD * 2 + 10 * NKV * GRP * self.npad * alen + (1 << 30)
+        free = torch.cuda.mem_get_info()[0]
+        if free < need:
+            raise RuntimeError(f"free VRAM {free / 1e9:.1f}GB < tree-capture estimate {need / 1e9:.1f}GB")
+        h = (torch.randn(1, self.npad, H, device=self.dv) * 0.1).to(torch.bfloat16)
+        st = _TGraphState(self.npad, alen, self.rd, self.dv, self.aux_ids)
+        # Capture-time tree: a full-Npad CHAIN (parents [-1,0,1,..], depths 1..npad) at start=alen-npad
+        # so total==alen. Mask/wcp/RoPE are VALUES in static buffers — captured kernels depend on
+        # shapes, not values, so any valid topology captures the general case.
+        st.set(0, alen - self.npad, self.npad, list(range(-1, self.npad - 1)),
+               [alen - self.npad + i for i in range(self.npad)], self.cos, self.sin)
+        # Capture writes garbage k/v into LIVE row 0 at [alen-npad, alen) — RowGraphRunner's MAJOR-3:
+        # a short stream's capture must not destroy a long stream's committed KV. Save row 0's slots
+        # per layer, restore AFTER the device drain (both success and failure paths).
+        lo = alen - self.npad
+        saved = [(L, L.bkc[0, :, lo:alen].clone(), L.bvc[0, :, lo:alen].clone()) for L in self.layers]
+        _GR = st
+        try:
+            side = torch.cuda.Stream(); side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad(), set_forward_context(None, self.vcfg):
+                for _ in range(3):
+                    self._layers(h)                      # warm-up before capture
+            torch.cuda.current_stream().wait_stream(side); torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g), torch.no_grad(), set_forward_context(None, self.vcfg):
+                out = self._layers(h)
+        finally:
+            _GR = None
+            torch.cuda.synchronize()                     # drain BEFORE restoring live KV (both paths)
+            for L, kb, vb in saved:
+                L.bkc[0, :, lo:alen] = kb; L.bvc[0, :, lo:alen] = vb
+        self.graphs[alen] = (g, h, st, out)
+        _TREE_GRAPH_COUNT += 1                           # tree graphs' own budget (M25_TREE_GRAPH_MAX)
+        print(f"[graph] tree capture OK (npad={self.npad}, alen={alen}) — "
+              f"{_TREE_GRAPH_COUNT}/{M25_TREE_GRAPH_MAX} tree graphs", flush=True)   # the A/B's fired-or-not proof
+
+    def run(self, row, start, x, parents, pos_ids):
+        """One padded tree-verify block: x [1,N,H] off the wire (N <= npad, enforced by the router),
+        parents/pos_ids host lists. Returns the [:N] SLICE of the static output buffer — consumed
+        (sent/digested) before the next run, like every runner. The host-side bound covers the FULL
+        pad span [start, start+npad) — a replay's captured index_put_ reads st.wcp, and dummy
+        columns past MAXLEN would be an OOB device assert that kills the stage — but a frame that
+        only overflows because of PADDING (start+n still fits) degrades to eager, never errors: the
+        graph must not shrink the servable context."""
+        global _GRAPH_SKIPPED
+        n = x.shape[1]
+        alen = self._bucket(start + n)
+        if start + self.npad > M25_KV_MAXLEN or alen in self.eager or not self._manual_ok(alen):
+            _GRAPH_SKIPPED += 1
+            return run_block_tree_row(self.layers, row, start, x, self.vcfg, parents, pos_ids)
+        if alen not in self.graphs:
+            try:
+                self._capture(alen)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()                 # drain in-flight side-stream garbage FIRST
+                self.eager.add(alen); _GRAPH_SKIPPED += 1
+                print(f"[graph] tree capture failed (npad={self.npad}, alen={alen}): {type(e).__name__}: {e} "
+                      f"-> bucket marked permanently eager", flush=True)
+                return run_block_tree_row(self.layers, row, start, x, self.vcfg, parents, pos_ids)
+        g, h, st, out = self.graphs[alen]
+        st.set(row, start, n, parents, pos_ids, self.cos, self.sin)
+        h[:, :n].copy_(x)
+        if n < self.npad:                                # dummy rows clone node 0 (bounded real-token values;
+            h[:, n:] = h[:, :1]                          # fully overwritten every replay — no stale leakage)
+        g.replay(); torch.cuda.synchronize()
+        for li in self.aux_ids:                          # [:n] slice of the static [npad,H] aux — solo-shaped,
+            _AUX[li] = st.aux[li][:n]                    # consumed synchronously by _merge_aux like every runner
+        return out[:, :n]
+
+    def run_eager_ref(self, row, start, x, parents, pos_ids):
+        """Eager-execute the PADDED forward through a fresh _TGraphState, no graph — the bit-identity
+        oracle for the capture-faithfulness gate (research/tree_graph_check.py): replay output must
+        equal this EXACTLY (same kernels, same shapes, same staging). Not on the serve path."""
+        from vllm.forward_context import set_forward_context
+        global _GR
+        n = x.shape[1]
+        alen = self._bucket(start + n)
+        st = _TGraphState(self.npad, alen, self.rd, self.dv, self.aux_ids)
+        st.set(row, start, n, parents, pos_ids, self.cos, self.sin)
+        h = torch.empty(1, self.npad, H, dtype=torch.bfloat16, device=self.dv)
+        h[:, :n].copy_(x)
+        if n < self.npad:
+            h[:, n:] = h[:, :1]
+        _GR = st
+        try:
+            with torch.no_grad(), set_forward_context(None, self.vcfg):
+                out = self._layers(h)
+        finally:
+            _GR = None
+        for li in self.aux_ids:
+            _AUX[li] = st.aux[li][:n]
+        return out[:, :n]
 
 
 class _BGraphState:

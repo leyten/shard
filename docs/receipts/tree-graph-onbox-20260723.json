@@ -1,0 +1,17 @@
+{
+  "what": "TREE-FRAME CUDA GRAPHS on-box gates (bar 2 of perf/tree-frame-graphs): a single rented 5090 (sm_120, cutlass NVFP4) ran the full correctness hierarchy on real M2.5 layers [29,31). VERDICT: FAITHFUL. Gate 1 capture-faithfulness: graph replay BIT-EQUAL (maxabs 0.0) to the eager-padded reference incl. EAGLE aux, across 6 cases spanning n=13/14/17/21/24, rows 0-3, buckets 2048/4096, repeat replays. Gate 1c: live GPU statics read back == independent CPU-composed _TGraphState, bit. Gate 1d: a padding-only overflow at the KV cap degrades to eager (no raise, no capture). Gate 2b no-poison: writes bit-confined to [start,start+npad) of the frame's own row. Dummy-magnitude probe: real-node delta EXACTLY 0.0 under x3-scaled dummies -> NVFP4 MoE activation scales are token-local (no cross-token coupling). Gate 2 numerics: padded-vs-unpadded diverges (worst cos 0.9717 at 2 layers) but per-op deltas are tiny (attn ~3e-2 bucketed-read, MoE ~2e-2 token-count; isolate receipt research/tree_pad_isolate.py) and the compounding mechanism is MoE router near-tie amplification -- measured EQUAL-CLASS to the SHIPPED solo chain-graph lever on the same layers (manual-bucketed vs SDPA-flash: cos 0.9873, maxabs 1.38), which has been live on every graph-armed ring since 07-05. End judge = ring accept/g (gate 3), exactly as it was for chain graphs. TIMING (idle box, 2 layers): eager-tree 3.77ms -> graph-tree 2.20ms (1.72x recovery); graph-chain s=7 1.31ms -> tree/chain 1.68x (npad=24 vs s=7 is 3.4x tokens; the 154-vs-45ms kill receipt came from contended ring stages where launch overhead dominates -- the ring round decomposition is the decisive number). Capture cost: 2 tree graphs = 3.50GB pool on this box.",
+  "date": "2026-07-23",
+  "box": "vast 45630072 (RTX 5090 32GB, Utah US, $0.56/hr, label treegraph-b2), vllm 0.23.0 venv, layers [29,31) incl. EAGLE aux 30, M25_TREE=1 M25_CUDA_GRAPH=1 M25_BATCH=4 npad=24 (derived default), maxlen 40960",
+  "branch": "perf/tree-frame-graphs (impl 639c119, harness f9db015+c48ca1c, precedent-anchored gate2 this commit)",
+  "gates": {
+    "gate1_capture_bit_equal": "PASS 6/6 maxabs 0.0",
+    "gate1c_static_readback_vs_cpu": "PASS bit",
+    "gate1d_nearcap_degrade": "PASS (eager fallback, no capture, no raise)",
+    "gate2b_no_poison": "PASS bit (row-local, span-local)",
+    "gate2_numerics": "worst cos 0.9717 vs shipped chain-graph precedent 0.9873 same class -> PASS; per-op: attn 3.1e-2, moe 1.6e-2, dummy-value coupling 0.0",
+    "timing_ms_2layers": {"eager_tree": 3.77, "graph_tree": 2.2, "graph_chain_s7": 1.31}
+  },
+  "cpu_gate0": "tests/test_tree_graph.py 16/16 + suite 419 passed (1 pre-existing CPU-contention flake: test_prefill_logits_slice lossless under EAGLE-watchdog fire; passes in isolation)",
+  "adversarial": "independent skeptic pass: 6 verdicts CONFIRMED-SAFE, 0 BROKEN; residues (near-cap degrade, GPU compose oracle) closed as gates 1c/1d",
+  "next": "gate 3 = ring A/B (perstream-trees-ab arms re-run with tree graphs armed) -> the per-content tok/s table"
+}
