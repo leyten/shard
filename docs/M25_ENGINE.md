@@ -20,6 +20,25 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-24 (LATEST-8) — TREE-FRAME GRAPHS BUILT + RING-VERDICTED; fp8-aux CHAIN WIN FOUND
+**PR #138: the padded-template tree-graph capture is CORRECT (bit-exact on-box, captures PROVEN
+firing live on a 6×5090 EU ring A/B) — and the B-mode tree verdict is now nailed three layers deep
+(receipts tree-graph-onbox-20260723 + tree-graph-ring-ab-20260724):** the g lever reproduces
+(+13..+76% committed/round) but per-stream tok/s stays −22..−61% at B=4 because **tree rounds pay a
+flat ~207ms sync-round cost (naked ring traversal; the round drains the pipeline) vs 60-87ms for
+keep-warm-hidden chain rounds — NOT compute (fixed by the graphs), NOT bytes (an fp8-aux control
+pass moved trees 0%).** Next tree lever = coordinator scheduling (pipeline tree rounds across
+streams), not kernel work. Solo trees (+18% banked) unaffected; kill criterion stands for B-mode.
+- **DISCOVERED WIN: M25_FP8_AUX=1 lifts CHAIN per-stream +20..+125% at B≥4 on consumer-uplink
+  rings** (code 13.2→20.3, qa 12.3→14.9, mix-B8 5.2→11.6; g held, receipts valid) — candidate
+  B-mode serve default after a fast-DC-ring accept re-check.
+- Launcher hardening from real WAN failures: `SHARD_SSH_OVERRIDE` (vast proxy aliased two iids to
+  ONE endpoint — fingerprint boxes by hostname+GPU UUID), `SHARD_RET_MADDR` (consumer-ISP peering
+  hole: tail unreachable from the head ONLY; relay-circuit return + DCUtR upgrade PROVEN live —
+  the launch-relay design carrying a real serving ring).
+- Ops lessons now in memory: dead-man switch needs a persistent session heartbeat (it destroyed a
+  warm ring mid-session); per-session box labels (concurrent sessions share the account).
+
 ### ⇒ 2026-07-21 (LATEST-7) — LAUNCH-REHEARSAL RING: 7 BUGS FOUND, ENGINE PROVEN ON sm_120, SERVE GAP OPEN
 **A 6-box EU rehearsal ring on real 5090s (~$8, receipt `docs/receipts/launch-rehearsal-20260721.json`)
 served MiniMax-M2.5 via the faithful stranger daemon path. It found 7 launch bugs and proved the
