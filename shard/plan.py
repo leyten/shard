@@ -233,8 +233,20 @@ _PROVEN_CAP_VRAM_MB = 32768.0    # the card size cap_layers was proven on; bigge
 
 def density_cap_layers(cap_layers, total_vram_mb):
     """The proven layer DENSITY scaled to the card size — a flat cap collapsed a 96 GB card
-    to the 32 GB verdict (the spec's core distinction). ONE rule, shared with probe.derive_layers."""
-    return int(int(cap_layers) * float(total_vram_mb) / _PROVEN_CAP_VRAM_MB)
+    to the 32 GB verdict (the spec's core distinction). ONE rule, shared with probe.derive_layers.
+
+    ROUNDED, not truncated. `_PROVEN_CAP_VRAM_MB` is the card's NOMINAL size, and no real card
+    reports it: the 5090s this cap was proven on report 32103-32117 MB once ECC/driver overhead is
+    taken out. Truncating then docked every one of them a full layer for a <2% shortfall against a
+    marketing number, which is how a 7-node pool that physically holds 62 layers was rejected as
+    "need more/fatter nodes". Rounding to nearest restores the intended ceiling on the proven card
+    without the ceil() behaviour of granting a 13th layer to a card one MB over the anchor (that
+    lands at ~98% VRAM, the configuration that OOM'd live).
+
+    This is only ever a SANITY CEILING; the binding rule is the footprint arithmetic in plan_ring
+    (measured layer_vram_mb + kv + reserves), which stays strictly conservative.
+    """
+    return max(0, int(round(int(cap_layers) * float(total_vram_mb) / _PROVEN_CAP_VRAM_MB)))
 
 
 def plan_ring(nodes, rtt, model=None, *, slack=None, privacy=None):
