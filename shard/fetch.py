@@ -22,6 +22,7 @@ content-verified from day one, so swapping the source changes nothing about trus
 Per the boundary law: pure engine. Knows about manifests, shards, and bytes — nothing
 about c0mpute's catalog or accounts (the caller passes the pinned publisher pubkey in).
 """
+import glob
 import json
 import os
 import re
@@ -216,6 +217,23 @@ class Libp2pProvider(Provider):
     mirror path has). Anything short of a complete transfer raises ProviderUnavailable
     so a ChainProvider can hand the shard to the mirror/origin."""
 
+    # A peer must sustain at least this much throughput or it is abandoned for the mirror.
+    #
+    # Peers-before-mirror is only a win when the peer is COMPETITIVE. Peer quality spans two
+    # orders of magnitude — a datacentre seeder saturates a link, a home seeder on a 20 Mbit
+    # uplink gives ~2.5 MB/s — and a pure preference order has no way to tell them apart. Live on
+    # 2026-07-25 a 5090 with a measured 48.9 MB/s path to the mirror chose a residential peer for a
+    # 5 GB shard instead: ~2.5 MB/s, ~33 minutes, against a 30-minute deadline it would have blown
+    # only to restart from the mirror anyway. The retry is progress-gated, so the tarpit looked
+    # healthy the whole time. At launch every node is residential AND every node seeds, so without
+    # a floor the network gets SLOWER as it grows — the inverse of the torrent property.
+    #
+    # The floor is deliberately far below a healthy peer and far above a residential uplink, so it
+    # abandons tarpits without punishing a genuinely useful seeder.
+    MIN_PEER_MBPS = float(os.environ.get("SHARD_MIN_PEER_MBPS", "8"))
+    _RAMP_S = 25.0        # grace before judging: DHT lookup + dial + first blocks
+    _POLL_S = 5.0
+
     def __init__(self, bootstrap: list[str] | None = None, sidecar_bin: str | None = None,
                  key: str | None = None, timeout: int = 1800):
         self.bin = sidecar_bin or os.environ.get("SHARD_SIDECAR", "/tmp/sidecar")
@@ -223,6 +241,17 @@ class Libp2pProvider(Provider):
         self.bootstrap = list(bootstrap) if bootstrap is not None else env_bs
         self.key = key
         self.timeout = timeout
+
+    @staticmethod
+    def _progress(dest: str) -> int:
+        """Bytes delivered so far: the sidecar streams into '<dest>.p2p.<pid>.<peer>.part'."""
+        n = 0
+        for p in glob.glob(f"{dest}.p2p.*.part") + ([dest] if os.path.exists(dest) else []):
+            try:
+                n += os.path.getsize(p)
+            except OSError:
+                pass
+        return n
 
     def fetch(self, shard: dict, dest: str) -> None:
         cmd = [self.bin, "-fetch-cid", shard["shard_id"], "-fetch-out", dest,
@@ -232,13 +261,40 @@ class Libp2pProvider(Provider):
         if self.key:
             cmd += ["-key", self.key]
         try:
-            r = subprocess.run(cmd, capture_output=True, text=True, timeout=self.timeout + 60)
+            proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
         except FileNotFoundError:
             raise ProviderUnavailable(f"sidecar binary {self.bin!r} not found")
-        except subprocess.TimeoutExpired:
-            raise ProviderUnavailable(f"libp2p fetch of {shard['path']} timed out ({self.timeout}s)")
-        if r.returncode != 0:
-            tail = ((r.stderr or r.stdout).strip().splitlines() or ["no output"])[-1]
+
+        started = time.monotonic()
+        base = self._progress(dest)
+        deadline = started + self.timeout + 60
+        slow = None
+        while proc.poll() is None:
+            time.sleep(self._POLL_S)
+            now = time.monotonic()
+            elapsed = now - started
+            if now > deadline:
+                slow = f"timed out ({self.timeout}s)"
+                break
+            if elapsed >= self._RAMP_S and self.MIN_PEER_MBPS > 0:
+                rate = (self._progress(dest) - base) / elapsed / 1e6
+                if rate < self.MIN_PEER_MBPS:
+                    slow = (f"peer too slow: {rate:.1f} MB/s over {elapsed:.0f}s "
+                            f"(floor {self.MIN_PEER_MBPS:.0f} MB/s) — falling back to the mirror")
+                    break
+        if slow:
+            proc.kill()
+            proc.wait(timeout=30)
+            # drop the abandoned partial so it cannot be mistaken for progress or leak disk
+            for p in glob.glob(f"{dest}.p2p.*.part"):
+                try:
+                    os.remove(p)
+                except OSError:
+                    pass
+            raise ProviderUnavailable(f"libp2p fetch of {shard['path']}: {slow}")
+        out, err = proc.communicate()
+        if proc.returncode != 0:
+            tail = ((err or out or "").strip().splitlines() or ["no output"])[-1]
             raise ProviderUnavailable(f"libp2p fetch failed: {tail[:160]}")
 
 
