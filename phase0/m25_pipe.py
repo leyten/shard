@@ -51,9 +51,21 @@ def _keepalive(s):
 
 try:                                                    # PROVE: opt-in signed per-stage receipts (trustless verify)
     from receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
-except Exception:
-    ReceiptSigner = None
+except ImportError:
+    try:                                                # self-provisioned node: only phase0/ is on
+        # sys.path, and the module lives at shard/receipt.py — WITHOUT this fallback the import
+        # failed, RECEIPTS silently became False even with --receipts passed, every job produced
+        # zero receipts, verification reported "assigned signer(s) produced no receipt", and the
+        # honest coordinator was docked reputation on every single job. Same shape as the
+        # `challenge` import below, which always had it.
+        from shard.receipt import ReceiptSigner, load_or_make_node_key, verify_receipt, verify_coverage
+    except ImportError:
+        ReceiptSigner = None
 RECEIPTS = bool(os.environ.get("SHARD_RECEIPTS")) and ReceiptSigner is not None
+if os.environ.get("SHARD_RECEIPTS") and ReceiptSigner is None:
+    # fail LOUD: silently serving unsigned work is what made this invisible for two nights
+    print("[shard] WARNING: SHARD_RECEIPTS set but the receipt module could not be imported — "
+          "this node will produce NO signed receipts and cannot be paid", flush=True)
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", os.path.expanduser("~/.shard_node_key"))
 
 # C2 activation authorization, engine layer: a per-swarm/epoch token minted ONCE per launch by the
