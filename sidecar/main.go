@@ -30,6 +30,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/libp2p/go-libp2p"
@@ -38,6 +39,7 @@ import (
 	"github.com/libp2p/go-libp2p/core/network"
 	"github.com/libp2p/go-libp2p/core/peer"
 	relayclient "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/client"
+	relayv2 "github.com/libp2p/go-libp2p/p2p/protocol/circuitv2/relay"
 	"github.com/multiformats/go-multiaddr"
 )
 
@@ -134,23 +136,69 @@ func newHost(priv crypto.PrivKey, listen string, n natOpts) (host.Host, error) {
 		libp2p.Identity(priv),
 		libp2p.ListenAddrStrings(listens...),
 		libp2p.EnableHolePunching(), // DCUtR: punch a direct hole between two NAT'd peers
+		// LAYER 1 of the standard NAT stack, and the one we were missing: ask the home gateway to
+		// map our listen port via UPnP-IGD / NAT-PMP. This is what every BitTorrent client and game
+		// console has done for twenty years — the node gets a REAL dialable public port with ZERO
+		// user router config. Without it we leaned entirely on DCUtR, which fails on symmetric/CGNAT
+		// and leaves a home box with no usable INBOUND path: it can pull weights and forward
+		// outbound all day, but the ring can never push an activation INTO it (observed 2026-07-22:
+		// a WSL/residential 4090 joined, seeded and held a stage, yet every inbound transfer stalled).
+		libp2p.NATPortMap(),
 	}
+	// One addrs factory for BOTH jobs: the operator's -announce hint, and the circuit addrs for
+	// relays we hold a reservation on.
+	//
+	// The circuit half is load-bearing. `relayclient.Reserve` makes us REACHABLE through a relay
+	// but publishes nothing — advertising the circuit addr is AutoRelay's job, and AutoRelay only
+	// starts on a reachability-change event and then waits for 4 candidates behind a 3-minute boot
+	// delay, so on a 2-relay network it effectively never fires (measured: no circuit addr after
+	// 240s). The result was a CGNAT node announcing only its undialable carrier addr, which is
+	// exactly why the ring's forward leg into a residential stage was dead 100% of the time.
+	// Since we did the reservation ourselves, we advertise its circuit ourselves too.
+	var ann multiaddr.Multiaddr
 	if n.announce != "" {
-		// libp2p only sees container-internal addrs behind Vast's port mapping; advertise
-		// the real public addr so reservations/circuit addrs others get are actually dialable.
-		ann, err := multiaddr.NewMultiaddr(n.announce)
+		a, err := multiaddr.NewMultiaddr(n.announce)
 		if err != nil {
 			return nil, err
 		}
-		opts = append(opts, libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
-			return append([]multiaddr.Multiaddr{ann}, addrs...)
-		}))
+		ann = a
 	}
+	opts = append(opts, libp2p.AddrsFactory(func(addrs []multiaddr.Multiaddr) []multiaddr.Multiaddr {
+		out := addrs
+		if ann != nil {
+			out = append([]multiaddr.Multiaddr{ann}, out...)
+		}
+		return append(out, reservedCircuitAddrs()...)
+	}))
 	if n.relayService {
 		// be a public relay (circuit-relay-v2) + an AutoNAT server (so NAT'd peers can
 		// learn their reachability + observed address from us). Force public reachability
 		// so the hop service activates immediately.
-		opts = append(opts, libp2p.EnableRelayService(), libp2p.ForceReachabilityPublic(), libp2p.EnableNATService())
+		//
+		// CRUCIAL: a default relay caps each circuit at 128KB / 2min and buffers only 2KB — fine for
+		// rendezvous, useless as a DATA PATH. A home box behind CGNAT/an IPv6 firewall (no direct
+		// inbound at all — see 2026-07-23: Telenet CGNAT'd IPv4 + firewalled IPv6) can ONLY be reached
+		// THROUGH the relay, so the relay must actually carry the activation stream. Lift the per-
+		// circuit limit entirely and fatten the buffers so a stage's [S,H] activations flow (this is
+		// the operator-paid guaranteed tier — the DERP/TURN equivalent).
+		opts = append(opts, libp2p.EnableRelayService(relayv2.WithResources(relayv2.Resources{
+			Limit:                  nil, // nil = no per-connection duration/byte cap: a real data pipe
+			ReservationTTL:         24 * time.Hour, // was 1h — a session-long serve outlived the TTL; the NAT'd stage's slot lapsed mid-run
+			MaxReservations:        512,
+			MaxCircuits:            256,
+			BufferSize:             256 * 1024, // 256KB relay buffers (default 2KB throttles throughput)
+			MaxReservationsPerPeer: 32,
+			MaxReservationsPerIP:   32,
+			MaxReservationsPerASN:  128,
+		})), libp2p.ForceReachabilityPublic(), libp2p.EnableNATService())
+	}
+	if !n.relayService && len(n.staticRelays) > 0 {
+		// LAYER 3: the guaranteed tier. When neither the port map nor hole-punching yields a
+		// dialable path (symmetric NAT, CGNAT, UPnP disabled), carry traffic OVER the relay —
+		// the same fallback WebRTC calls TURN (~15% of real calls) and Tailscale calls DERP.
+		// A bare reservation only makes us FINDABLE; AutoRelay makes the circuit a usable
+		// transport, so a home node still serves instead of silently having dead inbound.
+		opts = append(opts, libp2p.EnableAutoRelayWithStaticRelays(n.staticRelays))
 	}
 	// NAT'd nodes reserve on relays explicitly (in main) and let AutoNAT + the
 	// observed-address manager (from several observer peers) determine reachability — so
@@ -176,7 +224,7 @@ func main() {
 	listenAddr := flag.String("listen", "/ip4/0.0.0.0/tcp/0", "libp2p listen multiaddr; pin the port for cross-box reach, e.g. /ip4/0.0.0.0/tcp/29600")
 	inbound := flag.String("inbound", "", "tunnel: dial this local engine addr (host:port) for each inbound libp2p stream")
 	var forwards stringList
-	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr — listen localAddr, carry each conn to the peer (repeatable)")
+	flag.Var(&forwards, "forward", "tunnel: localAddr=peerMultiaddr[,peerMultiaddr...] — listen localAddr, carry each conn to the peer; give EVERY candidate addr (direct + /p2p-circuit) so libp2p races them (repeatable)")
 	var allowPeers stringList
 	flag.Var(&allowPeers, "allow", "PeerId allowed to open inbound activation streams (repeatable; none = allow all)")
 	frameTimeout := flag.Int("frame-timeout", 60, "tunnel: abort when a frame doesn't complete within this many seconds of its first byte (0 = legacy raw pipe)")
@@ -313,7 +361,35 @@ func main() {
 			continue
 		}
 		h.ConnManager().Protect(relay.ID, "relay")
+		noteReservation(relay) // start advertising this relay's circuit as an inbound path
 		log.Printf("RESERVED relay slot on %s (expires %s)", relay.ID, res.Expiration)
+	}
+
+	// RE-EMIT the addr set once a circuit exists.
+	//
+	// The ADDR lines above are printed at boot, BEFORE any reservation, so on a NAT'd box they
+	// contain only the (undialable) observed addr — the circuit addr peers actually need was
+	// never announced, and the ring's forward leg into that node was dead. AutoRelay publishes
+	// the circuit addr a beat after the reservation lands, so wait briefly for it and print the
+	// set again. The consumer keeps its original resolve (it reads ADDR lines until shortly
+	// after "tunnel up", which is logged after this), so nothing downstream has to change and
+	// the boot-time print still satisfies anything that resolves early.
+	if len(staticRelays) > 0 {
+		deadline := time.Now().Add(12 * time.Second)
+		for time.Now().Before(deadline) {
+			if hasCircuitAddr(h) {
+				break
+			}
+			time.Sleep(250 * time.Millisecond)
+		}
+		final := fullAddrs(h)
+		log.Printf("ADDRS-FINAL %d addr(s), circuit=%v", len(final), hasCircuitAddr(h))
+		for _, a := range final {
+			fmt.Printf("ADDR %s\n", a)
+		}
+		if !hasCircuitAddr(h) {
+			log.Printf("WARNING: no /p2p-circuit addr after reservation — a NAT'd node is UNROUTABLE to ringmates")
+		}
 	}
 
 	// DHT content routing — the torrent half of the verified weight-fetch. -seed
@@ -445,23 +521,134 @@ func main() {
 	select {} // serve until killed
 }
 
-// openStream dials a peer by multiaddr and opens an activation stream. libp2p's
-// Noise handshake guarantees the peer holds the key named in the multiaddr.
-func openStream(h host.Host, peerAddr string) (network.Stream, error) {
-	maddr, err := multiaddr.NewMultiaddr(peerAddr)
-	if err != nil {
-		return nil, err
+// Circuit addrs for the relays this host holds a live reservation on. Written by the reservation
+// loop, read by the addrs factory on every advertisement, so a NAT'd node starts publishing its
+// inbound path the moment the reservation lands.
+var (
+	circuitMu    sync.Mutex
+	circuitAddrs []multiaddr.Multiaddr
+)
+
+// noteReservation records "<relay addr>/p2p/<relayID>/p2p-circuit" for every addr of a relay we
+// just reserved on — the multiaddr a ringmate dials to reach us through that relay.
+func noteReservation(relay peer.AddrInfo) {
+	circuitMu.Lock()
+	defer circuitMu.Unlock()
+	for _, a := range relay.Addrs {
+		full, err := multiaddr.NewMultiaddr(a.String() + "/p2p/" + relay.ID.String() + "/p2p-circuit")
+		if err != nil {
+			continue
+		}
+		dup := false
+		for _, e := range circuitAddrs {
+			if e.Equal(full) {
+				dup = true
+				break
+			}
+		}
+		if !dup {
+			circuitAddrs = append(circuitAddrs, full)
+		}
 	}
-	info, err := peer.AddrInfoFromP2pAddr(maddr)
-	if err != nil {
-		return nil, err
+}
+
+func reservedCircuitAddrs() []multiaddr.Multiaddr {
+	circuitMu.Lock()
+	defer circuitMu.Unlock()
+	return append([]multiaddr.Multiaddr(nil), circuitAddrs...)
+}
+
+// hasCircuitAddr reports whether libp2p is currently advertising a relay circuit for this host —
+// the only inbound path a CGNAT'd node has.
+func hasCircuitAddr(h host.Host) bool {
+	for _, a := range h.Addrs() {
+		if strings.Contains(a.String(), "p2p-circuit") {
+			return true
+		}
 	}
+	return false
+}
+
+// forwardTarget is one successor stage: its PeerId plus EVERY candidate path to it.
+//
+// The addrs are ALTERNATE ROUTES TO THE SAME PEER, so they belong in one AddrInfo and libp2p
+// dials them in parallel under DefaultDialRanker (QUIC first, TCP +250ms, /p2p-circuit +500ms)
+// — the circuit is a genuine last resort rather than a replacement. Carrying a single addr,
+// which is what we used to do, threw that away: a CGNAT node announces an undialable
+// carrier addr, and the working circuit addr sitting right next to it was never tried, so the
+// forward leg was dead 100% of the time on any residential node.
+type forwardTarget struct {
+	id    peer.ID
+	addrs []multiaddr.Multiaddr
+}
+
+func (t *forwardTarget) String() string {
+	return fmt.Sprintf("%s via %d addr(s)", t.id, len(t.addrs))
+}
+
+// parseForwardTargets accepts "maddr[,maddr...]", every entry naming the SAME peer.
+func parseForwardTargets(list string) (*forwardTarget, error) {
+	t := &forwardTarget{}
+	for _, s := range strings.Split(list, ",") {
+		if s = strings.TrimSpace(s); s == "" {
+			continue
+		}
+		maddr, err := multiaddr.NewMultiaddr(s)
+		if err != nil {
+			return nil, err
+		}
+		info, err := peer.AddrInfoFromP2pAddr(maddr)
+		if err != nil {
+			return nil, err
+		}
+		if t.id == "" {
+			t.id = info.ID
+		} else if t.id != info.ID {
+			// Mixing peers in one forward would silently route activations to the WRONG stage
+			// and produce plausible-but-corrupt tokens — refuse rather than guess.
+			return nil, fmt.Errorf("mixes peers %s and %s", t.id, info.ID)
+		}
+		t.addrs = append(t.addrs, info.Addrs...)
+	}
+	if t.id == "" {
+		return nil, fmt.Errorf("names no peer")
+	}
+	return t, nil
+}
+
+// openStream connects to the successor over whichever candidate path wins and opens an
+// activation stream. libp2p's Noise handshake guarantees the peer holds the named key.
+func openStream(h host.Host, t *forwardTarget) (network.Stream, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	if err := h.Connect(ctx, *info); err != nil {
+	// A circuit is a LIMITED connection unless the relay granted unlimited resources; without
+	// this opt-in the activation stream is refused outright on any third-party relay.
+	ctx = network.WithAllowLimitedConn(ctx, "shard-activation")
+	if err := h.Connect(ctx, peer.AddrInfo{ID: t.id, Addrs: t.addrs}); err != nil {
 		return nil, err
 	}
-	return h.NewStream(ctx, info.ID, activationProto)
+	return h.NewStream(ctx, t.id, activationProto)
+}
+
+// openStreamRetry absorbs the ring-formation race: a successor whose sidecar has not yet
+// registered the activation handler answers "protocols not supported", and one still booting
+// refuses the dial. Both are startup states, not failures — a ring forms over seconds. The
+// deadline keeps a genuinely dead successor from hanging the stage forever.
+func openStreamRetry(h host.Host, t *forwardTarget, within time.Duration) (network.Stream, error) {
+	var last error
+	back := 250 * time.Millisecond
+	for end := time.Now().Add(within); time.Now().Before(end); {
+		s, err := openStream(h, t)
+		if err == nil {
+			return s, nil
+		}
+		last = err
+		time.Sleep(back)
+		if back < 2*time.Second {
+			back *= 2
+		}
+	}
+	return nil, fmt.Errorf("no activation stream to %s within %v: %w", t.id, within, last)
 }
 
 // monitorConns logs each new connection and whether it's via a relay or DIRECT — so we
@@ -567,23 +754,37 @@ func pipeFramed(a, b deadlineConn, T time.Duration) {
 
 // runForward listens on a local TCP addr; each accepted connection is carried to the
 // peer over a fresh libp2p stream — so the engine dials localhost and reaches the peer.
-func runForward(h host.Host, listenAddr, peerMaddr string, frameT time.Duration) {
-	// pre-establish the connection so DCUtR can upgrade relay->direct BEFORE data flows
-	// (otherwise the engine's first stream lands on the slow relay connection).
-	if ma, err := multiaddr.NewMultiaddr(peerMaddr); err == nil {
-		if ai, err := peer.AddrInfoFromP2pAddr(ma); err == nil {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			if err := h.Connect(ctx, *ai); err != nil {
-				log.Printf("forward pre-connect %s: %v", ai.ID, err)
-			}
-			cancel()
-		}
+func runForward(h host.Host, listenAddr, peerMaddrs string, frameT time.Duration) {
+	target, err := parseForwardTargets(peerMaddrs)
+	if err != nil {
+		log.Fatalf("forward %s: %v", listenAddr, err)
 	}
+	// pre-establish the connection so DCUtR can upgrade relay->direct BEFORE data flows
+	// (otherwise the engine's first stream lands on the slow relay connection). Retry: the
+	// successor may still be booting while this ring forms.
+	go func() {
+		ctx := network.WithAllowLimitedConn(context.Background(), "shard-activation")
+		back := time.Second
+		for end := time.Now().Add(120 * time.Second); time.Now().Before(end); {
+			c, cancel := context.WithTimeout(ctx, 30*time.Second)
+			err := h.Connect(c, peer.AddrInfo{ID: target.id, Addrs: target.addrs})
+			cancel()
+			if err == nil {
+				log.Printf("forward pre-connect %s OK", target.id)
+				return
+			}
+			log.Printf("forward pre-connect %s: %v (retrying)", target.id, err)
+			time.Sleep(back)
+			if back < 10*time.Second {
+				back *= 2
+			}
+		}
+	}()
 	ln, err := net.Listen("tcp", listenAddr)
 	if err != nil {
 		log.Fatalf("forward listen %s: %v", listenAddr, err)
 	}
-	log.Printf("forward %s -> %s", listenAddr, peerMaddr)
+	log.Printf("forward %s -> %s", listenAddr, target)
 	for {
 		c, err := ln.Accept()
 		if err != nil {
@@ -594,7 +795,7 @@ func runForward(h host.Host, listenAddr, peerMaddr string, frameT time.Duration)
 			tc.SetNoDelay(true)
 		}
 		go func() {
-			s, err := openStream(h, peerMaddr)
+			s, err := openStreamRetry(h, target, 30*time.Second)
 			if err != nil {
 				log.Printf("forward dial: %v", err)
 				c.Close()
