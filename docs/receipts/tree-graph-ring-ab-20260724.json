@@ -1,0 +1,19 @@
+{
+  "what": "TREE-FRAME CUDA GRAPHS ring A/B (gate 3, perf/tree-frame-graphs) — the perstream-trees-ab arms re-run with tree graphs ARMED and capture-PROVEN on every stage ('tree capture OK' in stage logs, npad=24). VERDICT: trees remain NET-NEGATIVE per-stream on this ring class (-22..-61% at B=4, medians of 3), with the mechanism now nailed three layers deep: (1) COMPUTE — FIXED: the 07-12 kill reason (154ms eager tree stage compute vs 45ms graphed chains) is gone; graphs captured and replayed live on all stages (bit-exact per the on-box receipt). (2) BYTES — chains yes, trees no: an M25_FP8_AUX=1 pass (halved aux) lifted CHAIN arms +20..+125%/stream (code 13.2->20.3, mix-B8 5.2->11.6 — a real standalone win, g held, receipts valid) but moved tree rounds NOT AT ALL. (3) SYNC-LATENCY — the binding term: tree rounds cost a flat ~207ms on this ring regardless of content, batch, aux size, or accept — the naked ring traversal, paid because a tree round drains the pipeline (dirty-frontier contract) while chain rounds hide RTT behind de-lockstep + cwnd keep-warm (60-87ms effective). The g lever itself reproduced: +13..+76% committed/round (summarize +75%, prose +30%, tools +26%, mix +22%, qa +17%, reasoning +13%; code -3% — chains already match code). NEXT LEVER (scoped, not built): pipeline tree rounds across streams / async tree rounds — a coordinator-scheduling problem; tail-side tree_greedy_walk aux slimming remains worthwhile for the return leg generally. KILL CRITERION: stands for THIS ring class at the current sync design; the 07-12 solo +18% tree win (sync cost amortized over one stream at depth-1) is unaffected.",
+  "date": "2026-07-24",
+  "ring": "6x RTX5090 EU (DE head [0:10), NO [10:22), FI [22:34), BG [34:46), IT [46:58), IT tail [58:62)), iids 45640267/45640272/45640296/45640937/45640939/45640292, label treegraph-ab, M25_BATCH=8 kv 4096 K=8 max_new 96, fp8 wire, aux_local ON, graphs on (M25_GRAPH_MAX=32, tree budget 4), M25_TREE_M=12 TOPB=3 DEPTH=8, receipts ON all passes (6/6 valid every arm). Return leg: head->tail via FSN relay circuit, DCUtR-upgraded to DIRECT (a consumer-ISP peering hole made the tail's addr unreachable from the head only — SHARD_RET_MADDR override, committed this branch; the relay-rendezvous design validated live)",
+  "method": "SWEEP_TREE_ARMS=off,on x3 reps (medians) + capture-proven discriminator pass + SWEEP_K=6 chain reference (partially degraded, k8 reference used — trees lose vs k8 a fortiori) + M25_FP8_AUX=1 off,on pass",
+  "per_stream_B4_medians": {
+    "chain_bf16aux": {"reasoning": 17.2, "tools": 13.4, "code": 13.2, "qa": 12.3, "mix": 10.1, "prose": 8.6, "summarize": 7.1},
+    "tree_graphed":  {"reasoning": 6.7, "tools": 6.4, "code": 5.3, "qa": 5.5, "mix": 4.8, "prose": 4.8, "summarize": 5.5},
+    "chain_fp8aux":  {"reasoning": 20.1, "tools": 15.3, "code": 20.3, "qa": 14.9, "mix": 13.1, "prose": 10.3, "summarize": 10.6}
+  },
+  "g_committed_per_round": {
+    "chain": {"reasoning": 4.95, "tools": 3.96, "code": 4.46, "qa": 3.56, "mix": 3.66, "prose": 2.79, "summarize": 2.42},
+    "tree":  {"reasoning": 5.61, "tools": 5.0, "code": 4.32, "qa": 4.17, "mix": 4.45, "prose": 3.63, "summarize": 4.25}
+  },
+  "ms_per_round_B4": {"chain_bf16aux": "73-87", "chain_fp8aux": "53-67", "tree": "182-228 (flat ~207)"},
+  "spend": "~$37 total across 2 days (incl. 3 aborted provisioning cycles: heavy-image stall, vast ssh-proxy aliasing two iids, dead-man switch firing on a stale heartbeat mid-warm — all three now have committed fixes/process guards)",
+  "branch": "perf/tree-frame-graphs (PR #138); launcher fixes f1d3bbd (SHARD_SSH_OVERRIDE) + circuit return (SHARD_RET_MADDR); capture log for arm proof",
+  "logs": "session scratchpad sweep_rep{1,2,3}.log sweep_disc.log sweep_fp8aux.log sweep_k6.log + ab_table.txt"
+}

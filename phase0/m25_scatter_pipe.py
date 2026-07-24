@@ -291,7 +291,18 @@ def main():
         j = vinst(iid)
         ports = j.get("ports") or {}
         m = ports.get(f"{LIBP2P}/tcp")
-        nodes.append(dict(region=region, iid=iid, host=j["ssh_host"], port=int(j["ssh_port"]),
+        host, port = j["ssh_host"], int(j["ssh_port"])
+        # SHARD_SSH_OVERRIDE="iid=host:port,...": route around a BROKEN vast ssh-proxy mapping.
+        # Proven failure (2026-07-23): the API returned ONE proxy endpoint for two different
+        # instances, so every ssh op (bootstrap, code push, key collect) silently hit the same box
+        # twice — caught only by the duplicate-receipt-pubkey guard. The direct '22/tcp' port map
+        # on public_ipaddr keeps working; this pins it explicitly, per iid.
+        ov = dict(kv.split("=") for kv in os.environ.get("SHARD_SSH_OVERRIDE", "").split(",") if "=" in kv)
+        if iid in ov:
+            host, port = ov[iid].rsplit(":", 1)
+            port = int(port)
+            print(f"[pipe] ssh override {region} {iid} -> {host}:{port}", flush=True)
+        nodes.append(dict(region=region, iid=iid, host=host, port=port,
                           pip=(j.get("public_ipaddr") or "").strip(), pport=m[0]["HostPort"] if m else None,
                           lo=int(lo), hi=int(hi), forced_eager=forced_eager))
     if a.external_tail:                               # a NON-SSH tail (home GPU): pre-set its circuit maddr + pid,
@@ -346,7 +357,14 @@ def main():
         if k < n - 1:
             forwards.append(f"127.0.0.1:{FWD_RING}={nodes[k+1]['maddr']}")
         if k == 0:
-            forwards.append(f"127.0.0.1:{FWD_RET}={nodes[-1]['maddr']}")   # head also tunnels coord-return -> tail
+            # SHARD_RET_MADDR: explicit coord-return target override. Proven need (2026-07-23): a
+            # consumer-ISP peering hole made the tail's direct addr unreachable FROM THE HEAD ONLY
+            # (reachable from everywhere else); the forward dial set is exactly this one maddr, so
+            # the fix is dialing the tail's /p2p-circuit addr via a launch relay — DCUtR then
+            # upgrades to direct where the hole allows. RemotePeer stays the head through a circuit,
+            # so the tail's allowlist is unaffected.
+            ret_maddr = os.environ.get("SHARD_RET_MADDR", "").strip() or nodes[-1]["maddr"]
+            forwards.append(f"127.0.0.1:{FWD_RET}={ret_maddr}")   # head also tunnels coord-return -> tail
         seed = "/root/m25_manifest.json=/root/m25" if a.seed_shards else None
         # bootstrap through the PREDECESSOR's sidecar only — it launched before us (k asc), so the
         # DHT link is up when we dial; the successor reciprocates when it launches. k=0 seeds solo.
