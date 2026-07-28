@@ -7,6 +7,7 @@ serves jobs read as JSON lines on stdin. A supervisor waits on the stdout contra
 
     SHARD_COORD_OK    {...}   --check preflight passed (engine imports, model dir sane), exit 0
     SHARD_COORD_READY {...}   pipe + return channel connected; jobs accepted on stdin
+    SHARD_JOB_START   {jobId, maxNew}  the job line was READ off stdin and handed to the ring
     SHARD_JOB_TOKEN   {jobId, delta}   one committed decode delta (streamed per ring round)
     SHARD_JOB_DONE    {jobId, ok, response, tokensGenerated, receipts, receiptsOk, nonce}
     SHARD_JOB_FATAL   {jobId?, error}  job failed (process continues) or boot failed (exit 1)
@@ -86,6 +87,37 @@ def _stall_budget(timeout):
     return v if v > 0 else None
 
 
+def _firstack_budget(stall_s):
+    """Budget (seconds) for a job's FIRST sign of ring life — the reset ack — kept separate from the
+    steady-state stall budget.
+
+    They are different failure classes. Mid-job, one legitimate wait can be a whole prefill chunk on
+    a thin residential uplink, so the stall budget is deliberately one full recv timeout wide (660s
+    at the daemon's defaults). The reset has no such case: it is one tiny control frame traversing
+    an already-WARM ring once (~160ms round-ring on the measured 6-hop EU ring). Bounding both by
+    the same number is what made the 2026-07-28 stranger-serve ring look like a coordinator that
+    "accepts jobs it never executes": it HAD sent the reset and was parked in recv_data for 11
+    minutes with nothing on stdout, so the operator saw an accepted job, silence, and 0% GPU.
+
+    This budget covers EXACTLY that leg, no further: coordinate_pipe ticks progress the moment the
+    reset is acked, so the prefill that follows is already back on the wide budget and a slow first
+    chunk can never be false-killed. The un-ticked window is that RTT plus whatever runs before it
+    on a job — render_ids over the prompt, and on a coordinator's FIRST job the drafter build
+    (make_drafter is evaluated as an argument, so an EAGLE head load lands inside it).
+
+    M25_JOB_FIRSTACK_S overrides; 0 disables. stall_s None means the operator turned the watchdog
+    OFF with M25_JOB_STALL_S=0, and that hatch has to keep meaning off — a second budget that
+    silently re-armed it would be a nasty surprise for whoever is debugging with it."""
+    if not stall_s:
+        return None
+    raw = os.environ.get("M25_JOB_FIRSTACK_S")
+    try:
+        v = float(raw) if raw not in (None, "") else 90.0
+    except ValueError:
+        v = 90.0
+    return min(v, stall_s) if v > 0 else None
+
+
 class _StallWatchdog:
     """P0-#5 L3 backstop: a RUNNING job that makes no observable progress (no reply received, no
     commit, no redial) for the stall budget gets a loud SHARD_JOB_FATAL and a hard process exit —
@@ -93,35 +125,55 @@ class _StallWatchdog:
     for the classes nothing else bounds: a drafter wedged inside torch/CUDA, a send stuck against
     a full buffer. Never a silent freeze."""
 
-    def __init__(self, stall_s, emit):
+    def __init__(self, stall_s, emit, first_s=None):
         self.stall_s = stall_s
+        self.first_s = first_s
         self.emit = emit
         self._last = time.monotonic()
         self._job = None
-        if stall_s:
+        self._moved = False              # has the ring answered anything at all for this job?
+        budgets = [b for b in (stall_s, first_s) if b]
+        if budgets:
+            self._poll = min(max(min(budgets) / 4.0, 0.05), 2.0)
             threading.Thread(target=self._run, daemon=True, name="job-stall-watchdog").start()
+
+    def _budget(self):
+        """The pre-first-reply wait and the mid-job wait are different failure classes (see
+        _firstack_budget) — this job is in exactly one of them."""
+        if self._moved or not self.first_s:
+            return self.stall_s
+        return self.first_s
 
     def arm(self, job_id):
         self._last = time.monotonic()
+        self._moved = False
         self._job = job_id
 
     def tick(self):
         self._last = time.monotonic()
+        self._moved = True
 
     def disarm(self):
         self._job = None
 
     def _run(self):
         while True:
-            time.sleep(min(max(self.stall_s / 4.0, 0.05), 2.0))
+            time.sleep(self._poll)
             job = self._job
-            if job is not None and time.monotonic() - self._last > self.stall_s:
+            budget = self._budget()
+            if job is not None and budget and time.monotonic() - self._last > budget:
                 # The kill must be UNCONDITIONAL — this is the last line of defense. The FATAL emit
                 # is best-effort: a bounded lock wait (the main thread may be wedged INSIDE a locked
                 # stdout write — the very stuck-write class this backstop covers), stderr fallback,
                 # and every exception swallowed so a dead stdout can never block or kill the exit.
-                err = (f"stall-watchdog: no progress in {self.stall_s:.0f}s "
-                       f"(ring or drafter wedged) — exiting so the daemon restarts us")
+                # Name the PHASE: "the ring never answered the job at all" and "the ring stopped
+                # answering mid-job" have different suspects, and the operator reading the daemon
+                # log is the one who has to tell them apart.
+                err = (f"stall-watchdog: no ring reply in {budget:.0f}s — the ring never acked this "
+                       f"job's reset (frames sent, nothing came back on the return channel)"
+                       if not self._moved else
+                       f"stall-watchdog: no progress in {budget:.0f}s (ring or drafter wedged)")
+                err += " — exiting so the daemon restarts us"
                 try:
                     if self.emit is not _emit:               # injected emit (tests/collectors): no stdout lock
                         self.emit("SHARD_JOB_FATAL", jobId=job, error=err)
@@ -248,7 +300,8 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
     eos = tok.eos_token_id
     eos_set = set(eos) if isinstance(eos, (list, tuple)) else {eos}
     chans = {"pipe": pipe, "ret": ret}
-    watchdog = _StallWatchdog(_stall_budget(a.timeout), emit)
+    stall_s = _stall_budget(a.timeout)
+    watchdog = _StallWatchdog(stall_s, emit, first_s=_firstack_budget(stall_s))
     if redial is None and getattr(a, "head", None) and getattr(a, "tail", None):
         def redial():
             # mid-job re-dial: cap the retry window well under the stall budget — a dead ring
@@ -266,6 +319,11 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
             emit("SHARD_JOB_FATAL", error=f"unparseable job line: {e}")
             continue
         watchdog.arm(job_id)
+        # The job line was READ off stdin and is going to the ring NOW. Without this, the whole
+        # window between the daemon's "swarm:job accepted" and a DONE/FATAL is silent, and a
+        # coordinator parked in recv_data is indistinguishable from one that never read stdin —
+        # the misread that cost the 2026-07-28 stranger-serve ring its root cause.
+        emit("SHARD_JOB_START", jobId=job_id, maxNew=job.get("maxNew"))
         try:
             r = run_job(MP, tok, eos_set, chans, a, job, emit=emit, watchdog=watchdog, redial=redial)
             if r.get("ok"):

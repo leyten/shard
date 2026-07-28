@@ -188,6 +188,8 @@ def test_job_submitted_on_socketpair_stdin_is_served():
         assert done["tokensGenerated"] == 32
         deltas = [f["delta"] for t, f in got if t == "SHARD_JOB_TOKEN"]
         assert deltas and "".join(deltas) == done["response"]
+        # the daemon-visible proof that the line left stdin, emitted BEFORE the ring is touched
+        assert tags.index("SHARD_JOB_START") == 0 and got[0][1]["jobId"] == "j-stdio-1"
     finally:
         coord.close()
         for s in (head_srv, ret_srv):
