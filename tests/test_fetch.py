@@ -12,11 +12,15 @@ with a synthetic signed manifest + LocalDirProvider (no network):
   - a manifest with a bad signature, or not matching the catalog-pinned publisher, is REJECTED
     before any byte is fetched;
   - a node fetches ONLY its block's shards (selectivity), and a correct cached file is not re-fetched
-    while a same-size-wrong-content file IS re-fetched (size match alone is never trusted).
+    while a same-size-wrong-content file IS re-fetched (size match alone is never trusted);
+  - the layer->files selection is derived from the signed weight_map's OWN tensor names, so a
+    checkpoint that namespaces its tensors differently still resolves, and a range that selects
+    zero weight files RAISES instead of pulling an empty block.
 
 Run: python3 -m pytest tests/test_fetch.py -q
 """
 import io
+import itertools
 import json
 import os
 import sys
@@ -28,7 +32,7 @@ sys.path.insert(0, _REPO)
 
 from shard import manifest as mf                    # noqa: E402
 from shard.fetch import (FetchError, LocalDirProvider, Provider, block_for_stage,  # noqa: E402
-                         fetch_block, fetch_block_range, shards_for_block)
+                         fetch_block, fetch_block_range, layer_of, shards_for_block)
 from shard.manifest import ManifestError            # noqa: E402
 
 
@@ -380,3 +384,103 @@ def test_mirror_provider_gives_up_after_retries(tmp_path, monkeypatch):
     monkeypatch.setattr(F.time, "sleep", lambda s: None)
     with pytest.raises(FetchError):
         F.MirrorProvider("http://mirror/", retries=2).fetch({"path": "x", "size": 9999}, str(tmp_path / "x"))
+
+
+# ---- 8. namespace genericity: the layer->files map comes from the signed weight_map ----------------
+
+def _m25_map(n_layers=6):
+    """An M2.5-shaped weight_map (the real nvidia/MiniMax-M2.5-NVFP4 tensor namespace): per-layer
+    norms, quantized MoE experts — a NUMBERED component that is not a layer number — and the three
+    boundary tensors. lm_head sits in a trailing file of its own (as it does in the real 29-shard
+    checkpoint), so the tail's boundary branch decides a file no layer range can pull."""
+    wm = {}
+    for j in range(n_layers):
+        fn = f"model-{1 if j < n_layers // 2 else 2:05d}-of-00003.safetensors"
+        P = f"model.layers.{j}."
+        for name in ("input_layernorm.weight", "post_attention_layernorm.weight",
+                     "self_attn.q_proj.weight", "self_attn.o_proj.weight",
+                     "block_sparse_moe.gate.weight", "block_sparse_moe.e_score_correction_bias"):
+            wm[P + name] = fn
+        for e in range(4):
+            for suf in ("weight", "weight_scale", "input_scale"):
+                wm[f"{P}block_sparse_moe.experts.{e}.w1.{suf}"] = fn
+    wm["model.embed_tokens.weight"] = "model-00001-of-00003.safetensors"
+    wm["model.norm.weight"] = "model-00002-of-00003.safetensors"
+    wm["lm_head.weight"] = "model-00003-of-00003.safetensors"
+    return wm
+
+
+def _legacy_files(wm, lo, hi, *, is_head, is_tail, tied):
+    """The pre-fix selection verbatim — hardcoded HF prefixes — as the equivalence oracle."""
+    need = set()
+
+    def add(prefixes):
+        for w, fn in wm.items():
+            if any(w.startswith(p) for p in prefixes):
+                need.add(fn)
+
+    add(tuple(f"model.layers.{j}." for j in range(lo, hi)))
+    if is_head or (is_tail and tied):
+        add(("model.embed_tokens",))
+    if is_tail:
+        add(("model.norm", "lm_head"))
+    return need
+
+
+def _files(wm, lo, hi, **kw):
+    """The weights files shards_for_block picks for a range (config/tokenizer are role-only)."""
+    manifest = {"weight_map": wm,
+                "shards": [{"path": p, "kind": "weights"} for p in sorted(set(wm.values()))]}
+    return {s["path"] for s in shards_for_block(manifest, lo, hi, want_tokenizer=False, **kw)}
+
+
+def test_layer_of_reads_the_checkpoints_own_numbering():
+    assert layer_of("model.layers.7.block_sparse_moe.experts.3.w1.weight") == 7   # not expert 3
+    assert layer_of("language_model.model.layers.61.self_attn.q_proj.weight") == 61
+    assert layer_of("model.embed_tokens.weight") is None                          # a boundary tensor
+
+
+@pytest.mark.parametrize("lo,hi", [(0, 1), (0, 3), (1, 3), (3, 6), (5, 6), (0, 6)])
+def test_m25_selection_identical_to_the_old_hardcoded_prefixes(lo, hi):
+    """M2.5 must not move a byte: for its namespace the weight_map-derived selection is the
+    SAME file set the hardcoded "model.layers.{j}." / embed / norm / lm_head prefixes picked,
+    for every range x role combination."""
+    wm = _m25_map()
+    for is_head, is_tail, tied in itertools.product((False, True), repeat=3):
+        role = dict(is_head=is_head, is_tail=is_tail, tied=tied)
+        assert _files(wm, lo, hi, **role) == _legacy_files(wm, lo, hi, **role), \
+            f"[{lo}:{hi}] {role}"
+
+
+def test_other_namespace_still_selects_its_layers():
+    """A multimodal checkpoint whose text model lives under its own prefix (Kimi-K3-shaped:
+    language_model.model.*, plus a vision tower). The hardcoded prefixes matched NOTHING here —
+    a silent zero-file pull, which is what made onboarding a new model a rewrite."""
+    wm = {f"language_model.model.layers.{j}.self_attn.q_proj.weight":
+          f"text-{1 if j < 2 else 2}.safetensors" for j in range(4)}
+    wm["language_model.model.embed_tokens.weight"] = "text-1.safetensors"
+    wm["language_model.model.norm.weight"] = "text-2.safetensors"
+    wm["language_model.lm_head.weight"] = "text-2.safetensors"
+    wm["vision_tower.patch_embed.proj.weight"] = "vision.safetensors"
+
+    assert _legacy_files(wm, 0, 2, is_head=True, is_tail=False, tied=False) == set()   # the bug
+    assert _files(wm, 0, 2, is_head=True, is_tail=False, tied=False) == {"text-1.safetensors"}
+    assert _files(wm, 2, 4, is_head=False, is_tail=True, tied=False) == {"text-2.safetensors"}
+    assert _files(wm, 1, 3, is_head=False, is_tail=False, tied=False) == {
+        "text-1.safetensors", "text-2.safetensors"}                     # spans the file boundary
+
+
+def test_unknown_namespace_fails_loudly():
+    """A checkpoint that numbers its blocks without a `layers.<n>.` component (GPT-2-shaped
+    transformer.h.<n>.) selects nothing — that must RAISE, naming the range and the pattern,
+    never return an empty block for the loader to fail on later."""
+    wm = {f"transformer.h.{j}.attn.c_attn.weight": "m.safetensors" for j in range(4)}
+    with pytest.raises(FetchError, match=r"no weight file for layers \[0:2\]"):
+        _files(wm, 0, 2, is_head=True, is_tail=False, tied=False)
+
+
+def test_range_outside_the_maps_layers_fails_loudly():
+    """A range the checkpoint does not have (a stale/wrong assignment) fails closed, naming
+    the layers the signed map actually carries."""
+    with pytest.raises(FetchError, match="only carries layers 0-5"):
+        _files(_m25_map(), 6, 8, is_head=False, is_tail=True, tied=False)
