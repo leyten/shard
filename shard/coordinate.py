@@ -32,6 +32,8 @@ import threading
 import time
 import traceback
 
+from shard.receipt import wire_receipt   # strip the post-sign `stage` debug tag before settlement
+
 _EMIT_LOCK = threading.Lock()
 _hard_exit = os._exit          # injectable for tests; the stall watchdog runs on a THREAD, where
                                # sys.exit only raises in that thread — os._exit is the real kill
@@ -340,7 +342,11 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
                     emit("SHARD_JOB_METRICS", jobId=job_id, **metrics)
                 emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
                      response=r.get("text", ""), tokensGenerated=int(r.get("n_tokens", 0)),
-                     receipts=r.get("receipts") or [], receiptsOk=r.get("receipts_ok"),
+                     # Hand settlement the SIGNED body: each stage tags its receipt with a `stage`
+                     # debug label after signing, and shard.verify signs-all-but-sig (stays strict),
+                     # so an un-stripped tag is InvalidSignature at the one call site that pays.
+                     receipts=[wire_receipt(rr) for rr in (r.get("receipts") or [])],
+                     receiptsOk=r.get("receipts_ok"),
                      nonce=job.get("nonce"),
                      degraded=bool(r.get("eagle_degraded") or r.get("degraded_retry")))
             else:
