@@ -35,6 +35,9 @@ from urllib.parse import urlsplit
 from urllib.request import Request
 
 from . import manifest as mf
+# the stage-key classification, re-exported here: the loaders resolve through the SAME
+# functions, so the files a node pulls are the tensors it materializes
+from .weightkeys import LAYER_PATTERN, boundary_of, layer_of
 
 
 class FetchError(Exception):
@@ -276,27 +279,6 @@ def block_for_stage(n_layers: int, stage: int, nstages: int) -> tuple[int, int]:
     return lo, hi
 
 
-# Every checkpoint numbers its decoder layers inside the tensor name, but the NAMESPACE around
-# that number is the checkpoint's own: "model.layers.0.", "text_model.layers.0." and
-# "language_model.model.layers.0." are all in the wild. Match the numbered component and tolerate
-# any prefix. Hardcoding "model.layers.{j}." selected ZERO files — a silent empty pull, no error —
-# for every checkpoint that namespaces its tensors differently.
-_LAYER_RE = re.compile(r"(?:^|\.)layers\.(\d+)\.")
-# Boundary tensors carry no layer number: the same prefix-tolerant match on the components the
-# loader places on the head (embedding) and on the tail (final norm, output head).
-_EMBED_RE = re.compile(r"(?:^|\.)embed_tokens(?:\.|$)")
-_NORM_RE = re.compile(r"(?:^|\.)norm(?:\.|$)")
-_HEAD_RE = re.compile(r"(?:^|\.)lm_head(?:\.|$)")
-
-
-def layer_of(tensor: str) -> int | None:
-    """The decoder layer a tensor belongs to per the checkpoint's own naming, or None for a
-    boundary/auxiliary tensor (embedding, final norm, output head, rotary cache). Numbers in
-    other components ("...experts.3.w1.weight") are not layer numbers — only `layers.<n>.` is."""
-    m = _LAYER_RE.search(tensor)
-    return int(m.group(1)) if m else None
-
-
 def shards_for_block(manifest: dict, lo: int, hi: int, *, is_head: bool,
                      is_tail: bool, tied: bool, want_tokenizer: bool) -> list[dict]:
     """Resolve the shards a node needs. weights shards are chosen via the signed
@@ -305,11 +287,11 @@ def shards_for_block(manifest: dict, lo: int, hi: int, *, is_head: bool,
     the index) go to everyone; tokenizer shards only to the coordinator/head. All non-
     weights files are KB–MB, so the multi-GB selectivity is entirely in the safetensors.
 
-    The layer->files mapping comes from the signed map's OWN tensor names (layer_of), so a
-    checkpoint that namespaces its tensors differently still resolves; a range that selects
-    nothing raises rather than pulling an empty block. The loaders it feeds still name the
-    HF layout explicitly (pipeline.load_stage's device_map, mlx_runtime.select_weight_keys),
-    so a foreign namespace fetches correctly here but does not load yet."""
+    The layer->files mapping comes from the signed map's OWN tensor names (shard.weightkeys),
+    so a checkpoint that namespaces its tensors differently still resolves; a range that
+    selects nothing raises rather than pulling an empty block. The loaders it feeds resolve
+    through the SAME classification (pipeline.load_stage's device_map,
+    mlx_runtime.select_weight_keys), so the files a node pulls are the tensors it loads."""
     wm = manifest["weight_map"]
     need_files: set[str] = set()
     layer_files: set[str] = set()
@@ -318,9 +300,11 @@ def shards_for_block(manifest: dict, lo: int, hi: int, *, is_head: bool,
         if j is not None:
             if lo <= j < hi:                 # a second numbered tower (e.g. a vision encoder) can
                 layer_files.add(fn)          # add files to a range: bytes, never a missing weight
-        elif _EMBED_RE.search(w) and (is_head or (is_tail and tied)):
+            continue
+        b = boundary_of(w)
+        if b == "embed" and (is_head or (is_tail and tied)):
             need_files.add(fn)               # the head's embedding (a tied tail reads logits from it)
-        elif is_tail and (_NORM_RE.search(w) or _HEAD_RE.search(w)):
+        elif is_tail and b in ("norm", "lm_head"):
             need_files.add(fn)               # the tail's final norm + output head
         # anything else belongs to no stage block and is not pulled, as before
     # A range resolving to NO file is the silent-empty-pull: fail closed and say what the map holds.
@@ -331,7 +315,7 @@ def shards_for_block(manifest: dict, lo: int, hi: int, *, is_head: bool,
         raise FetchError(
             f"weight_map selects no weight file for layers [{lo}:{hi}]: " + (
                 f"the map only carries layers {seen[0]}-{seen[-1]}" if seen else
-                f"no tensor name matches the layer pattern {_LAYER_RE.pattern!r} "
+                f"no tensor name matches the layer pattern {LAYER_PATTERN!r} "
                 f"(e.g. {sorted(wm)[:3]})") + " — refusing an empty weight pull")
     need_files |= layer_files
 

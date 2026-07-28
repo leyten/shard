@@ -6,7 +6,9 @@ that does NOT need a Metal device:
   - the module imports (and fails HONESTLY at call time) without mlx installed;
   - the range-loader's weight-key selection is a pure function, tested against a
     synthetic minimax-shaped weight_map (experts, gate, norms, embed, lm_head, quant
-    .scales/.biases companions, tied-embedding fallback, prefix-collision safety);
+    .scales/.biases companions, tied-embedding fallback, prefix-collision safety) and
+    pinned key-for-key against the hardcoded prefixes it replaced, so deriving the keys
+    from the checkpoint's own namespace loads M2.5 exactly as before;
   - the bf16 wire-bit bridge round-trips (numpy carries bf16 as uint16 bit patterns);
   - the ModelRuntime call/shape/dtype contract, EAGLE aux capture, and the spec-decode
     crop-to-start_pos KV ROLLBACK are exercised byte-for-byte on MlxRuntimeStub
@@ -19,6 +21,7 @@ checklist lives in docs/MLX_RUNTIME.md.
 Run: python3 -m pytest tests/test_mlx_runtime.py -q
 """
 import importlib.util
+import itertools
 import os
 import sys
 
@@ -312,6 +315,67 @@ def test_select_keys_corrupt_index_edges_fail_loud():
         select_weight_keys(no_norm, 2, 4, is_head=False, is_tail=True, tied=False)
     with pytest.raises(ValueError, match="embed_tokens"):
         select_weight_keys(no_embed, 2, 4, is_head=False, is_tail=True, tied=True)
+
+
+def _legacy_keys(wm, lo, hi, *, is_head, is_tail, tied):
+    """The pre-fix selection verbatim — hardcoded HF prefixes — as the equivalence oracle."""
+    prefixes = tuple(f"model.layers.{j}." for j in range(lo, hi))
+    keys = {k for k in wm if k.startswith(prefixes)} if prefixes else set()
+    if is_head:
+        keys |= {k for k in wm if k.startswith("model.embed_tokens.")}
+    if is_tail:
+        keys |= {k for k in wm if k.startswith("model.norm.")}
+        keys |= {k for k in wm if k.startswith("model.embed_tokens." if tied else "lm_head.")}
+    return sorted(keys)
+
+
+@pytest.mark.parametrize("lo,hi", [(0, 1), (0, 2), (1, 3), (2, 4), (0, 4)])
+def test_m25_key_selection_identical_to_the_old_hardcoded_prefixes(lo, hi):
+    """M2.5 must not load a different tensor: for its namespace the weight_map-derived
+    selection is the SAME key set the hardcoded "model.layers.{j}." / embed / norm / lm_head
+    prefixes picked, for every range x role combination."""
+    wm = _minimax_weight_map()
+    for is_head, is_tail, tied in itertools.product((False, True), repeat=3):
+        role = dict(is_head=is_head, is_tail=is_tail, tied=tied)
+        assert select_weight_keys(wm, lo, hi, **role) == _legacy_keys(wm, lo, hi, **role), \
+            f"[{lo}:{hi}] {role}"
+
+
+def test_select_keys_other_namespace_loads_what_the_fetch_pulled():
+    """The leak this closes: a checkpoint whose text stack lives under its own prefix
+    (Kimi-K3-shaped) FETCHES correctly (shard/fetch derives the same way) but selected ZERO
+    tensors here — the stage would have loaded a random-init block."""
+    wm = {f"language_model.model.layers.{j}.self_attn.q_proj.weight": "text.safetensors"
+          for j in range(4)}
+    wm["language_model.model.embed_tokens.weight"] = "text.safetensors"
+    wm["language_model.model.norm.weight"] = "text.safetensors"
+    wm["language_model.lm_head.weight"] = "text.safetensors"
+    wm["vision_tower.patch_embed.proj.weight"] = "vision.safetensors"
+
+    assert _legacy_keys(wm, 0, 2, is_head=True, is_tail=False, tied=False) == []      # the bug
+    assert select_weight_keys(wm, 0, 2, is_head=True, is_tail=False) == [
+        "language_model.model.embed_tokens.weight",
+        "language_model.model.layers.0.self_attn.q_proj.weight",
+        "language_model.model.layers.1.self_attn.q_proj.weight"]
+    tail = select_weight_keys(wm, 2, 4, is_head=False, is_tail=True)
+    assert "language_model.model.norm.weight" in tail and "language_model.lm_head.weight" in tail
+    assert "vision_tower.patch_embed.proj.weight" not in tail          # no stage owns it
+
+
+def test_select_keys_unknown_namespace_fails_loudly():
+    """A checkpoint numbering its blocks without a `layers.<n>.` component (GPT-2-shaped
+    transformer.h.<n>.) selects nothing — that must RAISE, never hand the loader an empty
+    set for a non-empty range (which mlx would happily fill with random init)."""
+    wm = {f"transformer.h.{j}.attn.c_attn.weight": "m.safetensors" for j in range(4)}
+    with pytest.raises(ValueError, match=r"no tensor for layers \[0:2\]"):
+        select_weight_keys(wm, 0, 2, is_head=False, is_tail=False)
+
+
+def test_select_keys_range_outside_the_maps_layers_fails_loudly():
+    """A range the checkpoint does not have (a stale/wrong assignment) fails closed, naming
+    the layers the index actually carries."""
+    with pytest.raises(ValueError, match="only carries layers 0-3"):
+        select_weight_keys(_minimax_weight_map(), 4, 6, is_head=False, is_tail=False)
 
 
 def test_files_for_keys_resolves_exactly():

@@ -18,11 +18,20 @@ launch tail-first so each node connects to an already-listening successor:
   python pipeline.py --stage 0 --nstages 4 --model M --next HOST1:29501 --prompt "..."
 """
 
-import argparse, socket, time
+import argparse, json, os, socket, sys, time
 import torch
 from transformers import AutoModelForCausalLM, AutoTokenizer, DynamicCache
 import wire
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError
+# node_kv's convention, verbatim: the flat import serves the single-dir box layout (launchers push
+# shard/*.py into /root/ next to phase0's files); off it -- repo checkout, installed wheel -- the
+# module lives at shard.weightkeys, and only THEN is this file's grandparent the repo root worth
+# putting on the path. Never demand a hand-set PYTHONPATH (LAUNCH.md P0-#2).
+try:
+    from weightkeys import namespace
+except ImportError:
+    sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+    from shard.weightkeys import namespace
 
 
 def _causal_mask(q_len, kv_len, start, window, dtype, device):
@@ -78,6 +87,41 @@ def run_block(h, parts, cache, start, par=None, dep=None):
     return h
 
 
+def checkpoint_tensor_names(model_id):
+    """The checkpoint's OWN tensor names, from a local model dir's safetensors index (exactly
+    what shard/fetch.py delivers). Empty for a bare hub id or a single-file checkpoint -- then
+    `namespace` keeps the HF-standard layout, which is what this loader used to hardcode."""
+    idx = os.path.join(model_id, "model.safetensors.index.json")
+    if not os.path.isfile(idx):
+        return []
+    with open(idx) as f:
+        return list(json.load(f).get("weight_map", {}))
+
+
+def device_map_for_block(ns, n_layers, lo, hi, *, is_head, is_tail, tied, device):
+    """Which modules land on the GPU and which stay on "meta" (never materialized). Keys are
+    MODULE paths, taken from the checkpoint's own namespace `ns` instead of the hardcoded
+    "model.layers.{j}" / "model.embed_tokens" / "model.norm" / "lm_head" -- which named nothing
+    in a checkpoint that puts its text stack elsewhere (a multimodal "language_model.model."),
+    so transformers refused the load and the model was un-onboardable without a code change.
+    The rotary cache carries no checkpoint tensor, so it is placed next to the layer list, where
+    an HF decoder keeps it."""
+    dmap = {ns["embed"]: device if (is_head or (is_tail and tied)) else "meta",
+            f"{ns['inner']}.rotary_emb".lstrip("."): device,
+            ns["norm"]: device if is_tail else "meta",
+            ns["lm_head"]: device if is_tail else "meta"}
+    for j in range(n_layers):
+        dmap[f"{ns['layers']}.{j}"] = device if lo <= j < hi else "meta"
+    return dmap
+
+
+def module_at(model, path):
+    """The submodule at a dotted MODULE path ("model.embed_tokens", "language_model.lm_head")."""
+    for part in filter(None, path.split(".")):
+        model = getattr(model, part)
+    return model
+
+
 def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eager", lo=None, hi=None):
     """load ONLY this stage's contiguous block of layers onto the GPU (+ embed on
     the head, norm/lm_head on the tail). every other component is mapped to "meta"
@@ -97,22 +141,19 @@ def load_stage(model_id, stage, nstages, device="cuda", dtype="auto", attn="eage
         hi = (stage + 1) * n_layers // nstages
     is_head, is_tail = stage == 0, stage == nstages - 1
     tied = bool(getattr(cfg, "tie_word_embeddings", False))   # then lm_head shares embed's weight
-    dmap = {"model.embed_tokens": device if (is_head or (is_tail and tied)) else "meta",
-            "model.rotary_emb": device,
-            "model.norm": device if is_tail else "meta",
-            "lm_head": device if is_tail else "meta"}
-    for j in range(n_layers):
-        dmap[f"model.layers.{j}"] = device if lo <= j < hi else "meta"
+    ns = namespace(checkpoint_tensor_names(model_id))          # the checkpoint's own module paths
+    dmap = device_map_for_block(ns, n_layers, lo, hi, is_head=is_head, is_tail=is_tail,
+                                tied=tied, device=device)
     print(f"[s{stage}] loading layers [{lo}:{hi}] of {model_id} ...", flush=True)
     model = AutoModelForCausalLM.from_pretrained(model_id, dtype=dtype, device_map=dmap,
                                                  attn_implementation=attn)
-    m = model.model
+    m = module_at(model, ns["inner"])                          # holds the layer list + rotary
     parts = {"rotary": m.rotary_emb, "n_layers": n_layers, "lo": lo, "hi": hi, "_model": model}
     if is_head:
-        parts["embed"] = m.embed_tokens
+        parts["embed"] = module_at(model, ns["embed"])
     if is_tail:
-        parts["norm"] = m.norm
-        parts["lm_head"] = model.lm_head
+        parts["norm"] = module_at(model, ns["norm"])
+        parts["lm_head"] = module_at(model, ns["lm_head"])
     kept = [m.layers[i] for i in range(lo, hi)]
     for i, layer in enumerate(kept):
         layer.self_attn.layer_idx = i
