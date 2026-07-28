@@ -29,6 +29,9 @@ from shard import manifest as mf  # noqa: E402
 TOKENIZER_FILES = {
     "tokenizer.json", "tokenizer_config.json", "tokenizer.model", "vocab.json",
     "merges.txt", "special_tokens_map.json", "chat_template.jinja", "added_tokens.json",
+    "tiktoken.model",   # a tiktoken vocab is the whole tokenizer (Kimi-K3 ships no tokenizer.json);
+                        # without it the manifest hands the head a tokenizer_config naming a file
+                        # the head can never verifiably fetch
 }
 CONFIG_FILES = {"config.json", "generation_config.json"}
 SKIP_DIRS = ("original/", "metal/", "onnx/", "gguf/")
@@ -74,6 +77,22 @@ def _kind(path):
     if base in CONFIG_FILES or base.endswith(".index.json"):
         return "config"
     return None  # README, .gitattributes, bf16 dupes, etc. — not loaded
+
+
+def decoder_config(cfg):
+    """The config of the stack a pipeline stage actually runs — the TEXT decoder.
+
+    A multimodal checkpoint's top-level config.json is a wrapper: Kimi-K3's carries the model_type,
+    the token ids and a `vision_config`, and nests the 93-layer decoder's own config under
+    `text_config`. `num_hidden_layers` is not at the top level at all, so reading it there raised
+    KeyError and no manifest could be published for such a checkpoint. It is not a cosmetic field:
+    the manifest's `layer_count` is the depth receipt coverage tiles against (shard/verify.py), so
+    it must be the DECODER's depth, not the wrapper's or the vision tower's.
+
+    Return the nested config only when it carries the depth, so a plain single-stack checkpoint
+    (and one whose text_config is a partial override) resolves exactly as before."""
+    inner = cfg.get("text_config")
+    return inner if isinstance(inner, dict) and "num_hidden_layers" in inner else cfg
 
 
 def _check_coverage(weight_map, shards):
@@ -184,14 +203,18 @@ def main():
         if os.path.isabs(p) or os.path.splitdrive(p)[0] or ".." in p.replace("\\", "/").split("/"):
             sys.exit(f"refusing to sign unsafe shard path: {p!r}")
 
+    # `arch` names the CHECKPOINT's own class (what a loader instantiates — for a multimodal one
+    # that is the wrapper, not the decoder); layer_count and tied_embeddings describe the decoder
+    # a stage runs, and come from its config.
+    dec = decoder_config(cfg)
     arch = (cfg.get("architectures") or ["unknown"])[0]
     manifest = {
         "schema": mf.SCHEMA,
         "model_id": model_id,
         "version": a.version,
         "arch": arch,
-        "layer_count": cfg["num_hidden_layers"],
-        "tied_embeddings": bool(cfg.get("tie_word_embeddings", False)),
+        "layer_count": dec["num_hidden_layers"],
+        "tied_embeddings": bool(dec.get("tie_word_embeddings", False)),
         "tokenizer": a.tokenizer_repo or repo,
         "weight_map": weight_map,
         "shards": shards,
@@ -214,7 +237,7 @@ def main():
     mf.verify_manifest(signed, expected_pubkey=mf.pub_b64(priv))  # self-check, fail closed
     print(json.dumps({
         "model_id": model_id, "version": a.version, "arch": arch,
-        "layer_count": cfg["num_hidden_layers"],
+        "layer_count": dec["num_hidden_layers"],
         "shards": len(shards), "weights_shards": len(weights),
         "total_gb": round(total / 1e9, 2),
         "publisher_pubkey": mf.pub_b64(priv), "out": a.out,
