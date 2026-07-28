@@ -15,10 +15,14 @@ reference file itself is untouched — it gets the API it asks for.
 
 The math is not invented here. It is fla's own published reference, transcribed from
 fla/ops/kda/naive.py (`naive_recurrent_kda`) and fla/ops/kda/gate.py (`naive_kda_gate`,
-`naive_kda_lowerbound_gate`), both MIT (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li, plus the
-fp32 ordering read off the Triton kernels so the two agree op-for-op:
+`naive_kda_lowerbound_gate`), both MIT (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li. The
+preprocessing those two do not cover -- what fla folds into the kernel -- is read off
+fla/ops/kda/fused_recurrent.py:149+:
   l2norm q,k as x/sqrt(sum(x*x)+1e-6)  ->  q *= K**-0.5  ->  gate  ->  sigmoid(beta)
-  S *= exp(g);  S += beta*k (x) (v - k.S);  o = q.S           (fla/ops/kda/fused_recurrent.py:149+)
+  S *= exp(g);  S += (beta*k) (x) (v - k.S);  o = q.S
+(the recurrence follows naive.py, which folds beta into k; the kernel folds it into v - k.S
+instead. Same product, different association -- fp-identical here because both run in fp32.)
+tests/test_k3_stage.py::test_cpu_kda_matches_flas_published_reference pins all of it.
 
 DELIBERATE M1 SIMPLIFICATION: `chunk_kda` here IS `fused_recurrent_kda` — one sequential recurrence
 for both prefill and decode. On a GPU the two are different kernels and are NOT bit-identical to each
@@ -75,11 +79,16 @@ def fused_recurrent_kda(q, k, v, g, beta, A_log=None, dt_bias=None, initial_stat
                         output_final_state=False, scale=None, use_qk_l2norm_in_kernel=False,
                         use_gate_in_kernel=False, use_beta_sigmoid_in_kernel=False,
                         allow_neg_eigval=False, lower_bound=None, safe_gate=None,
-                        transpose_state_layout=False, cu_seqlens=None, **kwargs):
+                        transpose_state_layout=False, state_v_first=False,
+                        cu_seqlens=None, **kwargs):
     """KDA's delta recurrence, token by token, in fp32. q,k: [B,T,H,K]  v,g: [B,T,HV,*]  beta: [B,T,HV].
 
     Returns (o [B,T,HV,V], final_state) with the state in fla's layout -- [B,HV,K,V], or [B,HV,V,K]
-    under transpose_state_layout (fla's `state_v_first`)."""
+    V-first. fla spells that flag `state_v_first`; the reference decoder still calls it
+    `transpose_state_layout`, so BOTH are accepted and mean the same thing. Swallowing the spelling
+    we do not know into **kwargs would silently return a transposed state -- the same numbers, the
+    wrong layout, no error -- which is exactly the handover M2 has to get right."""
+    transpose_state_layout = transpose_state_layout or state_v_first
     if cu_seqlens is not None:
         raise NotImplementedError("k3_kda_cpu: varlen (cu_seqlens) is a batched-serving concern, "
                                   "deferred to M2 -- pass one unpadded sequence per call")
@@ -178,17 +187,18 @@ class ShortConvolution(nn.Conv1d):
 
         y = F.conv1d(xfull.transpose(1, 2), self.weight, self.bias, groups=self.groups)
         y = y.transpose(1, 2)
-        if residual is not None:
-            y = y + residual
         if self.activation is not None:
             y = F.silu(y)
+        if residual is not None:
+            # fla adds the residual AFTER the activation (the Canon op). KDA never passes one, so
+            # this line is unreached today -- it is here so it is not wrong when something does.
+            y = y + residual
 
         if not output_final_state:
             return y, None
-        tail = xfull[:, -W:].transpose(1, 2)                       # [B, D, <=W]
-        if tail.shape[-1] < W:                                     # sequence shorter than the window
-            tail = F.pad(tail, (W - tail.shape[-1], 0))
-        return y, tail.contiguous()
+        # xfull is always >= W wide (W-1 of left context plus at least one new token), so the last
+        # W columns are exactly the window the next chunk needs.
+        return y, xfull[:, -W:].transpose(1, 2).contiguous()
 
 
 class FusedRMSNormGated(nn.Module):

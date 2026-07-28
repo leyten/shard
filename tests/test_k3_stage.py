@@ -84,6 +84,24 @@ def _adapt_reference_whole_model():
     return M
 
 
+def _seed_unreached_parameters(model):
+    """Seed the parameters Moonshot's own initializer does not reach.
+
+    KimiPreTrainedModel._init_weights handles nn.Linear and nn.Embedding only, but
+    KimiDeltaAttention declares `dt_bias` as a bare nn.Parameter(torch.empty(...)) and never
+    initializes it. torch.manual_seed cannot reach raw heap, so a random-init fixture gets whatever
+    was in memory: across ten builds at the SAME seed the absmax ran 0.0, 0.1, 3.4e11, ... 1.9e36,
+    and one build contained a NaN, which took the whole suite red (torch.equal(nan, nan) is False)
+    about 3% of runs. A real checkpoint always overwrites dt_bias with a loaded tensor, so this bites
+    fixtures only -- but a headline parity test that is randomly red proves nothing, so seed it.
+
+    A_log needs nothing: the reference builds it as log(empty.uniform_(1, 16)), which IS seeded."""
+    with torch.no_grad():
+        for name, p in model.named_parameters():
+            if name.endswith("dt_bias"):
+                p.normal_(0.0, 0.02)
+
+
 @pytest.fixture(scope="module")
 def fixture():
     """(reference module, config, reference model). Random-init, seeded, built once."""
@@ -91,6 +109,8 @@ def fixture():
     cfg = _tiny_config()
     torch.manual_seed(1234)
     model = M.KimiLinearForCausalLM(cfg).eval()
+    _seed_unreached_parameters(model)
+    assert all(p.isfinite().all() for p in model.parameters()), "fixture built a non-finite weight"
     # KimiLinearModel.__init__ overwrites the requested attention with flash_attention_2 (right on an
     # 8xB300, fatal on CPU). One config object is shared by the model and every Stage below, so
     # pinning it back here pins it for both sides of the parity comparison.
@@ -387,6 +407,85 @@ def test_quant_config_reads_the_checkpoints_own_block(tmp_path, fixture):
 
 
 # ── the CPU backend itself ───────────────────────────────────────────────────────────────────────
+
+def _fla_published_kda(q, k, v, g, beta, A_log, dt_bias, lower_bound, initial_state=None):
+    """flash-linear-attention's OWN published reference, transcribed here as the golden formulation.
+
+    Everything above this line runs the reference model and the stage through the same KDA backend
+    -- k3_stage.ref() installs k3_kda_cpu as `fla` before importing the reference -- so those tests
+    prove state THREADING and are blind to the recurrence itself. Verified by mutation: deleting the
+    delta subtraction entirely, dropping the q scale, or flipping the gate sign all survive every
+    other test in this file. This is what pins the math.
+
+    Sources, MIT (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li:
+      fla/ops/kda/naive.py     naive_recurrent_kda
+      fla/ops/kda/gate.py      naive_kda_lowerbound_gate
+    plus the preprocessing fla does inside the kernel rather than in naive.py (l2 norm, beta
+    sigmoid), read off fla/ops/kda/fused_recurrent.py's kernel body."""
+    B, T, H, Kd = q.shape
+    V = v.shape[-1]
+    q, k, v, g, beta = (x.float() for x in (q, k, v, g, beta))
+    q = q / torch.sqrt((q * q).sum(-1, keepdim=True) + 1e-6)
+    k = k / torch.sqrt((k * k).sum(-1, keepdim=True) + 1e-6)
+    q = q * (Kd ** -0.5)
+    g = lower_bound * torch.sigmoid(A_log.view(H, 1).float().exp() * (g + dt_bias.view(H, -1)))
+    beta = torch.sigmoid(beta)
+
+    S = q.new_zeros(B, H, Kd, V)
+    if initial_state is not None:
+        S = S + initial_state
+    o = torch.zeros_like(v)
+    for i in range(T):
+        q_i, k_i, v_i, g_i, b_i = q[:, i], k[:, i], v[:, i], g[:, i], beta[:, i]
+        S = S * g_i[..., None].exp()
+        S = S + torch.einsum("bhk,bhv->bhkv", b_i[..., None] * k_i,
+                             v_i - (k_i[..., None] * S).sum(-2))
+        o[:, i] = torch.einsum("bhk,bhkv->bhv", q_i, S)
+    return o, S
+
+
+def test_cpu_kda_matches_flas_published_reference():
+    """The CPU KDA recurrence, gate and in-kernel preprocessing against fla's own formulation."""
+    import k3_kda_cpu
+    torch.manual_seed(3)
+    B, T, H, Kd, V = 2, 6, 3, 8, 8
+    q, k = torch.randn(B, T, H, Kd), torch.randn(B, T, H, Kd)
+    v, g = torch.randn(B, T, H, V), torch.randn(B, T, H, Kd)
+    beta, A_log, dt_bias = torch.randn(B, T, H), torch.randn(H), torch.randn(H * Kd)
+
+    o, state = k3_kda_cpu.fused_recurrent_kda(
+        q, k, v, g, beta, A_log=A_log, dt_bias=dt_bias, output_final_state=True,
+        use_qk_l2norm_in_kernel=True, use_gate_in_kernel=True, use_beta_sigmoid_in_kernel=True,
+        lower_bound=-5.0, transpose_state_layout=True)
+    o_ref, s_ref = _fla_published_kda(q, k, v, g, beta, A_log, dt_bias, -5.0)
+
+    assert torch.allclose(o, o_ref, atol=1e-6), f"max |diff| {(o - o_ref).abs().max().item():.3e}"
+    # transpose_state_layout is fla's state_v_first: the state comes back [B,H,V,K], not [B,H,K,V]
+    assert state.shape == (B, H, V, Kd)
+    assert torch.allclose(state.transpose(-1, -2), s_ref, atol=1e-6)
+
+
+def test_state_v_first_is_accepted_under_both_fla_spellings():
+    """fla renamed transpose_state_layout -> state_v_first. A shim that swallowed the new name into
+    **kwargs would return [B,H,K,V] where the caller wants [B,H,V,K] -- silently transposed state,
+    which is the worst possible M2 handover bug. Both spellings must mean the same thing."""
+    import k3_kda_cpu
+    torch.manual_seed(5)
+    a = dict(q=torch.randn(1, 3, 2, 4), k=torch.randn(1, 3, 2, 4), v=torch.randn(1, 3, 2, 4),
+             g=torch.randn(1, 3, 2, 4), beta=torch.randn(1, 3, 2), output_final_state=True)
+    _, plain = k3_kda_cpu.fused_recurrent_kda(**a)
+    _, old = k3_kda_cpu.fused_recurrent_kda(**a, transpose_state_layout=True)
+    _, new = k3_kda_cpu.fused_recurrent_kda(**a, state_v_first=True)
+    assert torch.equal(old, new)
+    assert torch.equal(old, plain.transpose(-1, -2))
+
+
+def test_seed_block_residual_flattens_batch_and_sequence():
+    """(num_tokens, 0, hidden) -- num_tokens is B*S. At B=1 a bug here is invisible, which is
+    exactly why the parity tests above cannot be trusted to catch it."""
+    assert K3.seed_block_residual(torch.zeros(3, 5, 7)).shape == (15, 0, 7)
+
+
 
 def test_cpu_kda_backend_is_what_a_gpuless_box_resolves_to():
     """No GPU -> the CPU backend, so none of the above needs rented hardware."""
