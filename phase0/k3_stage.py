@@ -1,8 +1,9 @@
 """Kimi-K3 pipeline stage: one contiguous layer block, driven through shard's stage contract.
 
-The K3 analogue of m25_stage.py, at MILESTONE 1 scope -- a CPU-correct, parity-proven layer range
-for both attention types, with the AttnRes boundary threaded through the contract. No GPU kernels
-here; M2 swaps them in (see "what M1 leaves open" below).
+The K3 analogue of m25_stage.py. M1 built a CPU-correct, parity-proven layer range for both
+attention types with the AttnRes boundary threaded through the contract; M2 puts the GPU kernels
+G0 proved on sm_120 behind it, each under its own knob, with the CPU path still the default on a
+box with no CUDA (see "the M2 knobs" below).
 
 WHAT MAKES K3 DIFFERENT FROM EVERY STAGE WE HAVE SHIPPED
 A plain transformer stage is a function of one tensor: h_out = block(h_in). K3's decoder is not.
@@ -34,18 +35,28 @@ so a stage holding KDA layers REFUSES a rewind instead of silently answering fro
 M1 is therefore greedy sequential decode only. Speculative rollback needs SpecLA-style compact-factor
 bookkeeping or a state checkpoint/restore, and is M3 work.
 
-WHAT M1 LEAVES OPEN (the M25_* mechanisms deliberately NOT ported yet)
-  M25_CUDA_GRAPH / M25_STATIC_KV  graph capture + fixed-address KV; needs the GPU kernels first
+THE M2 KNOBS (all default to M1's behaviour on a box with no CUDA)
+  K3_KDA_BACKEND      auto|cpu|fla|flashkda   the delta recurrence         (k3_kda_cpu/k3_kda_flash)
+  K3_ATTNRES_BACKEND  auto|ref|fla            the AttnRes collapse         (k3_attnres)
+  K3_MOE_BACKEND      auto|none|marlin        the MXFP4 routed experts     (k3_moe_mxfp4)
+  K3_STATIC_STATE     0|1                     fixed-address KDA state (implied by the next one)
+  K3_CUDA_GRAPH       0|1                     capture the whole layer block, one graph per
+                                              (tokens, num_blocks); K3_GRAPH_MAX caps the set
+  K3_DIR, K3_DEV, K3_DTYPE                    where/what/which precision, as in M1
+
+WHAT M2 STILL LEAVES OPEN (the M25_* mechanisms deliberately NOT ported)
   M25_BATCH / M25_BATCH_MOE       continuous batching; the KDA ops here reject cu_seqlens outright
   M25_FP8_WIRE                    fp8 activation transport -- and `block_residual` is the bigger
                                   half of a K3 payload, so it is the thing worth packing
   M25_EAGLE / M25_TREE            drafting; K3 ships no MTP head (num_nextn_predict_layers 0), the
                                   candidate is the external DSpark drafter
-Knobs this file does read: K3_DIR, K3_DEV, K3_DTYPE, plus K3_KDA_BACKEND (in k3_kda_cpu).
+  graphs over an MLA layer        an MLA stage's KV grows by cat, so it has no fixed addresses to
+                                  capture; K3_CUDA_GRAPH refuses such a stage rather than
+                                  half-capturing it (69 of 93 layers are KDA and DO graph)
 
   self-test:  python3 phase0/k3_stage.py --dir /root/k3 --layers 0 4
 """
-import argparse, json, os, sys, torch
+import argparse, contextlib, json, os, sys, torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetensors import safe_open
@@ -65,6 +76,29 @@ dev = os.environ.get("K3_DEV", "cuda")
 # "" -> bf16 on a GPU (what the checkpoint's non-expert tensors already are), fp32 on CPU, where
 # bf16 is both slow and too coarse to tell a parity break from rounding.
 K3_DTYPE = os.environ.get("K3_DTYPE", "")
+# Fixed-address KDA state: the recurrent summary and the three conv windows are preallocated once
+# and updated IN PLACE, so `cache_params.recurrent_states[li] = ret` stops being a reallocation and
+# a captured graph keeps replaying against the live state. m25's M25_STATIC_KV, minus the length
+# cap -- a KDA state is a fixed-size summary of the whole history, so there is no MAXLEN to bound.
+K3_STATIC_STATE = os.environ.get("K3_STATIC_STATE", "0") != "0"
+# Whole-layer-block CUDA graphs. G0 (sm_120, real layer-46 weights) measured the capture of an
+# entire K3 layer at 1.1186 ms against 1.5141 ms eager on a 5090, and the pieces individually at
+# 21.2 -> 16.4 us (FlashKDA decode) and 118.6 -> 8.19 us (AttnRes, a 14x collapse -- at T=1 every
+# AttnRes variant is launch-bound, so graphs are the whole lever there).
+#
+# UNLIKE m25, THE KEY IS NOT A CONTEXT BUCKET. A KDA-only stage's forward reads no position at all
+# (no RoPE, no mask, and the recurrent state is position-free), so the only things that vary are the
+# token count and the DEPTH OF THE ATTNRES STACK -- which grows as blocks are appended at layers
+# {0,12,24,...}. One graph per (tokens, num_blocks); for a fixed layer range num_blocks is in fact
+# constant, so a decode stage converges on exactly one graph.
+K3_CUDA_GRAPH = os.environ.get("K3_CUDA_GRAPH", "0") != "0"
+if K3_CUDA_GRAPH:
+    K3_STATIC_STATE = True
+# Every captured graph pins its own workspace pool, so cap the set process-wide. Past the cap a new
+# shape runs EAGER (counted, never a crash), exactly like m25's M25_GRAPH_MAX.
+K3_GRAPH_MAX = int(os.environ.get("K3_GRAPH_MAX", "8"))
+_GRAPH_COUNT = 0        # graphs captured so far, across every Stage in this process
+_GRAPH_SKIPPED = 0      # blocks that ran eager because the cap was hit or a capture failed
 
 _REF = None
 _CFG = {}
@@ -93,16 +127,20 @@ def _tf_compat():
 
 
 def ref():
-    """Moonshot's reference decoder module, with a usable KDA backend installed first (memoized).
+    """Moonshot's reference decoder module, with usable kernels installed around it (memoized).
 
-    The import order matters: `modeling_kimi_linear` resolves `from fla...` at module scope, so the
-    backend has to be on sys.modules BEFORE the first import and can never be swapped after."""
+    ORDER IS LOAD-BEARING, in both directions. `modeling_kimi_linear` resolves `from fla...` at
+    module scope, so the KDA backend has to be in place BEFORE the first import and can never be
+    swapped after. The AttnRes backend is the opposite: it rebinds a name ON the imported module, so
+    it can only be installed after."""
     global _REF
     if _REF is None:
-        import k3_kda_cpu
+        import k3_attnres, k3_kda_cpu
+        k3_kda_cpu.set_static_state(K3_STATIC_STATE)
         k3_kda_cpu.install()
         _tf_compat()
         from kimi_k3_ref import modeling_kimi_linear as M
+        k3_attnres.install(M)
         _REF = M
     return _REF
 
@@ -144,18 +182,18 @@ def raw(n, d=None):
 
 
 def quant_config(d=None):
-    """K3's routed-expert quantization, or None -- the seam a 4-bit MoE backend resolves through.
+    """K3's routed-expert quantization block as the checkpoint writes it, or None.
 
-    M1 materializes bf16 tensors only and `Stage.load` fails loudly on a packed expert, because a
-    stage that silently skipped them would serve random-init experts behind a valid receipt.
+    Stays a pure reader -- validating here would make the seam's shape depend on how much of the
+    format this repo happens to support today. `k3_moe_mxfp4.spec()` is where the block is checked
+    (format, group_size, num_bits, what is in the ignore list) and `k3_moe_mxfp4.backend()` is where
+    it turns into a decision; both are pure dict work, so the format contract is testable with no
+    GPU and no vLLM.
 
-    TODO(M2): K3's format is `mxfp4-pack-quantized`, group_size 32, num_bits 4 -- the checkpoint IS
-    the quantized release, there is no bf16 upstream. G0 (2026-07-28, sm_120) measured the path:
-    vLLM 0.26 resolves this to CompressedTensorsW4A4Mxfp4MoEMethod, the two SM100+ backends fail
-    is_supported_config on sm_120 and it falls through to MarlinExperts -- a repack, NOT a bf16
-    dequant, so the VRAM saving survives and only FP4 tensor-core throughput is lost. Wire that in
-    here the way m25_stage.quant_config feeds _build_moe, and keep EMULATION out of the priority
-    list (it materializes bf16 every forward)."""
+    K3's answer: `mxfp4-pack-quantized`, group_size 32, num_bits 4, E8M0 scales, routed experts only
+    -- and the checkpoint IS the quantized release, there is no bf16 upstream to fall back to. With
+    the backend off, `Stage.load` still fails loudly on a packed expert (M1's rule), because a stage
+    that silently skipped them would serve random-init experts behind a valid receipt."""
     d = d or K3_DIR
     cfgj = json.load(open(f"{d}/config.json"))
     return cfgj.get("quantization_config") or cfgj.get("text_config", {}).get("quantization_config")
@@ -209,8 +247,28 @@ class Stage:
         # actually check correctness). A Stage constructed after one of those would inherit it, so
         # pin it here rather than trusting whoever handed us the config.
         self.cfg._attn_implementation = "eager"
-        self.layers = torch.nn.ModuleList([M.KimiDecoderLayer(self.cfg, li)
-                                           for li in range(lo, hi)])
+        import k3_moe_mxfp4
+        # The routed experts are decided BEFORE the layers are built, not after: at K3's real shape
+        # letting the reference materialize its 896 bf16 experts costs 58.6 GiB per layer, which is
+        # an OOM on any card and on most hosts. Under the marlin backend they are constructed on the
+        # meta device (free) and dropped immediately -- the MXFP4 tensors are what actually load.
+        self.quant = getattr(self.cfg, "quantization_config", None)
+        self.moe_backend = k3_moe_mxfp4.backend(self.quant)
+        build = (k3_moe_mxfp4.hollow_experts(M) if self.moe_backend == "marlin"
+                 else contextlib.nullcontext())
+        with build:
+            self.layers = torch.nn.ModuleList([M.KimiDecoderLayer(self.cfg, li)
+                                               for li in range(lo, hi)])
+        self.moe = {}
+        if self.moe_backend == "marlin":
+            for L in self.layers:
+                msb = getattr(L, "block_sparse_moe", None)
+                if msb is None:                       # a dense layer (first_k_dense_replace) has .mlp
+                    continue
+                msb.experts = torch.nn.ModuleList()   # drop the meta placeholders before any .to()
+                ex = k3_moe_mxfp4.MarlinRoutedExperts(self.cfg, self.quant, device=self.device)
+                msb.moe_infer = ex.moe_infer          # instance attribute shadows the reference's
+                self.moe[L.layer_idx] = ex
         self.has_kda = any(L.is_linear_attn for L in self.layers)
         self.has_mla = any(not L.is_linear_attn for L in self.layers)
         self.head, self.tail = head, tail
@@ -224,9 +282,17 @@ class Stage:
             self.lm_head = torch.nn.Linear(H, self.cfg.vocab_size, bias=False)
         for m in self._owned_modules():
             m.to(device=self.device, dtype=self.dtype).eval()
+        self._keep_gate_params_fp32()
         self.cache = None
         self._pos = 0
         self.reset()
+        self.graph = None
+        if K3_CUDA_GRAPH:
+            why = self._graph_refusal()
+            if why:
+                print(f"[k3] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
+            else:
+                self.graph = _StageGraph(self)
 
     def _owned_modules(self):
         yield self.layers
@@ -234,15 +300,86 @@ class Stage:
             if hasattr(self, n):
                 yield getattr(self, n)
 
+    def _keep_gate_params_fp32(self):
+        """Undo the blanket dtype cast for the two KDA parameters the reference declares fp32.
+
+        `A_log` and `dt_bias` are not weights in a GEMM -- they parameterize the decay itself, as
+        exp(A_log) * (g + dt_bias) inside a sigmoid, and every backend consumes them in fp32 (the CPU
+        one calls .float() on the way in; FlashKDA TORCH_CHECKs kFloat32 and rejects anything else).
+        A stage-wide .to(bfloat16) would round them to ~3 decimal digits first and then widen the
+        rounded value back, which is a quiet accuracy loss for zero saving: both are tiny (96 and
+        96x128 per layer). No-op on the CPU path, where the stage dtype is already fp32."""
+        with torch.no_grad():
+            for L in self.layers:
+                if not L.is_linear_attn:
+                    continue
+                a = L.self_attn
+                a.A_log.data = a.A_log.data.float()
+                a.dt_bias.data = a.dt_bias.data.float()
+
+    def _graph_refusal(self):
+        """Why this stage cannot be graph-captured, or None. Loud and specific, never silent."""
+        if not str(self.device).startswith("cuda"):
+            return f"device is {self.device}"
+        if self.has_mla:
+            mla = [L.layer_idx for L in self.layers if not L.is_linear_attn]
+            return (f"layers {mla} are MLA and their KV cache grows by torch.cat, so there are no "
+                    f"fixed addresses to capture (static KV for MLA is not in M2 scope)")
+        for L in self.layers:
+            msb = getattr(L, "block_sparse_moe", None)
+            if msb is not None and L.layer_idx not in self.moe:
+                return (f"layer {L.layer_idx} runs the reference's own moe_infer, whose "
+                        f"tokens_per_expert.cpu() is a host sync that a capture cannot contain — "
+                        f"set K3_MOE_BACKEND=marlin")
+        if not K3_STATIC_STATE:
+            return "K3_STATIC_STATE is off, so the KDA state reallocates on every step"
+        return None
+
     # ---- state ----
 
     def reset(self):
         """Drop every per-stage tensor a job accumulated: MLA KV, KDA recurrent + conv state, pos.
 
-        Unlike m25_stage.reset this is a real free, not a logical one -- there are no fixed-address
-        buffers to overwrite until M2 brings static KV."""
+        Under K3_STATIC_STATE this becomes a LOGICAL reset (m25_stage.reset's shape): the KDA
+        buffers are zeroed in place and keep their addresses, because a captured graph replays
+        against those exact pointers and a fresh cache between jobs would leave it reading a freed
+        allocation. Without it, a real free -- M1's behaviour."""
+        if K3_STATIC_STATE and self.cache is not None:
+            with torch.no_grad():
+                for li in range(self.lo, self.hi):
+                    r = self.cache.recurrent_states[li]
+                    if r is not None:
+                        r.zero_()
+                    for c in (self.cache.conv_states[li] or ()):
+                        c.zero_()
+                    self.cache.key_cache[li] = self.cache.value_cache[li] = None
+            self._pos = 0
+            return
         self.cache = ref().KimiDynamicCache(config=self.cfg)
         self._pos = 0
+        if K3_STATIC_STATE:
+            self._alloc_state()
+
+    def _alloc_state(self):
+        """Preallocate this stage's KDA state so every step writes the SAME addresses.
+
+        Both halves have to be fixed, not one: a graph that captured a static recurrent state and a
+        reallocating conv cache replays half against live data and half against a dead pointer. The
+        conv window carries activations so it takes the stage dtype; the recurrent state is fp32,
+        which is what both backends produce (and what FlashKDA stores, though it accumulates in
+        bf16 internally). Sizes at K3's shape: 6.00 MiB + 0.56 MiB per layer, per request."""
+        with torch.no_grad():
+            for L in self.layers:
+                if not L.is_linear_attn:
+                    continue
+                a, li = L.self_attn, L.layer_idx
+                z = lambda *s, dt: torch.zeros(*s, dtype=dt, device=self.device)   # noqa: E731
+                self.cache.recurrent_states[li] = z(1, a.num_heads, a.head_dim, a.head_dim,
+                                                    dt=torch.float32)
+                qk = a.head_k_dim * a.num_k_heads
+                self.cache.conv_states[li] = tuple(
+                    z(1, width, a.conv_size, dt=self.dtype)
+                    for width in (qk, qk, a.head_dim * a.num_heads))
 
     def _seek(self, start_pos):
         """Move the stage to `start_pos`, or refuse. See this module's docstring on KDA rollback."""
@@ -289,6 +426,11 @@ class Stage:
         h = h.to(device=self.device, dtype=self.dtype)
         br = block_residual.to(device=self.device, dtype=self.dtype)
         s = h.shape[1]
+        if self.graph is not None:
+            out = self.graph.run(h, br)
+            if out is not None:                  # None = this shape is not graphed (see _StageGraph)
+                self._pos = start_pos + s
+                return out
         mask = (_causal_mask(s, start_pos + s, start_pos, self.dtype, self.device)
                 if self.has_mla else None)
         with torch.no_grad():
@@ -328,12 +470,30 @@ class Stage:
         ns = weightkeys.namespace(wm)
         for li in range(self.lo, self.hi):
             prefix = f"{ns['layers']}.{li}."
-            sd = {n[len(prefix):]: raw(n, d) for n in wm
-                  if weightkeys.layer_of(n) == li and n.startswith(prefix)}
-            if not sd:
+            names = [n for n in wm if weightkeys.layer_of(n) == li and n.startswith(prefix)]
+            if not names:
                 raise RuntimeError(f"k3 stage[{self.lo}:{self.hi}]: no tensor under {prefix!r} — "
                                    f"the checkpoint's decoder resolved to {ns['layers']!r}")
-            self.layers[li - self.lo].load_state_dict(self._fixup(sd, prefix), strict=True)
+            ex = self.moe.get(li)
+            if ex is None:
+                sd = {n[len(prefix):]: raw(n, d) for n in names}
+                self.layers[li - self.lo].load_state_dict(self._fixup(sd, prefix), strict=True)
+                continue
+            # The 4-bit experts do not go through load_state_dict at all: they are streamed into
+            # vLLM's packed buffers one expert at a time (14.6 GiB/layer would otherwise sit in host
+            # RAM as a dict) and repacked at the end of THIS layer. Everything else -- the router,
+            # the latent projections, the norms, the shared experts -- is bf16 and loads normally.
+            epfx = "block_sparse_moe.experts."
+            sd = {k: raw(n, d) for n, k in ((n, n[len(prefix):]) for n in names)
+                  if not k.startswith(epfx)}
+            missing, unexpected = self.layers[li - self.lo].load_state_dict(
+                self._fixup(sd, prefix), strict=False)
+            if missing or unexpected:
+                raise RuntimeError(
+                    f"k3 stage[{self.lo}:{self.hi}]: layer {li} bf16 load is not exact — "
+                    f"missing {sorted(missing)[:4]} unexpected {sorted(unexpected)[:4]}. Only the "
+                    f"routed experts may be absent from the state dict under the marlin backend.")
+            ex.load(lambda n: raw(n, d), f"{prefix}block_sparse_moe").arm()
         if self.head:
             self.embed_tokens.load_state_dict({"weight": raw(ns["embed"] + ".weight", d)})
         if self.tail:
@@ -362,8 +522,9 @@ class Stage:
                         ("weight_packed", "weight_scale", "weight_shape", "weight_global_scale"))
         if packed:
             raise NotImplementedError(
-                f"k3 stage[{self.lo}:{self.hi}]: {prefix}{packed[0]} is a packed MXFP4 tensor and M1 "
-                f"materializes bf16 only — the 4-bit MoE backend is M2 (see quant_config()'s TODO)")
+                f"k3 stage[{self.lo}:{self.hi}]: {prefix}{packed[0]} is a packed MXFP4 tensor and "
+                f"this path materializes bf16 only — set K3_MOE_BACKEND=marlin to run the 4-bit "
+                f"routed experts (k3_moe_mxfp4), which needs vLLM and a CUDA device")
         if A in sd:
             want = self.cfg.linear_attn_config["num_heads"]
             if sd[A].shape[0] > want:
@@ -371,9 +532,134 @@ class Stage:
         return sd
 
     def __repr__(self):
+        import k3_attnres, k3_kda_cpu
         kinds = "".join("K" if L.is_linear_attn else "M" for L in self.layers)
+        be = f"kda={k3_kda_cpu.backend()} attnres={k3_attnres.backend()} moe={self.moe_backend}"
         return (f"<K3Stage [{self.lo}:{self.hi}) {kinds} head={self.head} tail={self.tail} "
-                f"{self.dtype} on {self.device} pos={self._pos}>")
+                f"{self.dtype} on {self.device} pos={self._pos} {be} "
+                f"graph={'on' if self.graph is not None else 'off'}>")
+
+
+# ── whole-layer-block CUDA graphs ────────────────────────────────────────────────────────────────
+
+class _StageGraph:
+    """Capture + replay this stage's entire layer block, one graph per (tokens, num_blocks).
+
+    G0 proved the capture end to end on real layer-46 weights (FlashKDA + fla AttnRes + Marlin
+    MXFP4 experts in one graph): 1.1186 ms replayed against 1.5141 ms eager on a 5090, and capture
+    succeeded at every batch size on both cards it was run on.
+
+    WHY THE KEY IS (s, nb) AND NOT A CONTEXT BUCKET. m25 keys its graphs on a KV-length bucket
+    because attention reads a span that grows with position. A KDA-only stage reads no position at
+    all: no RoPE, no mask, and the recurrent state is a fixed-size summary rather than a window. The
+    only things that change shape are the token count and the depth of the AttnRes stack, and for a
+    fixed layer range the latter is constant -- so a decode stage settles on exactly ONE graph, and
+    the dict is there to keep a prefill or a differently-placed stage from silently sharing it.
+
+    THE CAPTURE MUTATES LIVE STATE. Warm-up runs the real layers against the real recurrent buffers
+    and advances them, and unlike an MLA KV crop there is no way to undo a recurrence. The whole
+    KDA state is cloned before warm-up and written back after the device is drained -- both on the
+    success path and on the failure path, since a half-warmed state is a corrupted job, not a slow
+    one. (m25's RowGraphRunner MAJOR-3, in the shape a summary state forces.)
+
+    The returned pair ALIASES the graph's static output buffers: consume or copy it before the next
+    forward, exactly like m25's GraphRunner.run."""
+
+    def __init__(self, stage):
+        self.st = stage
+        self.graphs = {}                     # (s, nb) -> (graph, h_static, br_static, out_static)
+        self.eager = set()                   # shapes whose capture failed -> permanently eager
+
+    def _state(self):
+        """Every KDA buffer a capture can disturb: the recurrent summary and the three conv windows."""
+        c, out = self.st.cache, []
+        for li in range(self.st.lo, self.st.hi):
+            if c.recurrent_states[li] is not None:
+                out.append(c.recurrent_states[li])
+            out.extend(c.conv_states[li] or ())
+        return out
+
+    def _layers(self, h, br):
+        for L in self.st.layers:
+            h, br = L(h, attention_mask=None, past_key_values=self.st.cache, block_residual=br)
+        return h, br
+
+    def _capture(self, s, nb):
+        global _GRAPH_COUNT
+        st = self.st
+        H = st.cfg.hidden_size
+        h = torch.zeros(1, s, H, dtype=st.dtype, device=st.device)
+        br = torch.zeros(s, nb, H, dtype=st.dtype, device=st.device)
+        saved = [(t, t.clone()) for t in self._state()]
+        try:
+            side = torch.cuda.Stream()
+            side.wait_stream(torch.cuda.current_stream())
+            with torch.cuda.stream(side), torch.no_grad():
+                for _ in range(3):           # also warms fla's attnres autotuner, which SYNCS —
+                    self._layers(h, br)      # doing that inside a capture is fatal
+            torch.cuda.current_stream().wait_stream(side)
+            torch.cuda.synchronize()
+            g = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(g), torch.no_grad():
+                out = self._layers(h, br)
+        finally:
+            torch.cuda.synchronize()         # drain before touching live buffers (both paths)
+            with torch.no_grad():
+                for t, backup in saved:
+                    t.copy_(backup)
+        self.graphs[(s, nb)] = (g, h, br, out)
+        _GRAPH_COUNT += 1
+
+    def plan(self, h, br):
+        """Route a (h, block_residual) pair: ("replay"|"capture"|"budget"|"eager", key).
+
+        Pure -- no device work, no allocation, no capture -- so the routing rules are provable
+        without a GPU (tests/test_k3_stage_m2.py), which is the half of graph plumbing that is
+        cheapest to get subtly wrong and most expensive to debug on rented hardware. `key` is None
+        only for a shape that is out of scope entirely, where there is nothing to remember."""
+        if h.shape[0] != 1 or br.shape[0] != h.shape[1]:
+            return "eager", None             # batched, or a payload that is not this stage's tokens
+        key = (h.shape[1], br.shape[1])
+        if key in self.graphs:
+            return "replay", key
+        if key in self.eager:
+            return "eager", key
+        if _GRAPH_COUNT >= K3_GRAPH_MAX:
+            return "budget", key
+        return "capture", key
+
+    def run(self, h, br):
+        """Replay this (s, nb), or return None to say "run it eager" -- never raise, never crash.
+
+        A stage must not die because a graph would not capture: a fallback costs milliseconds, a
+        dead stage costs the warm weights behind it."""
+        global _GRAPH_SKIPPED
+        what, key = self.plan(h, br)
+        if what == "eager":
+            _GRAPH_SKIPPED += key is not None
+            return None
+        if what == "budget":
+            self.eager.add(key)
+            _GRAPH_SKIPPED += 1
+            print(f"[k3] graph budget K3_GRAPH_MAX={K3_GRAPH_MAX} spent — shape {key} stays eager",
+                  flush=True)
+            return None
+        if what == "capture":
+            try:
+                self._capture(*key)
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()
+                self.eager.add(key)
+                _GRAPH_SKIPPED += 1
+                print(f"[k3] graph capture failed for (tokens, blocks)={key}: "
+                      f"{type(e).__name__}: {e} — shape marked permanently eager", flush=True)
+                return None
+        g, hs, brs, out = self.graphs[key]
+        hs.copy_(h)
+        brs.copy_(br)
+        g.replay()
+        torch.cuda.synchronize()
+        return out
 
 
 def _selftest(lo, hi, d):
