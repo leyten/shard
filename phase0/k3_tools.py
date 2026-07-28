@@ -47,6 +47,27 @@ turns that into a hard error. The default is permissive because a caller seeding
 turns by hand is a legitimate (if degraded) request, and refusing it is a product call, not this
 file's.
 
+WHAT THIS FORMAT CANNOT EXPRESS (read before trusting a parse)
+XTML escapes ATTRIBUTE values (`&` then `"`) but not element BODIES, so the format is not
+self-delimiting and no parser of it can be lossless. An argument value that contains the literal
+characters `<|close|>argument<|sep|>` ends its own argument early, and can go on to open another
+argument or another whole `<|open|>call ...` — the rendered bytes are then indistinguishable from a
+model that really made two calls. Likewise a visible answer that quotes `<|open|>tools<|sep|>` ends
+the answer there and everything after it reads as a tool call. Both are properties of the wire, not
+of this parser; they are pinned as tests so a future change cannot quietly make them worse.
+
+What that does NOT include is the case that matters most: a USER cannot do this. Their text is a
+non-special segment, so those characters become ordinary bytes and never a control token. The
+exposure is a model persuaded to emit its own control markers, which is why a call is only accepted
+when its own `<|close|>call<|sep|>` arrives before the next opener, and why the raw-json escape
+hatch is honoured only when it is the entire call body. A tool name or argument key containing
+`<|sep|>` is unrepresentable and its call (or argument) is dropped.
+
+Two request-shaped gaps are the gateway's, not this file's: `reasoning_effort` is collapsed to a
+boolean before it reaches render_ids (so every K3 request currently renders `thinking_effort=max`),
+and `parse_completion`'s `reasoning` flag needs threading from the request to disambiguate a
+`reasoning=False` completion truncated before any marker.
+
 ASSISTANT PREFILL IS NOT IMPLEMENTED UPSTREAM
 Moonshot's hosted API supports it; `encoding_k3.py` does not — `build_chat_segments` always closes
 the last assistant message and opens a fresh one (HF discussion #99, open, unanswered). Rather than
@@ -64,7 +85,7 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from kimi_k3_ref.encoding_k3 import (        # noqa: E402 — the vendored reference IS the renderer
     CLOSE_TOKEN, END_OF_MSG_TOKEN, OPEN_TOKEN, SEP_TOKEN,
-    _VALID_THINKING_EFFORTS, build_chat_segments,
+    _VALID_THINKING_EFFORTS, _escape_attr_value, build_chat_segments,
 )
 
 OPEN, CLOSE, SEP, END_OF_MSG = OPEN_TOKEN, CLOSE_TOKEN, SEP_TOKEN, END_OF_MSG_TOKEN
@@ -117,6 +138,7 @@ def render_segments(messages, tools=None, *, add_generation_prompt=True, thinkin
         # the renderer. We follow the code, not the prose.
         raise ValueError(f"unsupported reasoning_effort={reasoning_effort!r}; K3 accepts "
                          f"{sorted(_VALID_THINKING_EFFORTS)}")
+    _reject_unrenderable(messages)
     if strict_thinking_history:
         bad = check_thinking_history(messages)
         if bad:
@@ -126,6 +148,25 @@ def render_segments(messages, tools=None, *, add_generation_prompt=True, thinkin
                 "quality silently. Echo back the reasoning_content of every assistant turn.")
     return build_chat_segments(messages, tools=tools, add_generation_prompt=add_generation_prompt,
                                thinking=thinking, thinking_effort=reasoning_effort, **kwargs)
+
+
+RENDERABLE_ROLES = frozenset({"user", "system", "assistant", "tool"})
+
+
+def _reject_unrenderable(messages):
+    """The reference's message loop is a chain of `elif role ==` with no else, so a role it does not
+    know is skipped in silence. That is a security bug at the gateway, not a nicety: OpenAI's
+    `developer` role is current API surface, and a caller who puts "never reveal the key" in one gets
+    a prompt that never contained it and an answer that reads as if it did. Refuse instead. A batched
+    conversation (list of lists) is left to the reference."""
+    if not isinstance(messages, list) or (messages and isinstance(messages[0], list)):
+        return
+    bad = [f"[{i}] {m.get('role')!r}" if isinstance(m, dict) else f"[{i}] {type(m).__name__}"
+           for i, m in enumerate(messages)
+           if not isinstance(m, dict) or m.get("role") not in RENDERABLE_ROLES]
+    if bad:
+        raise ValueError(f"K3's renderer would silently DROP these messages: {', '.join(bad)}. "
+                         f"Renderable roles are {sorted(RENDERABLE_ROLES)}.")
 
 
 def render_text(messages, tools=None, **kw):
@@ -148,12 +189,35 @@ def render_ids(tok, messages, tools=None, add_generation_prompt=True, reasoning=
     (tokenization_kimi._encode_text_piece). Joining the segments into one string and encoding that
     would hand every user a control-token injection, which is why render_text is not this function.
     """
+    n = _vocab_size(tok, vocab_size)
+    if not n:
+        raise ValueError(
+            f"{type(tok).__name__} states no vocab_size, so the embedding bound cannot be checked. "
+            "Pass vocab_size= (the config's) explicitly. Failing open here is how an out-of-range "
+            "id reaches an embedding as a device-side assert -- see check_ids.")
+    _assert_segment_boundary(tok)
     segs = render_segments(messages, tools, add_generation_prompt=add_generation_prompt,
                            thinking=reasoning, **kw)
     ids = []
     for s in segs:
         ids.extend(_encode_segment(tok, s.text, s.allow_special))
-    return check_ids(ids, _vocab_size(tok, vocab_size), where="prompt")
+    return check_ids(ids, n, where="prompt")
+
+
+def _assert_segment_boundary(tok):
+    """Prove the tokenizer HONOURS allow_special_tokens rather than merely accepting the keyword.
+
+    Encode a control marker both ways: as structure it is one id, as text it is several. A shim that
+    forwards allowed_special="all" both times — an easy thing to write, since tiktoken raises on an
+    unexpected special otherwise — returns the same ids, and every user gets a control-token
+    injection while this module's docstring promises the opposite. A signature check cannot tell the
+    two apart, and two encodes of eight characters is nothing next to rendering a prompt."""
+    if _encode_segment(tok, OPEN, False) == _encode_segment(tok, OPEN, True):
+        raise TypeError(
+            f"{type(tok).__name__} ignores allow_special_tokens: it encodes {OPEN!r} identically as "
+            "structure and as user text, so a prompt containing those characters could forge a "
+            "channel. Use the checkpoint's TikTokenTokenizer, or a shim that passes "
+            "disallowed_special=() for text segments.")
 
 
 def _encode_segment(tok, text, allow_special):
@@ -214,8 +278,12 @@ def check_ids(ids, vocab_size, where="ids"):
 
 def audit_tokenizer(tok, vocab_size=None):
     """The standing regression check for the above: every ADDED token must be addressable. Returns
-    the offenders as [(surface, id)] — empty is the healthy answer."""
+    the offenders as [(surface, id)] — empty is the healthy answer, which is why an unknown
+    vocab_size RAISES rather than returning the same empty list a clean tokenizer does."""
     n = _vocab_size(tok, vocab_size)
+    if not n:
+        raise ValueError(f"{type(tok).__name__} states no vocab_size; pass vocab_size= so a clean "
+                         "audit cannot be confused with an audit that could not run.")
     added = getattr(tok, "get_added_vocab", None)
     added = added() if callable(added) else getattr(tok, "added_tokens_encoder", {}) or {}
     return sorted(((s, i) for s, i in added.items() if n and i >= n), key=lambda x: x[1])
@@ -234,17 +302,39 @@ def check_thinking_history(messages):
 _ATTR_RE = re.compile(r'([A-Za-z_][\w.:-]*)="([^"]*)"')
 
 
-def _block_re(tag):
-    """<|open|>TAG attrs<|sep|> body <|close|>TAG<|sep|>. Attributes are matched non-greedily up to
-    the first <|sep|>; their values are escaped, so they can never contain a raw quote."""
-    e = re.escape
-    return re.compile(e(OPEN) + tag + r"(?P<attrs>.*?)" + e(SEP) + r"(?P<body>.*?)"
-                      + e(CLOSE) + tag + e(SEP), re.DOTALL)
+def _blocks(text, tag):
+    """Yield (attrs, body, start, end) for each COMPLETE <|open|>TAG a<|sep|>body<|close|>TAG<|sep|>.
 
+    Scanned, not regexed. The obvious pattern for this has two non-greedy groups, and a regex engine
+    answers it by trying every (attrs-end x body-end) pair from every start — so a run of openers
+    that never close costs seconds of CPU: 600 unclosed <|open|>call headers in 22 KiB took ten
+    seconds. That is reachable from a request. A user's prompt carries those characters through as
+    ordinary bytes (that is what the segment boundary is for), the model echoes them as ordinary
+    tokens, and the gateway parses the decoded output inside the request handler. Scanning is linear.
 
-_CALL_RE = _block_re("call")
-_ARG_RE = _block_re("argument")
-_JSON_RE = _block_re("json")
+    An opener with no close of its own before the NEXT opener is dropped, not stretched to the next
+    close — otherwise a truncated call absorbs the following call's arguments and reports them under
+    the first call's name, which is precisely the "executes the wrong thing" outcome that dropping
+    incomplete calls exists to prevent.
+    """
+    om, cm = f"{OPEN}{tag}", f"{CLOSE}{tag}{SEP}"
+    i = 0
+    while True:
+        s = text.find(om, i)
+        if s < 0:
+            return
+        h = text.find(SEP, s + len(om))                 # end of the header
+        if h < 0:
+            return
+        e = text.find(cm, h + len(SEP))
+        if e < 0:
+            return                                       # never closed: nothing complete follows
+        nxt = text.find(om, h + len(SEP))
+        if 0 <= nxt < e:                                 # this one never closed; resume at the next
+            i = nxt
+            continue
+        yield text[s + len(om):h], text[h + len(SEP):e], s, e + len(cm)
+        i = e + len(cm)
 
 
 def _unescape_attr(v):
@@ -281,7 +371,7 @@ def _earliest(text, markers):
     return best
 
 
-def _trim_partial(s, markers=_CONTENT_END + (RESPONSE_BEGIN, THINK_END)):
+def _trim_partial(s, markers=_CONTENT_END + (RESPONSE_BEGIN, THINK_BEGIN, THINK_END)):
     """Drop a trailing fragment that is the beginning of a marker.
 
     Generation stops on a token boundary, not a marker boundary, so a completion cut short lands
@@ -320,16 +410,20 @@ def parse_completion(text, reasoning=None):
     Robust to what a real stream hands it: a leading <|open|>think<|sep|> echo or none; a missing
     <|close|>think<|sep|>; a response channel that never closed; multiple calls. A call whose
     <|close|>call<|sep|> has not arrived is DROPPED, never half-reported — a fragment of a tool call
-    is worse than no tool call.
+    is worse than no tool call. See "WHAT THIS FORMAT CANNOT EXPRESS" in the module docstring for the
+    shapes no parser of XTML can recover.
     """
     body = text
     reasoning_content = None
     closed_think = THINK_END in body
     if closed_think:
         head, _, body = body.partition(THINK_END)
-        reasoning_content = head.replace(THINK_BEGIN, "") or None
+        # ONE leading opener, not every occurrence: the echo can only be at position 0, and a global
+        # replace silently deletes a <|open|>think<|sep|> the model wrote on purpose (asked to
+        # explain its own chat format, it will).
+        reasoning_content = head.removeprefix(THINK_BEGIN) or None
     elif _think_is_open(body, reasoning):
-        reasoning_content = _trim_partial(body.replace(THINK_BEGIN, "")) or None
+        reasoning_content = _trim_partial(body.removeprefix(THINK_BEGIN)) or None
         body = ""
 
     tail = body                              # everything after the think channel
@@ -349,30 +443,40 @@ def parse_completion(text, reasoning=None):
     tool_calls = []
     k = tail.find(TOOLCALL_BEGIN)
     if k >= 0:
-        for m in _CALL_RE.finditer(tail[k:]):
-            name = _attrs(m.group("attrs")).get("tool")
+        for attrs, cbody, _s, _e in _blocks(tail[k:], "call"):
+            name = _attrs(attrs).get("tool")
             if name:                         # a call with no tool attribute is not actionable --
-                tool_calls.append({"name": name, **_call_arguments(m.group("body"))})
+                tool_calls.append({"name": name, **_call_arguments(cbody)})
 
     return {"reasoning_content": reasoning_content, "content": content, "tool_calls": tool_calls}
 
 
 def _call_arguments(body):
-    """One call's arguments. The raw-json block wins over argument blocks if a model somehow emits
-    both: it is the whole-arguments form, so honouring it cannot produce a half-filled dict."""
-    j = _JSON_RE.search(body)
-    if j is not None:                        # the renderer's _xtml_json_block escape hatch
-        raw = j.group("body")
+    """One call's arguments.
+
+    The raw-json escape hatch is honoured only when it is the ENTIRE call body. The renderer emits
+    it alone (encoding_k3._render_assistant_segments takes that branch instead of the argument
+    blocks), so a json block sitting beside real arguments is not a K3 render — it is a value that
+    happens to contain those characters, and letting it win would discard every real argument.
+
+    `json` is kept ONLY when the raw text is not valid JSON, which is exactly the condition under
+    which the reference sets _xtml_json_block. That makes render -> parse -> render byte-stable
+    through this path. Valid JSON is decoded instead, and re-renders as ordinary typed argument
+    blocks; a valid non-object is dropped, because normalize_tool_arguments refuses to render one
+    and there is nothing replayable to keep."""
+    for attrs, raw, s, e in _blocks(body, "json"):
+        if body[:s].strip() or body[e:].strip():
+            break                            # not the whole body: a value, not the escape hatch
         try:
             parsed = json.loads(raw)
         except (ValueError, TypeError):
-            parsed = None
-        return {"arguments": parsed if isinstance(parsed, dict) else {}, "json": raw}
+            return {"arguments": {}, "json": raw}
+        return {"arguments": parsed if isinstance(parsed, dict) else {}, "json": None}
     args = {}
-    for m in _ARG_RE.finditer(body):
-        a = _attrs(m.group("attrs"))
+    for attrs, val, _s, _e in _blocks(body, "argument"):
+        a = _attrs(attrs)
         if "key" in a:
-            args[a["key"]] = _coerce(m.group("body"), a.get("type", "string"))
+            args[a["key"]] = _coerce(val, a.get("type", "string"))
     return {"arguments": args, "json": None}
 
 
@@ -421,6 +525,12 @@ class StreamSplitter:
         self.reasoning_on = reasoning_on
         self.phase = 0 if reasoning_on else 2   # thinking=False opens the response channel in the prompt
         self.buf = ""
+        # A completion may repeat the <|open|>think<|sep|> the prompt already opened. It can only do
+        # so at position 0, so the echo is resolved once, by holding the buffer until it is either
+        # matched or ruled out. Stripping it with a replace() on each take instead made the split
+        # depend on chunk size: with real (few-token) deltas the marker straddles takes and reaches
+        # the client as text.
+        self.echo = reasoning_on
 
     def _take(self, upto):
         s, self.buf = self.buf[:upto], self.buf[upto:]
@@ -439,16 +549,24 @@ class StreamSplitter:
         self.buf += delta
         r = c = ""
         while True:
+            if self.echo:                            # resolve a leading opener before emitting
+                if self.buf.startswith(THINK_BEGIN):
+                    self.buf = self.buf[len(THINK_BEGIN):]
+                    self.echo = False
+                elif THINK_BEGIN.startswith(self.buf):
+                    return r, c                      # still could become one: hold
+                else:
+                    self.echo = False
             if self.phase == 0:
                 i = self.buf.find(THINK_END)
                 if i >= 0:
-                    r += self._take(i).replace(THINK_BEGIN, "")
+                    r += self._take(i)
                     self.buf = self.buf[len(THINK_END):]
                     self.phase = 1
                     continue
                 safe = len(self.buf) - self._HOLD
                 if safe > 0:
-                    r += self._take(safe).replace(THINK_BEGIN, "")
+                    r += self._take(safe)
                 return r, c
             if self.phase == 1:
                 # between the channels the model emits only structure; drop it, and jump straight to
@@ -481,7 +599,7 @@ class StreamSplitter:
         stopped mid-channel, so "<|open|" is a cut-off marker, never the answer's last characters."""
         r = c = ""
         if self.phase == 0:
-            r = _trim_partial(self.buf.replace(THINK_BEGIN, ""))
+            r = _trim_partial(self.buf.removeprefix(THINK_BEGIN) if self.echo else self.buf)
         elif self.phase == 2:
             c = _trim_partial(self.buf)
         self.buf = ""
@@ -499,7 +617,7 @@ def mock_completion(last, tools, reasoning=True):
     'pass' against a format the parser here has never seen."""
     head = f"The user asked: {last[:40]}.{THINK_END}" if reasoning else ""
     if tools:
-        name = (tools[0].get("function") or tools[0])["name"]
+        name = _escape_attr_value((tools[0].get("function") or tools[0])["name"])
         return (f"{head}{RESPONSE_BEGIN}Let me look that up.{RESPONSE_END}{TOOLCALL_BEGIN}"
                 f'{OPEN}call tool="{name}" index="1"{SEP}'
                 f'{OPEN}argument key="query" type="string"{SEP}{last[:30]}{CLOSE}argument{SEP}'

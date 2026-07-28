@@ -18,7 +18,7 @@ Beta notes: decoding is greedy (speculative verify); non-greedy `temperature`/`t
 values are REJECTED with a 400 (silently ignoring them misrepresents the sampling the caller asked
 for — lossless sampling is a separate engine lever; the tail argmaxes today).
 """
-import argparse, json, os, socket, sys, threading, time, itertools
+import argparse, inspect, json, os, socket, sys, threading, time, itertools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
@@ -32,6 +32,11 @@ MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
 TOOLS = for_model(MODEL_ID)
 parse_completion, render_ids, to_openai_message = TOOLS.parse_completion, TOOLS.render_ids, TOOLS.to_openai_message
 TOOLCALL_BEGIN, THINK_BEGIN, THINK_END = TOOLS.TOOLCALL_BEGIN, TOOLS.THINK_BEGIN, TOOLS.THINK_END
+# Whether this family's parser can be told which mode the prompt asked for. M2.5 does not need it:
+# with reasoning off its output has no </think>, so "no think block" is unambiguous. K3 always opens
+# a channel in the generation prompt, so a completion truncated before any marker is ambiguous, and
+# guessing puts the answer in reasoning_content on exactly the requests that hit max_tokens.
+_PARSE_REASONING = "reasoning" in inspect.signature(parse_completion).parameters
 # default reasoning mode for the gateway: M2.5 hardwires a <think> block, which is novel (0% n-gram
 # accept) so it runs at the WAN floor and dominates latency. M25_DEFAULT_REASONING=0 makes the gateway
 # answer DIRECTLY by default (fast, for latency-sensitive/high-overlap normal usage); a request can
@@ -588,6 +593,11 @@ class _SSESplitter:
         return r, c
 
 
+def _parse(text, reasoning):
+    """parse_completion, told which mode the prompt asked for when the family can use that."""
+    return parse_completion(text, **({"reasoning": reasoning} if _PARSE_REASONING else {}))
+
+
 def _splitter(reasoning_on):
     """The incremental splitter for the served model. A family whose format needs more than M2.5's
     three markers ships its own factory (K3 wraps visible content in a response channel, which
@@ -741,7 +751,7 @@ class H(BaseHTTPRequestHandler):
     def _complete(self, cid, created, messages, tools, max_new, reasoning=True, require_tool=False):
         r = run_request(messages, tools, max_new, reasoning, on_commit=None)
         fin_cap = _enforce_cap(r, max_new)
-        parsed = parse_completion(r["text"])
+        parsed = _parse(r["text"], reasoning)
         if require_tool and not parsed["tool_calls"]:
             return self._json({"error": {"message": "tool_choice required a tool call but the model "
                                                     "produced none",
@@ -807,7 +817,7 @@ class H(BaseHTTPRequestHandler):
 
             r = run_request(messages, tools, max_new, reasoning, on_commit=on_commit)
             fin_cap = _enforce_cap(r, max_new)
-            parsed = parse_completion(r["text"])
+            parsed = _parse(r["text"], reasoning)
             if require_tool and not parsed["tool_calls"]:
                 raise RuntimeError("tool_choice required a tool call but the model produced none")
             _emit(*split.end())                            # release the marker hold-back
