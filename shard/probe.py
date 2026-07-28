@@ -100,7 +100,8 @@ def derive_layers(cap, model):
     total = float(cap.get("total_vram_mb") or 0.0)
     if not fp or fp <= 0 or total <= 0:
         return 0
-    usable = total - float(model["reserve_mb"]) - float(cap.get("load_peak_extra_mb") or 0.0)
+    usable = total - float(model["reserve_mb"]) - float(cap.get("load_peak_extra_mb")
+                                                        or model.get("load_peak_extra_mb") or 0.0)
     per_layer = fp + float(model["kv_mb_per_layer"])
     # cap_layers was proven on a 32 GB card; scale the proven DENSITY to the card size
     # (a flat cap collapsed 48 GB to the 32 GB verdict — the spec's core distinction).
