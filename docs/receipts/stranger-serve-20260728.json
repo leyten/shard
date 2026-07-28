@@ -1,0 +1,143 @@
+{
+  "receipt": "stranger-daemon STABLE-SERVE ring — 6-box EU 5090 ring; serve gap ROOT-CAUSED, tok/s still NOT obtained",
+  "date": "2026-07-28",
+  "goal": "produce the FIRST end-to-end tok/s receipt on the stranger-daemon serve path (announce -> admit -> place -> verified pull -> libp2p ring formation -> serve -> signed receipts -> settle), the one next action left open by the 2026-07-21 launch rehearsal.",
+  "outcome": "NOT ACHIEVED for tok/s. The ring formed and reached full READY (all 6 stages pulled + connected + serving) and the coordinator connected the ring, but every job still returned 0 tokens. The session's real product is the ROOT CAUSE: three independent, launch-blocking defects that together explain both this run and the 2026-07-21 result, plus a correction to what the 07-21 receipt claimed.",
+  "spend": "~$6.6 (7 boxes ~50min, then 6 boxes; 1 dud destroyed early). Budget cap was $25.",
+  "wall_clock": "10:12–12:22 UTC (~2.2h of a 5h cap)",
+  "ring_state_at_end": "TORN DOWN",
+
+  "method": {
+    "orchestrator": "test sim orchestrator only (c0mpute-dev scripts/shard-daemon-sim.ts --port 3904 --nodes 7 --stages 6 --full --suite --reps 3 --debounce 60000 --manifest-file <real signed manifest> --relays-file --manifest-ref mf1:m25-nvfp4-v1@bafkreib5dd2vl33joywylkcya2f3bbqffpskaudnabh3xwwcokg7xox6si). PROD c0mpute tree never touched; nothing published; nothing committed.",
+    "seam": "SimSeam (even-split stub) — capability-blind by design",
+    "deviations_from_a_true_stranger": [
+      "worker shipped as a tarball (scp) rather than npx — same as 07-21",
+      "shard ENGINE shipped as a tarball and pinned via C0MPUTE_SHARD_REPO, because the 4 required fixes are on the unmerged branch fix/residential-node-reachability and a stranger box clones the repo DEFAULT BRANCH (master) with no ref/branch env var (shard-setup.ts:18,71)",
+      "sidecar built from that branch and pre-placed at ~/.c0mpute/bin/sidecar (SIDECAR_BIN short-circuits the pinned release download); required because the worker's dial.join(',') change emits comma-joined -forward targets that only the branch sidecar parses (sidecar/main.go:592 parseForwardTargets)"
+    ]
+  },
+
+  "ring": {
+    "boxes": 7,
+    "gpu": "RTX 5090, 32607 MiB, compute capability 12.0 (sm_120)",
+    "hourly_usd_7box": 3.399,
+    "hourly_usd_6box": 2.91,
+    "geos": ["EE", "DK", "DK", "NO", "BE(dud, destroyed)", "IT", "CZ"],
+    "iids": [46097669, 46097673, 46097677, 46097682, 46097685, 46097688, 46097689],
+    "tiling": "full 62 layers: [0:10) [10:20) [20:31) [31:41) [41:51) [51:62)",
+    "model_bytes": "130.3 GB across 39 shards; ~25-30 GB pulled per stage (a 10-layer range spans ~8 shards)",
+    "measured_ring_hop_rtt_ms": {
+      "note": "REAL measured TCP-connect RTT per ring hop. The sim's planner used synthetic 30ms placeholders and no uplink at all.",
+      "hops": [
+        {"from": "0 CZ", "to": "1 NO", "rtt_ms": 37.6},
+        {"from": "1 NO", "to": "2 BE", "rtt_ms": 27.8},
+        {"from": "2 BE", "to": "3 DK", "rtt_ms": 27.3},
+        {"from": "3 DK", "to": "4 DK", "rtt_ms": 8.1},
+        {"from": "4 DK", "to": "5 IT", "rtt_ms": 32.9},
+        {"from": "5 IT", "to": "0 CZ", "rtt_ms": 28.4}
+      ],
+      "total_round_ring_ms": 162.1
+    }
+  },
+
+  "serve_results": {
+    "tok_s": null,
+    "ttft_ms": null,
+    "receipts_valid_jobs": 0,
+    "receipts_rejected_jobs": 4,
+    "reps_with_tokens": 0,
+    "scorecard": "A-prose / B-chat / C-code / D-longctx all 0.0 tok/s, 0 tokens, 0 reps",
+    "swarms_formed": 6,
+    "full_ring_ready_events": 1,
+    "reform_storm_defers": 81
+  },
+
+  "proven_green_on_real_hardware": [
+    "stranger self-provision end-to-end: node20 + pinned venv (torch 2.11.0 / vllm 0.23.0 / transformers 5.12.1) builds on a fresh 5090 box",
+    "network manifest resolved VERBATIM (18769731 B) and CID/pubkey/expect-* checks all pass",
+    "verified pull of the assigned layer range on all stages (~25-30 GB each, hash-checked against the signed manifest)",
+    "engine LOADS and RUNS on sm_120: 'Using VLLM_CUTLASS NvFp4 MoE backend', SHARD_STAGE_READY, 21-25 GB VRAM per stage",
+    "FULL 62-layer ring FORMED across 6 EU boxes and reached 'READY — all 6 stages pulled + connected; serving minimax-m2.5'",
+    "coordinator CONNECTED the ring: SHARD_COORD_READY {head, tail, receipts: true} — head-engine pipe + tail return tunnel up",
+    "RECEIPTS ARE ARMED: SHARD_COORD_READY reports receipts:true, i.e. the 834e306 receipt-module fix works on a self-provisioned node. On 07-21 this was silently false.",
+    "the #52 anti-storm guard WORKS: 'a ring is still loading — deferring to avoid a re-form storm' fired 81 times through the pulls instead of preempting them (07-21 bug #7 is closed)",
+    "relay-circuit fix works: sidecar logs 'ADDRS-FINAL 7 addr(s), circuit=true' and a node advertises its own /p2p-circuit addr; a RELAY-routed CONN was observed carrying a weight fetch",
+    "churn self-heal fired correctly on a real node death (DEGRADED -> freed slots -> re-formed from the free spare)",
+    "peer seeding DOES work once a node's sidecar re-boots after its pull: 'SEEDING 16 shards (16 announced)', and a re-pull ran at ~130 MB/s from ringmates vs ~25 MB/s from the mirror"
+  ],
+
+  "root_cause_of_the_serve_gap": {
+    "summary": "Jobs are accepted by the head daemon, relayed to a coordinator that has connected the ring, and then never executed. The engine, the pull, the formation and the receipts machinery are all fine; the SERVING CONTROL PATH is broken in three independent places.",
+    "bugs": [
+      {
+        "id": "S1",
+        "severity": "FATAL (the serve gap itself)",
+        "title": "the coordinator accepts jobs it never executes",
+        "evidence": "swarm:job accepted at 11:38:39 by a coordinator that had reported SHARD_COORD_READY at 11:35:14. 50s later: all 6 GPUs at 0% utilization, coordinator process CPU time flat at 3s, wchan=do_poll. /proc/net/tcp showed all three ring sockets ESTABLISHED with txq=0 rxq=0 — the coordinator never sent a single byte of the prefill into stage 0. Stage 0's last line was 'predecessor connected' and nothing after. Verified the daemon->coordinator stdio IS correctly wired (daemon fd 20/25/27 are the socketpair peers of coordinator fd 0/1/2), so the job bytes are delivered and simply never acted on. Every such job ends via failJob.",
+        "decisive_reproduction_on_a_CLEAN_ring": "Repeated at 12:23-12:26 on a fully clean ring, which rules out the S2 restart churn as the cause: swarm-1785239233402 reached 'READY — all 6 stages pulled + connected', its coordinator connected on the FIRST attempt at 12:00:15 with restarts=0 and no degradation. Job 0fcc829a accepted 12:23:40 -> hung. Three more jobs queued at 12:26:15 (testing whether Python stdin read-ahead needed more bytes to flush) -> still 0% GPU, coordinator CPU flat at 3s, 0 SHARD_JOB_TOKEN lines emitted. So the defect is deterministic, not a race and not a buffering artifact.",
+        "additional": "the daemon also does NOT serialize jobs to the single-job coordinator — it accepted 4 concurrent swarm:job submissions and wrote them all to stdin, contrary to shard-runner.ts's own contract note that 'the caller serializes'.",
+        "consequence": "shard-worker.ts:245-250 failJob() completes the job as {tokensGenerated: 0, response: '', receipts: []} — an ORDINARY completion. The orchestrator cannot distinguish a dead coordinator from a slow ring.",
+        "status": "OPEN — this is the next thing to fix, and it is the true blocker"
+      },
+      {
+        "id": "S2",
+        "severity": "FATAL on any cold ring",
+        "title": "coordinator lifecycle is gated on HEAD-stage readiness, not RING readiness, and shares the stage restart budget",
+        "evidence": "launchCoordinator() fires from stage.onReady (shard-worker.ts:318) as soon as the HEAD stage is ready. But connect_ring cannot succeed until the TAIL's engine is up. Each attempt burns retry_s=300 (coordinate.py:144) and increments the SAME counter as stage crashes; `restarts` is initialised to 0 ONLY at assignment (shard-worker.ts:456) and is never reset on success. Observed live: coordinator died at 11:07:17, 11:12:22, 11:17:29, 11:22:xx while the tail was still pulling (the tail needed 30.06 GB and finished at ~11:27).",
+        "consequence": "at restarts>=2 the coordinator silently latches EAGLE-off (shard-worker.ts:289-292); at restarts>5 the head calls release() and LEAVES the swarm, collapsing a ring that was minutes from ready. Observed: 'leaving swarm: coordinator kept dying'. On a launch ring where the tail is >25 min behind the head, the head always leaves.",
+        "status": "OPEN"
+      },
+      {
+        "id": "S3",
+        "severity": "FATAL for the real admission path",
+        "title": "every healthy 5090 is admitted as `verifier` (one as `reject`) because uplink is never measured",
+        "evidence": "live: 'node-bind: admission verdict \"verifier\"' x6 and '\"reject\"' x1 for seven RTX 5090s with 32106-32119 MB free VRAM. probeMeasure() (shard-runner.ts:139-141) runs ONLY `shard.probe --measure --dir <model> --backend auto` — the GPU vector — and never the network vector (`--net-only`), so the announced cap has no uplink_mbps. shard/probe.py:144 then reads `uplink = float(cap.get('uplink_mbps') or 0.0)` -> 0.0. Reproduced offline against the real cap shape: uplink=0 -> role=verifier, bindings failed interactive-anchor['hops_vs_rtt','uplink'] + batched-filler['uplink']; uplink=800 -> role=batched-filler. Corroborated by the captured plan request: up_mbps null on all 7 nodes.",
+        "consequence": "this run only survived it because SimSeam ignores capability. Under the production placement path, where the role decides whether a node is placed as a stage at all, a fleet of healthy 5090s is admitted as verifiers and NO ring forms.",
+        "status": "OPEN"
+      }
+    ]
+  },
+
+  "other_findings": [
+    {
+      "id": "F-correction",
+      "title": "CORRECTION to docs/receipts/launch-rehearsal-20260721.json",
+      "detail": "That receipt says 'warmup showed real 550ms/1350ms TTFT then empty'. That is a misreading of its own harness: measureServe computes ttftMs = tFirst ? tFirst - tDispatch : (tDone - tDispatch), so when NO token ever arrives it reports the whole job wall time as 'TTFT'. Re-parsing sim-fullring.log: every warmup and every rep had tokens=0. NO token has ever crossed the stranger-daemon path — the 550/1350ms were simply slower fail-closed jobs."
+    },
+    {
+      "id": "F-simfix",
+      "title": "the harness scored fail-closed jobs as healthy (FIXED this session, uncommitted)",
+      "detail": "measureServe.onDone resolved a 0-token completion as a valid rep, and `coherent: (response === full || response === '')` is TRUE for an empty response — which is how 07-21 printed a green-looking scorecard (3 reps, coherent=true) over a ring that never served a token. Fix applied in c0mpute-dev scripts/shard-daemon-sim.ts: reject a 0-token completion as a FAILED rep naming the fail-closed reason. Immediately paid off: 'warmup B-chat FAILED: served 0 tokens in 209664ms (fail-closed job ...)' and a scorecard that now honestly reads 0 reps / coherent=false."
+    },
+    {
+      "id": "F-dud",
+      "title": "a rented 5090 with driver CUDA 12.8 passes every preflight and then cannot run the engine",
+      "detail": "The BE box (46097685) had driver 570.211.01 / CUDA 12.8 while the venv installs torch 2.11 built against CUDA 13 -> 'RuntimeError: The NVIDIA driver on your system is too old (found version 12080)' in torch._C._cuda_init(), restart-looping stage 2. All other boxes were 13.0-13.2. It passed nvidia-smi preflight AND still announced and got PLACED, because probeMeasure() failure is non-fatal ('announce falls back to basics', shard-runner.ts:138-145). A stranger with an old driver therefore joins a ring and dies in it. Vast filter cuda_max_good>=12.8 is NOT sufficient; require >=13.0 for this venv."
+    },
+    {
+      "id": "F-reshuffle",
+      "title": "a single node death re-plans every downstream range, invalidating completed pulls",
+      "detail": "SimSeam plans by pool order, so removing one node shifts every later stage's range by one. Observed twice. After the first reshuffle 4 of 6 boxes had to pull a fresh ~25-30 GB; after the second, all 6 did. Nodes also KEEP the old range on disk ('ranges stay on disk for the warm re-join'), so disk grows per reshuffle: boxes went from ~30 GB to 51 GB used and down to 8.3 GB free on an 80 GB disk, and would have hit ENOSPC. Manually pruning the shards outside each node's new range (computed from the manifest weight_map) freed 42.8 GB and 21.7 GB on two boxes and unblocked them. A range-preserving re-plan (keep assignments whose node already holds the range; give the newcomer the orphaned range) would make churn nearly free."
+    },
+    {
+      "id": "F-seeding",
+      "title": "cold-cohort seeding is a boot-time snapshot (D2 re-confirmed live, with the workaround observed)",
+      "detail": "During the first cold pull every stage logged 'Libp2pProvider could not serve model-000NN-of-00029.safetensors -> next provider' and fell through to the HF mirror, because the sidecar boots before pullRange and `held` never rescans. After a node's sidecar re-booted post-pull it announced its shards ('SEEDING 16 shards (16 announced)') and the subsequent re-pull ran at ~130 MB/s from ringmates versus ~25 MB/s from the mirror — a ~5x provisioning win that a cold ring currently never gets."
+    },
+    {
+      "id": "F-eagle",
+      "title": "EAGLE is off on this model regardless of degradation",
+      "detail": "A cleanly-started, non-degraded coordinator still reported SHARD_COORD_READY {eagle: false}, i.e. MP.eagle_armed() is false because the served MiniMax-M2.5 NVFP4 manifest ships no drafter weights. Any tok/s from this ring is a plain-chain number; the EAGLE arm is not available here."
+    }
+  ],
+
+  "next_action": "Fix S1 first — it is the only thing between this ring and a tok/s number, and everything upstream of it is now proven green. Instrument the coordinator's stdin job loop (shard/coordinate.py serve_jobs) and the daemon's CoordinatorProcess.submit to prove delivery and consumption of a job line on a live ring; the engine, pull, formation, tunnels and receipts are all confirmed working. Then S2 (start the coordinator on RING readiness, give it its own restart budget, and reset the budget on a successful connect) and S3 (run shard.probe --net-only and put uplink_mbps in the announced cap). A re-run after S1+S2 should reach tok/s without a re-pull if the ring is kept warm.",
+
+  "discipline": {
+    "prod_untouched": true,
+    "npm_publish": false,
+    "commits_or_pushes_from_this_session": "none",
+    "boxes_destroyed": true,
+    "deadman_pin_cleaned": true
+  }
+}
