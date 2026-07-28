@@ -20,6 +20,46 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-28 (LATEST) — KIMI K3 ENGINE BUILT END-TO-END; NEXT = THE 19-BOX RING (leyten-gated)
+**Kimi K3 (2.78T-A104B, native MXFP4 ~1.45TB, released 07-27) is now fully onboarded to the shard
+engine — every layer of the port built, merged to master, and verified — in one day. The ONLY thing
+between here and the first coherent K3 output over a permissionless scattered swarm is the ~$150
+19-box RTX PRO 6000 ring, which is leyten-gated.** Full per-step research/detail in auto-memory
+`k3-verdict-research-round`; receipts in `docs/receipts/` (`k3-mechanics-ring-20260728.json`,
+`stranger-serve-confirm-20260728.json`).
+- **The port, in order (all merged):** G0 kernel probe (real layer-46 on a rented sm_120 box, $0.97 —
+  FlashKDA / fla-AttnRes / Marlin-MXFP4 all run, gate cleared 3.3×) → **#141** stage M1 (CPU bit-parity;
+  the two-tensor `(hidden, block_residual)` AttnRes boundary) → **#143** tokenizer + XTML wire + a
+  per-model tools seam → **#144** manifest publisher (K3's `num_hidden_layers` lives under `text_config`)
+  + `K3_PROFILE` planner tiling (2.97 tok/s g=1 on 19×Pro6000, matches G0) → **#146** stage M2 (the G0
+  kernels wired in-Stage, bit-exact on real weights, whole-layer CUDA graphs; MLA layers refuse the graph
+  → eager) → 2-box mechanics ring ($4.97, all 6 PASS on a real HU↔NO hop — the two-tensor boundary
+  crosses the wire with a byte-identical receipt chain) → **#148** `k3_pipe.py` full-ring launcher (head
+  embed → N stages → tail lm_head + sample → weightless coordinator; greedy decode BIT-IDENTICAL to
+  Moonshot's `KimiLinearForCausalLM` across 4 tilings incl. 1-layer-per-stage).
+- **Also this day — the stranger-serve gap CLOSED (the LATEST-9 work below): FIRST TOKEN EVER crossed the
+  fully-automatic permissionless path** (`stranger-serve-confirm-20260728.json`): 6 EU 5090s, 32 tokens,
+  6 signed receipts covering all 62 layers, warm plain-chain ~4-5 tok/s (EAGLE off — the NVFP4 manifest
+  ships no drafter). Exposed + fixed **C10** (settlement InvalidSignature: the engine appended a `stage`
+  key AFTER signing and `shard/verify.py` didn't strip it — one-line `wire_receipt` fix, #145). Also:
+  fetch/load genericity leaks fixed (#139/#140 — weight keys now derive from the manifest weight_map, so a
+  non-M2.5 namespace loads) and RTT-aware permissionless formation (c0mpute #54 — rings form on measured
+  latency, not a constant 30ms).
+- **Honest ceiling:** ~3 tok/s single-stream at g=1 on the fat ring; ~6-9 with the DSpark drafter (phase 2).
+  Real-hardware unknowns remaining for the full ring are ALL GPU/spend: MLA-layer CUDA-graph capture, the
+  real MXFP4 Marlin weight load at scale, sidecar hole-punch for a NAT'd tail, and spec-decode rollback (a
+  KDA stage refuses a rewind → greedy sequential until phase 2).
+- **OPS lesson banked:** squash-merges update only `origin/master`, not the local `master` ref — worktree
+  agents that branch from a stale local `master` will wrongly think work is unmerged. Sync
+  (`git branch -f master origin/master`) after every squash-merge; verify branch claims vs origin via the
+  GitHub API.
+
+**⇒ THE ONE NEXT ACTION: leyten's go/no-go on the ~$150 19-box RTX PRO 6000 ring** — 93 layers × 5/card =
+19 stages, ~$24-35/hr, produces the first coherent K3 output over a scattered permissionless swarm + the
+tok/s receipt + the launch tweet. Everything upstream is built and tested, so the spend buys the demo, not
+debugging. Supply is tight (~22 rentable Pro 6000s worldwide) so pick a window. Balance ~$75. (The M2.5
+betanet path is unaffected and still launches on its own `docs/LAUNCH.md` checklist.)
+
 ### ⇒ 2026-07-28 (LATEST-9) — STRANGER-SERVE RING: STILL 0 TOKENS, BUT THE SERVE GAP IS ROOT-CAUSED (S1/S2/S3)
 **A 6-box EU 5090 stranger-daemon ring (~$6.6, receipt `docs/receipts/stranger-serve-20260728.json`)
 reached full READY and connected its coordinator, and every job still returned 0 tokens.** The
