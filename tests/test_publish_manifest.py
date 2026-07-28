@@ -50,8 +50,9 @@ def _checkpoint(tmp_path, layers=4):
 
 
 def _manifest_from(cfg, weight_map, shards, priv, model_id="test/m2.5"):
+    dec = pub.decoder_config(cfg)                      # same resolution main() uses
     m = {"schema": mf.SCHEMA, "model_id": model_id, "arch": (cfg.get("architectures") or ["x"])[0],
-         "layer_count": cfg["num_hidden_layers"], "tied_embeddings": bool(cfg.get("tie_word_embeddings")),
+         "layer_count": dec["num_hidden_layers"], "tied_embeddings": bool(dec.get("tie_word_embeddings")),
          "tokenizer": model_id, "weight_map": weight_map, "shards": shards}
     return mf.sign_manifest(m, priv)
 
@@ -104,3 +105,75 @@ def test_kind_classification():
     assert pub._kind("tokenizer.json") == "tokenizer" and pub._kind("config.json") == "config"
     assert pub._kind("model.safetensors.index.json") == "config"
     assert pub._kind("README.md") is None and pub._kind(".gitattributes") is None
+    # a tiktoken vocab IS the tokenizer for the models that ship one (Kimi-K3 has no tokenizer.json)
+    assert pub._kind("tiktoken.model") == "tokenizer"
+
+
+# ---- 3. a multimodal checkpoint: nested depth, namespaced decoder, a second tower -----------------
+
+def _multimodal_checkpoint(tmp_path, layers=4):
+    """A Kimi-K3-shaped checkpoint at toy scale: the decoder is namespaced under
+    `language_model.model.*`, its depth lives ONLY in config.json's `text_config`, the boundary
+    tensors share one file, and a vision tower numbers its own `blocks.<n>.`."""
+    d = str(tmp_path / "mm")
+    os.makedirs(d, exist_ok=True)
+    for i in (1, 2, 3, 4):
+        open(os.path.join(d, f"model-0000{i}.safetensors"), "wb").write(b"f%d" % i + b"Z" * 200)
+    json.dump({"architectures": ["KimiK3ForConditionalGeneration"], "model_type": "kimi_k3",
+               "tie_word_embeddings": False, "vision_config": {"patch_size": 14},
+               "text_config": {"architectures": ["KimiLinearForCausalLM"], "model_type": "kimi_linear",
+                               "num_hidden_layers": layers, "tie_word_embeddings": False}},
+              open(os.path.join(d, "config.json"), "w"))
+    wm = {}
+    for j in range(layers):                                  # one file per half of the decoder
+        wm[f"language_model.model.layers.{j}.q.weight"] = f"model-0000{1 if j < layers // 2 else 2}.safetensors"
+    for t in ("model.embed_tokens", "model.norm", "lm_head", "model.output_attn_res_proj"):
+        wm[f"language_model.{t}.weight"] = "model-00003.safetensors"
+    wm["vision_tower.encoder.blocks.0.wo.weight"] = "model-00004.safetensors"
+    wm["mm_projector.proj.0.weight"] = "model-00004.safetensors"
+    json.dump({"weight_map": wm}, open(os.path.join(d, "model.safetensors.index.json"), "w"))
+    open(os.path.join(d, "tiktoken.model"), "wb").write(b"vocab")
+    return d
+
+
+def test_layer_count_comes_from_the_nested_text_config():
+    """A multimodal config.json has no top-level `num_hidden_layers` — reading it there raised
+    KeyError and no such checkpoint could be published at all. layer_count is what receipt
+    coverage tiles against, so it must be the DECODER's depth."""
+    cfg = {"architectures": ["KimiK3ForConditionalGeneration"], "tie_word_embeddings": False,
+           "text_config": {"num_hidden_layers": 93, "tie_word_embeddings": False}}
+    assert "num_hidden_layers" not in cfg
+    assert pub.decoder_config(cfg)["num_hidden_layers"] == 93
+    # a plain single-stack config resolves to itself, unchanged ...
+    flat = {"num_hidden_layers": 62}
+    assert pub.decoder_config(flat) is flat
+    # ... and so does one whose text_config is a partial override carrying no depth.
+    partial = {"num_hidden_layers": 62, "text_config": {"rope_theta": 1e6}}
+    assert pub.decoder_config(partial) is partial
+
+
+def test_multimodal_checkpoint_publishes_and_fetches_the_text_stack(tmp_path):
+    """End to end on the K3 shape: the published manifest carries the decoder's depth, the fetch
+    resolves the `language_model.model.layers.<n>.` namespace, head/tail pull the shared boundary
+    file — and the vision tower is pulled by NOBODY."""
+    d = _multimodal_checkpoint(tmp_path)
+    priv = mf.gen_key()
+    cfg, weight_map, shards = pub.build_from_dir(d)
+    manifest = _manifest_from(cfg, weight_map, shards, priv, model_id="test/k3")
+    assert manifest["layer_count"] == 4                       # from text_config, not the wrapper
+    assert {s["path"] for s in shards if s["kind"] == "tokenizer"} == {"tiktoken.model"}
+
+    def files(stage, nstages, role="stage"):
+        return {os.path.basename(p) for p in fetch_block(
+            manifest, str(tmp_path / f"n{stage}{nstages}{role}"), stage=stage, nstages=nstages,
+            role=role, provider=LocalDirProvider(d), expected_pubkey=mf.pub_b64(priv))}
+
+    head, tail = files(0, 2), files(1, 2)
+    assert "model-00001.safetensors" in head and "model-00002.safetensors" not in head
+    assert "model-00002.safetensors" in tail and "model-00001.safetensors" not in tail
+    assert "model-00003.safetensors" in head and "model-00003.safetensors" in tail  # embed | norm+head
+    # The vision tower and the projector are in no stage's block. That holds because this
+    # checkpoint numbers them `blocks.<n>.`: a second tower numbered `layers.<n>.` would be
+    # attributed to the decoder's ranges and over-pulled (the documented shard.weightkeys tradeoff
+    # — extra bytes are survivable, a missing weight behind a valid receipt is not).
+    assert all("model-00004.safetensors" not in f for f in (head, tail))

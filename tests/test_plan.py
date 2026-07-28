@@ -13,8 +13,11 @@ import os
 import subprocess
 import sys
 
+import pytest
+
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-from shard.plan import plan_ring  # noqa: E402
+from shard.plan import (K3_PROFILE, PROFILES, density_cap_layers,  # noqa: E402
+                        k3_kv_mb_per_layer, plan_ring, profile_for)
 
 REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
@@ -275,3 +278,203 @@ def test_tail_reserve_docked_once_reappearing_tail_still_plans():
     _assert_tiles_simple(plan, 15)
     tail = next(s for s in plan["stages"] if s["tail"])
     assert tail["layers"] * 1.0 + 6.0 <= {"A": 20.0, "B": 10.0}[tail["id"]] + 1e-6
+
+
+# ---- Kimi-K3 -------------------------------------------------------------------------------------
+# K3 is the first model whose per-stage unit is a WHOLE LAYER (15.8 GiB): 93 of them, and a 32 GB
+# card holds exactly one. These pin the calibration that turns that fact into a plan.
+
+K3 = "moonshotai/Kimi-K3-MXFP4"
+_PRO6000_MB = 94.97 * 1024        # what a 96 GB RTX PRO 6000 reports (the card G0 packed 5 on)
+_RTX5090_MB = 32607.0             # what a 32 GB 5090 reports
+# G0 receipts, written out here so the assertions below do not read the constants under test:
+_K3_REPACK_PEAK_MB = 9440.0       # 25.041 GiB peak - 15.823 GiB resident, per Marlin-repacked layer
+_K3_EMBED_MB = 2.188 * 1024       # embed_tokens, and separately lm_head (untied)
+
+
+def _k3_pool(fat=0, thin=0, rtt_ms=12.0):
+    """`fat` 96 GB Pro 6000s then `thin` 32 GB 5090s, one per subnet, symmetric RTT."""
+    nodes = []
+    for i in range(fat + thin):
+        mb = _PRO6000_MB if i < fat else _RTX5090_MB
+        nodes.append({"id": f"n{i}", "free_vram_mb": mb, "total_vram_mb": mb,
+                      "subnet": f"10.{i // 250}.{i % 250}.0/24"})
+    n = len(nodes)
+    return nodes, [[0.0 if i == j else rtt_ms for j in range(n)] for i in range(n)]
+
+
+def test_k3_profile_defines_every_key_it_is_merged_over():
+    """plan_ring merges a profile OVER M25_PROFILE, so any key K3 leaves out is silently answered
+    with M2.5's calibration — a 2330 MB/layer footprint standing in for a 16203 MB one is the
+    admit-then-OOM bug with extra steps. K3 must define all of them."""
+    from shard.plan import M25_PROFILE
+    assert set(M25_PROFILE) <= set(K3_PROFILE)
+    assert PROFILES[K3] is K3_PROFILE and profile_for(K3) == K3_PROFILE
+    assert profile_for(K3) is not K3_PROFILE          # a copy: a caller's override can't poison it
+    with pytest.raises(ValueError):
+        profile_for("moonshotai/Kimi-K3")             # the bare repo is NOT a quant-qualified id
+
+
+def test_k3_measured_numbers_are_the_measured_numbers():
+    """The G0 probe's outputs, verbatim — this is the file that gets edited when someone 'tidies'
+    a constant, so the receipt is the test."""
+    assert K3_PROFILE["n_layers"] == 93
+    assert K3_PROFILE["layer_vram_mb"] == 16203.0                  # 15.823 GiB, and 79.113/5
+    assert abs(K3_PROFILE["layer_vram_mb"] / 1024 - 79.113 / 5) < 0.001
+    assert K3_PROFILE["layer_ms_base"] == 1.15                     # whole-layer CUDA graph, B=1
+    assert K3_PROFILE["cap_layers"] == 5                           # 5 fit a 96 GB card, the 6th OOMs
+    assert K3_PROFILE["load_peak_extra_mb"] == _K3_REPACK_PEAK_MB  # 25.041 - 15.823 GiB, both cards
+    # the per-box reserve must cover the gap between what the allocator reports and what the driver
+    # says is in use: 89.661 GiB device-used against an 88.332 GiB allocator peak at the 5-layer pack
+    assert K3_PROFILE["reserve_mb"] >= (89.661 - 88.332) * 1024
+    assert K3_PROFILE["decode_steps"] == 600                       # g=1: one token per traversal
+    assert K3_PROFILE["head_layer_ms_mult"] == 1.3                 # carried from M2.5, not measured
+    assert 4096 // K3_PROFILE["prefill_chunks"] == 1024            # the deployable prefill chunk
+    # the boundary reserves must at least cover the tensor each one exists to hold
+    assert K3_PROFILE["head_reserve_mb"] > _K3_EMBED_MB            # embed_tokens, untied
+    assert K3_PROFILE["tail_reserve_mb"] > _K3_EMBED_MB            # lm_head, untied
+
+
+def test_k3_kv_folds_two_different_kinds_of_state():
+    """24 MLA layers hold KV that grows with B*context; 69 KDA layers hold a fixed state that grows
+    with B alone. The planner has ONE per-layer number, so the profile carries their average at the
+    stated target — and the two terms must not be assumed to share a scale factor."""
+    assert K3_PROFILE["kv_mb_per_layer"] == k3_kv_mb_per_layer(batch=8, maxlen=32768)
+    assert abs(K3_PROFILE["kv_mb_per_layer"] - 109.9) < 0.1
+    # KDA is context-INDEPENDENT: at batch 8 it contributes 69*6 MiB*8 / 93 whatever the context.
+    kda_only = 69 * 6.0 * 8 / 93
+    assert abs(k3_kv_mb_per_layer(batch=8, maxlen=0) - kda_only) < 1e-9
+    # doubling the context does NOT double the fold (only the MLA term moves) ...
+    assert k3_kv_mb_per_layer(8, 65536) < 2 * k3_kv_mb_per_layer(8, 32768)
+    # ... while doubling the batch DOES double it (both terms are linear in B).
+    assert abs(k3_kv_mb_per_layer(16, 32768) - 2 * k3_kv_mb_per_layer(8, 32768)) < 1e-9
+    # a 1M-token context is 27 GiB of MLA KV per request — far past what the phase-1 fold models,
+    # i.e. a workload the profile's default silently under-plans unless the caller recomputes.
+    assert k3_kv_mb_per_layer(1, 1048576) > 20 * k3_kv_mb_per_layer(8, 32768) / 8
+
+
+def test_k3_boundary_payload_is_attnres_not_a_hidden_state():
+    """A K3 hop carries prefix_sum + the block_residual stack, mean 5.348 x hidden across the 92
+    boundaries — 5.3x a plain transformer. The prefill CHUNK is what must fit transport.MAX_FRAME,
+    which is why the nominal 4096-token prefill is four chunks."""
+    from shard.transport import MAX_FRAME
+    unit = 7168 * 2.0                                    # hidden * bf16 = one plain hidden state
+    assert abs(K3_PROFILE["decode_bytes"] - unit * 492 / 92) < 1e-6
+    assert abs(K3_PROFILE["decode_bytes"] / 1024 - 74.87) < 0.01          # KiB/token/hop
+    assert K3_PROFILE["decode_bytes"] > 5 * unit         # never priced as a bare hidden state
+    assert K3_PROFILE["prefill_bytes"] == 4096 * K3_PROFILE["decode_bytes"]
+    chunk_tokens = 4096 // K3_PROFILE["prefill_chunks"]
+    assert chunk_tokens * 9 * unit < MAX_FRAME           # deepest boundary (9 units) still sends
+    assert 4096 * 9 * unit > MAX_FRAME                   # ... and M2.5's one-chunk prefill would not
+
+
+def test_k3_footprint_arithmetic_reproduces_the_g0_proven_caps():
+    """5 layers on a 96 GB card and 1 on a 32 GB card are MEASURED verdicts (the 6th layer OOMs
+    allocating 588 MiB). They must fall out of the profile's own arithmetic — reserve carries the
+    9.2 GiB Marlin repack transient — rather than out of a hardcoded ceiling."""
+    per_layer = K3_PROFILE["layer_vram_mb"] + K3_PROFILE["kv_mb_per_layer"]
+    fat_budget = _PRO6000_MB - K3_PROFILE["reserve_mb"]
+    thin_budget = _RTX5090_MB - K3_PROFILE["reserve_mb"]
+    assert int(fat_budget // per_layer) == 5
+    assert int(thin_budget // per_layer) == 1
+    # 5 layers + the load peak must fit the real card, and 6 must not (G0's OOM).
+    peak_over_resident = 9440.0                          # the transient inside reserve_mb
+    assert 5 * K3_PROFILE["layer_vram_mb"] + peak_over_resident < _PRO6000_MB
+    assert 6 * K3_PROFILE["layer_vram_mb"] + peak_over_resident > _PRO6000_MB
+    # the density rule is a LINEAR scaling of a cap proven on a 32 GB card; K3's real ceiling is
+    # floor((vram - 9.2 GiB)/15.8 GiB), which is not linear in card size. It reads far above the
+    # budget on both cards, so it never binds — and whether it truncates or rounds cannot change a
+    # K3 plan (the point of leaving cap_layers as a sanity ceiling rather than the binding rule).
+    for total, budget in ((_PRO6000_MB, fat_budget), (_RTX5090_MB, thin_budget)):
+        assert density_cap_layers(K3_PROFILE["cap_layers"], total) >= int(budget // per_layer)
+
+
+def test_k3_never_budgets_a_block_whose_load_peak_exceeds_the_card():
+    """The load peak, not the resident footprint, is what OOMs: repacking an MXFP4 layer needs
+    resident + 9.2 GiB free. Sweep card sizes and require the budgeted block to LOAD, using the
+    measured peak rather than the profile's own field — otherwise deleting the field from the
+    profile leaves this test asserting 'zero peak fits', which is how a knife-edge ships. The
+    two G0-proven cards are only two points on this curve; a 104 GB card is where dropping it
+    first plans a block that cannot load."""
+    per_layer = K3_PROFILE["layer_vram_mb"] + K3_PROFILE["kv_mb_per_layer"]
+    docked = K3_PROFILE["reserve_mb"] + K3_PROFILE["load_peak_extra_mb"]
+    for total in range(32768, 196609, 2048):
+        layers = int(max(total - docked, 0.0) // per_layer)
+        assert layers * K3_PROFILE["layer_vram_mb"] + _K3_REPACK_PEAK_MB <= total, \
+            f"a {total} MB card is budgeted {layers} layers it cannot load"
+    assert int(max(_PRO6000_MB - docked, 0.0) // per_layer) == 5      # G0: 5 fit, the 6th OOMs
+    assert int(max(_RTX5090_MB - docked, 0.0) // per_layer) == 1      # G0: exactly one
+
+
+def test_k3_load_peak_is_not_docked_twice_when_a_node_measures_it():
+    """The repack transient is a property of the MODEL — every card peaks the same 9.2 GiB — so a
+    probe that honestly measures it announces the number the profile already carries. Subtracting
+    both takes ~19 GB off every box: the 5090 loses its only layer and both rings read INFEASIBLE.
+    The node's measurement must override the profile's, not add to it."""
+    for fat, thin in ((19, 0), (0, 93)):
+        nodes, rtt = _k3_pool(fat=fat, thin=thin)
+        plain = plan_ring(nodes, rtt, K3)
+        for nd in nodes:
+            nd["load_peak_extra_mb"] = K3_PROFILE["load_peak_extra_mb"]
+        assert plan_ring(nodes, rtt, K3) == plain, "an honest K3 probe changed the plan"
+    # a node whose transient is genuinely LARGER than the model's still gets gated on its own
+    nodes, rtt = _k3_pool(fat=19)
+    nodes[3]["load_peak_extra_mb"] = 40000.0
+    plan = plan_ring(nodes, rtt, K3)
+    by_id = {s["id"]: s for s in (plan["stages"] if plan else [])}
+    assert "n3" not in by_id or by_id["n3"]["layers"] < 5
+
+
+def test_k3_tiles_93_layers_over_the_fat_card_ring():
+    """The real shape: 19-20 96 GB cards, 5 layers each. 19 is the floor (19*5 = 95 >= 93)."""
+    for k in (19, 20):
+        nodes, rtt = _k3_pool(fat=k)
+        plan = plan_ring(nodes, rtt, K3)
+        assert plan is not None, f"{k} Pro 6000s must hold K3"
+        _assert_tiles_simple(plan, 93)
+        assert max(s["layers"] for s in plan["stages"]) <= 5
+    # 18 of them cannot: 18*5 = 90 < 93, and the honest answer is None, not a short ring.
+    nodes, rtt = _k3_pool(fat=18)
+    assert plan_ring(nodes, rtt, K3) is None
+
+
+def test_k3_tiles_93_layers_over_93_thin_cards():
+    """A 32 GB 5090 holds exactly ONE 15.8 GiB layer, so the all-5090 ring is 93 hops of 1 layer —
+    the shape that says the crowd fleet can serve K3 at all, at the cost of 93 network hops."""
+    nodes, rtt = _k3_pool(thin=93)
+    plan = plan_ring(nodes, rtt, K3)
+    assert plan is not None
+    _assert_tiles_simple(plan, 93)
+    assert plan["k"] == 93 and {s["layers"] for s in plan["stages"]} == {1}
+    nodes, rtt = _k3_pool(thin=92)
+    assert plan_ring(nodes, rtt, K3) is None           # 92 cards hold 92 layers: not a K3 ring
+
+
+def test_k3_mixed_pool_places_each_card_at_its_own_capacity():
+    """A hetero pool is the realistic one: fat cards absorb 5 layers each, thin cards 1, and the
+    ring is feasible iff those add up to 93."""
+    nodes, rtt = _k3_pool(fat=15, thin=18)             # 15*5 + 18*1 = 93 exactly
+    plan = plan_ring(nodes, rtt, K3)
+    assert plan is not None
+    _assert_tiles_simple(plan, 93)
+    by_id = {s["id"]: s for s in plan["stages"]}
+    for i in range(15, 33):                            # every thin card that landed holds <= 1
+        if f"n{i}" in by_id:
+            assert by_id[f"n{i}"]["layers"] <= 1
+    assert sum(s["layers"] for s in plan["stages"]) == 93
+
+
+def test_k3_plans_identically_through_the_model_id_seam():
+    """c0mpute's catalog holds a model_id, not our calibration: plan_ring(model="<id>") must resolve
+    to the same plan as passing the profile dict, over the JSON CLI too."""
+    nodes, rtt = _k3_pool(fat=19)
+    assert plan_ring(nodes, rtt, K3) == plan_ring(nodes, rtt, K3_PROFILE)
+    r = subprocess.run([sys.executable, "-m", "shard.plan"],
+                       input=json.dumps({"nodes": nodes, "rtt": rtt, "model": K3}),
+                       capture_output=True, text=True, cwd=REPO, timeout=120)
+    assert r.returncode == 0, r.stderr
+    _assert_tiles_simple(json.loads(r.stdout), 93)
+    r = subprocess.run([sys.executable, "-m", "shard.plan"],
+                       input=json.dumps({"nodes": nodes, "rtt": rtt, "model": "no/such-model"}),
+                       capture_output=True, text=True, cwd=REPO, timeout=120)
+    assert r.returncode != 0 and "no engine profile" in json.loads(r.stdout)["error"]

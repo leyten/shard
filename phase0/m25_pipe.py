@@ -19,7 +19,12 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 os.environ.setdefault("M25_DIR", "/root/m25")
 import json
 import m25_stage as S
-from m25_tools import render_ids, parse_completion          # tool-calling: chat-template render + output parse
+from model_tools import for_model                          # tool-calling: per-model render + output parse
+# The served model decides the chat format, not this file (docs/MODEL_RUNTIME.md leak #4). M25_MODEL_ID
+# is the gateway's own knob and defaults to M2.5, so a ring that never sets it binds m25_tools exactly
+# as the direct import here used to.
+_TOOLS = for_model(os.environ.get("M25_MODEL_ID", "minimax-m2.5"))
+render_ids, parse_completion = _TOOLS.render_ids, _TOOLS.parse_completion
 from node_kv import send_msg, recv_msg, EDGE_ERRORS, TransportError   # libp2p codec (SHARD_TRANSPORT=libp2p)
 try:                                                    # opt-in confidence-scheduled depth (M25_CONF_SCHED=1)
     from confidence import ConfidenceScheduler

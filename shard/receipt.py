@@ -51,6 +51,17 @@ def _canonical(receipt: dict) -> bytes:
     return json.dumps(m, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
 
 
+def wire_receipt(receipt: dict) -> dict:
+    """The receipt in the form that must reach ANY verifier: byte-identical to the dict that was
+    signed. The engine STAGE role tags each emitted receipt with a coordinator-side `stage` debug
+    label AFTER signing ({"stage": ..., **finalize()} in m25_pipe / specpipe) — purely a per-stage
+    log label, already implied by layer_start. `_canonical` signs every key but `sig`, so leaving
+    that tag on a receipt handed to a verifier puts it in the preimage and breaks the signature.
+    Strip it HERE, at the boundary to the verifier, so the verifier can stay STRICT: any OTHER
+    unexpected key is left in place and remains a genuine tamper signal, never silently discarded."""
+    return {k: v for k, v in receipt.items() if k != "stage"}
+
+
 class ReceiptSigner:
     """Accumulates the activation hash-chain for ONE stage over ONE job, then signs it.
 

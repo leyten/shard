@@ -25,7 +25,9 @@ mlx = ["mlx>=0.21", "mlx-lm>=0.20"]
 # phase0/kimi_k3_ref/, imports einops at module scope, so a box serving K3 needs it; the M2.5
 # engine does not. `fla` (the KDA kernels the same file imports) is deliberately NOT listed --
 # it is Triton/GPU-only and phase0/k3_kda_cpu.py stands in for it off a GPU.
-k3 = ["einops>=0.7"]
+#   tiktoken: K3's tokenizer is a tiktoken BPE (no tokenizer.json), so phase0/k3_tools.py's
+#   segment encoding needs it -- and so does the synthetic vocab the round-trip tests build.
+k3 = ["einops>=0.7", "tiktoken>=0.7"]
 
 [build-system]
 requires = ["setuptools>=68"]
