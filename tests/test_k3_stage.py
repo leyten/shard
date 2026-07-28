@@ -57,28 +57,30 @@ def _tiny_config():
 
 
 def _adapt_reference_whole_model():
-    """Make the reference's WHOLE-MODEL path runnable on the installed transformers.
+    """Make the reference's WHOLE-MODEL path runnable on whatever transformers is installed.
 
     A Stage never touches KimiLinearModel -- it drives KimiDecoderLayer directly and builds its own
-    mask -- so these adapters exist only so the tests have an official model to measure against, and
-    they deliberately live here rather than in k3_stage. Two things moved under the reference since
-    it was written: create_causal_mask renamed input_embeds and dropped cache_position, and
-    transformers now hands Cache.get_mask_sizes a plain query length instead of a cache_position
-    tensor. Neither is on the stage's path."""
-    import inspect
-    from transformers.masking_utils import create_causal_mask
-    M = K3.ref()
-    params = inspect.signature(create_causal_mask).parameters
-    if "input_embeds" not in params:
-        def _mask(**kw):
-            kw["inputs_embeds"] = kw.pop("input_embeds", None)
-            return create_causal_mask(**{k: v for k, v in kw.items() if k in params})
-        M.create_causal_mask = _mask
+    mask -- so this adapter exists only so the tests have an official model to measure against, and
+    it deliberately lives here rather than in k3_stage.
 
-    def _get_mask_sizes(self, cache_position, layer_idx):
-        q = cache_position if isinstance(cache_position, int) else cache_position.shape[0]
-        return q + self.get_seq_length(layer_idx), 0
-    M.KimiDynamicCache.get_mask_sizes = _get_mask_sizes
+    It replaces the ONE thing the reference borrows from transformers on that path: the mask helper.
+    Doing it by signature-patching was a losing game -- create_causal_mask renamed a kwarg in 5.12
+    and by 5.14 its Cache protocol wanted a get_query_offset the vendored KimiDynamicCache has never
+    heard of, so the reference model broke on a transformers bump that touched nothing we own.
+    Building the mask here instead pins the comparison to the architecture rather than to a release.
+
+    It does mean the reference model is handed the STAGE's mask, so this comparison cannot also
+    prove the mask right. That is pinned separately and better, by properties a serving path
+    actually depends on: test_causal_mask_is_bottom_right_aligned on the tensor itself, and
+    test_kda_state_continuity_across_chunked_prefill, which a top-left-aligned or off-by-one mask
+    cannot survive (every decode step would attend to the wrong span)."""
+    M = K3.ref()
+
+    def _mask(**kw):
+        emb = kw["input_embeds"]
+        start, q = int(kw["cache_position"][0]), emb.shape[1]
+        return K3._causal_mask(q, start + q, start, emb.dtype, emb.device)
+    M.create_causal_mask = _mask
     return M
 
 
@@ -151,6 +153,23 @@ def _stage_decode(stages, prompt, n_new, drop_block_residual_at=None):
 
 
 # ── the contract ─────────────────────────────────────────────────────────────────────────────────
+
+def test_causal_mask_is_bottom_right_aligned():
+    """A decode step's query sits at the END of the kv, not the top-left.
+
+    Top-left alignment is the classic version of this bug and it is silent on a cold prefill (where
+    the two agree) -- it only corrupts the warm path, which is every token after the first."""
+    m = K3._causal_mask(1, 5, 4, torch.float32, "cpu")            # 1 new token, 4 already cached
+    assert m.shape == (1, 1, 1, 5)
+    assert (m[0, 0, 0] == 0).all(), "a decode step must see the whole kv"
+
+    m = K3._causal_mask(3, 5, 2, torch.float32, "cpu")            # a 3-token chunk at offset 2
+    allowed = (m[0, 0] == 0)
+    assert allowed.tolist() == [[True, True, True, False, False],
+                                [True, True, True, True, False],
+                                [True, True, True, True, True]]
+    assert m.min() == torch.finfo(torch.float32).min              # finfo.min, never -inf
+
 
 def test_boundary_payload_is_the_hidden_state_and_the_attnres_stack(fixture):
     """A stage's payload is (h, block_residual), and the stack GROWS as blocks are appended."""

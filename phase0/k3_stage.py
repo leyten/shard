@@ -92,25 +92,6 @@ def _tf_compat():
         setattr(mod, name, getattr(importlib.import_module(moved_to), name))
 
 
-def _tf_compat_post(M):
-    """`create_causal_mask` renamed input_embeds -> inputs_embeds and dropped cache_position after
-    the reference was written. Only KimiLinearModel.forward calls it -- a Stage builds its own mask
-    -- so this exists for the whole-model reference the parity test measures against.
-
-    Rebound on the REFERENCE MODULE's own binding, never on transformers.masking_utils: the vendored
-    file did `from ... import create_causal_mask`, so shadowing its name reaches exactly it, while
-    patching the transformers global would change masking for every other model in the process."""
-    import inspect
-    from transformers.masking_utils import create_causal_mask
-    params = inspect.signature(create_causal_mask).parameters
-    if "input_embeds" in params:
-        return
-    def _shim(**kw):
-        kw["inputs_embeds"] = kw.pop("input_embeds", None)
-        return create_causal_mask(**{k: v for k, v in kw.items() if k in params})
-    M.create_causal_mask = _shim
-
-
 def ref():
     """Moonshot's reference decoder module, with a usable KDA backend installed first (memoized).
 
@@ -122,7 +103,6 @@ def ref():
         k3_kda_cpu.install()
         _tf_compat()
         from kimi_k3_ref import modeling_kimi_linear as M
-        _tf_compat_post(M)
         _REF = M
     return _REF
 
