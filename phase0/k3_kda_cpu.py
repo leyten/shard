@@ -46,10 +46,16 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 # Which KDA kernels the reference gets. "fla" is the real package (Triton, needs a CUDA device),
-# "cpu" is this module, "auto" picks fla only when both the package AND a GPU are present -- fla
-# imports fine without one and then dies at the first kernel launch, so importability alone is the
-# wrong test.
+# "cpu" is this module, "flashkda" is FlashKDA's CUDA recurrence with this module's conv/gated-norm
+# around it (k3_kda_flash — the M2 GPU path, proven on sm_120), and "auto" picks a GPU backend only
+# when both the package AND a GPU are present -- either package imports fine without one and then
+# dies at the first kernel launch, so importability alone is the wrong test.
 K3_KDA_BACKEND = os.environ.get("K3_KDA_BACKEND", "auto")
+# Set by k3_stage when K3_STATIC_STATE (implied by K3_CUDA_GRAPH) is on: the conv cache is then
+# updated IN PLACE and handed back, so `cache_params.conv_states[li] = ret` preserves the address a
+# captured graph replays against. Off (the default, and every CPU parity test) a fresh tensor is
+# returned, which is M1's behaviour exactly.
+STATIC_STATE = False
 
 
 # ── the ops the reference calls ──────────────────────────────────────────────────────────────────
@@ -124,7 +130,11 @@ def fused_recurrent_kda(q, k, v, g, beta, A_log=None, dt_bias=None, initial_stat
 
     if not output_final_state:
         return o.to(dtype), None
-    return o.to(dtype), (S.transpose(-1, -2) if transpose_state_layout else S).contiguous()
+    final = (S.transpose(-1, -2) if transpose_state_layout else S).contiguous()
+    if STATIC_STATE and initial_state is not None:
+        initial_state.copy_(final)   # address-preserving update, same contract as k3_kda_flash's:
+        return o.to(dtype), initial_state    # the cache slot a captured graph replays against
+    return o.to(dtype), final
 
 
 def chunk_kda(*args, **kwargs):
@@ -198,7 +208,11 @@ class ShortConvolution(nn.Conv1d):
             return y, None
         # xfull is always >= W wide (W-1 of left context plus at least one new token), so the last
         # W columns are exactly the window the next chunk needs.
-        return y, xfull[:, -W:].transpose(1, 2).contiguous()
+        window = xfull[:, -W:].transpose(1, 2)
+        if STATIC_STATE and cache is not None:
+            cache.copy_(window)          # address-preserving update; `left` was copied out by the
+            return y, cache              # torch.cat above, so writing the cache now is safe
+        return y, window.contiguous()
 
 
 class FusedRMSNormGated(nn.Module):
@@ -260,27 +274,67 @@ def _installed(name):
 
 
 def backend():
-    """Which KDA backend this box resolves to under K3_KDA_BACKEND. See the constant's comment."""
-    if K3_KDA_BACKEND in ("cpu", "fla"):
+    """Which KDA backend this box resolves to under K3_KDA_BACKEND. See the constant's comment.
+
+    `auto` prefers flashkda over fla on a GPU: FlashKDA is the recurrence M2 actually measured on
+    sm_120, and fla's own KDA Triton kernels were never probed there."""
+    if K3_KDA_BACKEND in ("cpu", "fla", "flashkda"):
         return K3_KDA_BACKEND
     if K3_KDA_BACKEND != "auto":
-        raise RuntimeError(f"K3_KDA_BACKEND={K3_KDA_BACKEND!r} — expected auto, cpu or fla")
-    return "fla" if _installed("fla.ops.kda") and torch.cuda.is_available() else "cpu"
+        raise RuntimeError(f"K3_KDA_BACKEND={K3_KDA_BACKEND!r} — expected auto, cpu, fla or flashkda")
+    if not torch.cuda.is_available():
+        return "cpu"
+    import k3_kda_flash
+    if k3_kda_flash.available():
+        return "flashkda"
+    return "fla" if _installed("fla.ops.kda") else "cpu"
+
+
+# The names the reference imports that a non-`fla` backend has to supply. `_OVERRIDE` is the subset
+# that gets written ONTO a real fla package when one is installed: the two KDA entry points and the
+# two nn.Modules. `fla.ops.utils.index` and `fla.utils` are left alone there -- the real ones are
+# correct, and fla's memoizing tensor_cache is better than the passthrough stub.
+_OVERRIDE = ("fla.modules", "fla.ops.kda")
+
+
+def _table(be):
+    t = {k: dict(v) for k, v in _MODULES.items()}
+    if be == "flashkda":
+        import k3_kda_flash
+        t["fla.ops.kda"] = {"chunk_kda": k3_kda_flash.chunk_kda,
+                            "fused_recurrent_kda": k3_kda_flash.fused_recurrent_kda}
+    return t
 
 
 def install():
-    """Put this backend on sys.modules as `fla.*`, unless the real one is what we resolved to.
+    """Give the reference its KDA ops, and report which backend it got.
 
-    Idempotent, and refuses rather than clobbering a real fla another module is already using."""
-    if backend() == "fla":
+    Three shapes, because `fla` is both a thing we replace and a thing we depend on:
+      fla        nothing to do -- the real package serves every name.
+      real fla   present but a different backend was resolved: the four names the reference imports
+                 are written ON the real modules and the rest of the package is left intact.
+                 Replacing it wholesale would strand `fla.ops.attnres` -- a stub `fla.ops` has no
+                 __path__, so the submodule cannot be imported at all -- and the M2 box needs
+                 fla-core for exactly that. It DOES mean the override is process-wide: anything else
+                 importing fla.ops.kda gets this backend. That is what the knob asked for.
+      no fla     build the stub tree under sys.modules, M1's original behaviour.
+
+    M1 raised here instead of overriding, to avoid clobbering a real fla another module was using.
+    That refusal is gone for two reasons: the surgical override is a far smaller clobber than the
+    package replacement it was guarding against, and the check could not tell a genuine user of the
+    package from `_installed()`'s own probe -- find_spec on a dotted name imports the parent, so
+    merely ASKING whether fla existed made the guard fire. Idempotent either way."""
+    be = backend()
+    if be == "fla":
         return "fla"
-    live = sys.modules.get("fla")
-    if (live is not None and getattr(live, "__spec__", None) is not None
-            and live.__spec__.origin is not None
-            and not getattr(live, "_k3_cpu_backend", False)):
-        raise RuntimeError("k3_kda_cpu.install(): the real `fla` is already imported but the CPU "
-                           "backend was resolved — set K3_KDA_BACKEND=fla, or import k3_stage first")
-    for name, attrs in _MODULES.items():
+    table = _table(be)
+    if _installed("fla.ops.kda"):
+        for name in _OVERRIDE:
+            mod = importlib.import_module(name)
+            for attr, value in table[name].items():
+                setattr(mod, attr, value)
+        return be
+    for name, attrs in table.items():
         mod = sys.modules.get(name)
         if mod is None or not getattr(mod, "_k3_cpu_backend", False):
             mod = types.ModuleType(name)
@@ -291,8 +345,19 @@ def install():
     for parent, child in (("fla", "modules"), ("fla", "ops"), ("fla", "utils"),
                           ("fla.ops", "kda"), ("fla.ops", "utils"), ("fla.ops.utils", "index")):
         setattr(sys.modules[parent], child, sys.modules[f"{parent}.{child}"])
-    return "cpu"
+    return be
 
 
-__all__ = ["backend", "install", "chunk_kda", "fused_recurrent_kda", "kda_gate",
+def set_static_state(on):
+    """Turn address-preserving state updates on for every backend at once (K3_STATIC_STATE).
+
+    Both the conv cache (here) and the KDA recurrent state (k3_kda_flash) have to agree: a graph
+    that captured one fixed buffer and one reallocating one replays against a stale half."""
+    global STATIC_STATE
+    STATIC_STATE = bool(on)
+    import k3_kda_flash
+    k3_kda_flash.STATIC_STATE = bool(on)
+
+
+__all__ = ["backend", "install", "set_static_state", "chunk_kda", "fused_recurrent_kda", "kda_gate",
            "ShortConvolution", "FusedRMSNormGated"]
