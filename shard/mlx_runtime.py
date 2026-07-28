@@ -48,46 +48,66 @@ import os
 import numpy as np
 
 from .node import LayerRange, ModelRuntime
+from .weightkeys import LAYER_PATTERN, boundary_of, layer_of, namespace
 
 
 # ── pure helpers (no mlx; offline-testable) ───────────────────────────────────
 
 def select_weight_keys(weight_map: dict, lo: int, hi: int, *,
                        is_head: bool, is_tail: bool, tied: bool = False) -> list:
-    """Exactly the tensor names a stage holding layers [lo:hi) must materialize, derived
-    from the checkpoint's index `weight_map` — never hardcoded beyond the model family's
-    documented "model.layers.{j}." / "model.embed_tokens" / "model.norm" / "lm_head" naming
-    (the same prefixes shard/fetch.shards_for_block selects FILES by; this selects TENSORS,
-    so a quantized checkpoint's .scales/.biases companions ride along automatically because
-    they share the prefix).
+    """Exactly the tensor names a stage holding layers [lo:hi) must materialize, derived from
+    the checkpoint's index `weight_map` by the SAME classification shard/fetch.shards_for_block
+    selects FILES by (shard.weightkeys: the layer number comes from the tensor's own name, any
+    namespace around it). This selects TENSORS, so a quantized checkpoint's .scales/.biases
+    companions ride along automatically because they share the module path — and a checkpoint
+    the fetch pulls correctly is one this loads, which hardcoding "model.layers.{j}." made
+    false (a foreign namespace selected zero tensors, then failed on a random-init module).
 
     `tied` comes from the CONFIG (tie_word_embeddings), never inferred from the map: a tail
     whose index merely LACKS lm_head.* on an untied model must fail here, not fall back to
     projecting logits through a random-init substitute (the silent-corruption class this
     loader exists to refuse). Tied tails pull embed_tokens (logits via embed.as_linear).
     Pure function so the selection logic is testable without mlx or weights on disk."""
-    prefixes = tuple(f"model.layers.{j}." for j in range(lo, hi))
-    keys = {k for k in weight_map if k.startswith(prefixes)} if prefixes else set()
+    keys, edge = set(), {"embed": set(), "norm": set(), "lm_head": set()}
+    for k in weight_map:
+        j = layer_of(k)
+        if j is not None:
+            if lo <= j < hi:               # a second numbered tower over-selects (bytes), the same
+                keys.add(k)                # accepted cost the fetch takes — never a missing tensor
+            continue
+        b = boundary_of(k)
+        if b is not None:
+            edge[b].add(k)
+    # A non-empty range that matched NO tensor is the namespace miss: the block would load as
+    # random-init weights behind a healthy-looking receipt. Fail loud, naming what the map holds.
+    if weight_map and lo < hi and not keys:
+        seen = sorted({j for k in weight_map if (j := layer_of(k)) is not None})
+        raise ValueError(
+            f"weight_map holds no tensor for layers [{lo}:{hi}]: " + (
+                f"the map only carries layers {seen[0]}-{seen[-1]}" if seen else
+                f"no tensor name matches the layer pattern {LAYER_PATTERN!r} "
+                f"(e.g. {sorted(weight_map)[:3]})") + " — refusing a random block")
     if is_head:
-        keys |= {k for k in weight_map if k.startswith("model.embed_tokens.")}
-        if not any(k.startswith("model.embed_tokens.") for k in weight_map):
-            raise ValueError("head stage but weight_map has no model.embed_tokens.* — "
+        if not edge["embed"]:
+            raise ValueError("head stage but weight_map has no embed_tokens tensor — "
                              "corrupt/partial index, refusing a random embedding")
+        keys |= edge["embed"]
     if is_tail:
-        keys |= {k for k in weight_map if k.startswith("model.norm.")}
-        if not any(k.startswith("model.norm.") for k in weight_map):
-            raise ValueError("tail stage but weight_map has no model.norm.* — corrupt/partial index")
+        if not edge["norm"]:
+            raise ValueError("tail stage but weight_map has no final norm tensor — "
+                             "corrupt/partial index")
+        keys |= edge["norm"]
         if tied:
-            if not any(k.startswith("model.embed_tokens.") for k in weight_map):
-                raise ValueError("tied-embedding tail but weight_map has no model.embed_tokens.* — "
+            if not edge["embed"]:
+                raise ValueError("tied-embedding tail but weight_map has no embed_tokens tensor — "
                                  "corrupt/partial index")
-            keys |= {k for k in weight_map if k.startswith("model.embed_tokens.")}
+            keys |= edge["embed"]
         else:
-            if not any(k.startswith("lm_head.") for k in weight_map):
-                raise ValueError("untied model but weight_map has no lm_head.* — corrupt/partial "
+            if not edge["lm_head"]:
+                raise ValueError("untied model but weight_map has no lm_head tensor — corrupt/partial "
                                  "index, refusing a random lm_head (config says tie_word_embeddings"
                                  "=false; a tied checkpoint would say so in its config)")
-            keys |= {k for k in weight_map if k.startswith("lm_head.")}
+            keys |= edge["lm_head"]
     return sorted(keys)
 
 
@@ -185,8 +205,14 @@ class MlxRuntime(ModelRuntime):
         self._tied = bool(cfg.get("tie_word_embeddings", False))
         keys = select_weight_keys(weight_map, lo, hi, is_head=self.is_head,
                                   is_tail=self.is_tail, tied=self._tied)
+        # Coverage is counted within the DECODER stack only: a second numbered tower's blocks
+        # ride along in `keys` (the union the fetch also takes), and letting their numbers vote
+        # would let a vision layer 1 stand in for a missing decoder layer 1 — the exact
+        # silently-random layer this guard exists to refuse.
+        stack = namespace(weight_map)["layers"] + "."
+        covered = {j for k in keys if k.startswith(stack) and (j := layer_of(k)) is not None}
         for li in range(lo, hi):
-            if not any(k.startswith(f"model.layers.{li}.") for k in keys):
+            if li not in covered:
                 raise RuntimeError(f"weight_map covers no tensors for layer {li} — "
                                    "index/config mismatch, refusing a silently-random layer")
         weights = {}
