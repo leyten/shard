@@ -55,7 +55,11 @@ def sh(host, port, cmd, timeout=120):
 
 
 def push_code(host, port):
-    for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/ngram_draft.py", "phase0/eagle_draft.py",
+    # model_tools is a hard import of m25_pipe/m25_gateway (the per-model tools seam) -- a box without
+    # it cannot start. k3_tools is NOT pushed: it needs the whole phase0/kimi_k3_ref package, and
+    # model_tools only imports a family when that model is the one being served.
+    for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/model_tools.py",
+              "phase0/ngram_draft.py", "phase0/eagle_draft.py",
               "phase0/tree_spec.py", "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
               "phase0/safe_kill.sh",                       # every box gets the self-match-proof killer for ad-hoc ops (bash /root/safe_kill.sh PATTERN)
               "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:

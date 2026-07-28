@@ -22,10 +22,16 @@ import argparse, json, os, socket, sys, threading, time, itertools
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from m25_tools import parse_completion, render_ids, to_openai_message, TOOLCALL_BEGIN, THINK_BEGIN, THINK_END
+from model_tools import for_model
 
 MOCK = bool(os.environ.get("M25_GATEWAY_MOCK"))
 MODEL_ID = os.environ.get("M25_MODEL_ID", "minimax-m2.5")
+# Chat format is the served MODEL's, not this file's (phase0/model_tools.py; docs/MODEL_RUNTIME.md
+# leak #4). Bind the family's renderer/parser and channel markers once, from the model id. The id
+# defaults to M2.5, so an existing ring binds exactly the m25_tools names this used to import.
+TOOLS = for_model(MODEL_ID)
+parse_completion, render_ids, to_openai_message = TOOLS.parse_completion, TOOLS.render_ids, TOOLS.to_openai_message
+TOOLCALL_BEGIN, THINK_BEGIN, THINK_END = TOOLS.TOOLCALL_BEGIN, TOOLS.THINK_BEGIN, TOOLS.THINK_END
 # default reasoning mode for the gateway: M2.5 hardwires a <think> block, which is novel (0% n-gram
 # accept) so it runs at the WAN floor and dominates latency. M25_DEFAULT_REASONING=0 makes the gateway
 # answer DIRECTLY by default (fast, for latency-sensitive/high-overlap normal usage); a request can
@@ -447,8 +453,11 @@ def _mock_generate(messages, tools, max_new, on_commit, reasoning=True):
     Honours `reasoning`: with it off the output carries NO <think> block (mirrors render_ids closing
     it in the prompt), so the stream path is exercised in both modes."""
     last = messages[-1]["content"] if messages else ""
+    fam_mock = getattr(TOOLS, "mock_completion", None)
     think = f"\nThinking about it.\n{THINK_END}" if reasoning else ""
-    if tools:
+    if fam_mock is not None:          # a non-M2.5 family emits its own wire shape (K3's XTML)
+        text = fam_mock(last, tools, reasoning)
+    elif tools:
         name = tools[0]["function"]["name"]
         text = (f"{f'{chr(10)}The user asked: {last[:40]}. I will call {name}.{chr(10)}{THINK_END}' if reasoning else ''}\n\n"
                 f"Let me look that up.{TOOLCALL_BEGIN}\n<invoke name=\"{name}\">\n"
@@ -577,6 +586,14 @@ class _SSESplitter:
             c = self.buf
         self.buf = ""
         return r, c
+
+
+def _splitter(reasoning_on):
+    """The incremental splitter for the served model. A family whose format needs more than M2.5's
+    three markers ships its own factory (K3 wraps visible content in a response channel, which
+    _SSESplitter would stream to the user); everything else gets _SSESplitter, unchanged."""
+    f = getattr(TOOLS, "stream_splitter", None)
+    return f(reasoning_on) if f is not None else _SSESplitter(reasoning_on)
 
 
 class H(BaseHTTPRequestHandler):
@@ -767,7 +784,7 @@ class H(BaseHTTPRequestHandler):
             chunk({"role": "assistant"})
             state = {"r": 0, "c": 0}
             detok = None if MOCK else _IncrDetok()         # bounded-window decode (never the full list)
-            split = _SSESplitter(reasoning)                # O(delta) split (never the full text)
+            split = _splitter(reasoning)                   # O(delta) split (never the full text)
             seen = {"n": 0}                                # stable chars already fed to the splitter
 
             def _emit(rd, cd):
