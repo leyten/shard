@@ -371,3 +371,134 @@ def test_eagle_requested_but_head_absent_degrades(monkeypatch, tmp_path):
     assert isinstance(MP.make_drafter(), NgramDrafter)
     assert all(isinstance(d, NgramDrafter) for d in MP.make_drafters_b(3))
     assert MP._reset_op("sw", "job")["eagle"] == 0, "a degraded coordinator must not ask stages for aux"
+
+
+# ---- L3b: the FIRST-ACK budget (stranger-serve S1) ----------------------------------------------------
+
+def _blackhole(sock):
+    """A ring that reads every frame and never answers one — the 2026-07-28 shape: the coordinator's
+    reset lands (txq drains to 0) and nothing ever comes back on the return channel."""
+    while True:
+        try:
+            FR.MP.recv_msg(sock)
+        except Exception:                            # noqa: BLE001 — the test closes it at teardown
+            return
+
+
+def _wedged_ring_run(monkeypatch, first_s, stall_s, ring_kw=None, timeout=60):
+    """serve_jobs against a ring that never acks the reset (ring_kw=None) or one that answers first
+    and then goes silent. Returns (elapsed_s, emits, exits)."""
+    import threading
+    exits = []
+    socks = []
+
+    def fake_exit(code):
+        exits.append(code)
+        for s in socks:                              # a real os._exit would; unwedge the recv so the
+            try:                                     # test can assert instead of hanging
+                s.shutdown(socket.SHUT_RDWR)
+            except OSError:
+                pass
+
+    monkeypatch.setattr(C, "_hard_exit", fake_exit)
+    monkeypatch.setenv("M25_JOB_STALL_S", str(stall_s))
+    monkeypatch.setenv("M25_JOB_FIRSTACK_S", str(first_s))
+    monkeypatch.setenv("M25_REPLY_TIMEOUT", "120")   # only the watchdog may end this job
+    T = novel_T(400)
+    ring = None
+    if ring_kw is None:
+        c_pipe, r_pipe = socket.socketpair()
+        c_ret, r_ret = socket.socketpair()
+        c_ret.settimeout(timeout)
+        threading.Thread(target=_blackhole, args=(r_pipe,), daemon=True).start()
+    else:
+        c_pipe, c_ret, ring = _mk_ring(T, ring_kw, timeout=timeout)
+    socks += [c_pipe, c_ret]
+    emits = []
+    t0 = time.monotonic()
+    try:
+        C.serve_jobs(FR.MP, FakeTok(T[:P]), c_pipe, c_ret, _args(timeout=timeout),
+                     iter([_job(max_new=16)]), emit=lambda tag, **f: emits.append((tag, f)))
+    finally:
+        dt = time.monotonic() - t0
+        for s in socks:
+            try:
+                s.close()
+            except OSError:
+                pass
+        if ring is not None:
+            ring.join(2)
+    return dt, emits, exits
+
+
+def test_l3b_ring_that_never_acks_the_reset_fails_fast(monkeypatch):
+    """STRANGER-SERVE S1: the ring takes the reset and never answers. Before the first-ack budget
+    this job sat in recv_data for the whole stall budget (660s at the daemon's defaults) emitting
+    NOTHING — which is exactly why the live coordinator looked like it had never read stdin. It must
+    now die inside the first-ack budget with a FATAL that names the ring, not the coordinator."""
+    dt, emits, exits = _wedged_ring_run(monkeypatch, first_s=0.5, stall_s=60)
+    assert exits == [1], f"watchdog never fired (elapsed {dt:.1f}s, emits={emits})"
+    assert dt < 20, f"job took {dt:.0f}s — it rode the 60s STALL budget, not the first-ack budget"
+    fatal = [f for t, f in emits if t == "SHARD_JOB_FATAL"]
+    assert fatal and fatal[0]["jobId"] == "j-1"
+    assert "never acked this job's reset" in fatal[0]["error"], fatal[0]["error"]
+    # and the daemon can see the job was READ off stdin and handed to the ring
+    start = [f for t, f in emits if t == "SHARD_JOB_START"]
+    assert start and start[0]["jobId"] == "j-1" and start[0]["maxNew"] == 16
+
+
+def test_l3b_first_ack_budget_is_released_once_the_ring_answers(monkeypatch):
+    """The tight budget covers ONLY the pre-first-reply window. A ring that acks the reset and
+    replies, then goes silent mid-decode, must get the full (wide) stall budget — a big prefill
+    chunk on a thin residential uplink is legitimately slow and must never be killed at 0.5s."""
+    dt, emits, exits = _wedged_ring_run(monkeypatch, first_s=0.5, stall_s=3.0,
+                                        ring_kw={"mute_after_decode": 1})
+    assert exits == [1], f"watchdog never fired (elapsed {dt:.1f}s, emits={emits})"
+    assert dt > 2.0, f"died in {dt:.1f}s — the first-ack budget leaked into the mid-job wait"
+    fatal = [f for t, f in emits if t == "SHARD_JOB_FATAL"]
+    assert fatal and "no progress in" in fatal[0]["error"], fatal[0]["error"]
+    assert "never acked" not in fatal[0]["error"]
+
+
+def test_l3b_a_slow_first_prefill_chunk_is_not_false_killed(monkeypatch):
+    """The tight budget must cover the RESET ACK ONLY. A ring that acks the reset and then takes a
+    while over the first prefill chunk (a 4096-token chunk is ~25 MB of activations per hop — on a
+    thin uplink that is legitimately tens of seconds) is healthy, and killing it at the first-ack
+    budget would be a worse bug than the one this fixes."""
+    dt, emits, exits = _wedged_ring_run(monkeypatch, first_s=0.5, stall_s=3.0,
+                                        ring_kw={"stall_prefill": (1, 1.5)})
+    done = [f for t, f in emits if t == "SHARD_JOB_DONE"]
+    assert done and done[0]["ok"], (
+        f"a healthy job with a slow first prefill chunk was killed: exits={exits} emits={emits}")
+    assert not exits, "the watchdog fired on a job that was making progress"
+
+
+def _watchdog_thread_started(stall_s, first_s):
+    """Did constructing the watchdog spawn its poller? Threads are daemons that outlive the test,
+    so only the set DIFFERENCE across the construction is meaningful."""
+    import threading
+    before = {id(t) for t in threading.enumerate() if t.name == "job-stall-watchdog"}
+    C._StallWatchdog(stall_s, lambda *a, **k: None, first_s=first_s)
+    after = {id(t) for t in threading.enumerate() if t.name == "job-stall-watchdog"}
+    return bool(after - before)
+
+
+def test_l3b_stall_s_zero_still_disables_the_whole_watchdog(monkeypatch):
+    """M25_JOB_STALL_S=0 is the operator's OFF switch and predates the first-ack budget. A second
+    budget that re-armed the thread behind it would ambush whoever is debugging with it."""
+    monkeypatch.setenv("M25_JOB_STALL_S", "0")
+    monkeypatch.delenv("M25_JOB_FIRSTACK_S", raising=False)
+    stall = C._stall_budget(600)
+    assert stall is None and C._firstack_budget(stall) is None
+    assert _watchdog_thread_started(stall, C._firstack_budget(stall)) is False
+
+    # the default (watchdog ON) arms both, the tight one never wider than the wide one
+    monkeypatch.delenv("M25_JOB_STALL_S", raising=False)
+    stall = C._stall_budget(600)
+    first = C._firstack_budget(stall)
+    assert stall == 660.0 and first == 90.0
+    assert _watchdog_thread_started(stall, first) is True
+
+    # an explicit tiny stall budget clamps the first-ack budget under it, never above
+    monkeypatch.setenv("M25_JOB_STALL_S", "5")
+    assert C._firstack_budget(C._stall_budget(600)) == 5.0

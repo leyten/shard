@@ -20,6 +20,70 @@
 
 ## RESUME HERE  (the one next action)
 
+### ⇒ 2026-07-28 (LATEST-9) — STRANGER-SERVE RING: STILL 0 TOKENS, BUT THE SERVE GAP IS ROOT-CAUSED (S1/S2/S3)
+**A 6-box EU 5090 stranger-daemon ring (~$6.6, receipt `docs/receipts/stranger-serve-20260728.json`)
+reached full READY and connected its coordinator, and every job still returned 0 tokens.** The
+session's product is the diagnosis, not a number. Test orchestrator only; prod + npm untouched.
+- **CORRECTION to the 07-21 entry below: "warmup real 550/1350ms TTFT then empty" was a harness
+  misread.** `measureServe` reports `ttftMs = tFirst ? tFirst - tDispatch : (tDone - tDispatch)`, so
+  a job with NO token reports its whole wall time as TTFT. Re-parsed: every warmup and every rep had
+  tokens=0. **No token has ever crossed the stranger-daemon serve path.** The harness also scored
+  those jobs `coherent:true` (`response === ''` passes the equality) — fixed, it now fails loudly.
+- **S1 — the serve gap, RE-DIAGNOSED (the session's mechanism does not follow from its evidence).**
+  The receipt says the coordinator "accepts jobs it never executes" and infers from `txq=0` that no
+  prefill byte ever reached stage 0. That inference is invalid: `txq=0` means the send queue
+  DRAINED, not that nothing was sent, and jobs 2-4 queuing unread is the expected shape of a serial
+  single-job loop with job 1 in flight. What `wchan=do_poll` + flat CPU establishes is narrower than
+  I first wrote (adversarial review caught the overreach): CPython routes every *timed* socket recv
+  through `poll(2)`, so `do_poll` means **blocked in a timed socket recv — either `coordinate_pipe`'s
+  reset ack or `connect_ring`'s `ret_ok`**, and it rules out only the stdin-idle state, which sits in
+  `unix_stream_data_wait`. Both survivors are ring reachability, not the stdin loop — and
+  `tests/test_coordinate_stdio.py` drives `serve_jobs` over real socketpair stdio with the daemon's
+  own NDJSON payload and is green, so **the stdin/socketpair path is not the bug**. The wedge is in
+  the ring legs, and the ring was torn down before any per-hop evidence existed. NEXT TIME the
+  decisive probe is `cat /proc/PID/syscall`, not wchan: for `read(2)` arg0 IS the fd, so `0 0x0 …`
+  is unambiguously stdin.
+- **What SHIPS for S1: make that class impossible to mis-diagnose again, in minutes not a $6.6 ring.**
+  `SHARD_JOB_START {jobId, maxNew}` on stdout the moment a job line leaves stdin (the window between
+  the daemon's "job accepted" and DONE/FATAL was previously TOTALLY silent), plus a separate
+  **first-ack watchdog budget** (`M25_JOB_FIRSTACK_S`, default 90s) covering the RESET ACK and
+  nothing further. The steady-state stall budget is deliberately one full recv timeout wide (660s at
+  the daemon's defaults) because a prefill chunk on a thin uplink is legitimately slow — but the
+  reset is one control frame over an already-warm ring (the measured round-ring is 162ms), so it has
+  no legitimate slow case. `coordinate_pipe` now ticks progress the instant the reset is acked, so
+  the prefill that follows is back on the wide budget and can never be false-killed. A ring that
+  never acks dies fast with a FATAL that names the RING.
+- **S2 + S3 land on the c0mpute side:** coordinator launch no longer rides HEAD-stage readiness alone
+  on the stage's own crash budget (a tail >25min behind the head made the head LEAVE the swarm at
+  `restarts>5`, after silently latching EAGLE off at `>=2`); and the announce now carries a measured
+  network vector, so a healthy 5090 stops being admitted as `verifier`. The receipt is wrong in both
+  directions on S3: with no network vector the cap fails THREE gates, not one (`uplink`,
+  `nat_dialable`, and `hops_vs_rtt` — an absent `rtt_to_pool_ms` defaults to 9000ms); but "a pool of
+  verifiers forms NO ring" overstates it, because **the admission verdict is currently write-only** —
+  `setNodeRole` stores it and `getNodeRole` has no callers, `admit()` is a coarse VRAM/subnet floor,
+  and `formSwarm`'s `role()` filter is the reputation oracle, not admission. The real cost today is
+  that the pool's placement input is garbage (`up_mbps` null on every candidate), and that admission
+  is dead the day someone switches it on.
+- **PROVEN GREEN this run (all upstream of the gap):** `SHARD_COORD_READY {receipts:true}` on a
+  self-provisioned node (the 834e306 fix — silently false on 07-21); the #52 anti-storm guard fired
+  81× through the pulls instead of preempting them (07-21 bug #7 closed); relay-circuit advertise +
+  a RELAY-routed weight fetch; churn self-heal on a real node death; and **peer seeding re-pull at
+  ~130 MB/s vs ~25 MB/s from the HF mirror** once a node's sidecar reboots post-pull (a ~5× win a
+  cold ring still never gets — the boot-time `held` snapshot, D2).
+- **OPS RULES (new, from real money burned):** filter vast offers on **`cuda_max_good>=13.0`** (a
+  driver-12.8 box passes every preflight, then `torch._C._cuda_init` refuses and it restart-loops
+  INSIDE the ring — 12.8 is not enough for the torch-2.11 venv); **prune the shards outside a node's
+  new range after any re-plan** (ranges stay on disk for the warm re-join, so each reshuffle grows
+  disk ~25-30 GB/box and walks into ENOSPC — manual pruning freed 42.8 GB and 21.7 GB and unblocked
+  two boxes); and **collect the FULL N×N RTT mesh every session** (the planner used synthetic 30ms
+  placeholders; the real mesh was 8.1-37.6ms per hop, 162.1ms round-ring).
+
+**⇒ THE ONE NEXT ACTION: re-run the stranger-serve ring with S1/S2/S3 landed and INSTRUMENT THE HOPS.**
+Everything upstream of the coordinator's first ring frame is now proven green twice. With
+`SHARD_JOB_START` + the first-ack bound a wedged ring names itself in ~90s instead of burning the
+session — but the next run must capture EVERY stage's stdout (not just the head's), so the hop where
+the reset dies is on the record the first time it happens.
+
 ### ⇒ 2026-07-24 (LATEST-8) — TREE-FRAME GRAPHS BUILT + RING-VERDICTED; SCOREBOARD CORRECTION (fp8 aux)
 **PR #138: the padded-template tree-graph capture is CORRECT (bit-exact on-box, captures PROVEN
 firing live on a 6×5090 EU ring A/B) — and the B-mode tree verdict is now nailed three layers deep

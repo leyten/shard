@@ -858,6 +858,14 @@ def coordinate_pipe(pipe_sock, tok, messages, K, max_new, timeout, depth, ret_so
         if kw_job not in (None, ""):                        # + keepwarm toggle (interleaved A/B), one reset
             rop["keepwarm_ms"] = int(kw_job)
         kw.send(rop); _check_reset_ack(rop, recv_data(rx))  # kw lock; recv_data skips noops; raises on refused graph
+        if on_progress: on_progress()                # the ring ANSWERED. One traversal of a tiny
+                                                     # control frame — the only wait in a job with
+                                                     # no legitimate slow case (the prefill chunk
+                                                     # right after it very much has one, on a thin
+                                                     # uplink). shard.coordinate bounds this leg
+                                                     # tightly and everything after it loosely, so
+                                                     # this tick is what keeps the tight bound off
+                                                     # the prefill (_firstack_budget).
         t_pf = time.time()
         eagle_on = S.M25_EAGLE and hasattr(local_draft, "extend")
         if eagle_on:
