@@ -9,13 +9,16 @@ Third-party code redistributed in this repository
 ------------------------------------------------------------------------------
 
 phase0/kimi_k3_ref/
-    Kimi-K3's reference model code, vendored verbatim from
-    huggingface.co/moonshotai/Kimi-K3 (revision 9f62e4e9fffbd0a83ddd60e1c209d828994b3569).
+    Kimi-K3's reference model and chat-encoding code, vendored verbatim from
+    huggingface.co/moonshotai/Kimi-K3 (revision 9f62e4e9fffbd0a83ddd60e1c209d828994b3569):
+    modeling_kimi_linear.py, configuration_kimi_k3.py, encoding_k3.py, tokenization_kimi.py.
     Copyright 2025-2026 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc.
     The multi-head latent attention, MoE gating and sparse MoE block are adapted from
     DeepSeek-V3 and are licensed under the Apache License, Version 2.0; the remainder is
     licensed under the Kimi K3 License. Both notices are preserved in the file headers.
     Unmodified; phase0/kimi_k3_ref/__init__.py is shard's own addition.
+    The tokenizer's vocabulary (tiktoken.model) is NOT redistributed here — the file's URL
+    and sha256 are recorded in that __init__.py instead.
 
 phase0/k3_kda_cpu.py
     The KDA recurrence, gate and gated-RMSNorm transcribed from flash-linear-attention's

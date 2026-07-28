@@ -39,8 +39,9 @@ Always create boxes with `--env '-p 29600:29600'` (inter-stage transport unreach
 1. **Precheck** each candidate box: `ssh` reachable, `urllib` GET on the HF tokenizer_config 200, GPU
    count == expected. Drop failures, pull from the over-provision pool.
 2. **Bootstrap** (per box, deadline ~12 min): venv + `pip install vllm` (→ vLLM 0.23 + torch/cu13 +
-   flashinfer, just works on sm_120) + push code. Push set now includes **`m25_tools.py`** (hard dep
-   of `m25_pipe`) and **`receipt.py` + `manifest.py`** (so `SHARD_RECEIPTS=1` actually loads).
+   flashinfer, just works on sm_120) + push code. Push set now includes **`m25_tools.py` +
+   `model_tools.py`** (hard deps of `m25_pipe`; `model_tools` is the per-model tools seam and picks
+   `m25_tools` for any M2.5 id) and **`receipt.py` + `manifest.py`** (so `SHARD_RECEIPTS=1` loads).
 3. **Pull layer-range shards** (deadline ~15 min, hf_transfer; fallback `HF_HUB_ENABLE_HF_TRANSFER=0`
    if it STALLS): `m25_pull_range.py --lo L --hi H` per stage; `--head` adds embed+tokenizer, `--tail`
    adds norm+lm_head. **Verify** each box reports the expected shard count before launching.

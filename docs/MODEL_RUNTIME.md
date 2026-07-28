@@ -47,7 +47,7 @@ kernel, so it does not require owning the forward pass. Determinism does not jus
 | Per-architecture forward pass | **inherited** | vLLM/Transformers model class, behind `ModelRuntime` |
 | Quant / MoE / attention kernels | **inherited** | vLLM (NVFP4 FusedMoE on sm_120 already proven) |
 | Weight key names / layer slicing | **derive** | from the manifest `weight_map` + config, not hardcoded |
-| Tokenizer / chat template / tool parse | **inherited** | tokenizer's own `chat_template.jinja`; tool-parse = per-model plugin |
+| Tokenizer / chat template / tool parse | **inherited** | the model's own renderer — a `chat_template.jinja`, or a Python one where the model ships no template at all (K3); plugin per family, `phase0/model_tools.py` |
 
 ## The interface
 
@@ -71,9 +71,11 @@ orchestration stays ours.
    layers to a block, run that block's forward in isolation, confirm finite + matches a full-model reference.
    **Needs a GPU box — gated on ops go-ahead (don't improvise vast launches).**
 3. Build `VllmRuntime` behind the interface once the spike holds.
-4. Fix the two model-agnostic leaks: derive weight keys in `shard/fetch.py` from the manifest `weight_map`
-   instead of hardcoding `model.layers.{j}` / `model.embed_tokens` / `model.norm` / `lm_head`; make tool-call
-   parsing (`m25_tools.py`) a per-model output-parser plugin.
+4. Fix the two model-agnostic leaks. **Both done.** Weight keys now derive from the manifest `weight_map`
+   (PR #139/#140) instead of hardcoded `model.layers.{j}` / `model.embed_tokens` / `model.norm` / `lm_head`.
+   Chat rendering + tool parsing now dispatch per model family through `phase0/model_tools.py` — `m25_tools`
+   (MiniMax XML) and `k3_tools` (Kimi-K3 XTML) — selected at the call site from the served model id, with
+   `m25` as the fallback so an existing ring binds exactly the objects it always did.
 5. **Prove genericity by onboarding model #2** — a small dense model (7-8B Qwen/Llama) end-to-end over the
    existing ring. The executable proof that this is an engine, not an M2.5 server.
 6. Retire the hand-rolled M2.5 path once `VllmRuntime` matches it bit-for-bit on M2.5.
