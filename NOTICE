@@ -3,3 +3,22 @@ Copyright 2026 leyten
 
 Licensed under the Apache License, Version 2.0 (the "License").
 You may obtain a copy of the License at http://www.apache.org/licenses/LICENSE-2.0
+
+------------------------------------------------------------------------------
+Third-party code redistributed in this repository
+------------------------------------------------------------------------------
+
+phase0/kimi_k3_ref/
+    Kimi-K3's reference model code, vendored verbatim from
+    huggingface.co/moonshotai/Kimi-K3 (revision 9f62e4e9fffbd0a83ddd60e1c209d828994b3569).
+    Copyright 2025-2026 The Moonshot AI Team, DeepSeek-AI, and HuggingFace Inc.
+    The multi-head latent attention, MoE gating and sparse MoE block are adapted from
+    DeepSeek-V3 and are licensed under the Apache License, Version 2.0; the remainder is
+    licensed under the Kimi K3 License. Both notices are preserved in the file headers.
+    Unmodified; phase0/kimi_k3_ref/__init__.py is shard's own addition.
+
+phase0/k3_kda_cpu.py
+    The KDA recurrence, gate and gated-RMSNorm transcribed from flash-linear-attention's
+    own reference implementations (fla/ops/kda/naive.py, fla/ops/kda/gate.py,
+    fla/modules/fused_norm_gate.py), MIT licensed,
+    Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li.
