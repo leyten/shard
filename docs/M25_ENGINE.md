@@ -44,13 +44,37 @@ capstone ring session.** (K3 work is a PARALLEL session's lane — hands off her
   state already referenced but git never held — public box IPs redacted per repo policy) +
   `residential-upload-ab.json`. The K3 receipt stays for the K3 session to bank.
 
-**⇒ THE ONE NEXT ACTION: the CAPSTONE RING** (runbook `scratchpad/capstone-ring-runbook.md`,
-~7×EU-5090, ~$3/hr, supply healthy): ① settlement LIVE-confirm — #145 receipts must actually PAY
-on a real ring for the first time; ② the P0-#6 churn kill on real hardware (manual SIGKILL, not the
-sim-scale `--churn` timer); ③ the warm re-join receipt (≤3min target is at physics risk — 2-4min
-load + 30s debounce; bank the HONEST number). Keep the ring warm until all three are banked.
-After that, the launch list is pure leyten: npm publish, offline-key manifest publish, Ghent WSL
-smoke, the go-live flip, the rehearsal day.
+**CAPSTONE RING RAN — HONEST NEGATIVE, and it found a REGRESSION** (receipt
+`docs/receipts/capstone-ring-20260729.json`, 7×EU-5090, $14.15, ~3h, torn down clean).
+- **GREEN:** the REAL capability planner placed its first live ring (`--real-seam`) — and **refused 6
+  boxes** ("pool can't hold minimax-m2.5"), accepting only at 7. **6×32GB is NOT enough margin for 62
+  layers under probe-measured caps — the even-split assumption was wrong.** Tiling came out UNEVEN
+  ([0:10)[10:22)[22:34)[34:39)[39:51)[51:62), predicted 293.6ms/step). Also proven on hardware:
+  sidecar **v0.2.0** downloaded + sha-verified by every box with comma-list forwards parsed ("via 7
+  addr(s)", pre-connect OK); 6/6 self-provision + 25GB verified pull + sm_120 load + READY; the #54
+  RTT mesh reporting live; real probe vectors (uplink 341Mbps / rtt 30.6ms) closing the 07-28 C3
+  blindness; P11 restart-degraded and the #52 anti-storm guard both behaving.
+- **RED:** every job (3 attempts) died `stall-watchdog: no ring reply in 90s`, **0 tokens**. The head
+  logs `[s0] edge closed (BrokenPipeError); reset + drop forward link` at job start, GPU 0% — the
+  FIRST framed write on the forward leg breaks while every socket reads healthy (all forward tunnels
+  probe OPEN, tail has predecessor + coord-return). A tail-first re-warm of all 6 stages reproduced
+  it IDENTICALLY, so it is not a transient wedge.
+- **Settlement stays UNCONFIRMED** (neither proven nor disproven): the reject is "assigned signer(s)
+  produced no receipt", NOT the C10 InvalidSignature class — no receipts exist because no tokens do.
+- **Sidecar EXONERATED offline (free, post-teardown A/B):** two loopback sidecars, real 8-byte-BE
+  framed 4096B payload — ROUNDTRIP-OK both with a clean addr and with the ring-shaped DIRTY 4-addr
+  list (live wrong-PeerId decoy + docker-internal + unroutable, good addr last). v0.2.0 and today's
+  dial-every-addr change are SOUND.
+
+**⇒ THE ONE NEXT ACTION: GPU-LESS BISECT of the engine serve path.** The 07-28 confirm ring served 32
+tokens with 6 receipts on master 86b6d98 + `834e306`; today's cd44af3 cannot move a single frame.
+Suspect deltas: #136, #138, #139-#146 (k3 stack touched shared receipt/wire modules), #153. Method:
+reproduce the missing reset-ack in the fake-ring harness (`tests/`) — it exercises coordinator→stage→
+tail with no GPU — then `git bisect`. **Do NOT rent again until an offline repro exists**; the failure
+is deterministic and survives a re-warm, so more boxes only re-watch the same 90s watchdog. Once the
+regression is fixed, the capstone ring is a ~$10 re-run for the three original receipts (settlement
+live-confirm, churn kill, warm re-join). After that the list is pure leyten: npm publish, offline-key
+manifest publish, Ghent WSL smoke, the go-live flip, the rehearsal day.
 
 ### ⇒ 2026-07-28 (LATEST-10) — KIMI K3 ENGINE BUILT END-TO-END; NEXT = THE 19-BOX RING (leyten-gated)
 **Kimi K3 (2.78T-A104B, native MXFP4 ~1.45TB, released 07-27) is now fully onboarded to the shard
