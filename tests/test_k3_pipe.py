@@ -17,6 +17,7 @@ import os
 import socket
 import sys
 import threading
+import time
 
 import pytest
 
@@ -269,6 +270,37 @@ def test_even_tiling_covers_all_93_layers_contiguously():
 def test_even_tiling_rejects_impossible_splits():
     with pytest.raises(ValueError):
         KP.even_tiling(3, 4)
+
+
+# ── the forward-dial retry window: a stage keeps dialing a neighbour that is still loading ──────────
+
+def test_dial_retry_window_covers_a_slow_stage_load_and_is_configurable():
+    """Bug 1 (live K3 ring 2026-07-29): the old fixed ~30s dial window gave up on a 14-stage ring
+    mid-launch. The window now derives from the stage `timeout` (the 600s ceiling a stage already
+    tolerates on a frame), so it comfortably covers a neighbour taking MINUTES to load — and
+    K3_DIAL_RETRY_S overrides it for an even larger ring."""
+    assert KP._dial_window(600) == 600.0                   # keyed to timeout, not a magic number
+    assert KP._dial_window(600) >= 300                     # covers a stage that is minutes from ready
+    assert KP._dial_window(600) > 30                        # strictly beyond the old fixed window
+    old = KP.DIAL_RETRY_S
+    try:
+        KP.DIAL_RETRY_S = 1200.0
+        assert KP._dial_window(600) == 1200.0               # explicit override wins
+    finally:
+        KP.DIAL_RETRY_S = old
+
+
+def test_dial_gives_up_on_a_time_window_not_a_fixed_try_count():
+    """_dial loops on a wall-clock deadline: a small retry_s raises after ~that window (proving it is
+    not the old fixed 120x0.25s count), so a black-holing peer can't be dialed forever — while the
+    LARGE default window keeps a boot-time dialer retrying through a slow neighbour's whole load
+    instead of aborting the launch."""
+    port = _free_ports(1)[0]                                # a free, UNBOUND port -> connect refused
+    t0 = time.time()
+    with pytest.raises(RuntimeError):
+        KP._dial("127.0.0.1", port, timeout=5, retry_s=0.5)
+    dt = time.time() - t0
+    assert 0.4 <= dt < 5, f"dial window not honored: {dt:.2f}s"
 
 
 def test_ring_sidecar_spec_is_the_direct_return_topology():

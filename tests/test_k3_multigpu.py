@@ -54,18 +54,40 @@ def test_each_local_gpu_gets_its_own_visible_device_and_moe_port():
     assert len(set(ports)) == 4                                            # distinct MASTER_PORTs
 
 
-def test_single_gpu_stage_cmd_is_byte_identical_to_the_pre_multigpu_form():
-    """The device knob is additive: with gpu/port/nxt_addr unset the command is exactly what the
-    single-stage-per-box launcher emitted before (no CUDA_VISIBLE_DEVICES, binds ENG_IN, forwards to
-    the local sidecar FWD_RING leg)."""
+def test_single_gpu_stage_cmd_is_the_knobs_off_form_detached_via_setsid():
+    """The device knob is additive: with gpu/port/nxt_addr unset the command is the single-stage-
+    per-box form (no CUDA_VISIBLE_DEVICES, binds ENG_IN, forwards to the local sidecar FWD_RING leg).
+    In every shape the command is fully DETACHED via setsid + fd redirect (Bug 1) so a parallel
+    over-ssh launch returns the session instantly instead of hanging on the engine's child fds."""
     got = KP.stage_launch_cmd(1, 3, 31, 62, model_dir="/root/k3")
+    inner = (f"python3 /root/k3_pipe.py stage --stage 1 --nstages 3 --lo 31 --hi 62 "
+             f"--port {KP.ENG_IN} --next 127.0.0.1:{KP.FWD_RING} --dir /root/k3 "
+             f"> /root/k3_stage_{KP.ENG_IN}.log 2>&1")
     expect = (f"K3_DIR=/root/k3 K3_DEV=cuda M25_ENGINE_BIND=127.0.0.1 "
-              f"python3 /root/k3_pipe.py stage --stage 1 --nstages 3 --lo 31 --hi 62 "
-              f"--port {KP.ENG_IN} --next 127.0.0.1:{KP.FWD_RING} --dir /root/k3")
+              f"setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
     assert got == expect
     assert "CUDA_VISIBLE_DEVICES" not in got
     tail = KP.stage_launch_cmd(2, 3, 62, 93)                               # the tail: no --next
     assert "--next" not in tail and f"--port {KP.ENG_IN}" in tail
+
+
+def test_fourteen_stage_launch_spec_fully_detaches_every_stage():
+    """The launch race that aborted the live 14-stage ring (2026-07-29) had two halves: a stage gave
+    up dialing its neighbour too early (fixed by the _dial window, see test_k3_pipe), AND `nohup
+    <cmd> &` over ssh HUNG on the engine's child fds so the parallel launch never returned. So every
+    stage command in a real B*G launch spec must be fully detached (setsid + fd redirect + &), and
+    co-located stages on one box must log to DISTINCT files so their output never collides."""
+    nodes = _node_stages(KP.even_tiling(93, 2))            # 2 boxes ...
+    stages = KP.box_ring_launch(nodes, 7)["stages"]        # ... x 7 GPUs = 14 stages
+    assert len(stages) == 14
+    for s in stages:
+        cmd = s["cmd"]
+        assert "setsid bash -c " in cmd                    # its own detached process group
+        assert cmd.rstrip().endswith("</dev/null >/dev/null 2>&1 &")   # fds closed, backgrounded
+        assert f"/root/k3_stage_{s['eng_port']}.log" in cmd            # per-port log
+    for k in range(2):                                     # per box: every stage logs to a distinct file
+        logs = [f"/root/k3_stage_{s['eng_port']}.log" for s in stages if s["box_index"] == k]
+        assert len(set(logs)) == len(logs)
 
 
 # ── (b) planner: split node blocks to (node, gpu) with contiguity + B WAN hops ───────────────────────
