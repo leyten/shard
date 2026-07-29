@@ -1,0 +1,302 @@
+{
+ "receipt": "stranger-daemon CONFIRMATION ring \u2014 FIRST TOKEN EVER crossed the fully-automatic path",
+ "date": "2026-07-28",
+ "session": "confirmation run (PM), follow-up to docs/receipts/stranger-serve-20260728.json",
+ "headline": {
+  "did_a_token_cross": "YES",
+  "when_utc": "2026-07-28 ~16:12",
+  "swarm_id": "swarm-1785253694415",
+  "proof": "SHARD_JOB_DONE {ok:true, tokensGenerated:32, receiptsOk:true} with 6 receipts covering all 62 layers; then a full interactive suite served ~4-5 tok/s warm.",
+  "first_ever": "No token had ever crossed the stranger-daemon serve path before this (the 07-21 and 07-28-AM runs served 0 tokens throughout)."
+ },
+ "builds_under_test": {
+  "shard_engine": "master 86b6d98 (incl PRs #139-142) + cherry-picked 834e306 (receipt module resolution). 834e306 is NOT on master and is REQUIRED \u2014 without it a repo-checkout node silently signs zero receipts (finding C1). Verified on box.",
+  "c0mpute_worker": "master 79e2bb5 (incl PRs #54, #55), compiled tsc->dist. #55 changes verified in the compiled dist and on box (MAX_COORD_DIALS/RESTARTS, ring-gated coordinator, network vector).",
+  "sidecar": "pinned sidecar-v0.1.0 release, downloaded + sha256-verified on each box; byte-equal to master source (git diff sidecar-v0.1.0 HEAD -- sidecar/ empty). The morning's pre-placed-branch-sidecar deviation is GONE.",
+  "orchestrator": "test sim orchestrator only (scripts/shard-daemon-sim.ts --port 3904 --nodes 6 --stages 6 --full --suite --reps 3, real signed manifest mf1:m25-nvfp4-v1@bafkreib5dd2vl33joywylkcya2f3bbqffpskaudnabh3xwwcokg7xox6si). PROD untouched, nothing published, nothing committed."
+ },
+ "ring": {
+  "boxes": 6,
+  "gpu": "RTX 5090 32GB sm_120, all on driver CUDA 13.2 (cuda_max_good>=13.0 filter \u2014 zero F-dud repeats)",
+  "geos_and_tiling": {
+   "DK <ip-3>": "HEAD + coordinator, layers [0:10)",
+   "ES <ip-5>": "stage [10:20)",
+   "HR <ip-7>": "stage [20:31)",
+   "PL <ip-1>": "stage [31:41)",
+   "NO <ip-4>": "stage [41:51)",
+   "BG <ip-6>": "TAIL, layers [51:62)",
+   "RO <ip-8>": "free spare (churn reserve, pool 7)"
+  },
+  "iids": [
+   46119736,
+   46119738,
+   46119746,
+   46119748,
+   46119750,
+   46120482,
+   46120644
+  ],
+  "hourly_usd": 3.27
+ },
+ "serve_results": {
+  "scorecard_note": "interactive, plain-chain (EAGLE off \u2014 NVFP4 manifest ships no drafter). Warm; deployed sampling; M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_KV_MAXLEN=16384.",
+  "arms": {
+   "A-prose": {
+    "reps": 2,
+    "tok_s_mean": 4.2,
+    "tok_s_all": [
+     3.5,
+     4.9
+    ],
+    "ttft_ms_mean": 2119.0,
+    "tokens_total": 512,
+    "coherent_all": true
+   },
+   "B-chat": {
+    "reps": 1,
+    "tok_s_mean": 4.9,
+    "tok_s_all": [
+     4.9
+    ],
+    "ttft_ms_mean": 956.0,
+    "tokens_total": 256,
+    "coherent_all": true
+   },
+   "C-code": {
+    "reps": 2,
+    "tok_s_mean": 3.25,
+    "tok_s_all": [
+     2.3,
+     4.2
+    ],
+    "ttft_ms_mean": 12703.0,
+    "tokens_total": 768,
+    "coherent_all": true
+   },
+   "D-longctx": {
+    "reps": 1,
+    "tok_s_mean": 3.7,
+    "tok_s_all": [
+     3.7
+    ],
+    "ttft_ms_mean": 82444.0,
+    "tokens_total": 32,
+    "coherent_all": false
+   }
+  },
+  "warmups": [
+   {
+    "class": "D-longctx",
+    "ttft_ms": 92657,
+    "tok_s": 1.4
+   }
+  ],
+  "reps_raw": [
+   {
+    "rep": 1,
+    "class": "A-prose",
+    "ttft_ms": 2961,
+    "tok_s": 3.5,
+    "tokens": 256,
+    "coherent": true
+   },
+   {
+    "rep": 1,
+    "class": "C-code",
+    "ttft_ms": 24305,
+    "tok_s": 2.3,
+    "tokens": 384,
+    "coherent": true
+   },
+   {
+    "rep": 1,
+    "class": "D-longctx",
+    "ttft_ms": 82444,
+    "tok_s": 3.7,
+    "tokens": 32,
+    "coherent": false
+   },
+   {
+    "rep": 2,
+    "class": "A-prose",
+    "ttft_ms": 1277,
+    "tok_s": 4.9,
+    "tokens": 256,
+    "coherent": true
+   },
+   {
+    "rep": 2,
+    "class": "B-chat",
+    "ttft_ms": 956,
+    "tok_s": 4.9,
+    "tokens": 256,
+    "coherent": true
+   },
+   {
+    "rep": 2,
+    "class": "C-code",
+    "ttft_ms": 1101,
+    "tok_s": 4.2,
+    "tokens": 384,
+    "coherent": true
+   }
+  ],
+  "failures": [
+   {
+    "class": "A-prose",
+    "reason": "served 0 tokens in 90145ms (fail-closed job \u2014 check the head daemon log for the failJob reason)"
+   },
+   {
+    "class": "B-chat",
+    "reason": "served 0 tokens in 82ms (fail-closed job \u2014 check the head daemon log for the failJob reason)"
+   },
+   {
+    "class": "C-code",
+    "reason": "served 0 tokens in 20ms (fail-closed job \u2014 check the head daemon log for the failJob reason)"
+   },
+   {
+    "class": "B-chat",
+    "reason": "serve timeout 240s"
+   },
+   {
+    "class": "D-longctx",
+    "reason": "coordinator disconnected mid-job"
+   },
+   {
+    "class": "A-prose",
+    "reason": "no ready swarm serving minimax-m2.5"
+   },
+   {
+    "class": "B-chat",
+    "reason": "no ready swarm serving minimax-m2.5"
+   },
+   {
+    "class": "C-code",
+    "reason": "no ready swarm serving minimax-m2.5"
+   },
+   {
+    "class": "D-longctx",
+    "reason": "no ready swarm serving minimax-m2.5"
+   }
+  ],
+  "total_tokens_served": 1568,
+  "engine_truth_metrics_first_job": {
+   "jobId": "48258656 (warmup D-longctx, the first job to serve)",
+   "tok_s": 1.4711,
+   "prompt_tokens": 6013,
+   "n_tokens": 32,
+   "prefill_s": 86.06,
+   "decode_s": 21.75,
+   "ring_wait_s": 20.97,
+   "traversal_s": 82.87,
+   "toks_per_traversal": 1.0,
+   "mean_accept": 0.0,
+   "draft_s": 0.006,
+   "reading": "TTFT is prefill-bound: 86s prefill on a 6k-token prompt dominates. Warm rep2 A/B/C then hit 4.2-4.9 tok/s at sub-1.3s TTFT on shorter prompts."
+  },
+  "clean_window": "warmup -> rep2 C-code. rep2 D-longctx + all of rep3 were corrupted by the external teardown (finding C11) and are NOT engine faults."
+ },
+ "receipts": {
+  "receipts_valid_at_orchestrator": 0,
+  "winning_job_receipts": {
+   "job": "48258656",
+   "receiptsOk_engine_side": true,
+   "count": 6,
+   "coverage": "all 62 layers: [0:10][10:20][20:31][31:41][41:51][51:62]",
+   "nonce_consistent": true
+  },
+  "settlement": "EVERY token-producing job REJECTED with InvalidSignature. Root cause PROVED and reproduced on the live receipts (finding C10): the engine appends a 'stage' key AFTER signing; shard/verify.py (the settlement path) does not strip it, so the verify preimage != the signed preimage. One-line fix at shard/coordinate.py:343 (strip 'stage' at emit). Proved offline; NOT live-re-confirmed (ring destroyed before the retest)."
+ },
+ "verification_of_the_merged_fixes": {
+  "S1_#142": "PROVEN as instrumentation. SHARD_JOB_START fired on every job; the one wedged job died in 90s naming the ring ('no ring reply in 90s') instead of hanging 11min. NOTE: on this ring the death was survivable (86s legit prefill just after); the forced EAGLE-off restart is what unblocked serving. See C7.",
+  "S2_#55": "PROVEN. Coordinator survived a tail ~20min behind the head: 0 dial-restarts, 0 EAGLE-off degrades, 0 'leaving swarm'. Morning run died 4x in that window. See C8.",
+  "S3_#55": "MEASUREMENT half PROVEN (all 7 boxes announced real uplink_mbps 48-572, see below); VERDICT unchanged ('verifier') because nat_dialable=false \u2014 a vast port-mapping artifact (only 22 and 29600 mapped). Per #55 the verdict is write-only anyway (getNodeRole has no callers). Also: NO probe --serve receiver is deployed in c0mpute, so shipping #55 without deploying a receiver changes nothing in prod. See C3.",
+  "#54": "MEASUREMENT half proven (full 6x5 node RTT matrix reported, cache 42); PLACEMENT half NOT exercised \u2014 SimSeam.plan uses hardcoded step_ms=100/tok_s_per_g=10 and never reads rtt. See C5."
+ },
+ "network": {
+  "per_node_vector": {
+   "NO (<ip-4>)": {
+    "uplink_mbps": 242.74,
+    "rtt_to_pool_ms": 43.47,
+    "nat_dialable": false
+   },
+   "PL (<ip-1>)": {
+    "uplink_mbps": 363.12,
+    "rtt_to_pool_ms": 29.86,
+    "nat_dialable": false
+   },
+   "DK (<ip-3>)": {
+    "uplink_mbps": 571.94,
+    "rtt_to_pool_ms": 20.02,
+    "nat_dialable": false
+   },
+   "ES (<ip-5>)": {
+    "uplink_mbps": 189.89,
+    "rtt_to_pool_ms": 45.83,
+    "nat_dialable": false
+   },
+   "HR (<ip-7>)": {
+    "uplink_mbps": 472.72,
+    "rtt_to_pool_ms": 19.73,
+    "nat_dialable": false
+   },
+   "RO (<ip-8>)": {
+    "uplink_mbps": 282.97,
+    "rtt_to_pool_ms": 35.9,
+    "nat_dialable": false
+   },
+   "BG (<ip-6>)": {
+    "uplink_mbps": 47.98,
+    "rtt_to_pool_ms": 33.21,
+    "nat_dialable": false
+   }
+  },
+  "uplink_vs_advertised": "median measured/advertised = 34% \u2014 vast inet_up is NOT predictive. Worst (BG 48 Mbps = 7% of advertised) was placed as the TAIL by the capability-blind SimSeam.",
+  "nxn_rtt_mesh": {
+   "method": "TCP-connect RTT, min-of-5, from each box to every other box's public IP on the mapped 29600 port (the ring-leg path). Collected on a FRESH 4-box set immediately after the serve run, because the served ring was externally destroyed (finding C11) before the quiescent pass. Representative EU+Asia 5090 mesh, NOT the served ring.",
+   "boxes": {
+    "PL": "<ip-1>",
+    "ES": "<ip-5>",
+    "RO": "<ip-8>",
+    "KR": "<ip-2>"
+   },
+   "rtt_ms": {
+    "PL <ip-1>": {
+     "<ip-5>": 58.68,
+     "<ip-8>": 59.15,
+     "<ip-2>": 288.3
+    },
+    "ES <ip-5>": {
+     "<ip-1>": 60.03,
+     "<ip-8>": 55.94,
+     "<ip-2>": 254.97
+    },
+    "RO <ip-8>": {
+     "<ip-1>": 58.3,
+     "<ip-5>": 57.21,
+     "<ip-2>": 289.7
+    },
+    "KR <ip-2>": {
+     "<ip-1>": 289.06,
+     "<ip-5>": 255.08,
+     "<ip-8>": 288.56
+    }
+   },
+   "summary": {
+    "intra_EU_ms": "~55-60 (PL/ES/RO all-pairs)",
+    "EU_to_KR_ms": "~255-290"
+   }
+  }
+ },
+ "spend_usd": "~$5.0 total. Served ring: 7x 5090 (~$3.27/hr) for ~50min = ~$2.7 (1 EE dud destroyed early). Mesh re-rent: 9 boxes (6+3, several key-propagation duds) at ~$0.44/hr for ~15-30min = ~$1.8-2.3. Well under the $12 cap.",
+ "wall_clock": "~15:33-16:50 UTC (~1h15m of the 3.5h cap). Note: ~40min of this was the second re-rent purely to collect the N x N mesh after the served ring was externally destroyed mid-suite.",
+ "ring_state_at_end": "DESTROYED \u2014 externally, mid-suite (finding C11), NOT by me or the dead-man.",
+ "discipline": {
+  "prod_untouched": true,
+  "npm_publish": false,
+  "commits_or_pushes": "none",
+  "boxes_destroyed": true,
+  "deadman_pin_cleaned": true
+ },
+ "redaction": "public box IPs replaced with <ip-N> labels before tracking (repo policy: no public IPs in git); originals in session ops notes"
+}

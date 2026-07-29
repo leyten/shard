@@ -1,0 +1,81 @@
+{
+  "experiment": "residential-upload-ab",
+  "method": "app-layer send-pacing (no NET_ADMIN for tc)",
+  "n": 8,
+  "cable_mbit": 20,
+  "paced": [
+    "43313936",
+    "43313940",
+    "43313957"
+  ],
+  "regions": [
+    "Czechia",
+    "Croatia",
+    "Poland",
+    "Norway",
+    "Bulgaria",
+    "Norway",
+    "Czechia",
+    "Hungary"
+  ],
+  "up_mbps_baseline": {
+    "43313933": 0.5,
+    "43313936": 0.5,
+    "43313940": 0.5,
+    "43313957": 0.5,
+    "43313968": 0.5,
+    "43313981": 0.5,
+    "43313997": 0.5,
+    "43314004": 0.5
+  },
+  "up_mbps_paced": {
+    "43313933": 0.5,
+    "43313936": 0.5,
+    "43313940": 0.5,
+    "43313957": 0.5,
+    "43313968": 0.5,
+    "43313981": 0.5,
+    "43313997": 0.5,
+    "43314004": 0.5
+  },
+  "head": "43313933",
+  "blind_order": [
+    "43313957",
+    "43313940",
+    "43313936",
+    "43313933"
+  ],
+  "aware_order": [
+    "43313957",
+    "43313940",
+    "43313936",
+    "43313933"
+  ],
+  "aware_roles": {
+    "43313968": "aggregator",
+    "43313981": "aggregator",
+    "43313997": "aggregator",
+    "43314004": "aggregator"
+  },
+  "predicted_prefill_ms": {
+    "blind": null,
+    "aware": 2455916.1
+  },
+  "measured": [
+    {
+      "S": 16384,
+      "mb_per_hop": 100,
+      "blind_s": 2415.9,
+      "aware_s": 2415.9,
+      "aware_speedup": 1.0
+    },
+    {
+      "S": 65536,
+      "mb_per_hop": 402,
+      "blind_s": 7247.8,
+      "aware_s": 7247.8,
+      "aware_speedup": 1.0
+    }
+  ],
+  "head_push_100mb_s": 1.6
+}
