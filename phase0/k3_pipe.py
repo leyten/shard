@@ -74,6 +74,16 @@ except ImportError:
 # The direct-return port map, identical to m25_scatter_pipe so a K3 ring reuses the SAME sidecar
 # wiring: the sidecar is payload-agnostic (proven), so only the launched engine binary changes.
 LIBP2P, ENG_IN, FWD_RING, FWD_RET = 29600, 29610, 29611, 29612
+# Multi-GPU-per-box: one box runs G stage processes, each pinned to a distinct local GPU, chained
+# over LOOPBACK. The box's FIRST local stage binds ENG_IN (so the sidecar -inbound and the head
+# coordinator reach it); its 2nd..Gth bind ENG_LOCAL_BASE+idx, ports the sidecar never touches
+# (they hand off loopback). Base > FWD_RET so a local port can't collide with the WAN legs.
+ENG_LOCAL_BASE = 29620
+# k3_moe_mxfp4.vllm_ctx binds its single-GPU vLLM group on MASTER_PORT (its K3_MOE_PORT default,
+# 29557). Co-located stages each init their own group, so each needs a DISTINCT MASTER_PORT or the
+# second stage's init_distributed_environment dies on "address already in use" — the launcher gives
+# every local GPU K3_MOE_PORT_BASE+gpu.
+K3_MOE_PORT_BASE = 29557
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 # C2: per-swarm epoch token — env-only (never argv/log), rides every greeting so a stage never
@@ -421,17 +431,27 @@ def even_tiling(n_layers, nstages):
     return ranges
 
 
-def plan_layer_ranges(nodes, rtt, model_id=K3_MODEL_ID, **kw):
+def plan_layer_ranges(nodes, rtt, model_id=K3_MODEL_ID, *, per_gpu=False, **kw):
     """Place the 93-layer ring across a measured pool. Delegates to shard.plan.plan_ring with the
     K3 engine profile (K3_PROFILE — VRAM/ms/boundary bytes measured on real weights), so k3_pipe
     never re-derives the memory model. Returns [{id, index, lo, hi, head, tail, layers}, ...] or
-    None when the pool cannot hold the model."""
+    None when the pool cannot hold the model.
+
+    plan_ring places layers on NODES (a box announces its AGGREGATE free VRAM across its GPUs). With
+    per_gpu=True each node's block is then split into one contiguous sub-block per local GPU (read
+    from the node's "gpus" field, default 1) via split_stages_to_gpus — the per-(box, gpu) placement
+    the multi-GPU launcher consumes. per_gpu=False (default) returns the node plan unchanged, so a
+    single-GPU ring is byte-identical."""
     try:
         from plan import plan_ring
     except ImportError:
         from shard.plan import plan_ring
     plan = plan_ring(nodes, rtt, model=model_id, **kw)
-    return plan["stages"] if plan else None
+    if not plan:
+        return None
+    if not per_gpu:
+        return plan["stages"]
+    return split_stages_to_gpus(plan["stages"], {nd["id"]: int(nd.get("gpus", 1)) for nd in nodes})
 
 
 # ── sidecar wiring: the direct-return topology (payload-agnostic, mirrors m25_scatter_pipe) ─────────
@@ -463,16 +483,133 @@ def _peerid_of(maddr):
 
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/k3", receipts=False,
-                     device="cuda", token=None, extra_env=""):
-    """The shell command a launcher runs on box `stage` to start the k3 engine over the sidecar. The
-    non-tail stages point --next at the LOCAL sidecar forward leg (FWD_RING); the tail has none. The
-    engine binds loopback (M25_ENGINE_BIND) so only the local sidecar can reach it."""
-    nxt = "" if stage == nstages - 1 else f"--next 127.0.0.1:{FWD_RING}"
+                     device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None):
+    """The shell command a launcher runs to start ONE k3 engine stage over the sidecar.
+
+    Single-GPU box (gpu/port/nxt_addr all unset): byte-identical to before — the stage binds ENG_IN
+    and a non-tail stage forwards to the LOCAL sidecar forward leg (FWD_RING); the tail has none. The
+    engine binds loopback (M25_ENGINE_BIND) so only the local sidecar can reach it.
+
+    Multi-GPU box: pass this stage's local
+      * `gpu`      — the local GPU index. Sets CUDA_VISIBLE_DEVICES=<gpu> so the process sees ONLY
+                     that card, as cuda:0 — which is why k3_stage's K3_DEV=cuda and k3_moe_mxfp4's
+                     torch.cuda.set_device(0) are already correct with NO engine change (the
+                     least-invasive device pin). Also gives it a distinct K3_MOE_PORT so co-located
+                     vLLM MoE groups don't collide on MASTER_PORT.
+      * `port`     — its local engine port (ENG_IN for the box's first stage, else ENG_LOCAL_BASE+idx).
+      * `nxt_addr` — where it forwards: a LOOPBACK 127.0.0.1:<next local port> to the next GPU on this
+                     box, or the WAN 127.0.0.1:FWD_RING leg for the box's last stage.
+    """
+    port = port or ENG_IN
+    if nxt_addr is not None:
+        nxt = f"--next {nxt_addr}"
+    else:
+        nxt = "" if stage == nstages - 1 else f"--next 127.0.0.1:{FWD_RING}"
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
-    return (f"{rc}{tk}{extra_env}K3_DIR={model_dir} K3_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
+    cvd = (f"CUDA_VISIBLE_DEVICES={int(gpu)} K3_MOE_PORT={K3_MOE_PORT_BASE + int(gpu)} "
+           if gpu is not None else "")
+    return (f"{rc}{tk}{cvd}{extra_env}K3_DIR={model_dir} K3_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
             f"python3 /root/k3_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
-            f"--port {ENG_IN} {nxt} --dir {model_dir}")
+            f"--port {port} {nxt} --dir {model_dir}")
+
+
+# ── multi-GPU per box: split node blocks to GPUs, wire loopback intra-box + WAN inter-box ───────────
+
+def local_eng_port(local_index):
+    """The engine port for the `local_index`-th stage on a box. Index 0 -> ENG_IN (the box ingress
+    the sidecar -inbound and the head coordinator dial); 1.. -> ENG_LOCAL_BASE+idx (loopback only)."""
+    return ENG_IN if local_index == 0 else ENG_LOCAL_BASE + local_index
+
+
+def split_stages_to_gpus(node_stages, gpus):
+    """Split a head-first NODE plan into one contiguous sub-block per local GPU.
+
+    `node_stages` is plan_ring/plan_layer_ranges output (or any head-first [{id, lo, hi}...] whose
+    blocks tile the model): each entry is a BOX holding a contiguous layer range. `gpus` gives a
+    box's GPU count — an int applied to every box, a list aligned to node_stages, or a dict keyed by
+    node id. A box's range is tiled EVENLY across its GPUs (front GPUs take the extra layer), so a
+    G-GPU box becomes G contiguous sub-blocks. A 1-GPU box is returned unchanged (its one sub-block
+    == the node block), so a single-GPU ring is byte-identical.
+
+    Pure tiling: it does NOT enforce a per-GPU layer cap — VRAM feasibility is plan_ring's job
+    upstream (the caller announces a box's aggregate VRAM). Returns a FLAT head-first list of
+    per-GPU stage specs:
+      {"id", "box_index", "gpu", "local_index", "nlocal", "global_index", "nstages",
+       "lo", "hi", "layers", "head", "tail", "box_head", "box_tail"}
+    where head/tail are the GLOBAL ring ends (the head embeds, the tail samples) and box_head/box_tail
+    mark the first/last local stage on a box (its WAN-facing ends)."""
+    def _g(k, nd):
+        if isinstance(gpus, dict):
+            return int(gpus.get(nd["id"], 1))
+        if isinstance(gpus, (list, tuple)):
+            return int(gpus[k])
+        return int(gpus)
+    subs = []
+    for k, nd in enumerate(node_stages):
+        G = _g(k, nd)
+        if G < 1:
+            raise ValueError(f"box {nd.get('id', k)!r} announced {G} GPUs")
+        for j, (slo, shi) in enumerate(even_tiling(nd["hi"] - nd["lo"], G)):
+            subs.append({"id": nd["id"], "box_index": k, "gpu": j, "local_index": j, "nlocal": G,
+                         "lo": nd["lo"] + slo, "hi": nd["lo"] + shi, "layers": shi - slo,
+                         "box_head": j == 0, "box_tail": j == G - 1})
+    n = len(subs)
+    for g, s in enumerate(subs):
+        s["global_index"], s["nstages"] = g, n
+        s["head"], s["tail"] = g == 0, g == n - 1
+    return subs
+
+
+def box_stage_wiring(sub):
+    """(eng_port, next_addr, link) for one per-GPU stage from split_stages_to_gpus.
+
+    eng_port: the box's first local stage binds ENG_IN (the sidecar -inbound / head coordinator reach
+    it); the rest bind loopback-only local ports. next_addr / link:
+      * global tail            -> (None, "tail")      no forward; it samples + returns to the coordinator
+      * box_tail (not tail)    -> (FWD_RING, "wan")    the box's WAN egress -> next box via the sidecar
+      * otherwise              -> (next local port, "loopback")   hand off to the next GPU on THIS box
+    """
+    eng_port = local_eng_port(sub["local_index"])
+    if sub["tail"]:
+        return eng_port, None, "tail"
+    if sub["box_tail"]:
+        return eng_port, f"127.0.0.1:{FWD_RING}", "wan"
+    return eng_port, f"127.0.0.1:{local_eng_port(sub['local_index'] + 1)}", "loopback"
+
+
+def box_ring_launch(node_stages, gpus, box_maddrs=None, *, model_dir="/root/k3", receipts=False,
+                    token=None, ret_maddr=None):
+    """The full launch plan for a ring of B boxes x G GPUs = B*G stages but only B WAN hops.
+
+    node_stages: head-first NODE plan (plan_layer_ranges without per_gpu); gpus: per-box GPU count
+    (see split_stages_to_gpus); box_maddrs: the B box libp2p multiaddrs (head-first) for the sidecar
+    wiring — omit to skip it (topology-only). Returns:
+      {"stages":   [{**sub, "eng_port", "next", "link", "cmd"}...],   # one per (box, gpu)
+       "sidecars": [(inbound, forwards, allow)...] | None}            # per box, ring_sidecar_spec at
+                                                                      # BOX granularity
+
+    The intra-box GPU stages hand off over loopback and NEVER touch the sidecar, so the sidecar sees
+    only the B boxes: ring_sidecar_spec over B nodes gives B-1 forward hops + 1 head->tail return =
+    B WAN hops, whatever G is.
+
+    NOT YET RUNTIME-COMPLETE for a G>1 TAIL box: the coordinator-return stream is delivered by the
+    sidecar to the tail box's -inbound (ENG_IN = its FIRST local stage), but the tail COMPUTE is on
+    the LAST local GPU, so the token has to be bridged ingress<->tail internally. A 1-GPU tail box
+    (tail stage == box ingress == ENG_IN) works with the existing serve loop today; the forward path
+    (loopback handoff via a local --next) works for every box now. See the PR body."""
+    subs = split_stages_to_gpus(node_stages, gpus)
+    stages = []
+    for sub in subs:
+        eng_port, nxt, link = box_stage_wiring(sub)
+        cmd = stage_launch_cmd(sub["global_index"], sub["nstages"], sub["lo"], sub["hi"],
+                               model_dir=model_dir, receipts=receipts, token=token,
+                               gpu=sub["gpu"], port=eng_port, nxt_addr=nxt)
+        stages.append({**sub, "eng_port": eng_port, "next": nxt, "link": link, "cmd": cmd})
+    B = len(node_stages)
+    sidecars = ([ring_sidecar_spec(b, B, box_maddrs, ret_maddr=ret_maddr) for b in range(B)]
+                if box_maddrs is not None else None)
+    return {"stages": stages, "sidecars": sidecars}
 
 
 # ── offline selftest: the whole ring on localhost, CPU, no spend ───────────────────────────────────
