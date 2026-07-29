@@ -20,7 +20,39 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-28 (LATEST) — KIMI K3 ENGINE BUILT END-TO-END; NEXT = THE 19-BOX RING (leyten-gated)
+### ⇒ 2026-07-29 (LATEST) — LANDING DAY: every stranded launch fix is on master; sidecar v0.2.0; NEXT = the capstone ring
+**Everything the 07-28 first-token ring had to hand-patch is now genuinely on master, the release
+artifacts match the code, and the only engineering left before the leyten-gated publishes is ONE
+capstone ring session.** (K3 work is a PARALLEL session's lane — hands off here; see auto-memory
+`k3-owned-by-other-session`.)
+- **shard #153 (rebase-merged, 4 atomic fixes, 986 tests green):** the residential-reachability
+  branch that was stranded unpushed while strangers clone master — sidecar advertises the relay
+  circuit a NAT'd node reserved, receipt-module resolution on self-provisioned nodes (the fix the
+  confirm ring cherry-picked; without it a repo-checkout node signs ZERO receipts), density-cap
+  rounding, slow-peer fetch abandonment. Landing hazard caught: the branch base was a LOCAL-only
+  #137 — rebuilt from origin/master, range-diff-verified patch-identical.
+- **c0mpute #56:** the dirty c0mpute-dev tree extracted — ephemeral fetch identity (the node-key
+  phantom: a second connection claiming our PeerId but never registering the activation protocol
+  killed ringmates' forward legs for whole pulls), `--real-seam` (real shard.plan in the sim), the
+  07-28 OpenAI-compatible gateway + chat UI. The fail-loud-on-0-token sim check was already in #55.
+- **sidecar v0.2.0 PUBLISHED + pin bumped as a pair:** #153's comma-list multi-target forwards
+  (`parseForwardTargets`) are REQUIRED by the daemon's dial-every-addr change (held out of #56 —
+  proven not backward-safe: v0.1.0 fails the comma-list multiaddr parse on today's 8-addrs-per-peer
+  announces). Tag-push release from master cd44af3, artifact sha-verified + exec-checked
+  (`45a22cbd…`), c0mpute pin bump lands with the held-out change in the SAME PR.
+- **Receipts banked:** `stranger-serve-confirm-20260728.json` (the FIRST-TOKEN receipt the living
+  state already referenced but git never held — public box IPs redacted per repo policy) +
+  `residential-upload-ab.json`. The K3 receipt stays for the K3 session to bank.
+
+**⇒ THE ONE NEXT ACTION: the CAPSTONE RING** (runbook `scratchpad/capstone-ring-runbook.md`,
+~7×EU-5090, ~$3/hr, supply healthy): ① settlement LIVE-confirm — #145 receipts must actually PAY
+on a real ring for the first time; ② the P0-#6 churn kill on real hardware (manual SIGKILL, not the
+sim-scale `--churn` timer); ③ the warm re-join receipt (≤3min target is at physics risk — 2-4min
+load + 30s debounce; bank the HONEST number). Keep the ring warm until all three are banked.
+After that, the launch list is pure leyten: npm publish, offline-key manifest publish, Ghent WSL
+smoke, the go-live flip, the rehearsal day.
+
+### ⇒ 2026-07-28 (LATEST-10) — KIMI K3 ENGINE BUILT END-TO-END; NEXT = THE 19-BOX RING (leyten-gated)
 **Kimi K3 (2.78T-A104B, native MXFP4 ~1.45TB, released 07-27) is now fully onboarded to the shard
 engine — every layer of the port built, merged to master, and verified — in one day. The ONLY thing
 between here and the first coherent K3 output over a permissionless scattered swarm is the ~$150

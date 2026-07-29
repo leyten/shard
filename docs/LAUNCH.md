@@ -5,13 +5,27 @@
 > lights up on a live map, and it works — with nobody (no operator, no SSH, no hand-holding) in the loop.
 >
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
-> _Last synced: 2026-07-20._
+> _Last synced: 2026-07-29._
 >
-> **REMAINING BLOCKERS AT A GLANCE (2026-07-21):** the buildable launch list is DONE — what's left
-> is **one real-hardware ring session** (validates the whole new stack end-to-end: verified pull →
-> seeding → churn → warm re-join ≤3min receipt) plus **leyten-gated publish actions** (npm publish
-> `@c0mpute/worker` ≥2.8.3; the one-time offline-key manifest publish; the Ghent WSL smoke) → then
-> the rehearsal day.
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-29):** the serve gap is CLOSED — the first token crossed
+> the fully-automatic stranger path on 07-28 (receipt `stranger-serve-confirm-20260728.json`). What's
+> left is **one capstone ring session**: ① settlement LIVE-confirm (the C10 sign-preimage fix #145 is
+> merged but has never paid out on a real ring), ② the churn kill on real hardware (P0-#6 checkmark),
+> ③ the warm re-join receipt (≤3min target — at physics risk, bank the honest number). Plus the
+> **leyten-gated publish actions** (npm publish `@c0mpute/worker`; the one-time offline-key manifest
+> publish; the Ghent WSL smoke; the go-live flip: relays.json + `SWARM_PAYOUT_ENABLED` + paired
+> worker/orchestrator deploy) → then the rehearsal day.
+>
+> **DONE 2026-07-28/29 (serve gap + landing day):** FIRST TOKEN over the stranger-daemon path —
+> 6 self-provisioned EU 5090s, 32 tokens streamed, 6 signed receipts tiling [0:62), receiptsOk:true,
+> ~4-5 tok/s warm (07-28 PM confirm ring) · S1/S2/S3 serve fixes (shard #142, c0mpute #55) · C10
+> settlement sign-preimage fix (#145) · residential-reachability fixes merged (#153: sidecar
+> advertises its reserved relay circuit, receipt-module resolution on self-provisioned nodes — the
+> fix the confirm ring had to cherry-pick, density-cap rounding, slow-peer fetch abandonment) ·
+> c0mpute #56 (ephemeral fetch identity kills the node-key phantom that broke ringmates' forward
+> legs during pulls; `--real-seam`; the OpenAI-compatible gateway) · sidecar **v0.2.0** published +
+> pinned in the same breath as the daemon's dial-every-addr change (comma-list forwards — v0.1.0
+> cannot parse them; landing either half alone breaks stranger joins).
 >
 > **DONE 2026-07-21 (one session, 10 PRs, no spend):** sidecar `v0.1.0` PUBLISHED + pinned (was a
 > hidden blocker for every Go-less join) · **P1-#4 adversary hardening COMPLETE** — reputation gate
