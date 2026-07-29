@@ -32,6 +32,11 @@ TOKENIZER_FILES = {
     "tiktoken.model",   # a tiktoken vocab is the whole tokenizer (Kimi-K3 ships no tokenizer.json);
                         # without it the manifest hands the head a tokenizer_config naming a file
                         # the head can never verifiably fetch
+    "tokenization_kimi.py", "encoding_k3.py",   # Kimi-K3's tokenizer is CUSTOM remote code, not a
+                        # plain tokenizer.json: tokenizer_config's auto_map -> tokenization_kimi
+                        # (TikTokenTokenizer), which imports encoding_k3. AutoTokenizer.from_pretrained
+                        # (trust_remote_code) needs BOTH .py files present, so they must be in the
+                        # signed manifest or the coordinator cannot tokenize (live K3 ring 2026-07-29).
 }
 CONFIG_FILES = {"config.json", "generation_config.json"}
 SKIP_DIRS = ("original/", "metal/", "onnx/", "gguf/")

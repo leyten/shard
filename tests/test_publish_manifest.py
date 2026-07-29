@@ -107,6 +107,13 @@ def test_kind_classification():
     assert pub._kind("README.md") is None and pub._kind(".gitattributes") is None
     # a tiktoken vocab IS the tokenizer for the models that ship one (Kimi-K3 has no tokenizer.json)
     assert pub._kind("tiktoken.model") == "tokenizer"
+    # K3's tokenizer is custom remote code: the two chained tokenizer .py files travel with the
+    # checkpoint (the coordinator loads them via trust_remote_code), so they are tokenizer-kind ...
+    assert pub._kind("tokenization_kimi.py") == "tokenizer"
+    assert pub._kind("encoding_k3.py") == "tokenizer"
+    # ... but the MODELING/config remote code is loaded from the vendored kimi_k3_ref, never fetched
+    assert pub._kind("modeling_kimi_linear.py") is None
+    assert pub._kind("configuration_kimi_k3.py") is None
 
 
 # ---- 3. a multimodal checkpoint: nested depth, namespaced decoder, a second tower -----------------
@@ -133,6 +140,17 @@ def _multimodal_checkpoint(tmp_path, layers=4):
     wm["mm_projector.proj.0.weight"] = "model-00004.safetensors"
     json.dump({"weight_map": wm}, open(os.path.join(d, "model.safetensors.index.json"), "w"))
     open(os.path.join(d, "tiktoken.model"), "wb").write(b"vocab")
+    # K3's tokenizer is CUSTOM remote code, not a tokenizer.json: tokenizer_config's auto_map ->
+    # tokenization_kimi (TikTokenTokenizer), which imports encoding_k3. All of these must ride in the
+    # manifest or the coordinator cannot tokenize (live K3 ring 2026-07-29). configuration_k3.py /
+    # special_tokens_map.json / tokenizer.json do NOT exist for K3, so they are absent here on purpose.
+    json.dump({"tokenizer_class": "TikTokenTokenizer",
+               "auto_map": {"AutoTokenizer": ["tokenization_kimi.TikTokenTokenizer", None]}},
+              open(os.path.join(d, "tokenizer_config.json"), "w"))
+    open(os.path.join(d, "tokenization_kimi.py"), "wb").write(b"from .encoding_k3 import build_chat_segments\n")
+    open(os.path.join(d, "encoding_k3.py"), "wb").write(b"OPEN_TOKEN = '<|open|>'\n")
+    # NON-tokenizer remote code that must NOT be pulled (loaded from the vendored kimi_k3_ref instead)
+    open(os.path.join(d, "modeling_kimi_linear.py"), "wb").write(b"class KimiLinearForCausalLM: pass\n")
     return d
 
 
@@ -161,7 +179,11 @@ def test_multimodal_checkpoint_publishes_and_fetches_the_text_stack(tmp_path):
     cfg, weight_map, shards = pub.build_from_dir(d)
     manifest = _manifest_from(cfg, weight_map, shards, priv, model_id="test/k3")
     assert manifest["layer_count"] == 4                       # from text_config, not the wrapper
-    assert {s["path"] for s in shards if s["kind"] == "tokenizer"} == {"tiktoken.model"}
+    # ALL of K3's tokenizer files — the tiktoken vocab AND the two chained remote-code .py files —
+    # are selected as tokenizer shards; the modeling remote code is not in the manifest at all.
+    assert {s["path"] for s in shards if s["kind"] == "tokenizer"} == {
+        "tiktoken.model", "tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py"}
+    assert "modeling_kimi_linear.py" not in {s["path"] for s in shards}
 
     def files(stage, nstages, role="stage"):
         return {os.path.basename(p) for p in fetch_block(
@@ -169,6 +191,9 @@ def test_multimodal_checkpoint_publishes_and_fetches_the_text_stack(tmp_path):
             role=role, provider=LocalDirProvider(d), expected_pubkey=mf.pub_b64(priv))}
 
     head, tail = files(0, 2), files(1, 2)
+    # the HEAD pull carries the whole custom tokenizer (it hosts the coordinator); a middle/tail does not
+    assert {"tiktoken.model", "tokenizer_config.json", "tokenization_kimi.py", "encoding_k3.py"} <= head
+    assert not ({"tokenization_kimi.py", "encoding_k3.py"} & tail)
     assert "model-00001.safetensors" in head and "model-00002.safetensors" not in head
     assert "model-00002.safetensors" in tail and "model-00001.safetensors" not in tail
     assert "model-00003.safetensors" in head and "model-00003.safetensors" in tail  # embed | norm+head
