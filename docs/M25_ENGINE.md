@@ -44,8 +44,45 @@ capstone ring session.** (K3 work is a PARALLEL session's lane — hands off her
   state already referenced but git never held — public box IPs redacted per repo policy) +
   `residential-upload-ab.json`. The K3 receipt stays for the K3 session to bank.
 
-**CAPSTONE RING RAN — HONEST NEGATIVE, and it found a REGRESSION** (receipt
-`docs/receipts/capstone-ring-20260729.json`, 7×EU-5090, $14.15, ~3h, torn down clean).
+### ⇒ 2026-07-29 (LATEST) — ✅ ALL THREE CAPSTONE PROOFS GREEN — the last P0 hardware item is DONE
+**Receipt `docs/receipts/capstone-ring2-20260729.json`** (7×EU-5090, $14.56, ~2h, 0 duds, torn down
+clean). Ring #2 ran on master **8d83fa2** (the #156 forward-leg fix that ring #1 exposed) and took all
+three proofs in one warm session:
+- **① SETTLEMENT PAYS — FIRST TIME EVER ON A REAL RING.** 48 tokens, coherent M2.5 output, engine
+  `receiptsOk:true`, **6 receipts covering all 62 layers**, and settlement credited **every stage by
+  layers** (10/12/12/5/12/11 → 8/9/9/4/9/9), **0 rejections**. Mechanism visible: **no `stage` key on
+  any wire receipt** — `wire_receipt()` strips it at emit, so the sign-preimage matches. **C10/#145 is
+  CONFIRMED LIVE**, and the C1 receipt-module fix with it.
+- **② CHURN KILL — P0-#6 PROVEN ON HARDWARE.** Tail process-group SIGKILLed mid-stream: DEGRADED in
+  **3s**, re-formed in **33s** (30s of it the deliberate #52 debounce), healed ring served + settled
+  again with the replacement node paid in place of the corpse. **0 operator interventions.** The
+  interrupted job was REJECTED at settlement — **fail-closed pays nobody for unfinished work**.
+- **③ WARM RE-JOIN — the NODE meets the bar; the RING does not, for a different reason.** The warm
+  victim (33GB cached) was assigned its OLD range `[51:62)`, **verified 10 files from disk with ZERO
+  bytes downloaded**, and was loading the engine **12.2s after assignment** — comfortably inside the
+  180s bar. Ring-level READY still took **~30 min**, and finding ① below is why. Third settle green.
+
+**⚠️ FINDING (high, launch-relevant) — PLACEMENT CHURN, not re-join speed, is the healing cost.**
+The re-form **RE-TILES every range** instead of pinning survivors to what they already hold: after the
+2nd kill a survivor moved `[10:22)→[39:51)`, another `[46:51)→[22:27)`, another `[34:46)→[10:22)`, so
+**three UNTOUCHED nodes each re-downloaded ~25GB**. One death ⇒ ~29 min of ring downtime while the
+replacement was ready in 12s. **Fix shape: a stickiness term in `shard.plan` that maximises
+cached-range reuse across survivors** — turns a ~29min outage into ~1-2min. Two lesser findings: churn
+returns a **truncated completion with `finish_reason:"stop"`** (settlement correctly refuses to pay,
+but the caller can't tell); and `SHARD_JOB_DONE` carries **no tok_s/ttft_ms** (check whether #133's
+serve metrics regressed).
+
+**⇒ THE ONE NEXT ACTION: placement stickiness in `shard.plan`** (no-spend, testable in the sim) — it
+is the single biggest self-healing win available and the last engineering item that is clearly ours.
+Then the list is **pure leyten**: npm publish `@c0mpute/worker`, the one-time offline-key manifest
+publish, the Ghent WSL smoke, the go-live flip (relays.json + `SWARM_PAYOUT_ENABLED` + paired
+worker/orchestrator deploy), the rehearsal day. Checklist pre-staged + verified command-by-command
+against the code. Two open decisions for him: a standing seed box (`SWARM_SEED_ADDRS` has nothing real
+to point at) and an auditor key (`SWARM_AUDITOR_PUBKEYS` empty) — one cheap box closes both.
+
+### ⇒ 2026-07-29 (LATEST-2) — capstone ring #1: HONEST NEGATIVE that found the forward-leg bug
+(receipt `docs/receipts/capstone-ring-20260729.json`, 7×EU-5090, $14.15, ~3h, torn down clean).
+**Superseded by ring #2 above — kept because the diagnosis is the reason #156 exists.**
 - **GREEN:** the REAL capability planner placed its first live ring (`--real-seam`) — and **refused 6
   boxes** ("pool can't hold minimax-m2.5"), accepting only at 7. **6×32GB is NOT enough margin for 62
   layers under probe-measured caps — the even-split assumption was wrong.** Tiling came out UNEVEN
