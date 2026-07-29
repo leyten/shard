@@ -7,14 +7,23 @@
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
 > _Last synced: 2026-07-29._
 >
-> **REMAINING BLOCKERS AT A GLANCE (2026-07-29):** the serve gap is CLOSED — the first token crossed
-> the fully-automatic stranger path on 07-28 (receipt `stranger-serve-confirm-20260728.json`). What's
-> left is **one capstone ring session**: ① settlement LIVE-confirm (the C10 sign-preimage fix #145 is
-> merged but has never paid out on a real ring), ② the churn kill on real hardware (P0-#6 checkmark),
-> ③ the warm re-join receipt (≤3min target — at physics risk, bank the honest number). Plus the
-> **leyten-gated publish actions** (npm publish `@c0mpute/worker`; the one-time offline-key manifest
-> publish; the Ghent WSL smoke; the go-live flip: relays.json + `SWARM_PAYOUT_ENABLED` + paired
-> worker/orchestrator deploy) → then the rehearsal day.
+> **REMAINING BLOCKERS AT A GLANCE (2026-07-29 EOD): ALL P0 + P1 ENGINEERING IS ✅ DONE.**
+> The capstone ring took all three proofs (receipt `capstone-ring2-20260729.json`): **settlement PAID
+> every stage on a real ring for the first time ever** (48 tokens, 6 receipts tiling [0:62), 0
+> rejections — C10/#145 confirmed live), **the churn kill self-healed on hardware** (tail SIGKILLed
+> mid-serve → DEGRADED in 3s → re-formed in 33s → served + settled again, 0 operator intervention,
+> and the interrupted job correctly paid NOBODY), and **a warm node re-joined in 12.2s** from
+> assignment to engine-load, verifying its range from disk with zero downloads.
+> **What is left is leyten's, not engineering's:** npm publish `@c0mpute/worker`; the one-time
+> offline-key manifest publish; the Ghent WSL smoke; the go-live flip (fill relays.json + flip
+> `SWARM_PAYOUT_ENABLED` + paired worker/orchestrator deploy) → then the rehearsal day. A
+> command-by-command checklist is pre-staged and verified against the code.
+> **Two decisions he still owes:** a standing full-model seed box (`SWARM_SEED_ADDRS` currently points
+> at nothing) and an auditor key (`SWARM_AUDITOR_PUBKEYS` empty, and his own launch decision requires
+> ≥1 we-run auditor on day one). One cheap box closes both.
+> **Best-known post-launch win, not a blocker:** placement stickiness in `shard.plan` — today a
+> re-form re-tiles every range, so one node's death makes ~3 untouched survivors re-download ~25GB
+> and costs ~29 min of ring downtime, even though the replacement is ready in seconds.
 >
 > **DONE 2026-07-28/29 (serve gap + landing day):** FIRST TOKEN over the stranger-daemon path —
 > 6 self-provisioned EU 5090s, 32 tokens streamed, 6 signed receipts tiling [0:62), receiptsOk:true,
