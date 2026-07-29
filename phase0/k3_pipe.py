@@ -86,6 +86,17 @@ ENG_LOCAL_BASE = 29620
 # every local GPU K3_MOE_PORT_BASE+gpu.
 K3_MOE_PORT_BASE = 29557
 NODELAY = (socket.IPPROTO_TCP, socket.TCP_NODELAY, 1)
+# Forward-dial retry window (Bug 1, live K3 ring 2026-07-29): every stage dials its --next at boot,
+# but in a real B-box x G-GPU ring all stages load their weights IN PARALLEL and a single stage's
+# Marlin repack + whole-layer graph capture is 30-50s (minutes on a big shard). So a front stage can
+# be up and dialing long before a downstream neighbour finishes binding. The window must therefore
+# cover the SLOWEST stage's whole load, not a few seconds — the old fixed ~30s (120 tries x 0.25s)
+# gave up mid-launch on a 14-stage ring and aborted it. Default derives from the stage `timeout`
+# (the same 600s ceiling a stage already tolerates on a frame), overridable via K3_DIAL_RETRY_S for
+# a very large ring; each connect is capped at K3_DIAL_CONNECT_TIMEOUT so one black-holing WAN box
+# cannot burn the whole window in a single blocked connect.
+DIAL_RETRY_S = float(os.environ.get("K3_DIAL_RETRY_S", "0") or 0)          # 0 => derive from timeout
+DIAL_CONNECT_TIMEOUT = float(os.environ.get("K3_DIAL_CONNECT_TIMEOUT", "5") or 5)
 NODE_KEY_PATH = os.environ.get("SHARD_NODE_KEY", "/root/.shard_node_key")
 # C2: per-swarm epoch token — env-only (never argv/log), rides every greeting so a stage never
 # adopts a silent/foreign connection. Optional; a bare localhost ring runs token-less.
@@ -122,15 +133,34 @@ def sample_token(logits_row, temp=0.0, gen=None):
 
 # ── stage server: one K3 layer block, fire-forward ────────────────────────────────────────────────
 
-def _dial(host, port, timeout, tries=120):
-    for _ in range(tries):
+def _dial_window(timeout):
+    """The forward-dial retry WINDOW in seconds: K3_DIAL_RETRY_S when set, else the stage `timeout`
+    itself. Keyed to an existing constant rather than a bare magic number so it scales with how long
+    a stage is allowed to take, and comfortably covers a neighbour that is still loading weights."""
+    return DIAL_RETRY_S or float(timeout)
+
+
+def _dial(host, port, timeout, retry_s=None):
+    """Dial host:port, retrying for a time WINDOW while the peer is still coming up (see DIAL_RETRY_S).
+    A stage binds+listens BEFORE it dials, so a generous window lets the whole chain resolve whatever
+    order the stages were launched in. Each individual connect is capped at DIAL_CONNECT_TIMEOUT so a
+    black-holing WAN box cannot consume the window in one blocked connect."""
+    connect_timeout = min(float(timeout), DIAL_CONNECT_TIMEOUT)
+    window = float(retry_s) if retry_s is not None else _dial_window(timeout)
+    deadline = time.time() + window
+    last = None
+    while True:
         try:
-            s = socket.create_connection((host, int(port)), timeout=timeout)
+            s = socket.create_connection((host, int(port)), timeout=connect_timeout)
             s.setsockopt(*NODELAY)
             return s
-        except OSError:
+        except OSError as e:
+            last = e
+            if time.time() >= deadline:
+                break
             time.sleep(0.25)
-    raise RuntimeError(f"k3 stage: could not connect forward to {host}:{port}")
+    raise RuntimeError(f"k3 stage: could not connect to {host}:{port} within {window:.0f}s "
+                       f"({type(last).__name__}: {last})")
 
 
 def _is_return_hello(msg):
@@ -344,13 +374,14 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout):
             raise RuntimeError(f"tail: unknown op {op!r}")
 
 
-def _dial_return(addr, timeout, tries=240):
+def _dial_return(addr, timeout):
     """Dial an intra-box return channel to the box TAIL and greet it exactly as the coordinator
-    would — hello_return, then block on its ret_ok. Retries while the tail is still coming up (it
-    loads weights after the ingress). Returns the socket the tail replies on (reset ack, tokens,
-    receipts)."""
+    would — hello_return, then block on its ret_ok. Retries for the full dial window while the tail
+    is still coming up (it loads its weights after the ingress binds — a box tail holding several
+    KDA-MoE layers is minutes, not seconds). Returns the socket the tail replies on (reset ack,
+    tokens, receipts)."""
     host, port = addr.rsplit(":", 1)
-    s = _dial(host, port, timeout, tries=tries)
+    s = _dial(host, port, timeout)
     s.settimeout(timeout)
     send_msg(s, {"op": "hello_return", "token": SWARM_TOKEN} if SWARM_TOKEN is not None
              else {"op": "hello_return"})
@@ -543,11 +574,13 @@ def _peerid_of(maddr):
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/k3", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
                      ret_relay=None):
-    """The shell command a launcher runs to start ONE k3 engine stage over the sidecar.
+    """The shell command a launcher runs to start ONE k3 engine stage over the sidecar. Fully
+    DETACHED in every shape (setsid + fd redirect), mirroring m25_scatter_pipe.stage_cmd — see the
+    note by the return.
 
-    Single-GPU box (gpu/port/nxt_addr all unset): byte-identical to before — the stage binds ENG_IN
-    and a non-tail stage forwards to the LOCAL sidecar forward leg (FWD_RING); the tail has none. The
-    engine binds loopback (M25_ENGINE_BIND) so only the local sidecar can reach it.
+    Single-GPU box (gpu/port/nxt_addr all unset): the single-stage-per-box form — the stage binds
+    ENG_IN and a non-tail stage forwards to the LOCAL sidecar forward leg (FWD_RING); the tail has
+    none. The engine binds loopback (M25_ENGINE_BIND) so only the local sidecar can reach it.
 
     Multi-GPU box: pass this stage's local
       * `gpu`      — the local GPU index. Sets CUDA_VISIBLE_DEVICES=<gpu> so the process sees ONLY
@@ -571,9 +604,16 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/k3", receipts=F
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
     cvd = (f"CUDA_VISIBLE_DEVICES={int(gpu)} K3_MOE_PORT={K3_MOE_PORT_BASE + int(gpu)} "
            if gpu is not None else "")
+    # DETACH like m25_scatter_pipe.stage_cmd (Bug 1, live K3 ring 2026-07-29): a bare `nohup <cmd> &`
+    # over ssh kept the channel open on the engine's child fds and HUNG the launcher, so a parallel
+    # launch of all B*G stages never returned the ssh session. setsid + a full fd redirect fully
+    # detaches the engine and ssh returns instantly; its stdout goes to a PER-PORT log so co-located
+    # stages on one box never clobber each other's.
+    log = f"/root/k3_stage_{port}.log"
+    inner = (f"python3 /root/k3_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
+             f"--port {port} {nxt} {rr}--dir {model_dir} > {log} 2>&1")
     return (f"{rc}{tk}{cvd}{extra_env}K3_DIR={model_dir} K3_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
-            f"python3 /root/k3_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
-            f"--port {port} {nxt} {rr}--dir {model_dir}")
+            f"setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 
 # ── multi-GPU per box: split node blocks to GPUs, wire loopback intra-box + WAN inter-box ───────────
