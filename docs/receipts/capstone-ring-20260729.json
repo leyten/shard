@@ -1,0 +1,84 @@
+{
+ "receipt": "capstone ring — HONEST NEGATIVE: ring forms + stages READY on fresh master, but every job dies at the first forward frame; settlement never reached",
+ "date": "2026-07-29",
+ "verdict": "NO SERVE. The three target proofs (settlement live-confirm, churn kill, warm re-join) were NOT obtained. A serve-path regression sits between the 07-28 known-good engine and today's master; the sidecar was A/B-exonerated offline.",
+ "spend_usd": 14.15,
+ "wall_clock": "~3h (18:00-21:00 UTC)",
+ "builds_under_test": {
+  "shard_engine": "master cd44af3 (incl. #153's four residential-reachability fixes), self-cloned on-box by each daemon",
+  "c0mpute_worker": "master 81f2cf1 (incl. #56 ephemeral fetch identity, #58 dial-every-addr + sidecar pin)",
+  "sidecar": "sidecar-v0.2.0, sha256 45a22cbda27011abe0d96927737f4a1a5ac30112d744e3f0fdf447a6b16cd9be — downloaded + sha-verified by every box from the real GitHub release",
+  "orchestrator": "shard-daemon-sim --port 3903 --nodes 6 --stages 6 --full --serve --debounce 30000 --real-seam; PROD UNTOUCHED"
+ },
+ "ring": {
+  "boxes_rented": 8,
+  "boxes_in_ring": 6,
+  "free_spare": 1,
+  "gpu": "RTX 5090 32GB sm_120, cuda_max_good>=13.0",
+  "geos": ["Estonia", "Estonia", "Norway", "Norway", "Norway", "Spain", "Hungary"],
+  "label": "kloot-capstone-*",
+  "hourly_usd_approx": 2.9,
+  "attrition": {
+   "key_propagation_duds": 2,
+   "rescued_with_throwaway_key": 1,
+   "destroyed_unrecoverable": 1,
+   "note": "2 of 3 duds were SSH key-propagation, not hardware; the fresh-throwaway-key rescue worked on one and failed on the other"
+  }
+ },
+ "PROVEN_GREEN": {
+  "real_capability_planner_first_live_use": {
+   "detail": "--real-seam (c0mpute #56) placed a real ring for the first time on hardware",
+   "refused_at_6_boxes": "planner: pool can't hold minimax-m2.5 (need more/fatter nodes)",
+   "accepted_at_7_boxes": true,
+   "finding": "6x 32GB 5090 is NOT sufficient margin for 62 layers under probe-measured capabilities — the even-split stub assumption was wrong. One box of margin is required.",
+   "tiling": "[0:10) [10:22) [22:34) [34:39) [39:51) [51:62)",
+   "note": "ranges are UNEVEN — capability-driven, not an even split",
+   "predicted": "293.6 ms/step (3.41 tok/s per unit g)"
+  },
+  "sidecar_v0_2_0_on_hardware": "every box downloaded + sha-verified the published release; head parsed the comma-list multi-target forwards ('forward ... via 7 addr(s)') and logged 'forward pre-connect OK' on both legs",
+  "self_provision": "6/6 boxes: engine + venv (torch 2.11/vllm 0.23) + sidecar + manifest + probe slice, zero operator env",
+  "verified_pull": "25.03 GB per stage, hash-verified, then SEEDING 4 shards (4 announced)",
+  "stage_load_sm120": "6/6 SHARD_STAGE_READY, SDPA fused backends ['flash','cudnn']",
+  "rtt_mesh_live": "c0mpute #54 in production: every node reported 4-5 peer measurements, cache 33",
+  "probe_receiver_vectors": "real network vectors landed (e.g. uplink_mbps=341.02 rtt_to_pool_ms=30.57 nat_dialable=false) — the 07-28 'uplink 0' blindness (C3) is closed when a receiver is deployed",
+  "p11_restart_degraded": "coordinator stall-kill correctly relaunched EAGLE-off, every time, fail-closed",
+  "anti_storm_guard": "#52 held — 'a ring is still loading — deferring to avoid a re-form storm' throughout the pull window"
+ },
+ "THE_FAILURE": {
+  "signature": "SHARD_JOB_FATAL stall-watchdog: no ring reply in 90s — the ring never acked this job's reset (frames sent, nothing came back on the return channel)",
+  "jobs_attempted": 3,
+  "tokens_produced": 0,
+  "head_stage_log_at_job_start": "[stage] [s0] edge closed (BrokenPipeError); reset + drop forward link",
+  "gpu_utilisation_during_job": "0% on head and tail — no compute ever started",
+  "topology_state_at_failure": "HEALTHY: all 6 stages READY; every stage's forward tunnel (29611) probed OPEN; tail logged 'predecessor + coord-return connected'; stage 1 logged 'predecessor connected' during the job",
+  "interpretation": "the first framed write on the head's forward leg breaks, so the reset never traverses the ring. Sockets are open; bytes do not move.",
+  "re_warm_attempted": "tail-first restart of all 6 stage processes (weights cached) — all 6 returned READY with identical ranges, and the next job failed IDENTICALLY. This rules out a transient wedge."
+ },
+ "settlement_status": {
+  "c10_fix_145_confirmed_live": false,
+  "settle_result": "REJECTED: assigned signer(s) produced no receipt — nobody paid",
+  "important_distinction": "this is NOT the C10 InvalidSignature class the ring was meant to re-confirm. No receipts exist at all because no tokens were produced. #145 remains UNCONFIRMED on a live ring — neither proven nor disproven.",
+  "c1_receipt_module_fix": "also unvalidated for the same reason (no receipts produced)"
+ },
+ "offline_ab_sidecar_exoneration": {
+  "method": "free, on the orchestrator box after teardown: two loopback sidecars (A -forward -> B -inbound -> fake engine), real 8-byte-BE-length framed 4096B payload, reply framed back",
+  "arm_1_clean_single_addr": "ROUNDTRIP-OK (BODY 4096/4096, PONG returned)",
+  "arm_2_ring_shaped_dirty_list": "ROUNDTRIP-OK — 4 addrs with a live wrong-PeerId decoy on 127.0.0.1, a docker-internal 172.17.0.2, an unroutable 10.255.255.1, and the good addr LAST; the dial-every-addr path skipped the bad addrs and delivered",
+  "conclusion": "sidecar v0.2.0 forward tunnelling + today's comma-list multi-addr change are SOUND. The regression is NOT in the sidecar or the pin bump."
+ },
+ "next_action": {
+  "hypothesis": "an ENGINE serve-path regression between the 07-28 known-good build (master 86b6d98 + cherry-picked 834e306, which served 32 tokens with 6 receipts) and today's master cd44af3",
+  "deltas_to_bisect": "#136 eagle degrade-to-ngram, #138 tree-frame CUDA graphs, #139-#146 (k3 stack, shared modules incl. receipt/wire changes), #153's four fixes (m25_pipe.py touched)",
+  "method": "GPU-LESS FIRST — the fake-ring harness in tests/ exercises the coordinator->stage->tail reset path; reproduce the missing reset-ack offline, then git-bisect. Do NOT rent again until an offline repro exists.",
+  "rationale": "the failure is deterministic, reproduces after a clean re-warm, and needs no GPU to hit the reset path — renting more boxes to watch the same 90s watchdog fire is wasted money"
+ },
+ "discipline": {
+  "prod_untouched": true,
+  "npm_publish": false,
+  "boxes_destroyed": "all 8 (7 ours + 1 dud), verified: vastai show instances empty",
+  "deadman_pin_cleaned": true,
+  "label_allowlist_cleaned": true,
+  "shared_infra_left_running": "relay :29600 and asset server :8080 (shared with the other session) — deliberately not touched",
+  "other_session_boxes_touched": "none"
+ }
+}
