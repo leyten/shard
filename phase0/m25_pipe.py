@@ -2156,6 +2156,38 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
         nxt_sock = _dial_fwd()                        # launch-time dial stays strict: a dead --next at boot is a launcher bug
         nxt_kw.attach(nxt_sock)
         print(f"[s{stage}] forward connected -> {nxt}", flush=True)
+
+    def _fwd_open(msg):
+        """Forward a job-OPENING frame, rebuilding the leg if it died while the ring was idle.
+
+        A stage dials its successor above, BEFORE it binds its own listener, and every stage in the
+        ring loads weights concurrently — so whichever finishes first dials a successor whose engine
+        has not bound yet. The sidecar carrying that leg accepts the local conn anyway, fails to
+        reach the far engine, and closes it (sidecar/main.go runForward / runInbound). The leg is
+        write-only, so nothing observes that: the ring then sits idle for the rest of the pull
+        holding a dead socket that every readiness check still reads as healthy.
+
+        The FIRST WRITE of the next job is what discovers it, and that write is the reset. Losing it
+        there is UNRECOVERABLE — the coordinator reads the TAIL, so no error can reach it and the job
+        can only die on the stall watchdog. The 2026-07-29 capstone ring lost EVERY job that way: six
+        stages READY, every socket healthy, 0 tokens, GPU idle.
+
+        A reset carries no state — it IS the job barrier — so re-sending it on a fresh link is
+        exactly equivalent to having opened the job on that link. ONE retry: a successor that is
+        genuinely gone must still surface as a dead ring rather than a spin."""
+        nonlocal nxt_sock
+        try:
+            nxt_kw.send(msg)
+            return
+        except EDGE_ERRORS as e:
+            print(f"[s{stage}] forward leg was dead at job open ({type(e).__name__}); "
+                  f"rebuilding -> {nxt} and re-sending the reset", flush=True)
+        try: nxt_sock.close()                         # the retry dials a FRESH link; the dead one's
+        except OSError: pass                          # fd must not leak across jobs
+        nxt_sock = None; nxt_kw.attach(None)
+        nxt_sock = _dial_fwd()                        # a re-dial that fails raises OSError into the
+        nxt_kw.attach(nxt_sock)                       # loop's EDGE_ERRORS recovery, exactly as before
+        nxt_kw.send(msg)
     srv = socket.socket(); srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
     srv.bind((_engine_bind_addr(), port)); srv.listen(2)
     # the daemon's loopback-only challenge door (None unless SHARD_PROBE_TOKEN is minted —
@@ -2538,7 +2570,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                                    msg.get("job_id", "job"), lo, hi,
                                                    nonce=msg.get("nonce"))   # sign the job freshness challenge in
-                        nxt_kw.send(msg); continue              # propagate reset down chain UNCHANGED (carries 'graph' + 'keepwarm_ms')
+                        _fwd_open(msg); continue                # propagate reset down chain UNCHANGED (carries 'graph' + 'keepwarm_ms')
                     if msg["op"] == "receipt":                  # job done: sign + accumulate forward to the tail
                         job_active = False                      # probe door re-opens between jobs
                         if RECEIPTS and signer is not None:
@@ -2558,7 +2590,7 @@ def serve(stage, nstages, lo, hi, port, nxt, timeout):
                             signer = ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),   # solo job's signer
                                                    msg.get("job_id", "job"), lo, hi,         # bleed into batched)
                                                    nonce=msg.get("nonce"))
-                        nxt_kw.send(msg); continue
+                        _fwd_open(msg); continue                # same job barrier as solo's reset
                     try:
                         if msg["op"] == "verify_batch":             # batched decode: head embeds [B,K+1], else fwd [B,K+1,H]
                             if parts["head"]:
