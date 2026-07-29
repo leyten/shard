@@ -41,6 +41,7 @@ the settlement nonce into the reset (every stage signs it), sweeps the ring once
 the post-sign `stage` debug tag with wire_receipt() (C10) and verifies coverage — fail-closed.
 
   self-test (CPU, no GPU, no spend):  python3 phase0/k3_pipe.py selftest
+  self-test, multi-GPU tail box:      python3 phase0/k3_pipe.py selftest-relay
   one stage:   python3 phase0/k3_pipe.py stage --stage 0 --nstages 3 --lo 0 --hi 31 --port 29610 --next 127.0.0.1:29611
   coordinator: python3 phase0/k3_pipe.py coord --head 127.0.0.1:29610 --tail 127.0.0.1:29612 --dir /root/k3
 """
@@ -141,13 +142,20 @@ def _is_pred_hello(msg):
 
 
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, cfg=None, device=None,
-                receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None):
+                receipts=None, key_path=None, timeout=600.0, bind="127.0.0.1", ready=None,
+                ret_relay=None):
     """Serve one contiguous layer block [lo:hi) in the fire-forward ring.
 
     head (stage 0)      embeds token ids -> (h, br), runs its layers, forwards the pair.
     middle              runs its layers on the received pair, forwards it.
     tail (stage n-1)    runs its layers, then final-norm + output-AttnRes + lm_head + SAMPLE, and
                         returns the token id on the coordinator-return channel.
+
+    `ret_relay` (a multi-GPU TAIL box only) makes this the box-ingress RELAY: it is a normal forward
+    stage for its own layers, but the coordinator-return tunnel terminates at THIS box's ENG_IN while
+    the token is produced on the box's last-GPU stage, so it also bridges the return — dialing the box
+    tail's return channel at `ret_relay` (loopback) and pumping every frame the tail sends straight out
+    to the coordinator. Only the box ingress of a G>1 tail box passes it; every other path is untouched.
 
     `ready` is an optional threading.Event set once the stage is listening (the selftest waits on it
     instead of sleeping). `cfg` (a KimiLinearConfig) skips the on-disk config for an in-process ring;
@@ -181,6 +189,9 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, cfg=No
 
     if tail:
         _serve_tail(st, srv, lo, hi, node_key, receipts, timeout)
+    elif ret_relay is not None:
+        _serve_relay_ingress(st, stage, srv, nxt_sock, head, lo, hi, node_key, receipts, timeout,
+                             ret_relay)
     else:
         _serve_forward(st, stage, srv, nxt_sock, head, lo, hi, node_key, receipts, timeout)
 
@@ -203,6 +214,13 @@ def _serve_forward(st, stage, srv, nxt_sock, head, lo, hi, node_key, receipts, t
     """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe."""
     conn, queued = _accept_pred(srv, timeout)
     print(f"[s{stage}] predecessor connected", flush=True)
+    _forward_loop(st, stage, nxt_sock, head, lo, hi, node_key, receipts, conn, queued)
+
+
+def _forward_loop(st, stage, nxt_sock, head, lo, hi, node_key, receipts, conn, queued):
+    """The head/middle process-and-forward loop over an already-accepted predecessor `conn` (with an
+    optional already-read first frame `queued`). Split out of _serve_forward so the box-ingress relay
+    reuses it verbatim for the DOWN direction while a pump thread carries the return UP."""
     signer = None
     with torch.no_grad():
         while True:
@@ -324,6 +342,46 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout):
                     ret.close()
                 return
             raise RuntimeError(f"tail: unknown op {op!r}")
+
+
+def _dial_return(addr, timeout, tries=240):
+    """Dial an intra-box return channel to the box TAIL and greet it exactly as the coordinator
+    would — hello_return, then block on its ret_ok. Retries while the tail is still coming up (it
+    loads weights after the ingress). Returns the socket the tail replies on (reset ack, tokens,
+    receipts)."""
+    host, port = addr.rsplit(":", 1)
+    s = _dial(host, port, timeout, tries=tries)
+    s.settimeout(timeout)
+    send_msg(s, {"op": "hello_return", "token": SWARM_TOKEN} if SWARM_TOKEN is not None
+             else {"op": "hello_return"})
+    recv_msg(s)                                                # the box tail acks (ret_ok)
+    return s
+
+
+def _serve_relay_ingress(st, stage, srv, nxt_sock, head, lo, hi, node_key, receipts, timeout,
+                         ret_relay):
+    """Box-ingress serve loop for a MULTI-GPU TAIL box. The sidecar delivers the coordinator-return
+    tunnel to this box's ENG_IN (same one -inbound as the predecessor's job frames), but the token is
+    produced on the box's LAST-GPU stage. So this stage:
+      * runs its own layers and forwards frames down the intra-box loopback chain — byte-identical to
+        a plain forward stage (it appends its receipt too),
+      * bridges the return: it dials the box tail's return over loopback (`ret_relay`) and pumps every
+        frame the tail sends (reset ack, tokens, the receipt list) straight out to the coordinator.
+    The box tail's serve loop is UNCHANGED — it just gets its coordinator-return dialed from here
+    instead of the WAN. Reached only when a G>1 box holds the global tail (a 1-GPU tail box has
+    box ingress == box tail == the global tail and serves through _serve_tail)."""
+    ret_up, pred, queued = _tail_bringup(srv, timeout)         # coordinator-return + predecessor at ENG_IN
+    ret_down = _dial_return(ret_relay, timeout)                # our return leg to the box tail (loopback)
+
+    def _pump():
+        try:
+            while True:
+                send_msg(ret_up, recv_msg(ret_down))           # box tail -> coordinator, frame for frame
+        except OSError:                                        # ConnectionError on stop / ring torn down
+            pass
+    threading.Thread(target=_pump, daemon=True).start()
+    print(f"[s{stage}] relay ingress: coord-return <-> box tail {ret_relay}", flush=True)
+    _forward_loop(st, stage, nxt_sock, head, lo, hi, node_key, receipts, pred, queued)
 
 
 # ── coordinator: drive greedy generation over the ring ─────────────────────────────────────────────
@@ -483,7 +541,8 @@ def _peerid_of(maddr):
 
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/k3", receipts=False,
-                     device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None):
+                     device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
+                     ret_relay=None):
     """The shell command a launcher runs to start ONE k3 engine stage over the sidecar.
 
     Single-GPU box (gpu/port/nxt_addr all unset): byte-identical to before — the stage binds ENG_IN
@@ -499,19 +558,22 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/k3", receipts=F
       * `port`     — its local engine port (ENG_IN for the box's first stage, else ENG_LOCAL_BASE+idx).
       * `nxt_addr` — where it forwards: a LOOPBACK 127.0.0.1:<next local port> to the next GPU on this
                      box, or the WAN 127.0.0.1:FWD_RING leg for the box's last stage.
+      * `ret_relay` — set ONLY on the ingress of a G>1 TAIL box: the loopback 127.0.0.1:<box tail local
+                     port> it bridges the coordinator-return to (--ret-relay). Unset everywhere else.
     """
     port = port or ENG_IN
     if nxt_addr is not None:
         nxt = f"--next {nxt_addr}"
     else:
         nxt = "" if stage == nstages - 1 else f"--next 127.0.0.1:{FWD_RING}"
+    rr = f"--ret-relay {ret_relay} " if ret_relay else ""
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
     cvd = (f"CUDA_VISIBLE_DEVICES={int(gpu)} K3_MOE_PORT={K3_MOE_PORT_BASE + int(gpu)} "
            if gpu is not None else "")
     return (f"{rc}{tk}{cvd}{extra_env}K3_DIR={model_dir} K3_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
             f"python3 /root/k3_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
-            f"--port {port} {nxt} --dir {model_dir}")
+            f"--port {port} {nxt} {rr}--dir {model_dir}")
 
 
 # ── multi-GPU per box: split node blocks to GPUs, wire loopback intra-box + WAN inter-box ───────────
@@ -578,6 +640,18 @@ def box_stage_wiring(sub):
     return eng_port, f"127.0.0.1:{local_eng_port(sub['local_index'] + 1)}", "loopback"
 
 
+def box_return_relay(sub, tail_box_index):
+    """The intra-box return-relay target for one per-GPU stage, or None. Only the box INGRESS
+    (box_head) of a MULTI-GPU box that holds the global tail relays: the coordinator-return tunnel
+    lands at that box's ENG_IN, but the token is produced on its last-GPU stage — so the ingress
+    bridges them, dialing the box tail's return over loopback and pumping it out to the coordinator.
+    Returns '127.0.0.1:<box tail local port>' for that one stage, None for every other. A 1-GPU tail
+    box has box_head == box_tail == the global tail and needs no relay (returns None)."""
+    if sub["box_head"] and sub["nlocal"] > 1 and sub["box_index"] == tail_box_index:
+        return f"127.0.0.1:{local_eng_port(sub['nlocal'] - 1)}"
+    return None
+
+
 def box_ring_launch(node_stages, gpus, box_maddrs=None, *, model_dir="/root/k3", receipts=False,
                     token=None, ret_maddr=None):
     """The full launch plan for a ring of B boxes x G GPUs = B*G stages but only B WAN hops.
@@ -585,7 +659,7 @@ def box_ring_launch(node_stages, gpus, box_maddrs=None, *, model_dir="/root/k3",
     node_stages: head-first NODE plan (plan_layer_ranges without per_gpu); gpus: per-box GPU count
     (see split_stages_to_gpus); box_maddrs: the B box libp2p multiaddrs (head-first) for the sidecar
     wiring — omit to skip it (topology-only). Returns:
-      {"stages":   [{**sub, "eng_port", "next", "link", "cmd"}...],   # one per (box, gpu)
+      {"stages":   [{**sub, "eng_port", "next", "link", "ret_relay", "cmd"}...],  # one per (box, gpu)
        "sidecars": [(inbound, forwards, allow)...] | None}            # per box, ring_sidecar_spec at
                                                                       # BOX granularity
 
@@ -593,19 +667,23 @@ def box_ring_launch(node_stages, gpus, box_maddrs=None, *, model_dir="/root/k3",
     only the B boxes: ring_sidecar_spec over B nodes gives B-1 forward hops + 1 head->tail return =
     B WAN hops, whatever G is.
 
-    NOT YET RUNTIME-COMPLETE for a G>1 TAIL box: the coordinator-return stream is delivered by the
-    sidecar to the tail box's -inbound (ENG_IN = its FIRST local stage), but the tail COMPUTE is on
-    the LAST local GPU, so the token has to be bridged ingress<->tail internally. A 1-GPU tail box
-    (tail stage == box ingress == ENG_IN) works with the existing serve loop today; the forward path
-    (loopback handoff via a local --next) works for every box now. See the PR body."""
+    The RETURN path is closed for a G>1 TAIL box: the coordinator-return tunnel is delivered by the
+    sidecar to the tail box's -inbound (ENG_IN = its FIRST local stage), but the token is produced on
+    its LAST local GPU. That box's ingress carries a `ret_relay` (--ret-relay) and bridges the two over
+    loopback (box_return_relay / _serve_relay_ingress) — so the sidecar wiring stays BOX-granular and
+    identical to M2.5, and only that one engine gets the relay flag. A 1-GPU tail box (box ingress ==
+    box tail == the global tail, ret_relay None) serves the coordinator-return directly, as before."""
     subs = split_stages_to_gpus(node_stages, gpus)
+    tail_box = subs[-1]["box_index"]                           # the box holding the global tail
     stages = []
     for sub in subs:
         eng_port, nxt, link = box_stage_wiring(sub)
+        ret_relay = box_return_relay(sub, tail_box)
         cmd = stage_launch_cmd(sub["global_index"], sub["nstages"], sub["lo"], sub["hi"],
                                model_dir=model_dir, receipts=receipts, token=token,
-                               gpu=sub["gpu"], port=eng_port, nxt_addr=nxt)
-        stages.append({**sub, "eng_port": eng_port, "next": nxt, "link": link, "cmd": cmd})
+                               gpu=sub["gpu"], port=eng_port, nxt_addr=nxt, ret_relay=ret_relay)
+        stages.append({**sub, "eng_port": eng_port, "next": nxt, "link": link,
+                       "ret_relay": ret_relay, "cmd": cmd})
     B = len(node_stages)
     sidecars = ([ring_sidecar_spec(b, B, box_maddrs, ret_maddr=ret_maddr) for b in range(B)]
                 if box_maddrs is not None else None)
@@ -677,10 +755,14 @@ def _seed_unreached(model):
                 p.normal_(0.0, 0.02)
 
 
-def selftest(nstages=4, n_layers=6, prompt=(3, 9, 17, 2, 41), max_new=5):
+def selftest(nstages=4, n_layers=6, prompt=(3, 9, 17, 2, 41), max_new=5, tail_box_g=1):
     """Offline, CPU, no spend: a full k3_pipe ring on localhost (head embed + middles + tail sample +
     weightless coordinator over real shard.transport sockets) decodes greedily, and the token stream
-    is checked BIT-IDENTICAL against Moonshot's own KimiLinearForCausalLM whole-model decode."""
+    is checked BIT-IDENTICAL against Moonshot's own KimiLinearForCausalLM whole-model decode.
+
+    `tail_box_g` > 1 folds the last G stages into ONE multi-GPU tail box: the coordinator-return
+    terminates at that box's ingress and is bridged over loopback to the box tail (the --ret-relay
+    path a real G>1 tail box runs), proving the return relay against the same parity bar."""
     import tempfile
     os.environ["SHARD_RECEIPTS"] = "1"
     global RECEIPTS
@@ -694,19 +776,23 @@ def selftest(nstages=4, n_layers=6, prompt=(3, 9, 17, 2, 41), max_new=5):
     ranges = even_tiling(n_layers, nstages)
     base = 29661
     ports = [base + i for i in range(nstages)]
+    relay_i = nstages - tail_box_g                             # ingress of the multi-GPU tail box (>1)
     events = [threading.Event() for _ in range(nstages)]
     threads = []
     for i, (lo, hi) in enumerate(ranges):
         nxt = None if i == nstages - 1 else f"127.0.0.1:{ports[i + 1]}"
+        ret_relay = f"127.0.0.1:{ports[-1]}" if (tail_box_g > 1 and i == relay_i) else None
         t = threading.Thread(target=serve_stage, kwargs=dict(
             stage=i, nstages=nstages, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=d,
-            device="cpu", receipts=True, key_path=f"{d}/s{i}.key", ready=events[i]), daemon=True)
+            device="cpu", receipts=True, key_path=f"{d}/s{i}.key", ret_relay=ret_relay,
+            ready=events[i]), daemon=True)
         t.start()
         threads.append(t)
     for e in events:
         e.wait(30)
 
-    pipe, ret = connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{ports[-1]}", timeout=60)
+    tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]   # return lands at the tail box ingress
+    pipe, ret = connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{tail_port}", timeout=60)
     r = coordinate(pipe, ret, list(prompt), max_new, nonce="settle-nonce-0", receipts=True,
                    layer_count=n_layers)
     send_msg(pipe, {"op": "stop"})
@@ -717,8 +803,9 @@ def selftest(nstages=4, n_layers=6, prompt=(3, 9, 17, 2, 41), max_new=5):
         "coverage_tiles_all_layers": (sorted((c["layer_start"], c["layer_end"])
                                               for c in r["receipts"]) == _expected_cover(ranges)),
     }
+    tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
     print("\n=== K3 pipe offline selftest (CPU tiny config) ===")
-    print(f"  ring: {nstages} stages over {n_layers} layers {ranges}")
+    print(f"  ring: {nstages} stages over {n_layers} layers {ranges}{tag}")
     print(f"  tokens (ring) {r['tokens']}\n  tokens (ref)  {ref_tokens}")
     for k, v in checks.items():
         print(f"  [{'PASS' if v else 'FAIL'}] {k}")
@@ -827,6 +914,9 @@ def main():
     s.add_argument("--hi", type=int, required=True)
     s.add_argument("--port", type=int, default=ENG_IN)
     s.add_argument("--next", default=None, dest="next")
+    s.add_argument("--ret-relay", default=None, dest="ret_relay",
+                   help="multi-GPU tail box ingress only: loopback addr of the box tail's return "
+                        "channel to bridge the coordinator-return to")
     s.add_argument("--dir", default=os.environ.get("K3_DIR", "/root/k3"))
     s.add_argument("--device", default=None)
     s.add_argument("--bind", default=os.environ.get("M25_ENGINE_BIND", "127.0.0.1"))
@@ -841,15 +931,20 @@ def main():
     c.add_argument("--connect-retry", type=int, default=300, dest="connect_retry")
 
     sub.add_parser("selftest", help="offline CPU full-ring parity proof (no GPU, no spend)")
+    sub.add_parser("selftest-relay",
+                   help="offline CPU parity proof with a MULTI-GPU tail box (return relay path)")
     a = ap.parse_args()
 
     if a.cmd == "stage":
         serve_stage(a.stage, a.nstages, a.lo, a.hi, a.port, nxt=a.next, ckpt_dir=a.dir,
-                    device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind)
+                    device=a.device, receipts=(a.receipts or RECEIPTS), bind=a.bind,
+                    ret_relay=a.ret_relay)
     elif a.cmd == "coord":
         sys.exit(_coord_cli(a))
     elif a.cmd == "selftest":
         selftest()
+    elif a.cmd == "selftest-relay":
+        selftest(nstages=3, tail_box_g=2)
 
 
 if __name__ == "__main__":

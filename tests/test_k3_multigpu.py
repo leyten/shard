@@ -190,3 +190,54 @@ def test_box_ring_launch_topology_only_without_maddrs():
     # a single box: 3 loopback links + tail, NO WAN forward (nothing leaves the box)
     links = [s["link"] for s in plan["stages"]]
     assert links.count("loopback") == 3 and links.count("wan") == 0 and links.count("tail") == 1
+
+
+# ── (e) the RETURN path: a G>1 tail box bridges its ingress <-> its last-GPU stage ───────────────────
+
+def test_multigpu_tail_box_ingress_carries_a_return_relay_to_the_box_tail():
+    """The coordinator-return tunnel lands at the tail box's ENG_IN (its ingress), but the token is
+    produced on the box's LAST GPU. So ONLY that box's ingress gets a --ret-relay pointing at the box
+    tail's loopback port; every other stage (including the global tail itself) has none."""
+    nodes = _node_stages(KP.even_tiling(93, 2))            # 2 boxes
+    plan = KP.box_ring_launch(nodes, 4, [f"/ip4/10.0.0.{k}/tcp/29600/p2p/PEER{k}" for k in range(2)])
+    stages = plan["stages"]
+
+    relays = [s for s in stages if s["ret_relay"] is not None]
+    assert len(relays) == 1, "exactly one relay: the multi-GPU tail box's ingress"
+    relay = relays[0]
+    assert relay["box_index"] == 1 and relay["box_head"] and not relay["tail"]   # tail box ingress
+    # it bridges to the box tail = the box's last local GPU (local index G-1 = 3 => ENG_LOCAL_BASE+3)
+    assert relay["ret_relay"] == f"127.0.0.1:{KP.local_eng_port(3)}"
+    assert relay["eng_port"] == KP.ENG_IN                                        # the ingress binds ENG_IN
+    assert f"--ret-relay {relay['ret_relay']} " in relay["cmd"]
+    # the global tail is NOT a relay (it samples + is dialed BY the relay), and neither is any other
+    tail = next(s for s in stages if s["tail"])
+    assert tail["ret_relay"] is None and "--ret-relay" not in tail["cmd"]
+    assert sum("--ret-relay" in s["cmd"] for s in stages) == 1
+
+
+def test_return_relay_target_is_the_box_tail_port_across_geometries():
+    """box_return_relay marks the ingress of the tail box (nlocal>1) and points it at the box tail's
+    loopback port, whatever G — and marks nothing else."""
+    for G in (2, 3, 4):
+        subs = KP.split_stages_to_gpus(_node_stages(KP.even_tiling(30, 2)), [1, G])
+        tail_box = subs[-1]["box_index"]
+        marked = [(s["global_index"], KP.box_return_relay(s, tail_box)) for s in subs]
+        hits = [gi for gi, r in marked if r is not None]
+        ingress = next(s for s in subs if s["box_index"] == tail_box and s["box_head"])
+        assert hits == [ingress["global_index"]]              # only the tail box ingress
+        assert KP.box_return_relay(ingress, tail_box) == f"127.0.0.1:{KP.local_eng_port(G - 1)}"
+
+
+def test_single_gpu_tail_box_needs_no_return_relay():
+    """A 1-GPU tail box (or an all-single-GPU ring) has box_head == box_tail == the global tail, which
+    serves the coordinator-return directly — no relay, and no --ret-relay anywhere. Byte-identical to
+    the pre-relay launch spec."""
+    # tail box is 1 GPU, head box is 4 GPUs: the relay is a TAIL-box property, so still none
+    nodes = _node_stages(KP.even_tiling(93, 2))
+    plan = KP.box_ring_launch(nodes, [4, 1], [f"/ip4/10.0.0.{k}/tcp/29600/p2p/PEER{k}" for k in range(2)])
+    assert all(s["ret_relay"] is None for s in plan["stages"])
+    assert all("--ret-relay" not in s["cmd"] for s in plan["stages"])
+    # an all-single-GPU ring: no relay either
+    single = KP.box_ring_launch(_node_stages(KP.even_tiling(93, 5)), 1)
+    assert all(s["ret_relay"] is None for s in single["stages"])

@@ -56,25 +56,30 @@ class _Ring:
     `coordinate()` reuses the SAME warm ring across calls (each call resets), so a second job on the
     ring is the reset/warm path."""
 
-    def __init__(self, ckpt_dir, cfg, ranges, receipts=False):
+    def __init__(self, ckpt_dir, cfg, ranges, receipts=False, tail_box_g=1):
         self.ranges = ranges
         self.n = len(ranges)
         self.layer_count = cfg.num_hidden_layers
         ports = _free_ports(self.n)
+        relay_i = self.n - tail_box_g                          # ingress of a multi-GPU tail box (>1)
         events = [threading.Event() for _ in range(self.n)]
         self.threads = []
         for i, (lo, hi) in enumerate(ranges):
             nxt = None if i == self.n - 1 else f"127.0.0.1:{ports[i + 1]}"
+            # a G>1 tail box: its ingress bridges the coordinator-return to the box tail (last stage)
+            ret_relay = f"127.0.0.1:{ports[-1]}" if (tail_box_g > 1 and i == relay_i) else None
             t = threading.Thread(target=KP.serve_stage, kwargs=dict(
                 stage=i, nstages=self.n, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=ckpt_dir,
                 device="cpu", receipts=receipts, key_path=f"{ckpt_dir}/s{i}.key",
-                ready=events[i]), daemon=True)
+                ret_relay=ret_relay, ready=events[i]), daemon=True)
             t.start()
             self.threads.append(t)
         for e in events:
             assert e.wait(30), "a stage never came up"
+        # the coordinator-return terminates at the tail box INGRESS (the relay), not the global tail
+        tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]
         self.pipe, self.ret = KP.connect_ring(f"127.0.0.1:{ports[0]}",
-                                               f"127.0.0.1:{ports[-1]}", timeout=60)
+                                               f"127.0.0.1:{tail_port}", timeout=60)
         self.receipts = receipts
 
     def coordinate(self, prompt, max_new, nonce=None, temp=0.0, seed=0):
@@ -133,6 +138,47 @@ def test_streamed_tokens_arrive_one_per_step(tiny):
     finally:
         ring.close()
     assert len(seen) == NEW
+
+
+# ── multi-GPU tail box: the return relay closes the last-GPU -> coordinator leg ─────────────────────
+
+@pytest.mark.parametrize("ranges,tail_box_g", [
+    ([(0, 2), (2, 4), (4, 6)], 2),          # box0 head (1 GPU), box1 tail (2 GPUs): ingress relay + box tail
+    ([(0, 1), (1, 3), (3, 5), (5, 6)], 3),  # box1 tail (3 GPUs): ingress relay + a middle + box tail
+    ([(0, 3), (3, 6)], 2),                   # a single 2-GPU box that is BOTH head and tail
+])
+def test_multigpu_tail_box_relays_return_and_matches_reference(tiny, ranges, tail_box_g):
+    """The return path for a G>1 TAIL box: the coordinator-return lands at the box ingress (ENG_IN),
+    the token is produced on the box's last-GPU stage, and the ingress bridges them over loopback.
+    The ring must stay BIT-IDENTICAL to Moonshot's whole-model greedy decode — proving the relay is
+    a transparent tunnel, not a numerics change. (The box tail's serve loop is untouched; only the
+    ingress relays.)"""
+    d, cfg, model = tiny
+    ref = KP._reference_tokens(cfg, model, PROMPT, NEW)
+    ring = _Ring(d, cfg, ranges, tail_box_g=tail_box_g)
+    try:
+        got = ring.coordinate(list(PROMPT), NEW)["tokens"]
+    finally:
+        ring.close()
+    assert got == ref, f"{ranges} (tail_box_g={tail_box_g}): ring {got} != ref {ref}"
+
+
+def test_multigpu_tail_receipts_settle_through_the_relay(tiny):
+    """Receipts sweep through the relay: the ingress appends its OWN receipt down the loopback chain
+    (it is a compute stage), the box tail aggregates the set and sends it back on the return channel,
+    and the ingress pumps that set out to the coordinator. Coverage still tiles every layer and the
+    chain settles under the nonce."""
+    d, cfg, model = tiny
+    nonce = "relay-settle-nonce"
+    ring = _Ring(d, cfg, [(0, 2), (2, 4), (4, 6)], receipts=True, tail_box_g=2)
+    try:
+        r = ring.coordinate(list(PROMPT), NEW, nonce=nonce)
+    finally:
+        ring.close()
+    assert r["receipts_ok"] is True
+    assert len(r["receipts"]) == 3, "ingress-relay stage's own receipt must be in the settled set"
+    wired = [wire_receipt(rr) for rr in r["receipts"]]
+    verify_coverage(wired, cfg.num_hidden_layers, expected_nonce=nonce, check_chain=True)
 
 
 # ── receipts settle over the full ring (C10) ───────────────────────────────────────────────────────
