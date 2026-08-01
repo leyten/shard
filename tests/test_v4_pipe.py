@@ -1116,3 +1116,49 @@ def test_swarm_token_value_is_actually_compared(monkeypatch):
     monkeypatch.setattr(VP, "SWARM_TOKEN", None)
     assert VP._is_pred_hello({"op": "hello_pred"}), "token-less ring accepts on shape"
     assert VP._is_pred_hello({"op": "hello_pred", "token": "ignored"})
+
+
+# ── 10. the fp8 activation wire (V4_FP8_WIRE): bytes, scale axis, and what it refuses ──────────────
+# The lever is opt-in and default OFF. Three things have to hold for it to be worth switching on:
+# it must actually halve the hop AT V4's shape (not be eaten by framing overhead), its scale axis
+# must keep the drafted stream identical to the greedy one, and a frame whose scale sidecar does not
+# match its hidden must be refused rather than silently applied.
+
+V4_DIM, V4_HC, V4_BLOCK = 4096, 4, 5          # phase0/deepseek_v4_ref/inference/config.json
+
+
+def _bench():
+    return pytest.importorskip("v4_wire_bench")
+
+
+def test_fp8_wire_halves_the_hop_and_framing_overhead_does_not_eat_it():
+    """The bytes, at the SHIPPED config, through the real transport codec.
+
+    The s=1 PIPELINED DECODE frame is the one to be suspicious about: it is the smallest frame the
+    ring sends, so it is where fixed per-frame overhead would have the best chance of swamping the
+    saving. It does not — V4's boundary is 4 hyper-connection streams x 4096 x 2 B = 32 KiB for a
+    SINGLE token, against a 168 B JSON header. That is the V4 difference: on a model with one
+    residual stream this frame would be 8 KiB and the argument would be closer."""
+    WB = _bench()
+    for s, floor in ((1, 1.95), (V4_BLOCK + 1, 1.95), (2048, 1.99)):
+        bf16, fp8 = WB._frames(s, V4_DIM, V4_HC)
+        nb, nf = WB._wire_len(bf16), WB._wire_len(fp8)
+        assert nb / nf >= floor, f"s={s}: fp8 wire only {nb/nf:.3f}x ({nb} -> {nf})"
+    bf16, _ = WB._frames(1, V4_DIM, V4_HC)
+    payload = V4_HC * V4_DIM * 2 + 8                        # h + one int64 id
+    overhead = WB._wire_len(bf16) - payload
+    assert overhead < 0.01 * WB._wire_len(bf16), \
+        f"framing overhead {overhead} B is >1% of the s=1 decode frame — metadata would dominate"
+
+
+def test_bf16_cannot_prefill_v4s_own_max_seq_in_one_frame_but_fp8_can():
+    """A live constraint, not a curiosity: V4_MAX_SEQ defaults to 8192 and one bf16 prefill frame at
+    8192 positions is 268,501,190 B against transport's 268,435,456 B MAX_FRAME. The ring cannot
+    prefill its own advertised context in a single frame on the bf16 wire; recv_msg refuses the
+    length before it ever allocates. fp8 moves the ceiling past it with room to spare."""
+    WB = _bench()
+    T = WB.T
+    assert WB._wire_len(WB._frames(VP.V4_MAX_SEQ, V4_DIM, V4_HC)[0]) > T.MAX_FRAME
+    assert WB._wire_len(WB._frames(VP.V4_MAX_SEQ, V4_DIM, V4_HC)[1]) < T.MAX_FRAME
+    assert WB.max_single_frame_prefill(V4_DIM, V4_HC, False) < VP.V4_MAX_SEQ
+    assert WB.max_single_frame_prefill(V4_DIM, V4_HC, True) > VP.V4_MAX_SEQ
