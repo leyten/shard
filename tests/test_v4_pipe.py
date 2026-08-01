@@ -43,9 +43,15 @@ VP = pytest.importorskip("v4_pipe")          # protocol only — v4_stage/v4_ref
 send_msg, recv_msg = VP.send_msg, VP.recv_msg
 
 try:
-    from receipt import load_or_make_node_key, verify_coverage, wire_receipt, ReceiptSigner
+    # ReceiptError MUST come from the same module as verify_coverage: in a full-suite process an
+    # earlier test's sys.path setup makes the flat `receipt` importable, so `shard.receipt` and
+    # `receipt` are two live module objects for one file — and an except clause holding the OTHER
+    # module's ReceiptError silently stops catching (CI caught this; a file-scoped run cannot).
+    from receipt import (load_or_make_node_key, verify_coverage, wire_receipt, ReceiptSigner,
+                         ReceiptError)
 except ImportError:
-    from shard.receipt import load_or_make_node_key, verify_coverage, wire_receipt, ReceiptSigner
+    from shard.receipt import (load_or_make_node_key, verify_coverage, wire_receipt, ReceiptSigner,
+                               ReceiptError)
 
 B, S, HC, D = 1, 3, 4, 8                      # a V4 boundary payload in miniature: [b, s, hc_mult, dim]
 
@@ -902,7 +908,6 @@ def test_full_ring_receipts_settle_and_c10(tiny):
     """Every stage signs its (h || ids) hash-chain over the job; the coordinator sweeps the ring once
     and settles. wire_receipt (C10) strips the post-sign `stage` debug tag, so the RAW receipts fail
     verify (the tag is in the signed preimage) and the WIRE receipts pass."""
-    ReceiptError = pytest.importorskip("shard.receipt").ReceiptError
     d, args, _ref = tiny
     ring = _Ring(d, args, [(0, 3), (3, 6), (6, 8)], receipts=True)
     try:

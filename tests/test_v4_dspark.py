@@ -204,16 +204,18 @@ def test_stepwise_advance_equals_oracle_sequence(oracle, args):
     ids = _ids(PROMPT, args, seed=LOOP_SEED)
     st, dr, tok = prefilled(oracle, args, ids)
 
-    # the oracle: RUN single-token forwards, then RUN forward_spec calls over what they produced
+    # The committed run is FORCED distinct ids, not the model's own stream. A verify chunk feeds
+    # drafted tokens whatever the model would have said, so forcing is exactly ring semantics — and
+    # it makes the pairing-shift sensitivity platform-independent: each call pairs the tap at
+    # position p+j with the token at p+j+1, a shifted pairing is INVISIBLE when the run repeats a
+    # token, and a natural greedy stream's diversity is platform arithmetic (the seed that gave this
+    # box distinct tokens gave CI's BLAS a repeat — same model, different bf16 rounding).
+    forced = [torch.full((BATCH,), t, dtype=torch.long) for t in (7, 151, 293)[:RUN]]
     toks, mains = [tok], []
     for j in range(RUN):
-        o_tok, _, o_main = oracle(toks[-1].unsqueeze(1), PROMPT + j)
-        toks.append(o_tok)
+        _, _, o_main = oracle(toks[-1].unsqueeze(1), PROMPT + j)
+        toks.append(forced[j])
         mains.append(o_main)
-    # LOOP_SEED, not the default prompt: each call pairs the tap at position p+j with the token at
-    # p+j+1, and a pairing shifted by one is INVISIBLE when the committed run is the same token
-    # repeated — which a random model's greedy stream usually is.
-    assert len({int(t) for t in toks[1:]}) == RUN, "the committed run must be distinct tokens"
     o_spec = None
     for j in range(RUN):
         o_spec = oracle.forward_spec(toks[j + 1], mains[j], PROMPT + j)
@@ -583,6 +585,27 @@ def _greedy_stream(args, ids, n):
     return out
 
 
+def _rich_ids(args, n):
+    """A prompt whose greedy stream is non-constant ON THIS PLATFORM, richest of a fixed seed list.
+
+    The stream's token VALUES are platform arithmetic: the seed that gives one box 4+ distinct
+    tokens gave CI's BLAS 3 (bf16 rounds differently at toy scale), and a CONSTANT stream would
+    make a stream-equality assertion vacuous — any misalignment emits the same constant. The parity
+    bar itself is within-platform, so any non-constant stream carries it; searching a fixed list
+    keeps the choice deterministic per box and loud when no candidate qualifies."""
+    best = None
+    for seed in (LOOP_SEED, 5, 11, 29, 47):
+        ids = _ids(PROMPT, args, seed=seed)
+        want = _greedy_stream(args, ids, n)
+        k = len(set(want[:GEN]))
+        if best is None or k > best[0]:
+            best = (k, ids, want)
+        if k >= 4:
+            break
+    assert best[0] >= 2, "every candidate seed yields a CONSTANT greedy stream on this platform"
+    return best[1], best[2]
+
+
 def _rewind(st, ids, committed):
     """Put the stage back to 'has seen the prompt + `committed`'. Step 5's rollback, the slow way.
 
@@ -634,9 +657,7 @@ def test_spec_loop_emits_the_greedy_stream(oracle, args):
     The headline. Lossless is the whole claim of speculative decoding, and every position mistake in
     the protocol -- a tap paired with the wrong token, an advance over the rejected tail, a draft
     block read one column off -- changes this stream and nothing else visible."""
-    ids = _ids(PROMPT, args, seed=LOOP_SEED)
-    want = _greedy_stream(args, ids, GEN + args.dspark_block_size)
-    assert len(set(want[:GEN])) >= 4, "a near-constant greedy stream would make this assertion empty"
+    ids, want = _rich_ids(args, GEN + args.dspark_block_size)
     got, drafted, rewound = _spec_loop(oracle, args, ids, lambda d: d)
     assert got == want[:len(got)], "the speculated stream is not the greedy stream"
     assert len(got) >= GEN
@@ -809,9 +830,7 @@ def test_spec_loop_with_a_perfect_drafter(oracle, args):
     exercises n = 0. This one forces n = block_size every round -- the multi-position advance, the
     full-accept bonus, and the case where the chunk the stage consumed happens to be exactly what
     was committed. Both loops must emit the same greedy stream."""
-    ids = _ids(PROMPT, args, seed=LOOP_SEED)
-    want = _greedy_stream(args, ids, GEN + args.dspark_block_size + 1)
-    assert len(set(want[:GEN])) >= 4, "a near-constant greedy stream would make this assertion empty"
+    ids, want = _rich_ids(args, GEN + args.dspark_block_size + 1)
     g = args.dspark_block_size
 
     def perfect(_):
