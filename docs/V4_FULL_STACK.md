@@ -105,19 +105,32 @@ Each stage prints its `__repr__` — this reports **observed** state, not the en
 
 ## Levers: what composes, what is exclusive
 
-| lever | env | composes with pipelining? | why |
-|---|---|---|---|
-| pipelined speculation | `V4_PIPELINED_SPEC=1` | **the base** | streams `s=1` frames instead of one `[cur]+drafts` block per round, so the D stages fill |
-| whole-layer CUDA graphs | `V4_CUDA_GRAPH=whole` | **YES** | `_run`'s graph path needs `start_pos > 0`, `s == 1`, not replaying — exactly what a pipelined frame is |
-| island CUDA graphs | `V4_CUDA_GRAPH=1` | **YES** (weaker) | same gate; graphs only the hc_pre/hc_post/norm islands |
-| grouped fp4 MoE | `V4_MOE_GROUPED=1` | **YES** | claims the single-token score-routed step; declines s>1 to `v4_moe_decode` |
-| MoE decode fast path | `V4_MOE_DECODE=1` | **YES** (default) | the fallback under grouped |
-| DSpark draft collapse | `V4_DSPARK_FAST=1` | **YES** | tail-local; rebinds `DSparkTail.advance_and_draft`, orthogonal to the wire shape |
-| ref-slim, item 1 | `V4_REF_SLIM=1` | **YES** | rebinds `Indexer.forward`, which the `s=1` path calls |
-| W-deep rollback ring | `V4_SPEC_DEPTH=N` | **YES** (required) | pipelining streams W frames before the first is judged; a rewind past the oldest checkpoint refuses loudly. Default 16 |
-| chunked verify | `V4_FAST_VERIFY=1` | **NO — mutually exclusive** | see below |
-| ref-slim, item 2 | `V4_REF_SLIM_NOQAT=1` | composes, but **not lossless** | removes a precision reduction; changes the stream |
-| confidence gate | `V4_DSPARK_CONF_GATE=1` | **NO — refused** | gates a block length the pipelined path never sends |
+| lever | env | composes with pipelining? | measured alone | why |
+|---|---|---|---|---|
+| pipelined speculation | `V4_PIPELINED_SPEC=1` | **the base** | **2.67× on a live 6-box ring** | streams `s=1` frames instead of one `[cur]+drafts` block per round, so the D stages fill |
+| whole-layer CUDA graphs | `V4_CUDA_GRAPH=whole` | **YES** | **2.15× on the layer** (attn core graphed, real routed MoE eager) | `_run`'s graph path needs `start_pos > 0`, `s == 1`, not replaying — exactly what a pipelined frame is |
+| island CUDA graphs | `V4_CUDA_GRAPH=1` | **YES** (weaker) | 1.22× on the layer | same gate; graphs only the hc_pre/hc_post/norm islands |
+| grouped fp4 MoE | `V4_MOE_GROUPED=1` | **YES** | MoE.forward 2.35×; whole stage 1.45× eager / 1.54× graphed | claims the single-token score-routed step; declines s>1 to `v4_moe_decode` |
+| MoE decode fast path | `V4_MOE_DECODE=1` | **YES** (default) | — | the fallback under grouped |
+| DSpark draft collapse | `V4_DSPARK_FAST=1` | **YES** | 4.51× at n=6, tail-local | rebinds `DSparkTail.advance_and_draft`, orthogonal to the wire shape |
+| ref-slim, item 1 | `V4_REF_SLIM=1` | **YES** | ~15-22 of ~240 launches/layer on 21 of 43 layers | rebinds `Indexer.forward`, which the `s=1` path calls |
+| W-deep rollback ring | `V4_SPEC_DEPTH=N` | **YES** (required) | — | pipelining streams W frames before the first is judged; a rewind past the oldest checkpoint refuses loudly. Default 16 |
+| chunked verify | `V4_FAST_VERIFY=1` | **NO — mutually exclusive** | — | see below |
+| ref-slim, item 2 | `V4_REF_SLIM_NOQAT=1` | composes, but **not lossless** | — | removes a precision reduction; changes the stream |
+| confidence gate | `V4_DSPARK_CONF_GATE=1` | **NO — refused** | uncalibrated | gates a block length the pipelined path never sends |
+
+**Do not multiply these together and predict a number.** They are measured on different things — a
+ring, a layer, a stage, a drafter call — and three of them (graphs, grouped MoE, ref-slim) all attack
+the same bottleneck, CPU launch count, so they overlap rather than stack. Two numbers in particular
+are routinely over-read:
+
+- **`whole` is 2.15×, not 7.31×.** The receipt's 7.31× wall / 12.01× cpu is the ceiling measured with
+  a STUB MoE; the deployable mode leaves the real routed MoE eager between two graphs.
+- **grouped MoE is 2.35× on `MoE.forward`, not on the stage.** On a real multi-layer stage that lands
+  as 1.45×/1.54×. The older 3.19× came from a one-layer bench with nothing else competing for the
+  launch queue.
+
+The composed number is what the ring measures. That is the point of running arm 2 as an anchor.
 
 ### The exclusivity, exactly
 
