@@ -64,9 +64,14 @@ model.py:497), which is why `reset()` zeroes the underlying buffers IN PLACE rat
 modules: the aliases are views, so they follow, and the weights survive.
 
 WHAT IS A SEAM HERE AND NOT YET A FEATURE
-  _spec       arm it and a chunk at `start_pos > 0` checkpoints the rollback-able state before it is
-              touched; `_seek` then rewinds INSIDE that chunk (restore + replay the accepted prefix),
-              which is what makes a rejected speculation safe to commit. One chunk deep, by design.
+  _spec       arm it and every forward at `start_pos > 0` checkpoints the rollback-able state before
+              it is touched, into a position-keyed ring of the last W (`_spec_ckpts`); `_seek` then
+              rewinds up to W deep (restore the covering checkpoint + replay the accepted prefix),
+              which is what makes a rejected speculation safe to commit. Pipelined speculation streams
+              s=1 frames back-to-back so 5-of-6 idle stages fill, and a rejection W frames downstream
+              has to rewind across every boundary those frames crossed — see `_seek`/`_snapshot` for
+              why crossing a `ratio`-block COMPRESSION boundary stays bit-exact at any depth ≤ W.
+              `commit` drops checkpoints the ring has settled past.
   _dspark     arm it and the stage records `h.mean(dim=2)` after each owned `dspark_target_layer_id`,
               which is the drafter's input (`Transformer.forward:921`). Inert otherwise: the greedy
               path clones nothing.
@@ -76,6 +81,7 @@ WHAT IS A SEAM HERE AND NOT YET A FEATURE
   self-test:  python3 phase0/v4_stage.py --layers 0 4
 """
 import argparse, glob, json, os, sys, torch
+from collections import deque
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetensors import safe_open
@@ -210,7 +216,7 @@ class Stage:
     is for: it loads the embedding on a stage that would otherwise have no use for it."""
 
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
-                 device=None, dtype=None):
+                 device=None, dtype=None, spec_depth=None):
         self.lo, self.hi = lo, hi
         self.args = args if args is not None else config()
         self.device = device or dev
@@ -246,10 +252,20 @@ class Stage:
         # the layers' order however dspark_target_layer_ids happens to be written.
         self._tap_ids = tuple(sorted(li for li in a.dspark_target_layer_ids if lo <= li < hi))
         self._spec = False
-        self._spec_ckpt = None
+        # W-deep rollback ring: pipelined speculation streams W s=1 frames before the first reply
+        # comes back, so a rejection may have to rewind across all of them. maxlen caps how far —
+        # a rewind past the oldest live checkpoint refuses loudly rather than serving stale state.
+        self._spec_depth = spec_depth if spec_depth is not None else int(os.environ.get("V4_SPEC_DEPTH", 16))
+        self._spec_ckpts = deque(maxlen=self._spec_depth)
         self._last_tap = {}
         self._pos = 0
         self.reset()
+
+    @property
+    def _spec_ckpt(self):
+        """The newest live checkpoint, or None. The one-chunk seam generalized to a ring of W: the
+        full-accept no-op and the guard tests read the most recent as 'the' checkpoint."""
+        return self._spec_ckpts[-1] if self._spec_ckpts else None
 
     def _owned_modules(self):
         yield self.layers
@@ -298,7 +314,7 @@ class Stage:
                 c.score_state.fill_(float("-inf"))
         self._pos = 0
         self._last_tap = {}
-        self._spec_ckpt = None
+        self._spec_ckpts.clear()
 
     def _snapshot(self):
         """Clone exactly the state a rejected speculation can poison. `_seek` restores it.
@@ -330,6 +346,20 @@ class Stage:
         tests/test_v4_stage.py::test_rollback_survives_a_poisoned_compressed_region is the red test
         that pins it: it fills every slot this argument calls safe-to-be-stale with NaN, after a
         rewind that lands ON a compression boundary, and the stream must still come out bit-exact.
+
+        THE ARGUMENT IS DEPTH-INVARIANT, which is what lets `_seek` rewind W frames and not one. The
+        read set `[0, (P+1)//ratio)` is a function of the POSITION P alone -- slot j enters it exactly
+        at P = q = (j+1)*ratio-1, the same position that writes it, at no earlier P and for no compress
+        ratio. A rewind to r = (last committed + 1) re-processes every position >= r in order, so a
+        slot poisoned by a rejected frame (necessarily at some q >= r, since positions < r committed)
+        is rewritten at its own q before that q reads it -- however many boundaries, ratio-4 overlap
+        or ratio-8 plain, the W rejected frames crossed. What the snapshot must carry FULLY for this to
+        hold is the whole window ring plus BOTH accumulators of every compressor incl. the Indexer's
+        (kv_state/score_state, all rows) -- the overlap compressor mutates them at each boundary (the
+        `kv_state[:ratio] = kv_state[ratio:]` shift, model.py:359) and a partial clone would restore a
+        half-shifted ring. tests/test_v4_stage.py::test_multi_deep_rollback_across_boundaries streams
+        W s=1 frames, rewinds the whole way across several boundaries, NaN-poisons, and its
+        mutation-check proves a snapshot that drops any of those rows is caught.
 
         The Indexer's own kv_cache needs no window snapshot at all: unlike Attention's it is
         entirely compressed slots, with no ring prefix (model.py:405)."""
@@ -377,22 +407,28 @@ class Stage:
     def _seek(self, start_pos):
         """Move the stage to `start_pos`, or refuse. k3_stage._seek's shape, V4's reasons.
 
-        A rewind IS the speculative rollback: the round after a partial accept re-feeds the ring from
-        the last COMMITTED position, so every stage has to put its per-token state back to what that
-        position left behind. V4's is simpler than K3's -- no recurrent state to unwind and no KV to
-        crop, because the reference's buffers are POSITION-INDEXED (`kv_cache[:, p % win]`,
-        `kv_state[:, p % ratio]`). Restore the pre-chunk snapshot, re-feed the accepted prefix, and
-        every slot the rejected tail touched has been rewritten by the token that really belongs
-        there; the compressed regions are argued away in `_snapshot`'s docstring.
+        A rewind IS the speculative rollback: a rejection re-feeds the ring from the last COMMITTED
+        position, so every stage has to put its per-token state back to what that position left
+        behind. V4's is simpler than K3's -- no recurrent state to unwind and no KV to crop, because
+        the reference's buffers are POSITION-INDEXED (`kv_cache[:, p % win]`, `kv_state[:, p % ratio]`).
+        Restore the snapshot taken before `start_pos`, re-feed any accepted prefix, and every slot the
+        rejected tail touched has been rewritten by the token that really belongs there; the
+        compressed regions are argued away — at any depth ≤ W — in `_snapshot`'s docstring.
 
-        THE WINDOW IS ONE CHUNK WIDE, on purpose. `_spec_ckpt` covers [ck.start_pos, ck.start_pos + s]
-        — every position that round could commit. A rewind outside it is a coordinator asking for a
-        position no checkpoint describes, and serving it off the current state would be silently
-        wrong instead of loudly broken.
+        UP TO W CHUNKS DEEP. Pipelined speculation streams s=1 frames back-to-back without waiting for
+        replies, so the rejection that arrives while W frames are in flight has to rewind across all W.
+        `_spec_ckpts` is the ring of their pre-frame snapshots; this picks the NEWEST checkpoint whose
+        [start_pos, start_pos+s] still contains the target (an exact per-position snapshot needs no
+        replay; a coarser one replays its accepted prefix) and then SPENDS it and every checkpoint
+        after it — the discarded speculative future. Checkpoints BEFORE the target survive, so a
+        deeper rewind in a later round is still possible; `commit` is what finally drops them. A
+        target the whole ring cannot cover is a coordinator asking for a position no snapshot
+        describes, and serving it off the current state would be silently wrong instead of loudly
+        broken — so it refuses, naming the interval the ring does cover.
 
         THE FULL-ACCEPT PATH NEVER REACHES ANY OF THIS. A round that accepts all g = s-1 drafts
-        commits g+1 tokens, so the next chunk opens at ck.start_pos + s, which IS `_pos` — the no-op
-        return above. Rollback costs exactly nothing on the rounds speculation is winning."""
+        commits g+1 tokens, so the next frame opens exactly at `_pos` — the no-op return above.
+        Rollback costs exactly nothing on the rounds speculation is winning."""
         if start_pos == self._pos:
             return
         if start_pos > self._pos:
@@ -400,21 +436,38 @@ class Stage:
                 f"v4 stage[{self.lo}:{self.hi}]: start_pos {start_pos} is ahead of the {self._pos} "
                 f"tokens this stage has seen — a gap means the skipped tokens were never fed "
                 f"through this block's layers (reset() first, or replay from {self._pos})")
-        ck = self._spec_ckpt
-        if ck is None or not (ck["start_pos"] <= start_pos <= ck["start_pos"] + ck["s"]):
-            covered = "none" if ck is None else f"[{ck['start_pos']}, {ck['start_pos'] + ck['s']}]"
+        ck = next((c for c in reversed(self._spec_ckpts)
+                   if c["start_pos"] <= start_pos <= c["start_pos"] + c["s"]), None)
+        if ck is None:
+            covered = ("none" if not self._spec_ckpts else
+                       f"[{self._spec_ckpts[0]['start_pos']}, "
+                       f"{self._spec_ckpts[-1]['start_pos'] + self._spec_ckpts[-1]['s']}]")
             raise RuntimeError(
                 f"v4 stage[{self.lo}:{self.hi}]: cannot rewind {self._pos} -> {start_pos}; the spec "
-                f"checkpoint covers {covered}. A rollback only ever rewinds INSIDE the most recent "
-                f"speculative chunk — arm _spec (the reset's `spec` flag does it) and rewind before "
-                f"the next chunk spends the checkpoint. reset() is the only other way back.")
+                f"checkpoint covers {covered} (the last W speculative frames' ring). A rollback only "
+                f"rewinds inside that ring — arm _spec (the reset's `spec` flag does it) and rewind "
+                f"before `commit` or the maxlen cap drops the checkpoint. reset() is the only other "
+                f"way back.")
         self._restore(ck["state"])
         self._pos = ck["start_pos"]
-        n = start_pos - ck["start_pos"]                     # the accepted prefix of the spent chunk
+        n = start_pos - ck["start_pos"]                     # the accepted prefix of the spent frame
         if n:
             self._replay(ck["h"][:, :n], ck["ids"][:, :n], ck["start_pos"])
         self._pos = start_pos
-        self._spec_ckpt = None                              # spent: forward() takes a fresh one
+        while self._spec_ckpts and self._spec_ckpts[-1]["start_pos"] >= ck["start_pos"]:
+            self._spec_ckpts.pop()                          # spent: the frame + every one it un-did
+
+    def commit(self, pos):
+        """Drop every checkpoint the ring has settled irrevocably past. The coordinator's ack.
+
+        A checkpoint covering [p, p+s] is only ever rewound INTO to reach a position in that span; once
+        `pos` tokens are committed the ring will never ask to go below `pos`, so a checkpoint that ends
+        at or before it is dead weight. Dropping frees its clones (a window ring + both accumulators
+        per compressor, per frame) — the memory the W-deep ring costs — without disturbing anything
+        still in flight. Idempotent and cheap; the maxlen cap is the backstop when commits lag."""
+        keep = deque((c for c in self._spec_ckpts if c["start_pos"] + c["s"] > pos),
+                     maxlen=self._spec_ckpts.maxlen)
+        self._spec_ckpts = keep
 
     # ---- the serve contract ----
 
@@ -471,10 +524,14 @@ class Stage:
         self._seek(start_pos)
         if self._spec and start_pos > 0:
             # Taken BEFORE anything is touched: the whole point is to be able to put the stage back
-            # the way an unaccepted chunk found it. `h`/`ids` ride along so step 5 can re-drive the
-            # accepted prefix without asking the previous stage to re-send it.
-            self._spec_ckpt = {"start_pos": start_pos, "s": s, "state": self._snapshot(),
-                               "h": h.clone(), "ids": ids.clone()}
+            # the way an unaccepted frame found it. `h`/`ids` ride along so a rewind can re-drive the
+            # accepted prefix without asking the previous stage to re-send it. Pushed onto the W-deep
+            # ring — pipelined speculation streams the next frame before this one is judged, so the
+            # ring may hold W un-judged snapshots at once (maxlen evicts the oldest, `commit` the
+            # settled). A re-armed forward at the same start_pos (a rewind then a fresh frame) simply
+            # pushes a newer checkpoint; `_seek` reads the newest that covers its target.
+            self._spec_ckpts.append({"start_pos": start_pos, "s": s, "state": self._snapshot(),
+                                     "h": h.clone(), "ids": ids.clone()})
         taps = {}
         with torch.no_grad():
             if start_pos == 0 or s == 1:

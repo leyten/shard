@@ -64,7 +64,7 @@ def _ids(n, args, seed=0):
 
 # ── oracle -> stage weight transfer ──────────────────────────────────────────────────────────────
 
-def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=False):
+def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=False, spec_depth=None):
     """A Stage over [lo, hi) holding the oracle's OWN weights, transferred in process.
 
     No checkpoint round-trip and no name mapping: `Stage.layers[i]` is the same `Block` class the
@@ -78,7 +78,8 @@ def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=Fals
     in any state_dict here -- each Stage allocates its own, in its constructor state."""
     head = (lo == 0) if head is None else head
     tail = (hi == args.n_layers) if tail is None else tail
-    st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device="cpu")
+    st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device="cpu",
+                  spec_depth=spec_depth)
     for li in range(lo, hi):
         st.layers[li - lo].load_state_dict(oracle.layers[li].state_dict(), strict=True)
     if st.embed_tokens is not None:
@@ -541,6 +542,237 @@ def test_a_refused_frame_does_not_spend_the_rollback(oracle, args):
         st.forward(st.embed(_ids(3, args, seed=9)), mismatched, PROMPT + 1)
     assert st._pos == PROMPT + CHUNK and st._spec_ckpt is not None, \
         "a rejected frame rewound the stage before noticing it was malformed"
+
+
+# ── 7c. the W-deep rollback — pipelined speculation ──────────────────────────────────────────────
+
+def stream_spec(st, ids, start_pos):
+    """Feed `ids` through a single stage one position at a time with _spec armed — a sender that
+    streams s=1 speculative frames back-to-back, which is what fills the 5-of-6 idle pipeline stages.
+
+    Each forward pushes its own pre-frame checkpoint, so the ring ends holding one per position: the
+    W un-judged snapshots a rejection W frames downstream has to rewind through. The one-shot s=W
+    chunk the existing tests use collapses all of that into a single checkpoint and never exercises
+    the ring."""
+    for i in range(ids.shape[1]):
+        st.forward(st.embed(ids[:, i:i + 1]), ids[:, i:i + 1], start_pos + i)
+
+
+@pytest.mark.parametrize("prompt,W,k", [
+    (13, 12, 0),    # reject all 12 — rewind across ratio-4 boundaries 15,19,23 and ratio-8 15,23
+    (13, 12, 3),    # commit 3, reject a boundary-crossing tail
+    (11, 14, 1),    # a 13-frame rejected tail, several ratio blocks wide
+    (17, 10, 5),    # tail [22,27) crosses the ratio-4 AND ratio-8 boundary at p=23
+    (40, 12, 3),    # past index_topk*ratio=32: the Indexer now DISCRIMINATES, so its own compressor
+    (40, 12, 0),    # accumulators are load-bearing — a regime the short-prompt tests never reach
+    (13, 12, 12),   # full accept at depth W — still the no-op path
+])
+def test_multi_deep_rollback_across_boundaries(oracle, args, prompt, W, k):
+    """Stream W s=1 frames, rewind up to W deep across several compression boundaries, NaN-poison the
+    stale compressed region, and match sequential decode bit-for-bit.
+
+    test_rollback_is_bit_exact + test_rollback_survives_a_poisoned_compressed_region taken to the
+    depth pipelined speculation runs at: not one chunk, but W frames streamed before the first reply,
+    so the rejection unwinds a ring of W checkpoints crossing ratio-4 (overlap) and ratio-8 (plain)
+    boundaries at once. The compressed regions are STILL not snapshotted; the poison proves the
+    depth-invariant write-before-read argument in Stage._snapshot's docstring holds W deep, not one."""
+    ratios = [r for r in args.compress_ratios if r]
+    assert k == W or any((p + 1) % r == 0 for r in ratios for p in range(prompt + k, prompt + W)), \
+        "this case rejects no compression boundary — it would not exercise the argument"
+
+    ids = _ids(prompt + W, args)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    st = stage_from_oracle(oracle, args, 0, args.n_layers)
+    st._spec = True
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    assert st._pos == prompt + W
+    assert len(st._spec_ckpts) == W, "one pre-frame checkpoint per streamed s=1 frame"
+
+    st._seek(prompt + k)
+    assert st._pos == prompt + k
+    if k == W:
+        assert len(st._spec_ckpts) == W, "full accept is the no-op path — nothing restored or spent"
+    else:
+        assert all(c["start_pos"] < prompt + k for c in st._spec_ckpts), \
+            "every checkpoint at or after the rewind target is spent; earlier ones survive"
+        _poison_stale_compressed(st)
+
+    want = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    run([want], head, 0)
+    for j in range(k):
+        run([want], chunk[:, j:j + 1], prompt + j)
+
+    first = _ids(1, args, seed=5)
+    for i, ((h_got, l_got), (h_want, l_want)) in enumerate(
+            zip(stream(st, first, prompt + k, STEPS + 3),
+                stream(want, first, prompt + k, STEPS + 3))):
+        assert torch.isfinite(h_got).all(), \
+            f"step {i}: a poisoned compressed slot was READ before being rewritten — the " \
+            f"write-before-read ordering broke {W - k} frames deep"
+        assert torch.equal(h_got, h_want) and torch.equal(l_got, l_want), \
+            f"step {i}: W-deep rollback diverged from sequential decode (rewound {W - k} frames)"
+
+
+def _snapshot_dropping(st, region):
+    """A `_snapshot` that fails to preserve exactly ONE region the real one covers — the mutation the
+    green must catch. Restore it and the W-deep rollback has to diverge, or the poison test is
+    vacuous (a snapshot that copied nothing would pass it just as well)."""
+    real = V4.Stage._snapshot
+
+    def broken():
+        snap = real(st)
+        n = len(st.layers)
+        if region == "window":
+            for e in snap[:n]:
+                e["win"].zero_()
+        else:
+            for (c, is_idx), e in zip(st._compressors(), snap[n:]):
+                if region == "indexer" and not is_idx:
+                    continue
+                if region in ("kv_state", "indexer"):
+                    e["kv_state"].zero_()
+                if region in ("score_state", "indexer"):
+                    e["score_state"].zero_()
+        return snap
+
+    return broken
+
+
+@pytest.mark.parametrize("region", ["window", "kv_state", "score_state", "indexer"])
+def test_multi_deep_rollback_mutation_check(oracle, args, region):
+    """Every region the W-deep snapshot preserves is load-bearing: drop it and the rollback DIVERGES.
+
+    Long prompt on purpose — past index_topk*ratio the Indexer discriminates, so dropping its own
+    compressor's accumulators actually moves the selected slots and therefore the output; under 32
+    tokens it picks everything and the drop would be silently harmless (which is itself the reason the
+    short-prompt suite could never have pinned the Indexer's state)."""
+    prompt, W, k = 40, 12, 2
+    ids = _ids(prompt + W, args)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    st = stage_from_oracle(oracle, args, 0, args.n_layers)
+    st._spec = True
+    st._snapshot = _snapshot_dropping(st, region)
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    st._seek(prompt + k)
+
+    want = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    run([want], head, 0)
+    for j in range(k):
+        run([want], chunk[:, j:j + 1], prompt + j)
+
+    first = _ids(1, args, seed=5)
+    diverged = any(
+        not torch.equal(g[0], w[0]) or not torch.equal(g[1], w[1])
+        for g, w in zip(stream(st, first, prompt + k, STEPS + 5),
+                        stream(want, first, prompt + k, STEPS + 5)))
+    assert diverged, \
+        f"dropping {region!r} from the snapshot changed nothing — the W-deep poison test is vacuous"
+
+
+def test_multi_deep_rollback_exceeds_window(oracle, args):
+    """A rewind farther back than `window_size` positions is still exact. The window snapshot is a
+    FULL copy of the ring, not its last few slots, so the ring's depth is bounded by W (the checkpoint
+    count) and never by the window — the one buffer whose size might have looked like the real cap."""
+    win = args.window_size
+    prompt, W, k = 20, win + 6, 0                          # 22 frames, well past the 16-slot ring
+    assert W > win
+    st = stage_from_oracle(oracle, args, 0, args.n_layers, spec_depth=W + 2)
+    st._spec = True
+    ids = _ids(prompt + W, args)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    st._seek(prompt + k)
+    _poison_stale_compressed(st)
+
+    want = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    run([want], head, 0)
+
+    first = _ids(1, args, seed=5)
+    for i, ((h_got, l_got), (h_want, l_want)) in enumerate(
+            zip(stream(st, first, prompt + k, STEPS + 3),
+                stream(want, first, prompt + k, STEPS + 3))):
+        assert torch.isfinite(h_got).all() and torch.equal(h_got, h_want) and torch.equal(l_got, l_want), \
+            f"step {i}: rewind {W} deep (> window {win}) diverged from sequential decode"
+
+
+def test_multi_deep_rollback_on_a_split_chain(oracle, args):
+    """The ring is PER-STAGE: the coordinator rewinds every stage to the same position, and each one
+    restores its own window ring and compressor accumulators. A three-stage split streamed and rewound
+    W deep must decode exactly what a fresh chain fed the accepted prefix one token at a time does — so
+    nothing about the rollback depends on a stage owning the whole stack."""
+    prompt, W, k = 13, 12, 3
+    ids = _ids(prompt + W, args)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    split = chain(REFCPU.build_oracle(args, SEED), args, SPLITS)
+    for st in split:
+        st._spec = True
+    run(split, head, 0)
+    for i in range(W):
+        tok = chunk[:, i:i + 1]
+        h = split[0].embed(tok)
+        for st in split:
+            h = st.forward(h, tok, prompt + i)
+    for st in split:
+        st._seek(prompt + k)
+    assert [st._pos for st in split] == [prompt + k] * len(SPLITS)
+
+    want = chain(REFCPU.build_oracle(args, SEED), args, SPLITS)
+    run(want, head, 0)
+    for j in range(k):
+        run(want, chunk[:, j:j + 1], prompt + j)
+
+    first = _ids(1, args, seed=5)
+    assert [t.tolist() for t in greedy(split, first, prompt + k, STEPS)] == \
+           [t.tolist() for t in greedy(want, first, prompt + k, STEPS)], \
+        "the split chain's rollback diverged from sequential decode"
+
+
+def test_rewind_deeper_than_W_refuses(oracle, args):
+    """The ring is W deep and no deeper. Stream W+2 frames into a W-cap ring: the two oldest are
+    evicted, so a rewind to their positions refuses (loudly, naming the interval still covered) rather
+    than serving off a checkpoint that no longer exists — while a rewind INSIDE the ring still works."""
+    W, prompt = 4, 13
+    st = stage_from_oracle(oracle, args, 0, args.n_layers, spec_depth=W)
+    st._spec = True
+    ids = _ids(prompt + W + 2, args)
+    run([st], ids[:, :prompt], 0)
+    stream_spec(st, ids[:, prompt:], prompt)
+    assert len(st._spec_ckpts) == W, "maxlen caps the ring at W live checkpoints"
+    assert st._spec_ckpts[0]["start_pos"] == prompt + 2, "the two oldest frames were evicted"
+
+    with pytest.raises(RuntimeError, match="cannot rewind"):
+        st._seek(prompt + 1)                               # below the ring — evicted
+    assert st._pos == prompt + W + 2, "a refused rewind must not move the stage"
+
+    st._seek(prompt + 3)                                   # inside the ring — fine
+    assert st._pos == prompt + 3
+
+
+def test_commit_drops_settled_checkpoints(oracle, args):
+    """commit(pos) frees the checkpoints the ring has settled irrevocably past — the memory the
+    W-deep ring costs — and leaves everything still in flight rewindable and bit-exact."""
+    prompt, W = 13, 8
+    st = stage_from_oracle(oracle, args, 0, args.n_layers)
+    st._spec = True
+    ids = _ids(prompt + W, args)
+    run([st], ids[:, :prompt], 0)
+    stream_spec(st, ids[:, prompt:], prompt)
+    assert len(st._spec_ckpts) == W
+
+    st.commit(prompt + 3)
+    assert all(c["start_pos"] + c["s"] > prompt + 3 for c in st._spec_ckpts)
+    assert st._spec_ckpts[0]["start_pos"] == prompt + 3, "s=1 frames ending at/below the ack are gone"
+
+    with pytest.raises(RuntimeError, match="cannot rewind"):
+        st._seek(prompt + 2)                               # settled past — refuse
+    st._seek(prompt + 5)                                   # still in flight — bit-exact rewind
+    assert st._pos == prompt + 5
 
 
 # ── 8. the red test ──────────────────────────────────────────────────────────────────────────────
