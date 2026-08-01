@@ -6,9 +6,19 @@ never reimplemented. This file is the cross-session anchor: read it first, updat
 
 ## RESUME HERE (2026-08-01)
 
-Best measured single-stream number on a real scattered ring: **3.68 tok/s end-to-end / 5.35 decode-only**, pipelined
-speculative decode, output **bit-identical to greedy**, receipts verified out-of-process.
-Target is 20 tok/s. The open work is listed under "What is actually blocking 20" below.
+Best measured single-stream number on a real scattered ring: **5.91 tok/s end-to-end /
+7.78 decode-only** — 192 tokens, six distinct EU RTX 5090s, `V4_MOE_GROUPED=1 V4_CUDA_GRAPH=1`,
+`V4_SPEC_DEPTH=6`, pipelined DSpark. Output **bit-identical to greedy** (`pipelined_equals_greedy`),
+6/6 receipts, g = 6.4. That is **2.3x greedy** on the same ring (2.56 / 2.88).
+
+Target is 20 tok/s and it is **not reachable on this ring shape** — see §1. Getting there needs a
+draft block >= 12 *and* roughly 8-16x on per-stage compute.
+
+**MEASURE WARM, THREE TIMES, OR DO NOT MEASURE.** A single cold pass said grouped MoE was 2.3x
+SLOWER (2.2 -> 0.945). Warm, it is **1.6x faster** (2.90 -> 4.66) — the cold number was wrong by
+~3.7x in the wrong direction and would have discarded the most valuable lever in the engine. The
+grouped path JIT-compiles kernels the baseline never touches, and graph capture costs tens of
+seconds against a ~30 s window. Run every config three times and discard the first.
 
 ## The model
 
