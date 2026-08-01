@@ -102,6 +102,19 @@ Proven on the CPU oracle (ground truth = sequential decode), all green:
   So the green above is load-bearing, not an accident of harmless numbers.
 - `test_rewind_deeper_than_W_refuses`, `test_commit_drops_settled_checkpoints`, and the split-chain
   case pin the bounded-`W` refusal, the commit-drop, and per-stage independence.
+- `test_multi_deep_rollback_at_a_larger_ratio` (ratio 16) and `test_multi_deep_rollback_batched` (b=2)
+  close the two coverage gaps that would otherwise weaken the toy-oracle→shipped-model inference:
+  ratio-agnosticism beyond 4/8, and a snapshot that restores *all* batch rows.
+
+**Independently attacked.** An adversarial verifier tried to break the claim with its own harness
+(scratch, not committed): 36 cases across interleaved push/spend/re-push rollbacks, boundary-exact
+targets (on vs one-past, both ratios, incl. the double boundary), deep multi-boundary rewinds with the
+overlap shift inside the rejected tail, correction tokens differing from the drafts, `commit()`
+off-by-one and maxlen eviction, long-context (Indexer discriminating), coarse-checkpoint replay, and 6
+randomized fuzzer seeds — every one NaN-poisoned and graded against a fresh sequential oracle on both
+`h` and logits. **No case diverged.** Its own harness was mutation-audited (8/8) so the green is not
+vacuous. The single red it reported was a bug in its parametrization — it asked to rewind to an
+*evicted* frame, and `_seek` refused correctly.
 
 **Verdict on the gate: GO.** Multi-deep rollback is bit-exact, at any depth `≤ W`, across compression
 boundaries. The lever is safe to build.

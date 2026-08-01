@@ -19,7 +19,12 @@ Everything runs on CPU against v4_ref_cpu's toy 8-layer V4 (2 hash-routed MoE la
 + ratio-4-indexed + ratio-8-compressed attention, 4 HC streams, 3 DSpark taps) with the whole
 single-process Transformer as the oracle -- no GPU, no network, no 158 GiB checkpoint.
 
-Run: python3 -m pytest tests/test_v4_stage.py -q
+Run: OMP_NUM_THREADS=1 python3 -m pytest tests/test_v4_stage.py -q
+
+Pin the threads. At cpu_args' toy shape (dim 256) torch's intra-op threading is pure contention --
+measured 1.78 s per decode step at 4 threads against 0.079 s at 1, a 22x slowdown, and this suite
+decodes thousands of single positions. It changes no numerics (every comparison here is
+stage-vs-oracle inside ONE process at the same thread count).
 """
 import os
 import sys
@@ -731,6 +736,75 @@ def test_multi_deep_rollback_on_a_split_chain(oracle, args):
     assert [t.tolist() for t in greedy(split, first, prompt + k, STEPS)] == \
            [t.tolist() for t in greedy(want, first, prompt + k, STEPS)], \
         "the split chain's rollback diverged from sequential decode"
+
+
+def test_multi_deep_rollback_at_a_larger_ratio(args):
+    """The depth-invariance argument is RATIO-AGNOSTIC, so prove it at a ratio far from 4 and 8.
+
+    The shipped config compresses at 4 and 128; cpu_args uses 4 and 8 so a short prompt still crosses a
+    boundary. That leaves "does a big ratio behave differently" untested, and the whole reason a toy
+    oracle licenses a claim about the 158 GiB model is that the read set [0,(P+1)//ratio) has the same
+    shape at every ratio. Ratio 16 (plain, no overlap — only 4 overlaps) with a rejected tail crossing
+    p=31 is that check."""
+    a = REFCPU.cpu_args(compress_ratios=(0, 0, 4, 16, 4, 16, 4, 0, 0, 0))
+    prompt, W, k = 20, 14, 2
+    assert any((p + 1) % 16 == 0 for p in range(prompt + k, prompt + W)), "must cross a ratio-16 bound"
+    o = REFCPU.build_oracle(a, SEED)
+    ids = _ids(prompt + W, a)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    st = stage_from_oracle(o, a, 0, a.n_layers)
+    st._spec = True
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    st._seek(prompt + k)
+    _poison_stale_compressed(st)
+
+    want = stage_from_oracle(REFCPU.build_oracle(a, SEED), a, 0, a.n_layers)
+    run([want], head, 0)
+    for j in range(k):
+        run([want], chunk[:, j:j + 1], prompt + j)
+
+    first = _ids(1, a, seed=5)
+    for i, ((h_got, l_got), (h_want, l_want)) in enumerate(
+            zip(stream(st, first, prompt + k, STEPS), stream(want, first, prompt + k, STEPS))):
+        assert torch.isfinite(h_got).all() and torch.equal(h_got, h_want) and torch.equal(l_got, l_want), \
+            f"step {i}: W-deep rollback diverged at compress ratio 16"
+
+
+def test_multi_deep_rollback_batched(args):
+    """b=2. `_snapshot` clones whole buffers (all `max_batch_size` rows), not `[:bsz]`, and the
+    reference indexes every write `[:bsz, ...]` — so a rollback must restore BOTH rows and the two
+    sequences must stay independent. A snapshot that silently covered only row 0 passes every b=1 test
+    in this file."""
+    prompt, W, k = 13, 10, 3
+    b = 2
+    assert args.max_batch_size >= b
+    g = torch.Generator().manual_seed(11)
+    ids = torch.randint(0, args.vocab_size, (b, prompt + W), generator=g)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    st = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    st._spec = True
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    st._seek(prompt + k)
+    _poison_stale_compressed(st)
+
+    want = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    run([want], head, 0)
+    for j in range(k):
+        run([want], chunk[:, j:j + 1], prompt + j)
+
+    nxt = torch.randint(0, args.vocab_size, (b, 1), generator=g)
+    pos = prompt + k
+    for i in range(STEPS):
+        h_got, l_got = run([st], nxt, pos + i)
+        h_want, l_want = run([want], nxt, pos + i)
+        assert h_got.shape[0] == b
+        assert torch.isfinite(h_got).all() and torch.equal(h_got, h_want) and torch.equal(l_got, l_want), \
+            f"step {i}: batched W-deep rollback diverged from sequential decode"
+        nxt = l_got.argmax(dim=-1).unsqueeze(1)
 
 
 def test_rewind_deeper_than_W_refuses(oracle, args):
