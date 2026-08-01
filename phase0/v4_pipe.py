@@ -47,10 +47,14 @@ WHAT CROSSES THE RETURN TUNNEL: a TOKEN, not logits (V4's vocab is 129280 — a 
 vector would dwarf the boundary payload for no gain). The tail runs hc_head + final norm + lm_head,
 argmaxes, and returns the int id.
 
-PHASE 1 IS GREEDY (g=1). V4 ships a DSpark drafter with open code, and its tail-side seam is here
-(TAIL_DRAFTER, below) — but step 4 builds the drafter and step 5 the stage rollback that makes a
-speculative chunk safe to commit. coordinate_spec() is wired and pinned by tests against a scripted
-tail; it must not be pointed at a real ring until the stage stops raising on a rewind.
+THREE WAYS TO DECODE, ONE ACCEPT RULE. coordinate() is greedy (g=1). coordinate_spec() drafts on the
+COORDINATOR (n-gram/repeat — any proposer) and coordinate_dspark() lets the TAIL draft with V4's own
+trained MTP speculator, which is where that drafter has to run because `main_hidden` never leaves the
+box. Both drafted paths verify a whole chunk in one traversal, commit the accepted prefix plus one
+correction, and are LOSSLESS: the committed stream is bit-identical to greedy, because every logits
+row the tail ever computes is taken at the same GEMM shape (_tail_logit_rows) and because a rejected
+tail is rolled back by Stage._seek before the next chunk. The accept rule itself is ONE function,
+v4_dspark_draft.plan_verify_round, run by both ends of every round and asserted to agree.
 
   self-test (CPU, no GPU, no spend):  python3 phase0/v4_pipe.py selftest
   self-test, multi-GPU tail box:      python3 phase0/v4_pipe.py selftest-relay
@@ -110,6 +114,15 @@ RECEIPTS = os.environ.get("SHARD_RECEIPTS", "") not in ("", "0")
 V4_MODEL_ID = "deepseek-ai/DeepSeek-V4-Flash-0731"
 N_LAYERS = 43                                          # the shipped config's n_layers (not the DSpark stages)
 
+# The two fields V4's shipped config.json OMITS. ModelArgs defaults them to 4096 / 4, and everything
+# a stage allocates is sized off them: the freqs_cis table, every kv_cache (window + max_seq_len//ratio
+# compressed slots), the Indexer's cache and the DSpark drafter's end-of-context guard. Left alone, an
+# 8k benchmark rolls off the end of freqs_cis and the drafter stops drafting at ~4090, while a batch
+# of 4 pays 4x the cache for a ring that serves one sequence. generate.py:84-85 patches the same two
+# fields for its own interactive path; a Stage built straight from config.json does not.
+V4_MAX_SEQ = int(os.environ.get("V4_MAX_SEQ", "8192") or 8192)
+V4_MAX_BATCH = int(os.environ.get("V4_MAX_BATCH", "1") or 1)
+
 # A dead forward leg is an EDGE fault, not a process death — see _fwd_open.
 _LEG_ERRORS = (OSError, EOFError)
 
@@ -120,6 +133,19 @@ def _v4():
     Everything above this line is protocol; everything that calls this needs weights."""
     import v4_stage
     return v4_stage
+
+
+def _dspark():
+    """phase0/v4_dspark_draft, imported on first use. Costs `import torch` and nothing else.
+
+    The coordinator needs exactly ONE thing from it — `plan_verify_round`, the accept rule — and the
+    tail needs the drafter. Two implementations of "longest matching prefix" that ever disagreed
+    would desynchronise the drafter from the committed stream while both halves still looked
+    plausible, so there is one function and both ends import it. v4_dspark_draft resolves v4_stage
+    lazily for precisely this reason: the protocol layer must keep running on a box with no
+    checkpoint loader."""
+    import v4_dspark_draft
+    return v4_dspark_draft
 
 
 # Building a Stage is not thread-safe, and that is a property of the REFERENCE, not of v4_stage:
@@ -282,18 +308,22 @@ def sample_token(logits_row, temp=0.0, gen=None):
     return int(logits_row.argmax().item())
 
 
-# ── DSpark tail seam (step 4 fills this) ───────────────────────────────────────────────────────────
+# ── DSpark tail seam ───────────────────────────────────────────────────────────────────────────────
 # V4 ships a TRAINED speculator (the DSpark MTP stages) that lives on the TAIL, not on the
 # coordinator: forward_spec() needs `main_hidden` — the mean-pooled hidden of the last few main
 # layers — which only the tail holds. So a V4 drafted round does not stream aux down the ring the way
 # K3's DSpark did; the tail drafts locally and returns the draft with the token.
 #
-# THE SEAM: set this module-level hook to an object with
+# THE SEAM: an object with
 #     on_chunk(msg, st, out) -> dict | None
 # where `msg` is the received step frame, `st` the tail Stage (st.tail_main_hidden() is the
 # [b, s, 3*dim] the MTP stages consume) and `out` the reply dict already holding {"token": ...} (and
 # "tokens" when the job is spec-armed). Whatever it returns is merged into the reply. It is called
 # ONLY on a step frame of a job whose reset armed dspark, so a greedy ring never touches it.
+#
+# The real one is v4_dspark_draft.RingDrafter, which a --dspark tail builds for itself on the first
+# drafted job (_tail_drafter). Setting this module hook OVERRIDES that — it is the injection point a
+# test scripts a tail with, and it stays None in every deployment.
 TAIL_DRAFTER = None
 
 
@@ -381,6 +411,33 @@ def _fwd_open(kw, nxt, timeout, msg, tag="[s]"):
     return sock
 
 
+def ring_args(ckpt_dir):
+    """The ModelArgs a V4 process is built from, with the fields the shipped config omits filled in.
+
+    ONLY where the checkpoint's own config.json is SILENT, or where the env says so explicitly. That
+    distinction is the whole design: V4's release declares neither max_seq_len nor max_batch_size, so
+    the ring supplies 8192 / 1 (V4_MAX_SEQ / V4_MAX_BATCH) — but a config that DOES declare them means
+    it, and overwriting those would build stages whose caches and freqs_cis table disagree with the
+    model they are graded against. (The CPU parity fixtures declare both; that is how they stay
+    bit-exact against the oracle while a real ring gets 8k.)
+
+    Neither field changes numerics — both only SIZE things. `precompute_freqs_cis` derives its YaRN
+    correction from original_seq_len, not from the table length, and every read of a compressed region
+    is sliced by position (`kv_cache[:bsz, :end_pos // ratio]`), so a longer buffer is a bigger buffer
+    and nothing else. It is memory and reach, not answers."""
+    V4 = _v4()
+    args = V4.config(ckpt_dir)
+    with open(os.path.join(ckpt_dir or V4.V4_DIR, "config.json")) as f:
+        declared = json.load(f)
+    for field, env, default in (("max_seq_len", "V4_MAX_SEQ", V4_MAX_SEQ),
+                                ("max_batch_size", "V4_MAX_BATCH", V4_MAX_BATCH)):
+        if os.environ.get(env):
+            setattr(args, field, int(os.environ[env]))
+        elif field not in declared:
+            setattr(args, field, default)
+    return args
+
+
 def _is_return_hello(msg):
     return isinstance(msg, dict) and msg.get("op") == "hello_return"
 
@@ -411,7 +468,7 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     in-process ring; `ckpt_dir` loads real weights."""
     V4 = _v4()
     head, tail = (stage == 0), (stage == nstages - 1)
-    args = args if args is not None else V4.config(ckpt_dir)
+    args = args if args is not None else ring_args(ckpt_dir)
     dev = device or getattr(V4, "dev", "cuda")
     receipts = RECEIPTS if receipts is None else receipts
     key_path = key_path or NODE_KEY_PATH
@@ -439,7 +496,8 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         ready.set()
 
     if tail:
-        _serve_tail(st, srv, lo, hi, node_key, receipts, timeout)
+        _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
+                                                                           else None))
     elif ret_relay is not None:
         _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
                              timeout, ret_relay)
@@ -621,15 +679,57 @@ def _tail_bringup(srv, timeout):
     return ret, pred, queued
 
 
-def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout):
+def _tail_logit_rows(st, h, start_pos):
+    """The tail's logits, ONE ROW PER CHUNK POSITION, each computed at the SAME GEMM shape greedy
+    decode uses. -> [ [b, vocab] fp32, ... ] with one entry per position the reply answers for.
+
+    THIS IS THE LOSSLESSNESS OF SPECULATION, and it is a shape rule, not an approximation:
+    `hc_head` -> `norm` -> `ParallelHead` over a chunk runs its fp32 GEMMs at M = b*s where greedy
+    decode runs them at M = b, and a different M reassociates the reduction — measured at ~4e-7 in
+    step 2. That is invisible right up until an argmax NEAR-TIE flips, at which point the speculated
+    stream stops being the greedy stream at random, rarely, and unfalsifiably. With every logits row
+    the engine ever computes taken at M = b (greedy decode, the verify rows here), spec == greedy
+    holds BY CONSTRUCTION and the CPU selftest's bit-exact bar actually proves something.
+
+    PREFILL (start_pos == 0) is the one place the whole chunk goes in at once, and it must: the
+    reference's own `Transformer.forward` collapses and norms the entire prompt before
+    `ParallelHead` slices to the last position, so matching the oracle means doing exactly that. It
+    is also where `full_logits=False` earns its keep — at V4's shape a 4096-token prefill's full
+    logits are [1, 4096, 129280] fp32 = 2 GiB, of which one row is wanted."""
+    if start_pos == 0:
+        return [st.logits_all(h, full_logits=False)]
+    return [st.logits_all(h[:, j:j + 1], full_logits=False) for j in range(h.shape[1])]
+
+
+def _tail_drafter(st, ckpt_dir, cache):
+    """The drafter a dspark-armed job hands its chunks to, built ONCE per tail process.
+
+    TAIL_DRAFTER (the module seam) wins when a test injects one; otherwise a real
+    v4_dspark_draft.RingDrafter is built over this tail's own Stage and its `mtp.*` loaded from the
+    same checkpoint dir the layers came from. Lazily, on the first dspark job: a greedy ring never
+    pays for the MTP stages (3 extra Blocks with their own MoE at V4's shape), and a checkpoint
+    without `mtp.*` is a loud failure at the moment someone asks for drafting rather than at boot."""
+    if TAIL_DRAFTER is not None:
+        return TAIL_DRAFTER
+    if cache.get("drafter") is None:
+        cache["drafter"] = _dspark().ring_drafter(st, ckpt_dir)
+        print(f"[tail] dspark drafter {cache['drafter'].tail}", flush=True)
+    return cache["drafter"]
+
+
+def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
     """Tail serve loop. Accepts BOTH inbound streams (predecessor + coordinator-return) on the one
     engine port, classified by the hello_return greeting, then serves: run the block, collapse the
-    hyper-connections, sample, and send the token id back on the return channel."""
+    hyper-connections, sample, and send the token id back on the return channel.
+
+    `ckpt_dir` is set only when the stage was built --dspark: it is where the drafter's `mtp.*` come
+    from, and passing it is what makes a drafted ring possible at all."""
     ret, pred, queued = _tail_bringup(srv, timeout)
     print("[tail] predecessor + coord-return connected", flush=True)
 
     signer = None
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
+    drafter, built = None, {}                                # per-job arm, process-lifetime drafter
     with torch.no_grad():
         while True:
             msg = queued if queued is not None else recv_msg(pred)
@@ -639,8 +739,19 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout):
                 continue
             if op == "reset":
                 st.reset()
-                st._spec = bool(msg.get("spec"))              # arm the stage snapshot/rollback (step 5)
-                st._dspark = bool(msg.get("dspark"))          # arm the DSpark drafter seam (step 4)
+                st._spec = bool(msg.get("spec"))              # arm the stage's snapshot/rollback
+                st._dspark = bool(msg.get("dspark"))          # arm the taps the drafter consumes
+                try:
+                    drafter = _tail_drafter(st, ckpt_dir, built) if st._dspark else None
+                except Exception as e:  # noqa: BLE001 — any drafter fault is this JOB's, not the ring's
+                    # A dspark job on a tail that cannot draft — launched without --dspark, or a
+                    # checkpoint carrying no mtp.* — must fail the JOB and leave the ring standing.
+                    # Raising here kills the serve loop, and the coordinator only ever reads the TAIL,
+                    # so it would see a stall on this job and on every job after it. The reset ack is
+                    # the one channel back, and a non-"ok" ack is already a hard failure there.
+                    print(f"[tail] dspark unavailable: {type(e).__name__}: {e}", flush=True)
+                    send_msg(ret, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                    continue
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
                           if receipts else None)
@@ -660,12 +771,12 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout):
                 h = st.forward(h, ids, start_pos)
                 if signer is not None:
                     signer.observe(in_b, _payload_bytes(h, ids))
-                logits = st.logits_all(h)                     # hc_head + final norm + lm_head, [b,s,vocab]
-                out = {"token": sample_token(logits[0, -1], temp, gen)}
+                rows = _tail_logit_rows(st, h, start_pos)     # hc_head + norm + lm_head, one row per pos
+                out = {"token": sample_token(rows[-1][0], temp, gen)}
                 if getattr(st, "_spec", False):               # spec: model's greedy token at EVERY chunk pos
-                    out["tokens"] = logits[0].argmax(-1).tolist()
-                if getattr(st, "_dspark", False) and TAIL_DRAFTER is not None:
-                    out.update(TAIL_DRAFTER.on_chunk(msg, st, out) or {})   # step-4 seam, see TAIL_DRAFTER
+                    out["tokens"] = [int(r[0].argmax()) for r in rows]
+                if drafter is not None:                       # dspark: draft the next block locally
+                    out.update(drafter.on_chunk(msg, st, out) or {})
                 send_msg(ret, out)
                 continue
             if op == "stop":
@@ -845,12 +956,14 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     accepted draft prefix + one correction: byte-identical to greedy decode (lossless), at up to K+1
     committed tokens per WAN round-trip.
 
-    STEP 5 GATE — do not point this at a real ring yet. A rejected draft leaves the stage's KV and
-    compressor state ahead of the committed sequence, so the round after a partial accept must REWIND
-    them; v4_stage raises on a rewind until step 5 lands. The loop arithmetic itself (accept prefix,
-    commit n+1, rewind pos) is pinned NOW by tests/test_v4_pipe.py against a scripted tail.
+    THE ROLLBACK IS THE STAGE'S. A rejected draft leaves every stage's window ring and compressor
+    accumulators ahead of the committed sequence; re-opening the next chunk at the last committed
+    position is what makes `Stage._seek` restore its pre-chunk snapshot and replay the accepted
+    prefix. This loop's job is to compute that position correctly — `pos = len(ids) - 1`, never the
+    end of the rejected draft.
 
     Returns coordinate()'s dict plus spec stats {rounds, generated, g, accept_hist}."""
+    plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
     propose = _drafter_propose(drafter, ng)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
@@ -880,15 +993,9 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
         rounds += 1
         send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
         r = recv_msg(ret)["tokens"]                           # model greedy token AFTER each chunk pos (K+1)
-        n = 0
-        for j in range(K):                                    # accept the longest matching draft prefix
-            if drafts[j] == r[j]:
-                n += 1
-            else:
-                break
+        n, committed = plan_verify_round(drafts, r)           # longest matching prefix + the correction
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
-        committed = drafts[:n] + [r[n]]                       # n accepted drafts + one free correction
         stop = False
         for t in committed:
             toks.append(int(t))
@@ -910,6 +1017,102 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "generated": gen, "accepted": accepted_total,
+            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
+
+
+def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
+                      job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None):
+    """DSPARK speculative decode over the fire-forward ring — the headline drafted path.
+
+    Same propose->verify->accept->rollback contract coordinate_spec proves, with the proposer moved
+    to where its input already lives. V4 ships a TRAINED speculator (the MTP stages) whose input is
+    `main_hidden`, 24 KiB per position at V4's shape, held only by the tail — so unlike K3's DSpark,
+    nothing is streamed down the ring to draft with. The tail drafts LOCALLY and returns the block
+    with the token, which is why this coordinator takes no drafter argument at all: it is weightless
+    even by speculation's standards, and a drafted round costs the wire a few dozen extra bytes.
+
+    THE ROUND. Reset arms `spec` (the per-position replies + the stage rollback) AND `dspark` (the
+    taps + the drafter). Prefill returns the first token and primes the mtp window. Round 1 is the
+    BARE `[cur]` chunk — the drafter deliberately produces no block at prefill (v4_dspark_draft's
+    FIRST ROUND paragraph) — and every round after sends `[cur] + drafts` where `drafts` came back
+    with the previous round's reply.
+
+    BOTH ENDS RUN THE ACCEPT RULE, ON THE SAME INPUTS, AND MUST AGREE. The tail has to, to know how
+    far to advance the drafter before it can answer; this loop has to, to know what to emit. So the
+    reply carries the tail's own `n` and it is ASSERTED against ours: a mismatch means the two halves
+    of a lossless protocol have diverged, and the drafter is now conditioning on a history the ring
+    never took. That is a job-killing bug, not a degradation, and it fails loudly here rather than
+    surfacing as quietly worse acceptance forever after.
+
+    Returns coordinate()'s dict plus spec stats {rounds, drafted, generated, accepted, g,
+    accept_hist} — `drafted` being the rounds that carried a real block, which is how a selftest
+    tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"."""
+    plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
+    ret.settimeout(timeout)
+    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True})
+    ack = recv_msg(ret)
+    if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
+        raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
+
+    eos = set(eos_ids)
+    ids = list(prompt_ids)                                    # full committed sequence (prompt + gen)
+    toks = []                                                 # generated tokens only
+    rounds, accepted_total = 0, 0
+    hist = {}
+
+    # prefill: the whole prompt as one chunk. The tail also builds the mtp window from its taps here.
+    send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": 0})
+    rep = recv_msg(ret)
+    pos = len(ids)                                            # absolute position of `cur` (not yet fed)
+    cur = int(rep["token"] if isinstance(rep, dict) else rep)
+    ids.append(cur)
+    toks.append(cur)
+    if on_token is not None:
+        on_token(cur)
+
+    drafts = []                                               # round 1 is the bare [cur] chunk
+    drafted = 0                                               # rounds that actually carried a block
+    while len(toks) < max_new and cur not in eos:
+        rounds += 1
+        drafted += bool(drafts)
+        send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
+        rep = recv_msg(ret)
+        if "n" not in rep:
+            raise RuntimeError(
+                "v4 dspark: the tail's reply carries no accept length, so nothing is drafting on it "
+                "— launch the tail stage with --dspark so it builds the MTP speculator")
+        n, committed = plan_verify_round(drafts, rep["tokens"])
+        if int(rep["n"]) != n:
+            raise RuntimeError(
+                f"v4 dspark: the tail accepted {rep['n']} of round {rounds}'s {len(drafts)} drafts "
+                f"and this coordinator accepted {n}, off the same drafts and the same replies. The "
+                f"two ends of a lossless round have diverged, so the drafter is advancing over a "
+                f"history the ring is not taking — one accept rule, and it is plan_verify_round.")
+        accepted_total += n
+        hist[n] = hist.get(n, 0) + 1
+        stop = False
+        for t in committed:
+            toks.append(int(t))
+            ids.append(int(t))
+            if on_token is not None:
+                on_token(int(t))
+            if int(t) in eos or len(toks) >= max_new:
+                stop = True
+                break
+        cur = ids[-1]
+        pos = len(ids) - 1                                    # `cur` sits here — the stage rewinds to it
+        drafts = [int(t) for t in (rep.get("draft") or [])]   # the block drafted off what we committed
+        if stop:
+            break
+
+    recs, receipts_ok = [], None
+    if receipts:
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+    gen = len(toks)
+    return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
+            "receipts": recs, "receipts_ok": receipts_ok,
+            "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
 
 
@@ -1210,18 +1413,62 @@ def _expected_cover(ranges):
     return sorted((lo, hi) for lo, hi in ranges)
 
 
-def selftest(nstages=3, prompt=(3, 9, 17, 2, 41), max_new=6, tail_box_g=1):
-    """Offline, CPU, no spend: a full v4_pipe ring on localhost (head embed + middles + tail sample +
-    weightless coordinator over real shard.transport sockets) decodes greedily, and the token stream
-    is checked BIT-IDENTICAL against the vendored reference Transformer's own greedy decode.
+def _spawn_ring(d, ranges, tail_box_g=1, dspark=False, tag="s"):
+    """Start one localhost ring over a tiny checkpoint and dial it. -> (pipe, ret).
+
+    One stage thread per range — the in-process shape of one box per stage — with the last
+    `tail_box_g` of them standing in for a MULTI-GPU tail box, whose coordinator-return terminates at
+    the box ingress and is bridged to the box tail over loopback (the --ret-relay path). `dspark`
+    builds the tail's MTP speculator, exactly as --dspark does on a real box."""
+    n = len(ranges)
+    ports = _free_ports(n)
+    relay_i = n - tail_box_g                                   # ingress of the multi-GPU tail box (>1)
+    events = [threading.Event() for _ in range(n)]
+    for i, (lo, hi) in enumerate(ranges):
+        nxt = None if i == n - 1 else f"127.0.0.1:{ports[i + 1]}"
+        ret_relay = f"127.0.0.1:{ports[-1]}" if (tail_box_g > 1 and i == relay_i) else None
+        threading.Thread(target=serve_stage, kwargs=dict(
+            stage=i, nstages=n, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=d, device="cpu",
+            receipts=True, key_path=f"{d}/{tag}{i}.key", ret_relay=ret_relay, dspark=dspark,
+            ready=events[i]), daemon=True).start()
+    for e in events:
+        e.wait(120)
+    tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]   # return lands at the tail box ingress
+    return connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{tail_port}", timeout=120)
+
+
+def _dspark_tiling(args, nstages):
+    """A tiling whose TAIL owns EVERY dspark target layer, which even_tiling has no reason to know.
+
+    `Stage.tail_main_hidden()` refuses a split target range — the drafter consumes all the taps
+    concatenated, so they have to land on ONE stage — and at the toy shape even_tiling leaves the
+    first target on the middle stage. That is not a test artifact: it is the placement constraint a
+    real V4 ring has (its tail owns at least max(targets) - min(targets) + 1 layers), and the
+    eventual V4_PROFILE has to encode it or the planner will place a ring that cannot draft."""
+    lo = min(args.dspark_target_layer_ids)
+    if nstages != 3 or lo < 2:
+        raise ValueError(f"the drafted selftest ring wants 3 stages and targets from layer 2 up "
+                         f"(got {nstages} stages, first target {lo})")
+    return [(0, lo // 2), (lo // 2, lo), (lo, args.n_layers)]
+
+
+def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
+    """Offline, CPU, no spend: full v4_pipe rings on localhost (head embed + middles + tail sample +
+    weightless coordinator over real shard.transport sockets), decoding three ways, and every one of
+    them checked BIT-IDENTICAL against the vendored reference Transformer's own greedy decode.
+
+      greedy   coordinate()          one token per traversal — the baseline the other two must match
+      spec     coordinate_spec()     a coordinator-side drafter, deliberately a BAD one (repeat the
+                                     last token), so nearly every round is rejected and every one of
+                                     those REWINDS each stage's window ring + compressor accumulators
+      dspark   coordinate_dspark()   V4's own trained MTP speculator, drafting on the tail
+
+    Losslessness is the whole claim of speculative decoding and it is precisely what is graded here:
+    the same tokens as the reference, bit for bit, with the receipts still settling over the ring.
 
     `tail_box_g` > 1 folds the last G stages into ONE multi-GPU tail box: the coordinator-return
     terminates at that box's ingress and is bridged over loopback to the box tail (the --ret-relay
-    path a real G>1 tail box runs), proving the return relay against the same parity bar.
-
-    NOT covered here, deliberately: coordinate_spec against the real ring. A rejected draft needs the
-    stage to rewind its KV + compressor state, which is step 5 — the spec loop's own arithmetic is
-    pinned by tests/test_v4_pipe.py against a scripted tail until then."""
+    path a real G>1 tail box runs), proving the return relay against the same parity bar."""
     import tempfile
     import v4_ref_cpu as R
     os.environ["SHARD_RECEIPTS"] = "1"
@@ -1238,39 +1485,75 @@ def selftest(nstages=3, prompt=(3, 9, 17, 2, 41), max_new=6, tail_box_g=1):
 
     ref_tokens = _reference_tokens(model, list(prompt), max_new)
     ranges = even_tiling(n_layers, nstages)
-    ports = _free_ports(nstages)
-    relay_i = nstages - tail_box_g                             # ingress of the multi-GPU tail box (>1)
-    events = [threading.Event() for _ in range(nstages)]
-    for i, (lo, hi) in enumerate(ranges):
-        nxt = None if i == nstages - 1 else f"127.0.0.1:{ports[i + 1]}"
-        ret_relay = f"127.0.0.1:{ports[-1]}" if (tail_box_g > 1 and i == relay_i) else None
-        threading.Thread(target=serve_stage, kwargs=dict(
-            stage=i, nstages=nstages, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=d,
-            device="cpu", receipts=True, key_path=f"{d}/s{i}.key", ret_relay=ret_relay,
-            ready=events[i]), daemon=True).start()
-    for e in events:
-        e.wait(120)
-
-    tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]   # return lands at the tail box ingress
-    pipe, ret = connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{tail_port}", timeout=120)
+    pipe, ret = _spawn_ring(d, ranges, tail_box_g)
     r = coordinate(pipe, ret, list(prompt), max_new, nonce="settle-nonce-0", receipts=True,
                    layer_count=n_layers, timeout=120)
+    s = coordinate_spec(pipe, ret, list(prompt), max_new, nonce="spec-nonce-0", receipts=True,
+                        layer_count=n_layers, timeout=120, K=4, drafter=_RepeatDrafter())
+
+    def perfect(seq, K):
+        """The other extreme: propose the reference's OWN continuation, so every draft is accepted.
+
+        A bad drafter only ever exercises rejection; this forces the full-accept path — K+1 tokens
+        committed in one traversal, and a next chunk that opens exactly where the stage already
+        stands (the rollback's zero-cost no-op). It is not circular: a draft is accepted only when
+        the RING's own reply at that position equals it, so a wrong ring rejects it and the
+        correction it commits instead diverges from the reference all the same."""
+        nxt = ref_tokens[len(seq) - len(prompt):][:K]
+        return list(nxt) + [0] * (K - len(nxt))
+    p = coordinate_spec(pipe, ret, list(prompt), max_new, nonce="spec-nonce-1", receipts=True,
+                        layer_count=n_layers, timeout=120, K=2, drafter=perfect)
     send_msg(pipe, {"op": "stop"})
 
+    d_ranges = _dspark_tiling(args, nstages)                   # the drafted ring: its own tail placement
+    d_pipe, d_ret = _spawn_ring(d, d_ranges, tail_box_g, dspark=True, tag="d")
+    k = coordinate_dspark(d_pipe, d_ret, list(prompt), max_new, nonce="dspark-nonce-0",
+                          receipts=True, layer_count=n_layers, timeout=120)
+    send_msg(d_pipe, {"op": "stop"})
+
+    def cover(res, rs):
+        return sorted((c["layer_start"], c["layer_end"])
+                      for c in res["receipts"]) == _expected_cover(rs)
+
     checks = {
+        # A random model's greedy stream usually falls into a fixed point within a token or two, and
+        # "the speculated stream equals the greedy stream" says almost nothing when both are one
+        # token repeated: every drafter is perfect on a constant. The prompt is picked so the
+        # reference's continuation is 6 distinct tokens, and that is asserted rather than assumed.
+        "reference_stream_is_a_fingerprint": (len(set(ref_tokens)) >= max(4, max_new - 1)),
         "full_ring_matches_reference": (r["tokens"] == ref_tokens),
         "receipts_settle": (r["receipts_ok"] is True),
-        "coverage_tiles_all_layers": (sorted((c["layer_start"], c["layer_end"])
-                                             for c in r["receipts"]) == _expected_cover(ranges)),
+        "coverage_tiles_all_layers": cover(r, ranges),
+        "spec_lossless_vs_greedy": (s["tokens"] == ref_tokens),
+        "spec_receipts_settle": (s["receipts_ok"] is True and cover(s, ranges)),
+        # the rejection path above rewinds every round; this is the acceptance path — more than one
+        # token committed per traversal, which is the entire point of the lever
+        "spec_full_accept_commits_a_block": (p["tokens"] == ref_tokens and p["g"] > 1.0
+                                             and max(p["accept_hist"]) == 2),
+        "dspark_lossless_vs_greedy": (k["tokens"] == ref_tokens),
+        "dspark_receipts_settle": (k["receipts_ok"] is True and cover(k, d_ranges)),
+        # A MACHINERY bar, not an acceptance bar. At random weights a trained drafter has nothing to
+        # be right about, so demanding g > 1 here would be demanding luck; what must hold is that real
+        # draft blocks crossed the ring and were verified — every round after the deliberately bare
+        # first one carries one — and that the stream came out exact anyway. Acceptance is a
+        # measurement for real weights on a real ring. Losslessness is provable here, and here it is.
+        "dspark_drafted_real_blocks": (k["rounds"] > 1 and k["drafted"] == k["rounds"] - 1),
     }
     tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
     print("\n=== V4 pipe offline selftest (CPU tiny config) ===")
-    print(f"  ring: {nstages} stages over {n_layers} layers {ranges}{tag}")
-    print(f"  tokens (ring) {r['tokens']}\n  tokens (ref)  {ref_tokens}")
-    for k, v in checks.items():
-        print(f"  [{'PASS' if v else 'FAIL'}] {k}")
-    print("  [SKIP] spec_lossless_vs_greedy — needs the stage rewind (step 5); the loop arithmetic "
-          "is pinned in tests/test_v4_pipe.py")
+    print(f"  ring:   {nstages} stages over {n_layers} layers {ranges}{tag}")
+    print(f"  dspark: {d_ranges} — the tail owns targets {tuple(args.dspark_target_layer_ids)}, "
+          f"block={args.dspark_block_size}")
+    print(f"  tokens (ring)   {r['tokens']}\n  tokens (spec)   {s['tokens']}")
+    print(f"  tokens (dspark) {k['tokens']}\n  tokens (ref)    {ref_tokens}")
+    print(f"  spec   rounds={s['rounds']} accepted={s['accepted']} g={s['g']:.2f} "
+          f"hist={s['accept_hist']}  (repeat-last drafter: rejects, so every round rewinds)")
+    print(f"  spec   rounds={p['rounds']} accepted={p['accepted']} g={p['g']:.2f} "
+          f"hist={p['accept_hist']}  (perfect drafter: full accepts, no rewind)")
+    print(f"  dspark rounds={k['rounds']} drafted={k['drafted']} accepted={k['accepted']} "
+          f"g={k['g']:.2f} hist={k['accept_hist']}")
+    for name, v in checks.items():
+        print(f"  [{'PASS' if v else 'FAIL'}] {name}")
     ok = all(checks.values())
     print(f"\n  {'ALL PASS' if ok else 'FAILURES PRESENT'}", flush=True)
     os._exit(0 if ok else 1)
@@ -1303,7 +1586,7 @@ def _coord_cli(a):
     """The node-daemon serving entrypoint (mirrors shard.coordinate): dial the ring, read jobs as
     JSON lines on stdin, drive decode, and emit the SHARD_JOB_* stdout contract."""
     os.environ.setdefault("V4_DIR", a.dir)
-    layer_count = _v4().config(a.dir).n_layers
+    layer_count = ring_args(a.dir).n_layers                   # same view of the config the stages built
     try:
         from transformers import AutoTokenizer
         tok = AutoTokenizer.from_pretrained(a.dir, trust_remote_code=True)
@@ -1338,7 +1621,12 @@ def _coord_cli(a):
         try:
             prompt_ids = _encode_prompt(tok, job)
             state["t0"] = time.time()
-            if job.get("spec"):                               # speculative decode — STEP 5 (stage rewind)
+            if job.get("dspark"):                             # V4's own trained speculator, on the tail
+                r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                                      nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
+                                      job_id=job_id, layer_count=layer_count, receipts=a.receipts,
+                                      timeout=a.timeout, on_token=_on_token)
+            elif job.get("spec"):                             # coordinator-side drafter (n-gram)
                 r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
                                     nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                                     job_id=job_id, layer_count=layer_count, receipts=a.receipts,
@@ -1358,7 +1646,7 @@ def _coord_cli(a):
                   tokPerSec=round(ngen / elapsed, 3) if elapsed > 0 else None,
                   firstTokenMs=round((state["tft"] or 0) * 1000, 1),
                   elapsedS=round(elapsed, 2),
-                  spec=bool(job.get("spec")),
+                  spec=bool(job.get("spec") or job.get("dspark")), dspark=bool(job.get("dspark")),
                   g=r.get("g"), rounds=r.get("rounds"), acceptHist=r.get("accept_hist"),
                   receipts=[wire_receipt(rr) for rr in (r["receipts"] or [])],
                   receiptsOk=r["receipts_ok"], nonce=job.get("nonce"))

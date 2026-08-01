@@ -69,8 +69,10 @@ cache for the attention and thrown away (model.py:784); nothing speculative is e
 rejected draft leaves the drafter's state untouched by construction, and `reset()` exists for a new
 sequence, not for a rollback. (tests/test_v4_dspark.py::test_cache_never_speculative is the proof:
 the slots the draft block's positions WOULD occupy stay zero.) That is the opposite of the main
-stage, whose window ring and compressor accumulators do need `Stage._snapshot()/_restore()` -- the
-asymmetry is worth remembering when step 5 wires the two together.
+stage, whose window ring and compressor accumulators DO need `Stage._snapshot()/_restore()`, which
+`Stage._seek` spends on the round after a partial accept. The asymmetry is the reason `RingDrafter`
+advances the drafter over the committed prefix and never un-advances it: on the stage side a
+rejected chunk has to be rolled back, on this side it was never recorded.
 
 ── THE NUMERICS RULE STEP 5 MUST READ ────────────────────────────────────────────────────────────
 The tail's VERIFY logits must be computed PER POSITION, with the same GEMM shape greedy decode uses
@@ -87,11 +89,12 @@ logits, which this file does not compute and v4_pipe does.
 
 ── TWO THINGS THE CPU SUITE STRUCTURALLY CANNOT CATCH ────────────────────────────────────────────
 1. THE SHIPPED CONFIG HAS NO `max_seq_len`. config.json declares neither it nor `max_batch_size`,
-   so `v4_stage.config()` takes ModelArgs' defaults (4096 / 4) -- and nothing in v4_stage or v4_pipe
-   overrides them, though generate.py:85 sets 64k for its own interactive path. The `freqs_cis`
-   table, every kv_cache and this drafter's end-of-context guard are all sized off that number, so
-   a long-context ring stops drafting at ~4090 until somebody sets it. Not this file's to fix; this
-   file is where it becomes visible.
+   so `v4_stage.config()` takes ModelArgs' defaults (4096 / 4), though generate.py:85 sets 64k for
+   its own interactive path. The `freqs_cis` table, every kv_cache and this drafter's end-of-context
+   guard are all sized off that number, so a long-context ring would stop drafting at ~4090. Step 5
+   fills the hole where a ring can see it -- `v4_pipe`'s V4_MAX_SEQ / V4_MAX_BATCH (8192 / 1) supply
+   both fields when the checkpoint's own config is silent -- and `RingDrafter` degrades to greedy at
+   whatever limit ends up set, rather than raising inside the tail's serve loop.
 2. `get_dspark_topk_idxs` (model.py:744) builds its index with a bare `torch.arange` on the AMBIENT
    default device. Construction here happens inside `with torch.device(...)`, but that call is at
    FORWARD time, and generate.py gets away with it only because it does a global
@@ -101,11 +104,12 @@ logits, which this file does not compute and v4_pipe does.
    never see it.
 
 ── WHAT IS NOT HERE ──────────────────────────────────────────────────────────────────────────────
-Ring integration (step 5), the confidence head's USE (it is returned raw; gating draft length on it
-is a measurement, not a guess), a ragged batch (one accept length per round, see
-`advance_and_draft`), and CUDA graphs. Also note the cost this adds to the tail: `n_mtp_layers`
-DSparkBlocks are full Blocks with their own MoE -- 3 of them at V4's shipped config, i.e. the tail
-carries ~3 layers of extra weights that the placement planner has to budget for.
+The confidence head's USE (it is returned raw; gating draft length on it is a measurement, not a
+guess), a ragged batch (one accept length per round, see `advance_and_draft` and `RingDrafter`), and
+CUDA graphs. Also note the cost this adds to the tail: `n_mtp_layers` DSparkBlocks are full Blocks
+with their own MoE -- 3 of them at V4's shipped config, i.e. the tail carries ~3 layers of extra
+weights that the placement planner has to budget for, on top of the dspark target layers all having
+to land on it.
 
 self-test:  python3 phase0/v4_dspark_draft.py
 """
@@ -115,7 +119,19 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-import v4_stage
+
+
+def _v4():
+    """phase0/v4_stage, imported on FIRST USE, not at module scope (v4_pipe's LAZY MODEL IMPORT rule).
+
+    `plan_verify_round` is pure python and both ends of the ring need it -- the tail to know how far
+    to advance the drafter, v4_pipe's coordinator to know what to emit -- and there must be exactly
+    ONE implementation of an accept rule, or the two would drift and desynchronise silently. So the
+    coordinator imports THIS module, and this module must not drag the checkpoint loader (and its
+    safetensors dependency) into a process that only speaks protocol."""
+    import v4_stage
+    return v4_stage
+
 
 # The two keys a DSparkBlock's state_dict has but a converted checkpoint deliberately does not.
 # `mtp[k].embed`/`mtp[k].head` are ASSIGNED the main model's modules (model.py:903-904), so they are
@@ -184,7 +200,7 @@ class DSparkTail:
     `temperature` is the DRAFTER's, and it defaults to greedy on purpose -- see the constructor."""
 
     def __init__(self, stage, temperature=0.0):
-        M = v4_stage.ref()
+        M = _v4().ref()
         a = stage.args
         if not stage.tail:
             raise RuntimeError("v4 dspark: the drafter runs on the TAIL — main_hidden is the tap "
@@ -420,8 +436,9 @@ class DSparkTail:
         then checks the report by hand: anything missing beyond those two aliases is a corrupt or
         wrong checkpoint and raises, rather than serving a random-init Markov head behind a valid
         receipt."""
-        d = d or v4_stage.V4_DIR
-        wm = v4_stage.weight_map(d)
+        V4 = _v4()
+        d = d or V4.V4_DIR
+        wm = V4.weight_map(d)
         self.alias_missing = []
         for k, blk in enumerate(self.mtp):
             prefix = f"mtp.{k}."
@@ -432,7 +449,7 @@ class DSparkTail:
                     f"MTP stage {k}. The drafter's weights ship with the model (mtp.0/1/2.*); a "
                     f"checkpoint without them can only be served greedily.")
             missing, unexpected = blk.load_state_dict(
-                {n[len(prefix):]: v4_stage.raw(n, d) for n in names}, strict=False)
+                {n[len(prefix):]: V4.raw(n, d) for n in names}, strict=False)
             extra = sorted(set(missing) - set(ALIAS_KEYS))
             if extra or unexpected:
                 raise RuntimeError(
@@ -448,6 +465,93 @@ class DSparkTail:
                 f"pos={self._pos}>")
 
 
+class RingDrafter:
+    """The tail-side half of a drafted round: v4_pipe's `TAIL_DRAFTER` seam over a `DSparkTail`.
+
+    v4_pipe calls `on_chunk(msg, st, out)` on every step frame of a dspark-armed job — the frame as
+    received, the tail Stage that has just forwarded it, and the reply already holding `token` (the
+    sampled next token) and `tokens` (the model's greedy token at every chunk position). What comes
+    back is merged into that reply, so ONE ring traversal carries both the verified tokens and the
+    next block of drafts.
+
+    WHAT CROSSES THE WIRE. `draft` (g ints), `n` (the accept length) and `conf` (g floats, diagnostic
+    and unused). `main_hidden` -- 24 KiB per position at V4's shape -- never leaves the box; that is
+    the entire reason the drafter runs here rather than on the coordinator, and it is why a drafted
+    round costs the ring a few dozen bytes more than a greedy one.
+
+    WHY THE TAIL RUNS THE ACCEPT RULE TOO. It must advance the mtp cache over exactly the COMMITTED
+    positions before it can draft the next block, and "committed" is `plan_verify_round`'s answer for
+    the round it just forwarded -- which it holds in full: the chunk's drafts are `ids[:, 1:]` and the
+    replies are its own per-position argmax. The coordinator runs the SAME function over the SAME two
+    inputs and asserts the two answers agree (v4_pipe.coordinate_dspark), so a divergence is a loud
+    protocol failure rather than a drafter quietly conditioning on a history the ring never took.
+
+    SINGLE SEQUENCE. The reply protocol is row 0's alone (`_serve_tail` samples `logits[0]`), so a
+    b>1 chunk cannot even express the other rows' accept lengths; it is refused rather than silently
+    drafting for row 0 and advancing the whole batch's lockstep cache. Batching needs the ragged
+    accept path first."""
+
+    def __init__(self, tail):
+        self.tail = tail                                   # a DSparkTail (its 4-method contract)
+        self._done = False
+
+    def on_chunk(self, msg, st, out):
+        ids = torch.as_tensor(msg["ids"], dtype=torch.long)
+        if ids.dim() == 1:
+            ids = ids.unsqueeze(0)
+        if ids.dim() != 2 or ids.shape[0] != 1:
+            raise RuntimeError(f"v4 dspark: a drafted round is single-sequence today, got ids "
+                               f"{tuple(ids.shape)} — see RingDrafter's docstring")
+        start_pos = int(msg["start_pos"])
+        main = st.tail_main_hidden()
+        if start_pos == 0:
+            # THE RING'S PREFILL. The tail holds the tap for every prompt position and `out["token"]`
+            # is the token the model predicted for position P, so this is model.py's __main__ line
+            # exactly: one forward_spec over 0..P-1, which drafts NOTHING (the module docstring's
+            # FIRST ROUND paragraph says why the free-looking first block is deliberately skipped).
+            # Round 1 is therefore the bare `[cur]` chunk, and `plan_verify_round` takes it as the
+            # degenerate drafts == [] case.
+            self.tail.reset()
+            self._done = False
+            self.tail.prefill([int(out["token"])], main)
+            return {}
+        replies = out.get("tokens")
+        if replies is None:
+            raise RuntimeError(
+                "v4 dspark: a dspark job's reset must arm `spec` as well — the accept rule needs the "
+                "model's greedy token at EVERY chunk position, and the tail only computes those when "
+                "_spec is armed (v4_pipe.coordinate_dspark sends both flags)")
+        n, committed = plan_verify_round(ids[0, 1:].tolist(), replies)
+        # THE CONTEXT CLIFF. `advance_and_draft` refuses to draft a block that would rope past
+        # max_seq_len, which happens within block_size+1 positions of the limit. That refusal is
+        # right for the drafter and fatal for the ring — an exception here kills the tail's serve
+        # loop and with it every later job — so the last rounds of a max-length generation degrade to
+        # greedy instead: stop drafting, stop advancing, keep answering. V4_MAX_SEQ sets where.
+        end = start_pos + n + self.tail.block_size + 1     # where the next block would rope to
+        self._done = self._done or end > self.tail.args.max_seq_len
+        if self._done:
+            return {"draft": [], "n": n}
+        # ADVANCE OVER THE COMMITTED PREFIX, NOT THE CHUNK: positions start_pos..start_pos+n are the
+        # ones the ring keeps, `committed` holds the tokens that live at start_pos+1..start_pos+n+1,
+        # and `main[:, :n+1]` are those positions' taps. Feeding the whole chunk instead passes every
+        # check the drafter can make and drafts off a history the ring rejected.
+        blk, conf = self.tail.advance_and_draft([committed], main[:, :n + 1], start_pos=start_pos)
+        return {"draft": blk[0].tolist(), "n": n,
+                "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+
+
+def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
+    """Build the tail's drafter: a `DSparkTail` over `stage`, its `mtp.*` loaded from `ckpt_dir`.
+
+    `ckpt_dir=None` skips the load, which is the in-process path where the weights were transferred
+    by hand; a serving tail always passes the dir it loaded its own layers from, and a checkpoint
+    without `mtp.*` raises there rather than drafting out of uninitialised memory."""
+    tail = DSparkTail(stage, temperature=temperature)
+    if ckpt_dir is not None:
+        tail.load(ckpt_dir)
+    return RingDrafter(tail)
+
+
 def _selftest():
     """Prefill + three drafted rounds against the reference's own forward_spec, on CPU.
 
@@ -459,7 +563,7 @@ def _selftest():
     args = v4_ref_cpu.cpu_args()
     prompt, rounds = 13, 3
     oracle = v4_ref_cpu.build_oracle(args, 0)
-    st = v4_stage.Stage(0, args.n_layers, args, head=True, tail=True, dspark=True, device="cpu")
+    st = _v4().Stage(0, args.n_layers, args, head=True, tail=True, dspark=True, device="cpu")
     for li in range(args.n_layers):
         st.layers[li].load_state_dict(oracle.layers[li].state_dict(), strict=True)
     st.embed_tokens.load_state_dict(oracle.embed.state_dict(), strict=True)

@@ -12,14 +12,15 @@ run on any box, in seconds, with no weights and no checkpoint:
   * a forward leg that died while the ring was idle is rebuilt at job open (#156) — the failure that
     cost the 2026-07-29 capstone ring every one of its jobs,
   * the keep-warm noop never interleaves with a real send on the same socket,
-  * the SPEC accept/commit/rewind arithmetic, against a scripted tail. Step 5 (the stage rewind) is
-    what makes a real spec ring safe; this pins the coordinator half of it NOW so step 5 only has to
-    debug the stage.
+  * the SPEC accept/commit/rewind arithmetic, against a scripted tail,
+  * the DSPARK round, likewise: who drafts, which chunk goes on the wire, and the tripwire that fires
+    when the tail's accept length disagrees with the coordinator's.
 
 Section 9 is the headline, and it is the same proof `python3 phase0/v4_pipe.py selftest` prints:
 real v4_stage stages over a real tiny checkpoint, decoding through real sockets, BIT-IDENTICAL to
-the vendored reference Transformer's own greedy decode. It imports v4_ref_cpu/v4_stage inside its
-fixture, so a box without them skips that section and still runs everything above it.
+the vendored reference Transformer's own greedy decode — greedy, coordinator-drafted (rejecting AND
+accepting) and DSpark-drafted, all three against that one bar. It imports v4_ref_cpu/v4_stage inside
+its fixture, so a box without them skips that section and still runs everything above it.
 
 Run: python3 -m pytest tests/test_v4_pipe.py -q
 """
@@ -584,6 +585,104 @@ def test_spec_drafter_fallbacks_are_valid_proposers():
     assert VP._drafter_propose(lambda ids, k: [7] * k, 3)([1], 2) == [7, 7]
 
 
+# ── 7b. the DSPARK round: the tail drafts, and both ends must agree on the accept ──────────────────
+
+class _ScriptedDsparkRing(_ScriptedRing):
+    """The tail half of a drafted round, scripted: each reply carries the model's per-position tokens,
+    the tail's own accept length `n` and the block it drafted for the NEXT round.
+
+    `n` is computed with the real accept rule, off the drafts it actually received — which is the
+    point: the coordinator computes the same thing independently and the two are asserted equal.
+    `lie` forces a divergence, the failure a silent drafter desync would otherwise look like."""
+
+    def __init__(self, first_token, script, lie=None):
+        self.script = list(script)                        # (tokens, next_draft) per drafted round
+        self.lie = lie
+        self.accept = VP._dspark().plan_verify_round      # the coordinator's rule, on the tail's side
+        super().__init__(first_token, [])
+
+    def _run(self):
+        try:
+            while True:
+                msg = recv_msg(self.pipe_b)
+                op = msg.get("op")
+                if op == "reset":
+                    send_msg(self.ret_a, "ok")
+                elif op == "step":
+                    ids, pos = list(msg["ids"][0]), int(msg["start_pos"])
+                    self.chunks.append((ids, pos))
+                    if len(self.chunks) == 1:
+                        send_msg(self.ret_a, {"token": self.first_token})
+                        continue
+                    tokens, draft = self.script.pop(0)
+                    n = self.accept(ids[1:], tokens)[0]
+                    send_msg(self.ret_a, {"token": tokens[-1], "tokens": tokens,
+                                          "draft": list(draft),
+                                          "n": self.lie if self.lie is not None else n})
+                else:
+                    return
+        except (OSError, EOFError, IndexError):
+            return
+
+
+def _dspark_round(first_token, script, max_new, lie=None, eos_ids=()):
+    ring = _ScriptedDsparkRing(first_token, script, lie=lie)
+    try:
+        r = VP.coordinate_dspark(ring.pipe_a, ring.ret_b, [1, 2, 3], max_new, eos_ids=eos_ids,
+                                 timeout=10)
+    finally:
+        ring.close()
+    return r, ring.chunks
+
+
+def test_coordinate_dspark_first_round_is_bare_then_drafts_the_tails_block():
+    """The round structure. The drafter deliberately produces no block at prefill, so round 1 is
+    `[cur]` alone (the accept rule's degenerate case, one committed token); every later round sends
+    `[cur] + the drafts the tail returned last time`. Nothing the coordinator invents — it does not
+    own a drafter at all, which is the whole point of drafting on the tail."""
+    script = [([21], [31, 32, 33]),                       # bare round: one reply, one commit
+              ([31, 32, 99, 0], [41, 42, 43]),           # 2 of 3 accepted, then the correction
+              ([41, 0, 0, 0], [51, 52, 53])]             # 1 of 3, and max_new lands mid-commit
+    r, chunks = _dspark_round(first_token=10, script=script, max_new=6)
+    assert chunks[0] == ([1, 2, 3], 0), "prefill sends the whole prompt at position 0"
+    assert chunks[1] == ([10], 3), "round 1 is the bare [cur] chunk — no drafts exist yet"
+    assert chunks[2] == ([21, 31, 32, 33], 4), "round 2 sends the tail's block behind cur"
+    assert r["tokens"] == [10, 21, 31, 32, 99, 41]
+    assert r["accept_hist"] == {0: 1, 2: 1, 1: 1} and r["accepted"] == 3
+    assert r["rounds"] == 3 and r["drafted"] == 2, "only the bare first round carried no block"
+    # the REWIND: [1,2,3,10,21,31,32,99] leaves cur=99 at absolute position 7, and the next chunk
+    # must open THERE — not at the end of the draft the ring rejected
+    assert chunks[3] == ([99, 41, 42, 43], 7)
+
+
+def test_coordinate_dspark_full_accept_commits_the_block_plus_the_bonus():
+    """A fully accepted block of 3 commits 4 tokens for ONE traversal, and the next chunk opens where
+    the stage already stands — the rollback's no-op path."""
+    script = [([21], [31, 32, 33]), ([31, 32, 33, 44], [51, 52, 53])]
+    r, chunks = _dspark_round(first_token=10, script=script, max_new=6)
+    assert r["tokens"] == [10, 21, 31, 32, 33, 44]
+    assert r["accept_hist"] == {0: 1, 3: 1} and r["g"] == 3.0
+    assert chunks[2] == ([21, 31, 32, 33], 4)
+
+
+def test_coordinate_dspark_fails_loudly_when_the_tail_accepts_differently():
+    """The protocol's own tripwire. The tail runs the accept rule to advance its drafter and the
+    coordinator runs it to decide what to emit; if they ever disagree, the drafter is conditioning on
+    a history the ring did not take, and every later draft looks plausible while being wrong. That is
+    a job-killing bug, so it fails HERE rather than as quietly worse acceptance forever."""
+    script = [([21], [31, 32, 33]), ([31, 32, 99, 0], [41, 42, 43])]
+    with pytest.raises(RuntimeError, match="two ends of a lossless round have diverged"):
+        _dspark_round(first_token=10, script=script, max_new=6, lie=3)
+
+
+def test_coordinate_dspark_stops_at_eos_inside_a_commit():
+    """EOS in the middle of an accepted block: the tokens behind it are never emitted, even though
+    the tail computed them and the drafter has already advanced past them."""
+    script = [([21], [31, 32, 33]), ([31, 32, 33, 44], [51, 52, 53])]
+    r, _ = _dspark_round(first_token=10, script=script, max_new=10, eos_ids=(32,))
+    assert r["tokens"] == [10, 21, 31, 32] and r["generated"] == 4
+
+
 # ── 8. the pure builders: tiling, per-GPU split, sidecar wiring, planner seam ──────────────────────
 
 def test_even_tiling_covers_all_43_layers_contiguously():
@@ -734,7 +833,7 @@ class _Ring:
     dial. coordinate() reuses the SAME warm ring across calls (each call resets), so a second job on
     the ring is the reset/warm path."""
 
-    def __init__(self, ckpt_dir, args, ranges, receipts=False, tail_box_g=1):
+    def __init__(self, ckpt_dir, args, ranges, receipts=False, tail_box_g=1, dspark=False):
         self.n = len(ranges)
         self.layer_count = args.n_layers
         self.receipts = receipts
@@ -748,7 +847,7 @@ class _Ring:
             t = threading.Thread(target=VP.serve_stage, kwargs=dict(
                 stage=i, nstages=self.n, lo=lo, hi=hi, port=ports[i], nxt=nxt, ckpt_dir=ckpt_dir,
                 device="cpu", receipts=receipts, key_path=f"{ckpt_dir}/s{i}.key",
-                ret_relay=ret_relay, ready=events[i]), daemon=True)
+                ret_relay=ret_relay, dspark=dspark, ready=events[i]), daemon=True)
             t.start()
             self.threads.append(t)
         for e in events:
@@ -761,6 +860,16 @@ class _Ring:
     def coordinate(self, prompt, max_new, nonce=None):
         return VP.coordinate(self.pipe, self.ret, prompt, max_new, nonce=nonce,
                              receipts=self.receipts, layer_count=self.layer_count, timeout=60)
+
+    def spec(self, prompt, max_new, nonce=None, **kw):
+        return VP.coordinate_spec(self.pipe, self.ret, prompt, max_new, nonce=nonce,
+                                  receipts=self.receipts, layer_count=self.layer_count,
+                                  timeout=60, **kw)
+
+    def dspark(self, prompt, max_new, nonce=None):
+        return VP.coordinate_dspark(self.pipe, self.ret, prompt, max_new, nonce=nonce,
+                                    receipts=self.receipts, layer_count=self.layer_count,
+                                    timeout=60)
 
     def close(self):
         try:
@@ -844,6 +953,133 @@ def test_multigpu_tail_box_relays_return_and_matches_reference(tiny):
         ring.close()
     assert r["tokens"] == ref, f"relay ring {r['tokens']} != ref {ref}"
     assert r["receipts_ok"] is True and len(r["receipts"]) == 3
+
+
+def test_spec_ring_is_lossless_both_ways(tiny):
+    """SPECULATION ON A REAL RING IS BIT-IDENTICAL TO GREEDY — both halves of the protocol.
+
+    A drafter that is always WRONG (repeat-last) makes every round a rejection, so every round drives
+    Stage._seek: restore the pre-chunk snapshot, replay the accepted prefix, re-open at the committed
+    position. A drafter that is always RIGHT (the reference's own continuation) makes every round a
+    full accept, so the ring commits K+1 tokens per traversal and never rewinds at all. Both must
+    emit exactly the reference's tokens.
+
+    IT IS THE PER-POSITION LOGITS THAT MAKE THE SECOND ONE POSSIBLE. A draft is accepted only where
+    the tail's own reply at that position equals it, so a full accept is the assertion "the verify
+    rows ARE the greedy rows" — bitwise, at every position of the chunk. Batch the chunk's logits
+    into one [b, s, vocab] GEMM instead and the fp32 reassociation shifts them ~4e-7, which flips an
+    argmax near-tie at random: acceptance would quietly rot and the stream would stop being greedy
+    without anything failing."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, [(0, 3), (3, 6), (6, 8)], receipts=True)
+    try:
+        bad = ring.spec(list(PROMPT), NEW, nonce="spec-bad", K=4, drafter=VP._RepeatDrafter())
+        good = ring.spec(list(PROMPT), NEW, nonce="spec-good", K=2,
+                         drafter=lambda seq, K: (ref[len(seq) - len(PROMPT):][:K] + [0] * K)[:K])
+    finally:
+        ring.close()
+    assert bad["tokens"] == ref, f"rejected-round ring {bad['tokens']} != greedy {ref}"
+    assert good["tokens"] == ref, f"accepted-round ring {good['tokens']} != greedy {ref}"
+    assert bad["receipts_ok"] is True and good["receipts_ok"] is True
+    assert max(good["accept_hist"]) == 2, "the perfect drafter was not fully accepted — verify rows " \
+                                          "differ from the greedy rows they claim to replace"
+    assert good["g"] > bad["g"], "a perfect drafter must commit more per traversal than a useless one"
+
+
+def test_full_ring_dspark_matches_reference(tiny):
+    """THE drafted ring, end to end: the tail runs V4's own MTP speculator over its `main_hidden`,
+    returns the block with the token, and the emitted stream is the reference's greedy stream.
+
+    Acceptance is NOT asserted: at random weights a trained drafter has nothing to be right about, so
+    g > 1 here would be luck rather than evidence. What is asserted is that the machinery really ran
+    — every round after the deliberately bare first one carried a real draft block through the whole
+    ring and was verified — and that the stream is exact anyway. That is the property speculation must
+    have; the acceptance rate is a measurement for real weights."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        r = ring.dspark(list(PROMPT), NEW, nonce="dspark-nonce")
+    finally:
+        ring.close()
+    assert r["tokens"] == ref, f"dspark ring {r['tokens']} != greedy {ref}"
+    assert r["receipts_ok"] is True, "a drafted job must still settle its receipts"
+    assert r["rounds"] > 1 and r["drafted"] == r["rounds"] - 1, \
+        f"the drafter never proposed a block: {r['rounds']} rounds, {r['drafted']} drafted"
+
+
+def test_a_second_dspark_job_on_a_warm_ring_is_a_cold_rings_answer(tiny):
+    """Two drafted jobs back to back on one warm ring — the shape a served ring actually runs in.
+
+    A drafted job leaves MORE behind than a greedy one: the stages carry a spec checkpoint and a
+    rewound KV, and the tail's drafter carries an mtp window and a position cursor that only means
+    anything for the sequence it was built on. The drafter is rebuilt for no job — it is a process
+    lifetime object — so if the per-job reset missed any of that, the second job would draft off the
+    first one's history and could not come back with the reference's stream."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    try:
+        first = ring.dspark([7, 7, 7, 1, 2, 9], NEW)               # a different job, warming the state
+        warm = ring.dspark(list(PROMPT), NEW)
+    finally:
+        ring.close()
+    assert first["tokens"] != ref, "the warming job must be a DIFFERENT sequence to prove anything"
+    assert warm["tokens"] == ref, f"warm drafted ring {warm['tokens']} != cold greedy {ref}"
+
+
+def test_dspark_job_on_a_greedy_ring_fails_the_job_not_the_ring(tiny):
+    """Ask a tail that was launched WITHOUT --dspark to draft: the job dies, the ring lives.
+
+    The tail is the only thing the coordinator reads, so an exception in its serve loop is not a
+    failed job — it is a ring that stalls this job and every job after it, which is how the 2026-07-29
+    capstone ring was lost. A drafter that cannot be built (no embedding, or a checkpoint with no
+    `mtp.*`) therefore answers the RESET with a failure the coordinator raises on, and the next
+    greedy job goes through the same warm ring untouched."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3))          # no dspark=True: no MTP stages here
+    try:
+        with pytest.raises(RuntimeError, match="not acked"):
+            ring.dspark(list(PROMPT), NEW)
+        assert ring.coordinate(list(PROMPT), NEW)["tokens"] == ref, "the ring did not survive"
+    finally:
+        ring.close()
+
+
+def test_dspark_tiling_puts_every_target_layer_on_the_tail(tiny):
+    """The placement constraint a drafted ring has and a greedy one does not: `main_hidden` is the
+    taps of ALL dspark target layers concatenated, so they must land on ONE stage — the tail. A plan
+    that splits them serves greedily and refuses to draft (Stage.tail_main_hidden), which is why the
+    V4_PROFILE this ring is eventually planned with has to encode it."""
+    _d, args, _ref = tiny
+    ranges = VP._dspark_tiling(args, 3)
+    lo, hi = ranges[-1]
+    assert all(lo <= t < hi for t in args.dspark_target_layer_ids)
+    assert ranges[0][0] == 0 and hi == args.n_layers
+    for (_a, a_hi), (b_lo, _b) in zip(ranges, ranges[1:]):
+        assert a_hi == b_lo, "the drafted tiling still has to tile"
+
+
+def test_ring_args_fills_only_what_the_shipped_config_omits(tiny, tmp_path, monkeypatch):
+    """V4's release declares neither max_seq_len nor max_batch_size, so ModelArgs' 4096/4 silently
+    size every kv_cache, the freqs_cis table and the drafter's end-of-context guard — an 8k ring would
+    stop drafting at ~4090. ring_args fills them, but ONLY where the config is silent: a checkpoint
+    that states them means it, and overriding those would build stages whose caches disagree with the
+    model they are graded against (which is exactly the CPU parity fixtures' case)."""
+    import dataclasses
+    import json
+    d, args, _ref = tiny
+    full = dataclasses.asdict(args)
+    silent = {k: v for k, v in full.items() if k not in ("max_seq_len", "max_batch_size")}
+    quiet = tmp_path / "silent"
+    quiet.mkdir()
+    (quiet / "config.json").write_text(json.dumps(silent))
+
+    got = VP.ring_args(str(quiet))
+    assert (got.max_seq_len, got.max_batch_size) == (VP.V4_MAX_SEQ, VP.V4_MAX_BATCH)
+    kept = VP.ring_args(d)
+    assert (kept.max_seq_len, kept.max_batch_size) == (args.max_seq_len, args.max_batch_size)
+
+    monkeypatch.setenv("V4_MAX_SEQ", "777")               # an explicit env override always wins
+    assert VP.ring_args(str(quiet)).max_seq_len == 777
 
 
 def test_reset_gives_a_warm_ring_a_cold_rings_answer(tiny):

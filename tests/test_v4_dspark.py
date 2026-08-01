@@ -23,6 +23,11 @@ Four headlines, each a different way a speculator can be silently wrong:
   test_cache_never_speculative          the design claim that the drafter needs no rollback: the
       slots the draft block's own positions would occupy stay zero.
 
+  test_ring_drafter_advances_over_the_committed_prefix   the ring adapter's one dangerous slice. A
+      round's chunk and its COMMITTED prefix are the same length on a full accept, so feeding the
+      wrong one is invisible to every check the drafter can make and drafts off a continuation the
+      ring discarded.
+
 Everything runs on CPU against v4_ref_cpu's toy 8-layer V4 (2 MTP stages, block_size 3, window 16,
 3 DSpark taps) -- no GPU, no network, no 158 GiB checkpoint.
 
@@ -637,6 +642,164 @@ def test_spec_loop_emits_the_greedy_stream(oracle, args):
     assert len(got) >= GEN
     assert drafted >= 2, "every round after the first must carry a real draft block"
     assert rewound >= 1, "no round was rejected — the rewind path was never exercised"
+
+
+# ── 9. the ring adapter ──────────────────────────────────────────────────────────────────────────
+# RingDrafter is the tail-side protocol: chunk in, (accept length, next block) out. Everything it can
+# get wrong is a SLICE — which taps, which tokens, which position — and a wrong slice still produces
+# well-shaped drafts. So it is driven against a recorder that captures exactly what it handed the
+# drafter, with taps whose VALUES identify their position; the real-weights version of this same
+# protocol is the dspark ring in tests/test_v4_pipe.py.
+
+class _RecordingTail:
+    """A DSparkTail's contract, recording what it was handed. Nothing computes."""
+
+    def __init__(self, block_size=3, max_seq_len=256, block=(71, 72, 73)):
+        self.block_size = block_size
+        self.args = type("A", (), {"max_seq_len": max_seq_len})()
+        self.block = list(block)
+        self.calls = []
+
+    def reset(self):
+        self.calls.append(("reset",))
+
+    def prefill(self, pred_ids, main_hidden):
+        self.calls.append(("prefill", [int(t) for t in pred_ids], _rows(main_hidden)))
+
+    def advance_and_draft(self, ids_seq, main_hidden_seq, start_pos):
+        self.calls.append(("advance", [int(t) for t in torch.as_tensor(ids_seq).reshape(-1)],
+                           _rows(main_hidden_seq), start_pos))
+        return (torch.tensor([self.block], dtype=torch.long),
+                torch.tensor([[0.5] * len(self.block)]))
+
+
+class _TapStage:
+    """A tail Stage's one method the drafter uses, with taps that SAY which position they are: row j
+    is the constant j, so a slice taken from the wrong end is visible instead of merely mis-shaped."""
+
+    def __init__(self, s, dim=6):
+        self.taps = torch.arange(s, dtype=torch.float32).view(1, s, 1).repeat(1, 1, dim)
+
+    def tail_main_hidden(self):
+        return self.taps
+
+
+def _rows(t):
+    """The positions a [1, s, d] tap tensor covers, read back off _TapStage's marking."""
+    return [int(r[0]) for r in torch.as_tensor(t)[0]]
+
+
+def _chunk(ids, start_pos, tokens=None, token=None):
+    msg = {"ids": [list(ids)], "start_pos": start_pos}
+    out = {"token": token if token is not None else (tokens[-1] if tokens else 0)}
+    if tokens is not None:
+        out["tokens"] = list(tokens)
+    return msg, out
+
+
+def test_ring_drafter_prefill_round_drafts_nothing():
+    """The ring's prefill primes the mtp window over the whole prompt and returns NO draft, so round
+    1 is the bare `[cur]` chunk. The token it primes with is the one the model predicted for position
+    P — the reply's own `token` — and the taps are all P of the prompt's."""
+    tail = _RecordingTail()
+    dr = DS.RingDrafter(tail)
+    msg, out = _chunk([5, 6, 7, 8], 0, token=99)
+    assert dr.on_chunk(msg, _TapStage(4), out) == {}
+    assert tail.calls == [("reset",), ("prefill", [99], [0, 1, 2, 3])]
+
+
+def test_ring_drafter_bare_round_advances_exactly_one():
+    """Round 1 carries no drafts: the accept rule's degenerate case commits one token, so the drafter
+    advances over one position — the chunk's own — and drafts from there."""
+    tail = _RecordingTail()
+    dr = DS.RingDrafter(tail)
+    msg, out = _chunk([5, 6, 7], 0, token=42)              # the ring's prefill, as above
+    dr.on_chunk(msg, _TapStage(3), out)
+    tail.calls.clear()
+
+    msg, out = _chunk([42], 7, tokens=[63])
+    rep = dr.on_chunk(msg, _TapStage(1), out)
+    assert rep == {"draft": [71, 72, 73], "n": 0, "conf": [0.5, 0.5, 0.5]}
+    assert tail.calls == [("advance", [63], [0], 7)], "one committed position, its own tap, at pos 7"
+
+
+@pytest.mark.parametrize("tokens,n,committed,taps", [
+    ([7, 8, 55, 0], 2, [7, 8, 55], [0, 1, 2]),        # partial: drafts 7,8 accepted, 9 rejected
+    ([90, 0, 0, 0], 0, [90], [0]),                    # nothing accepted: one correction, one tap
+    ([7, 8, 9, 11], 3, [7, 8, 9, 11], [0, 1, 2, 3]),  # full accept + the bonus token
+])
+def test_ring_drafter_advances_over_the_committed_prefix(tokens, n, committed, taps):
+    """THE slice that matters: the drafter is advanced over the ACCEPTED PREFIX of the round, never
+    over the whole chunk.
+
+    Feeding the chunk instead passes every check the drafter itself can make — a full accept commits
+    g+1 positions, so length alone cannot tell them apart — and drafts off a continuation the ring
+    threw away. Here the committed tokens and the taps' own position markers are both asserted, for
+    every accept length a round can produce."""
+    tail = _RecordingTail()
+    dr = DS.RingDrafter(tail)
+    msg, out = _chunk([1, 2], 0, token=42)
+    dr.on_chunk(msg, _TapStage(2), out)
+    tail.calls.clear()
+
+    msg, out = _chunk([42, 7, 8, 9], 7, tokens=tokens)
+    rep = dr.on_chunk(msg, _TapStage(4), out)
+    assert rep["n"] == n and rep["draft"] == [71, 72, 73]
+    assert tail.calls == [("advance", committed, taps, 7)]
+
+
+def test_ring_drafter_refuses_what_it_cannot_answer():
+    """Two refusals, both about a reply the protocol cannot express: a batch (the tail answers for row
+    0 alone) and a dspark job whose reset forgot `spec` (no per-position tokens, hence no accept)."""
+    dr = DS.RingDrafter(_RecordingTail())
+    st = _TapStage(2)
+    with pytest.raises(RuntimeError, match="single-sequence"):
+        dr.on_chunk({"ids": [[1, 2], [3, 4]], "start_pos": 3}, st, {"token": 1, "tokens": [1, 2]})
+    with pytest.raises(RuntimeError, match="must arm `spec`"):
+        dr.on_chunk({"ids": [[1, 2]], "start_pos": 3}, st, {"token": 1})
+
+
+def test_ring_drafter_degrades_to_greedy_at_the_context_limit():
+    """The context cliff. `advance_and_draft` REFUSES to rope a block past max_seq_len — correct for
+    the drafter, fatal for the ring, because an exception in the tail's serve loop takes the whole
+    ring down with it and the coordinator (which only ever reads the tail) sees a stall. So the last
+    rounds of a max-length generation stop drafting and keep answering, and once stopped they stay
+    stopped: the drafter's cursor no longer tracks the stream."""
+    tail = _RecordingTail(max_seq_len=20)
+    dr = DS.RingDrafter(tail)
+    msg, out = _chunk([1, 2], 0, token=42)
+    dr.on_chunk(msg, _TapStage(2), out)
+    tail.calls.clear()
+
+    at = tail.args.max_seq_len - tail.block_size            # a block from here would rope past the end
+    msg, out = _chunk([42, 7], at, tokens=[7, 8])
+    rep = dr.on_chunk(msg, _TapStage(2), out)
+    assert rep == {"draft": [], "n": 1}, "the accept still has to be reported — the ring commits it"
+    assert tail.calls == [], "nothing may reach the drafter once it would raise"
+    msg, out = _chunk([9], 1, tokens=[10])                 # and it stays stopped for the job
+    rep = dr.on_chunk(msg, _TapStage(1), out)
+    assert rep == {"draft": [], "n": 0} and tail.calls == []
+
+
+def test_ring_drafter_over_the_real_drafter(oracle, args):
+    """The same adapter, over a real Stage + DSparkTail: one drafted round, graded on the oracle.
+
+    The recorder above proves the slices; this proves they are the slices the REFERENCE wants. The
+    ring's own reply is assembled by hand (a chunk of one, the tail's greedy token) so the assertion
+    is about RingDrafter and not about v4_pipe's serve loop."""
+    ids = _ids(PROMPT, args, seed=LOOP_SEED)
+    st, dr_tail, tok = prefilled(oracle, args, ids)
+    o_tok, _, o_main = oracle(tok.unsqueeze(1), PROMPT)
+    o_spec = oracle.forward_spec(o_tok, o_main, PROMPT)
+
+    ring = DS.RingDrafter(dr_tail)
+    h = st.forward(st.embed(tok.unsqueeze(1)), tok.unsqueeze(1), PROMPT)
+    reply = int(st.logits_all(h, full_logits=False).argmax(-1))
+    rep = ring.on_chunk({"ids": [[int(tok)]], "start_pos": PROMPT}, st,
+                        {"token": reply, "tokens": [reply]})
+    assert rep["n"] == 0, "a bare round accepts nothing and commits the model's own token"
+    assert rep["draft"] == o_spec[0][0, 1:].tolist(), "the block is not the reference's"
+    assert dr_tail.pos == PROMPT
 
 
 def test_spec_loop_with_a_perfect_drafter(oracle, args):

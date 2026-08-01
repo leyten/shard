@@ -65,8 +65,8 @@ modules: the aliases are views, so they follow, and the weights survive.
 
 WHAT IS A SEAM HERE AND NOT YET A FEATURE
   _spec       arm it and a chunk at `start_pos > 0` checkpoints the rollback-able state before it is
-              touched. `_seek` still REFUSES a rewind -- restoring it is step 5. The seam is built
-              now so step 5 is a fill-in and not a redesign of the contract.
+              touched; `_seek` then rewinds INSIDE that chunk (restore + replay the accepted prefix),
+              which is what makes a rejected speculation safe to commit. One chunk deep, by design.
   _dspark     arm it and the stage records `h.mean(dim=2)` after each owned `dspark_target_layer_id`,
               which is the drafter's input (`Transformer.forward:921`). Inert otherwise: the greedy
               path clones nothing.
@@ -301,7 +301,7 @@ class Stage:
         self._spec_ckpt = None
 
     def _snapshot(self):
-        """Clone exactly the state a rejected speculation can poison. Step 5 restores it.
+        """Clone exactly the state a rejected speculation can poison. `_seek` restores it.
 
         WHAT IS IN: the window ring `kv_cache[:, :win]`, because a rejected token's kv sits at
         `start_pos % win` and would be READ by the next accepted token at the same absolute position
@@ -312,11 +312,24 @@ class Stage:
 
         WHAT IS DELIBERATELY OUT: the compressed regions -- `kv_cache[:, win:]` and
         `Indexer.kv_cache`. A stale slot written by rejected speculation is ALWAYS REWRITTEN BEFORE
-        ITS FIRST READ, because a compressed slot is only produced at a position where
-        `(start_pos + 1) % ratio == 0` and is only ever indexed by positions strictly after that same
-        boundary -- so the write that fixes the slot happens before the read that includes it. That
-        sentence is the correctness argument for not snapshotting the largest buffer in the stage
-        (at V4's shape, `max_seq_len // 4` compressed slots against a 128-slot window).
+        ITS FIRST READ, which is the correctness argument for not snapshotting the largest buffer in
+        the stage (at V4's shape, `max_seq_len // 4` compressed slots against a 128-slot window). The
+        margin, though, is EXACTLY ZERO, and that is the part worth stating precisely: slot `j` is
+        produced at position `q = (j + 1) * ratio - 1`, and the read set at position P is
+        `[0, (P + 1) // ratio)`, whose last element is the slot P itself just wrote. So the first
+        read of a slot is AT `q`, never after it -- inside the same position, and safe only because
+        the reference WRITES BEFORE IT READS within that position:
+        `self.compressor(x, start_pos)` (model.py:537) precedes
+        `sparse_attn(q, self.kv_cache[:bsz], ...)` (:538), and the Indexer's own
+        `self.compressor(x, start_pos)` (:423) precedes its
+        `einsum(..., self.kv_cache[:bsz, :end_pos // ratio])` (:426).
+
+        Swap either pair -- a re-vendored model.py, or a fused attention kernel that reads the
+        compressed region from a value captured at `Attention.forward` entry -- and a rejected
+        chunk's slot IS read stale, silently, in plausible-looking numbers.
+        tests/test_v4_stage.py::test_rollback_survives_a_poisoned_compressed_region is the red test
+        that pins it: it fills every slot this argument calls safe-to-be-stale with NaN, after a
+        rewind that lands ON a compression boundary, and the stream must still come out bit-exact.
 
         The Indexer's own kv_cache needs no window snapshot at all: unlike Attention's it is
         entirely compressed slots, with no ring prefix (model.py:405)."""
@@ -330,7 +343,7 @@ class Stage:
         return snap
 
     def _restore(self, snap):
-        """Write a `_snapshot()` back in place. Step 5's rollback; unused on the greedy path."""
+        """Write a `_snapshot()` back in place. `_seek`'s rollback; unused on the greedy path."""
         win = self.args.window_size
         with torch.no_grad():
             n = len(self.layers)
@@ -340,8 +353,46 @@ class Stage:
                 c.kv_state.copy_(e["kv_state"])
                 c.score_state.copy_(e["score_state"])
 
+    def _replay(self, h, ids, start_pos):
+        """Re-feed an accepted prefix through the layers to rebuild what a restore rolled back.
+
+        STATE ONLY: it advances the window ring and both compressor accumulators over
+        [start_pos, start_pos + s) exactly as sequential decode would, and throws the outputs away.
+        The per-token loop is `forward`'s, for `forward`'s reason -- the reference's decode branch
+        writes a squeezed `seqlen == 1` into `kv_cache[:, start_pos % win]`.
+
+        Three deliberate differences from `forward`, each of which is a bug if it is dropped:
+          * NO new checkpoint. The one being spent is the only one that covers this interval, and
+            overwriting it mid-rollback would leave the stage unable to rewind again.
+          * NO taps. `_last_tap` still describes the VERIFY chunk, whose taps the drafter consumed
+            before the rejection was known; the drafter is advanced over committed positions only and
+            is never re-driven from a replay, so re-recording here would hand it its own history back.
+            (The taps are recomputed into a throwaway dict and dropped -- a mean over 4 streams.)
+          * NO prefill branch. A replay is by construction at start_pos > 0."""
+        with torch.no_grad():
+            for i in range(h.shape[1]):
+                self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, {})
+        self._pos = start_pos + h.shape[1]
+
     def _seek(self, start_pos):
-        """Move the stage to `start_pos`, or refuse. k3_stage._seek's shape, V4's reasons."""
+        """Move the stage to `start_pos`, or refuse. k3_stage._seek's shape, V4's reasons.
+
+        A rewind IS the speculative rollback: the round after a partial accept re-feeds the ring from
+        the last COMMITTED position, so every stage has to put its per-token state back to what that
+        position left behind. V4's is simpler than K3's -- no recurrent state to unwind and no KV to
+        crop, because the reference's buffers are POSITION-INDEXED (`kv_cache[:, p % win]`,
+        `kv_state[:, p % ratio]`). Restore the pre-chunk snapshot, re-feed the accepted prefix, and
+        every slot the rejected tail touched has been rewritten by the token that really belongs
+        there; the compressed regions are argued away in `_snapshot`'s docstring.
+
+        THE WINDOW IS ONE CHUNK WIDE, on purpose. `_spec_ckpt` covers [ck.start_pos, ck.start_pos + s]
+        — every position that round could commit. A rewind outside it is a coordinator asking for a
+        position no checkpoint describes, and serving it off the current state would be silently
+        wrong instead of loudly broken.
+
+        THE FULL-ACCEPT PATH NEVER REACHES ANY OF THIS. A round that accepts all g = s-1 drafts
+        commits g+1 tokens, so the next chunk opens at ck.start_pos + s, which IS `_pos` — the no-op
+        return above. Rollback costs exactly nothing on the rounds speculation is winning."""
         if start_pos == self._pos:
             return
         if start_pos > self._pos:
@@ -349,11 +400,21 @@ class Stage:
                 f"v4 stage[{self.lo}:{self.hi}]: start_pos {start_pos} is ahead of the {self._pos} "
                 f"tokens this stage has seen — a gap means the skipped tokens were never fed "
                 f"through this block's layers (reset() first, or replay from {self._pos})")
-        raise NotImplementedError(
-            f"v4 stage[{self.lo}:{self.hi}]: cannot rewind {self._pos} -> {start_pos}. "
-            f"spec rollback lands in step 5 — _snapshot()/_restore() already checkpoint the window "
-            f"ring and both compressor accumulators when _spec is armed, and this is where the "
-            f"restore hooks in. reset() and replay to rewind today.")
+        ck = self._spec_ckpt
+        if ck is None or not (ck["start_pos"] <= start_pos <= ck["start_pos"] + ck["s"]):
+            covered = "none" if ck is None else f"[{ck['start_pos']}, {ck['start_pos'] + ck['s']}]"
+            raise RuntimeError(
+                f"v4 stage[{self.lo}:{self.hi}]: cannot rewind {self._pos} -> {start_pos}; the spec "
+                f"checkpoint covers {covered}. A rollback only ever rewinds INSIDE the most recent "
+                f"speculative chunk — arm _spec (the reset's `spec` flag does it) and rewind before "
+                f"the next chunk spends the checkpoint. reset() is the only other way back.")
+        self._restore(ck["state"])
+        self._pos = ck["start_pos"]
+        n = start_pos - ck["start_pos"]                     # the accepted prefix of the spent chunk
+        if n:
+            self._replay(ck["h"][:, :n], ck["ids"][:, :n], ck["start_pos"])
+        self._pos = start_pos
+        self._spec_ckpt = None                              # spent: forward() takes a fresh one
 
     # ---- the serve contract ----
 
@@ -388,13 +449,17 @@ class Stage:
         `kv_cache[:, start_pos % win]` and `kv_state[:, start_pos % ratio]` from a squeezed
         `seqlen == 1` (model.py:353,362,535) and would silently write only the chunk's last token
         otherwise. Exact, not approximate: HC mixing is per-position, and the loop advances the KV
-        and compressor state in exactly the order sequential decode would."""
+        and compressor state in exactly the order sequential decode would.
+
+        VALIDATE FIRST, SEEK SECOND. `_seek` MUTATES -- a rewind restores, replays and spends the
+        checkpoint -- so a frame that is going to be rejected must be rejected before it can do that.
+        Otherwise a malformed chunk leaves the stage rewound with its checkpoint gone, and the
+        retry of that same round can no longer roll back any deeper than it already did."""
         if ids is None:
             raise RuntimeError(
                 f"v4 stage[{self.lo}:{self.hi}]: forward() needs the token ids, not just the hidden "
                 f"state — the first {self.args.n_hash_layers} layers route their MoE by "
                 f"tid2eid[input_ids] (see this module's docstring). Carry them with the payload.")
-        self._seek(start_pos)
         h = h.to(device=self.device, dtype=self.dtype)
         ids = torch.as_tensor(ids, dtype=torch.long, device=self.device)
         if ids.dim() == 1:
@@ -403,6 +468,7 @@ class Stage:
         if ids.shape[:2] != h.shape[:2]:
             raise RuntimeError(f"v4 stage[{self.lo}:{self.hi}]: ids {tuple(ids.shape)} do not match "
                                f"the payload's [b, s] = {tuple(h.shape[:2])}")
+        self._seek(start_pos)
         if self._spec and start_pos > 0:
             # Taken BEFORE anything is touched: the whole point is to be able to put the stage back
             # the way an unaccepted chunk found it. `h`/`ids` ride along so step 5 can re-drive the
