@@ -891,6 +891,45 @@ def test_a_repeated_hash_expert_is_dropped_exactly_as_the_reference_drops_it(ora
             f"draw {t}: max|d| = {(want.float() - got.float()).abs().max()}"
 
 
+def test_a_discarded_hash_slot_cannot_poison_the_token_whatever_it_holds(oracle, monkeypatch):
+    """The reference never EVALUATES a discarded slot, so its contents must not reach the sum.
+
+    That is stronger than "it contributes zero", and the difference is not academic: masking by
+    multiplying makes `inf * 0.0` a NaN, which would poison the whole token instead of dropping the
+    slot. A select cannot. This spikes the discarded rows of the w2 launch with inf and NaN and
+    demands the SAME token back, bit for bit, as the unspiked run — the discarded slots are not
+    merely weighted out, they are not read.
+
+    inf is reachable on a real card: the routed output is bf16, and an e8m0 weight scale times an
+    fp4 magnitude can overflow it on a checkpoint we do not control."""
+    mod = _runnable(monkeypatch)
+    moe = _loaded_fp4_moe(oracle, layer_id=0)
+    with torch.no_grad():                            # expert 2 named three times: slots 0 and 1 die
+        moe.gate.tid2eid.copy_(torch.tensor([2, 2, 5, 2], dtype=torch.int32).expand_as(moe.gate.tid2eid))
+    g = torch.Generator().manual_seed(SEED + 11)
+    x = torch.randn(1, 1, 128, generator=g, dtype=torch.bfloat16)
+    ids = torch.randint(0, 32, (1, 1), generator=g)
+    assert GROUPED._keep_last_of_each(torch.tensor([2, 2, 5, 2])).tolist() == [False, False, True, True]
+
+    with torch.no_grad():
+        want = GROUPED.grouped_forward(moe, x, ids)
+
+    real, calls = GROUPED.grouped_fp4_gemm, []
+
+    def spiked(*a, **k):
+        out = real(*a, **k)
+        calls.append(1)
+        if len(calls) == 2:                          # the w2 launch — the rows that get discarded
+            out = out.clone()
+            out[0], out[1] = float("inf"), float("nan")
+        return out
+
+    monkeypatch.setattr(GROUPED, "grouped_fp4_gemm", spiked)
+    with torch.no_grad():
+        got = GROUPED.grouped_forward(moe, x, ids)
+    assert torch.isfinite(got.float()).all(), "a discarded slot's inf/NaN reached the token"
+    assert torch.equal(want, got), "the discarded slots were read, not dropped"
+
 # ── the coverage gate: a matrix kind that silently un-groups must FAIL, not just get slower ──────
 
 

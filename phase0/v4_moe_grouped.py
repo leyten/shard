@@ -102,9 +102,11 @@ DISCARDED. (Verified against torch, not inferred: `y[[0,0]] += [[1],[10]]` from 
 That is a pure function of the six ids, so it reproduces on device with no host sync:
 
     keep[k] = not any(ids[k'] == ids[k] for k' > k)      # a [G, G] compare, 36 elements
-    out6    = out6 * keep[:, None]                       # the discarded slots contribute +0.0
+    out6    = where(keep[:, None], out6, 0)              # the discarded slots are NOT READ
 
-and a discarded slot then adds exactly zero into the fp32 accumulator, which is exact. The surviving
+and a discarded slot then adds exactly zero into the fp32 accumulator, which is exact. A SELECT and
+not a multiply by the mask, because the reference never evaluates those slots at all: `inf * 0.0` is
+NaN, and a routed output that overflowed bf16 would poison the token rather than be skipped. The surviving
 slots carry distinct expert ids, so the ascending-id fold is unchanged and the order still matches
 the reference's `for i in range(...)`. The one thing this leans on that a CPU emulator does not give
 for free is that the vendored fp4 GEMM is ROW-INVARIANT — the reference runs the duplicated expert as
@@ -669,9 +671,13 @@ def grouped_forward(self, x, input_ids):
     # A hash gate can name the same expert twice, and the reference DISCARDS all but that expert's
     # last slot (module doc). Zeroing the discarded rows reproduces it exactly: they then add +0.0
     # into the fp32 accumulator, which is not an approximation of skipping them, it IS skipping them.
+    # `where` and NOT a multiply by the mask: the reference never evaluates the discarded slot at all,
+    # so whatever it would have contained must not reach the sum -- and `inf * 0.0` is NaN, which
+    # would poison the token instead of dropping the slot. A select cannot, whatever the row holds.
     # Top-k routing cannot repeat, so a score-routed layer skips the compare entirely.
     if self.gate.hash:
-        out6 = out6 * _keep_last_of_each(ids)[:, None].to(out6.dtype)
+        keep = _keep_last_of_each(ids)[:, None]
+        out6 = torch.where(keep, out6, torch.zeros_like(out6))
 
     # Accumulate in ascending expert id — the reference's loop order — via a device argsort gather and
     # a fixed six-add fold. fp32 add is not associative, so the order is what keeps this bit-exact.
