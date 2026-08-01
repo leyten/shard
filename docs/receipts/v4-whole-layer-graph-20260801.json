@@ -1,0 +1,47 @@
+{
+  "what": "Whole-layer CUDA graphs for a DeepSeek-V4-Flash decode step: the attention core made capture-safe so the whole layer (attn + islands, and with a graph-safe MoE the FFN too) captures as one graph.",
+  "date": "2026-08-01",
+  "box": "vast.ai RTX 5090 (sm_120), torch 2.10.0+cu128, tilelang 0.1.12",
+  "backend": "tilelang (real sm120 sparse-attn + act_quant); hadamard via v4_kernels_cpu shim (fast_hadamard_transform extension absent on this box)",
+  "weights": "synthetic at V4's real attention dims; no 158GiB checkpoint",
+  "config": {
+    "dim": 4096, "n_heads": 64, "head_dim": 512, "rope_head_dim": 64,
+    "window_size": 128, "index_topk": 512, "index_head_dim": 128, "index_n_heads": 64,
+    "compress_ratios_measured": [4, 128, 0], "note": "layer 0 = indexer (ratio 4), layer 1 = compressor (ratio 128), layer 2 = pure sliding window; the three kinds a stage contains",
+    "trimmed_for_synthetic_bench": {"n_routed_experts": 8, "max_seq_len": 2048, "vocab_size": 2048, "dtype": "bf16", "expert_dtype": "None"}
+  },
+  "parity": {
+    "capture_safe_block_vs_reference_CPU": "torch.equal on hidden, logits, and every KV/compressor buffer over 40 decode steps (positions 20-59, window 16, ratios 4 and 8) -- the attention core is bit-exact to model.py Block.forward, proven GPU-free (tests/test_v4_whole_layer.py)",
+    "whole_layer_graph_stub_vs_eager_GPU": "bit-exact over 40 decode steps crossing the 128-window wrap and the ratio-4 and ratio-128 compression boundaries",
+    "moe_eager_graph_vs_reference_GPU": "bit-exact -- the deployable path (attn+islands graphed, real routed MoE eager) reproduces the reference block byte for byte",
+    "stage_whole_mode_vs_eager_GPU": "a Stage with V4_CUDA_GRAPH=whole is bit-exact to the eager Stage (tests/test_v4_whole_layer.py::test_whole_layer_stage_is_bit_exact_to_eager)"
+  },
+  "timing_per_decode_layer_ms": {
+    "position": 200,
+    "reps": 300,
+    "note": "cpu = perf_counter around the launch submit (dispatch cost); wall = CUDA events (GPU). This box is dispatch-bound (eager cpu ~= wall), which is the scattered-consumer-GPU regime the graph is for.",
+    "sum_over_3_layers": {
+      "eager_real":  {"cpu_ms": 16.18, "wall_ms": 16.13},
+      "island_real": {"cpu_ms": 13.47, "wall_ms": 13.42},
+      "moe_eager":   {"cpu_ms":  7.68, "wall_ms":  7.64},
+      "eager_stub":  {"cpu_ms": 15.53, "wall_ms": 15.49},
+      "whole_stub":  {"cpu_ms":  1.18, "wall_ms":  1.93}
+    }
+  },
+  "multipliers": {
+    "island_vs_eager_realMoE":    {"cpu": 1.20, "wall": 1.20, "meaning": "the existing lever (hc islands only)"},
+    "moe_eager_vs_eager_realMoE": {"cpu": 2.11, "wall": 2.11, "meaning": "DEPLOYABLE today: attention core graphed, routed MoE eager, bit-exact to the reference"},
+    "whole_vs_eager_stubMoE":     {"cpu": 13.17, "wall": 8.02, "meaning": "CEILING: the whole layer graphed -- realized once the MoE is graph-safe (sibling grouped-fp4 MoE)"}
+  },
+  "how_the_attention_core_was_made_capture_safe": {
+    "1_device_position": "start_pos enters as a length-1 device buffer; every kv_cache[:, p%win] / kv_state[:, p%ratio] / kv_cache[:, p//ratio] store becomes index_copy_ on a device-derived slot, chosen at replay not baked at capture",
+    "2_fixed_width_masked_read": "the Indexer scores q against the WHOLE kv_cache (fixed MAXW), masks columns >= end_pos//ratio to -inf, takes a FIXED topk of index_topk, and maps future-slot selections to -1; sparse_attn treats -1 as a no-op, so the fixed-width topk is byte-identical to the reference's growing-width one",
+    "3_two_graphs_by_position": "should_compress = (start_pos+1)%ratio is host-known, so the block is captured twice (compress / no-compress) and the replay picks by position -- zero data-dependent control flow inside a graph"
+  },
+  "risks": {
+    "fixed_width_indexer_cost": "the masked einsum reads MAXW = max_seq_len/ratio every step instead of a growing slice, so it does the full-context work even early; position-INVARIANT cost, a real trade for graphability",
+    "kv_rewind_under_speculative_rollback": "the graph writes are position-parameterized so a rewind (_seek: restore snapshot + replay accepted prefix) advances the SAME slots the eager path would; the replay uses the eager per-token path (not the graph) by design (_replaying guard), so rollback correctness rides on the existing _snapshot/_seek proof, unchanged",
+    "dispatch_bound_dependence": "the 8x is on a dispatch-bound box; a fast-CPU/uncontended box is nearer the GPU compute floor (~0.6ms/layer here, stub) and the multiplier is smaller -- but vast/consumer boxes are dispatch-bound, which is the target",
+    "moe_is_the_ceiling": "the deployable multiplier is capped at ~2x until the routed MoE is graph-safe; the whole-layer 8x needs the sibling grouped-fp4 MoE to compose in"
+  }
+}

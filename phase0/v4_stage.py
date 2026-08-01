@@ -107,7 +107,22 @@ V4_DTYPE = os.environ.get("V4_DTYPE", "bfloat16")
 # launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
 # Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
 # through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
-V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0") not in ("", "0")
+# "0"/off (default), "1"/"island" (hc_pre/hc_post/norm islands only, attn+MoE eager), "whole"/"eager"
+# (the WHOLE decode layer -- the capture-safe attention core folded in too, real routed MoE eager
+# between two graphs, bit-exact to the reference; v4_whole_layer_graph.py). See _graph_mode.
+V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0")
+
+
+def _graph_mode(v=None):
+    """Resolve V4_CUDA_GRAPH (env string or a monkeypatched bool) to off/island/whole."""
+    v = V4_CUDA_GRAPH if v is None else v
+    if v in (True, "1", "island", "on"):
+        return "island"
+    if v in ("whole", "2", "eager"):
+        return "whole"
+    return "off"
+
+
 # Every captured graph pins its own workspace pool; cap the set process-wide (3 graphs per layer).
 # Past the cap a layer stays EAGER (counted, never a crash), exactly like K3's K3_GRAPH_MAX.
 V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
@@ -240,6 +255,7 @@ class Stage:
         self.dtype = dtype or getattr(torch, V4_DTYPE)
         self.head, self.tail, self._dspark = head, tail, dspark
         M = ref()
+        self._M = M                       # the exec'd reference module (v4_whole_layer_graph borrows its kernels)
         self.globals = _set_globals(M, self.args)
         a = self.args
         if not 0 <= lo < hi <= a.n_layers:
@@ -274,13 +290,19 @@ class Stage:
         self._pos = 0
         self._replaying = False
         self.reset()
-        # One _BlockGraphs per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH).
-        # A stage that cannot graph stays fully eager and says why -- never a silent half-capture.
+        # One graph object per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH):
+        # island mode graphs only the hc_pre/hc_post/norm islands, whole mode graphs the WHOLE decode
+        # layer (attention core included, real routed MoE eager). A stage that cannot graph stays fully
+        # eager and says why -- never a silent half-capture.
         self._block_graphs = None
-        if V4_CUDA_GRAPH:
+        self._graph_mode = _graph_mode()
+        if self._graph_mode != "off":
             why = self._graph_refusal()
             if why:
                 print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
+            elif self._graph_mode == "whole":
+                import v4_whole_layer_graph as _wl
+                self._block_graphs = [_wl.WholeBlockGraphs(L, self, moe_mode="eager") for L in self.layers]
             else:
                 self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
 
@@ -483,9 +505,10 @@ class Stage:
     def _run(self, h, ids, start_pos, taps):
         """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps.
 
-        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its
-        _BlockGraphs when the stage is armed: the graph replays the hc_pre/hc_post/norm islands and
-        runs `attn`/`ffn` eager between them. Prefill, a multi-token chunk, and a rollback replay
+        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its captured
+        graph when the stage is armed -- island mode replays the hc_pre/hc_post/norm islands (attn/ffn
+        eager between), whole mode replays the whole layer incl. the capture-safe attention core (real
+        routed MoE eager between two graphs). Prefill, a multi-token chunk, and a rollback replay
         (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
         the reference's own decode branch is the thing it is proven against."""
         bg = self._block_graphs
@@ -635,7 +658,7 @@ class Stage:
                 f"kernels={v4_kernels_cpu.backend()} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
                 f"spec={'on' if self._spec else 'off'} "
-                f"graph={'on' if self._block_graphs is not None else 'off'}>")
+                f"graph={self._graph_mode if self._block_graphs is not None else 'off'}>")
 
 
 # ── partial CUDA graphs over a decode step ─────────────────────────────────────────────────────────
