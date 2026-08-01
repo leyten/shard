@@ -184,7 +184,10 @@ def _check_spec_depth(ctx):
     if ctx.side == COORDINATOR:
         vp = _mod("v4_pipe")
         req = str(vp.V4_SPEC_DEPTH) if vp is not None else "absent"
-        return req, req, None                      # the coordinator's own value IS the observation
+        fact = _NOTES.get("V4_SPEC_DEPTH")         # the W a real round streamed at
+        if fact is None:
+            return req, "no-job-yet", None
+        return req, fact, _agree(req, fact)
     req = os.environ.get("V4_SPEC_DEPTH", "16")
     if ctx.stage is None:
         return req, "no-stage", None
