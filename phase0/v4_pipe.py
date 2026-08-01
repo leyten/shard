@@ -25,10 +25,12 @@ RECEIPTS attest BOTH: a stage hashes (h || ids) at input and output, so the chai
 crossed intact. A hop that dropped or rewrote the ids — which would silently change which experts
 the next hash layer picks — breaks the chain, where a hidden-state-only chain could not see it.
 
-fp8 WIRE (V4_FP8_WIRE): only `h` is packed (e4m3, per-tensor scale, chain-preserving — sender hashes
-the packed wire bytes, receiver hashes the same received bytes). The ids ALWAYS ride int64: they are
-exact indices into a hash function and a vocab table, a quantized token id is not a token id, and
-they are 4000x smaller than h anyway.
+fp8 WIRE (V4_FP8_WIRE, opt-in, default OFF): only `h` is packed — e4m3, ONE SCALE PER (position,
+stream) so that a position's bytes never depend on how many other positions shared its frame, which
+is what keeps the drafted stream bit-identical to the greedy one; chain-preserving, since the sender
+hashes the packed wire bytes and the receiver hashes the same received bytes. The ids ALWAYS ride
+int64: they are exact indices into a hash function and a vocab table, a quantized token id is not a
+token id, and they are 4000x smaller than h anyway.
 
 LAZY MODEL IMPORT.  k3_pipe does `import k3_stage as K3` at module scope. This module imports
 v4_stage (and, in the selftest, v4_ref_cpu) INSIDE the functions that need them. The frame codec,
@@ -308,41 +310,103 @@ def _payload_bytes(h, ids):
 
 # ── fp8 activation wire (V4_FP8_WIRE): halve the inter-stage bytes/hop ──────────────────────────────
 # V4's boundary is 4 hyper-connection streams x dim x 2 B = 32 KiB/token at dim 4096, and a DSpark
-# chunk carries block_size+1 positions of it. Transporting h as fp8 (e4m3, per-tensor scale) halves
-# those bytes. CHAIN-PRESERVING: the receipt hashes the EXACT fp8 wire bytes on BOTH sides (sender's
-# out_root over the packed tensor, receiver's in_root over the same received bytes), so out_root ==
-# in_root still holds and the receipts stay CHAINED even though the activation is lossy — no
-# check_chain relaxation needed. The bf16 path is byte-identical when off. The IDS are never packed:
-# they are exact indices into a hash function and a vocab table.
+# chunk carries block_size+1 positions of it. Transporting h as fp8 (e4m3) halves those bytes, and
+# the framing does NOT eat it: measured through the real transport codec at the shipped config, the
+# s=1 pipelined decode frame is 32,968 B bf16 against 16,672 B fp8 (1.977x), of which the JSON
+# header and length prefixes are 192 B — 0.58%. phase0/v4_wire_bench.py re-derives the table.
+#
+# CHAIN-PRESERVING: the receipt hashes the EXACT fp8 wire bytes on BOTH sides (sender's out_root over
+# the packed tensor, receiver's in_root over the same received bytes), so out_root == in_root still
+# holds and the receipts stay CHAINED even though the activation is lossy — no check_chain relaxation
+# needed. The bf16 path is byte-identical when off. The IDS are never packed: they are exact indices
+# into a hash function and a vocab table.
 V4_FP8_WIRE = bool(int(os.environ.get("V4_FP8_WIRE", "0") or 0))
 
 
 def _pack_t(t):
-    """fp8 (e4m3) per-tensor quantize one activation for transport. A per-tensor scale keeps the
-    hyper-connection OUTLIER channels inside e4m3's +-448 range. Returns (fp8_tensor, float_scale)."""
-    scale = (t.detach().abs().amax() / 448.0).clamp(min=1e-8)
-    return (t / scale).to(torch.float8_e4m3fn).contiguous(), float(scale)
+    """fp8 (e4m3) quantize one boundary activation for transport, ONE SCALE PER (position, stream):
+    the amax reduces over `dim` ONLY, which is the same axis the reference's own act_quant scales
+    along (kernel.py act_quant, block_size on the last dim). Returns (fp8 [b,s,hc,dim], bf16 [b,s,hc]).
+
+    THE REDUCTION AXIS IS THE WHOLE DESIGN, AND IT IS A CORRECTNESS PROPERTY, NOT AN ACCURACY ONE.
+    e4m3 is a FLOAT — it carries its own 4-bit exponent, 2^14.8 of normal dynamic range — so a
+    coarser scale buys almost nothing in error: measured over the boundary tensors of a real V4
+    stack, a per-TENSOR scale is 1.03x worse than a per-128-block one even when the chunk spans
+    2^-20 of dynamic range, and block scales cost 4-32x more sidecar bytes. Granularity is not where
+    the accuracy is.
+
+    Where it does decide something is SPECULATION. A scale that reduces over the SEQUENCE axis makes
+    a position's transmitted bytes depend on which OTHER positions happened to share its frame, and
+    the DSpark path deliberately sends the same position inside chunks of different lengths (the
+    bare first round is s=1, a drafted round is s=dspark_block_size+1). Under a per-tensor scale the
+    drafted stream therefore stops being bit-identical to the greedy stream — the engine's headline
+    property, and the thing coordinate_dspark's accept rule is built on — for a reason that has
+    nothing to do with the model. Reducing over `dim` alone makes the packing of position p a
+    function of position p's own values, so spec == greedy survives the lossy wire. MEASURED on the
+    CPU ring with a drafter proposing the ring's own greedy continuation (so a self-consistent wire
+    must accept everything): bf16 g=4.00, this codec g=4.00, a per-tensor scale g=1.71. Granularity
+    is worth 2.3x of acceptance here, and nothing at all in error.
+
+    The amax is taken in fp32, NOT in the activation's own dtype: `clamp(min=1e-8)` coerces its
+    bound to the tensor dtype, and in float16 1e-8 underflows to 0.0, so the guard silently vanishes
+    and an all-zero row divides by zero. The clamp on the quotient is the vendored kernel's own
+    contract (act_quant: `(z / s).clamp(-FP8_MAX, FP8_MAX)`); without it a division that rounds a
+    hair above 448 lands in e4m3fn's saturating band, and far enough above it is a silent NaN.
+
+    The scale rides bf16 and the sender divides by that SAME rounded value, so both ends use bit-
+    identical scales. That is 2 B per (position, stream) — 8 B against 32 KiB of payload per token,
+    0.024% — and the residual the rounding adds is ~2^-9 against e4m3's own 2^-4 step.
+
+    The upper clamp is unreachable for any finite activation (it binds only past 448 * bf16-max) and
+    exists solely so ONE inf cannot poison its neighbours: an infinite amax would make the scale
+    infinite, and then every FINITE value in the row divides to 0 and the inf itself to NaN. The
+    bf16 wire carries a bad value in exactly one slot; without this the fp8 wire would turn it into
+    a row of 4096 NaN. With it, the inf saturates to 448 and the rest of the row is untouched."""
+    f = t.detach().float()
+    scale = (f.abs().amax(-1, keepdim=True) / 448.0).clamp(
+        min=1e-8, max=torch.finfo(torch.bfloat16).max).to(torch.bfloat16)
+    q = (f / scale.float()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn).contiguous()
+    return q, scale.squeeze(-1).contiguous()
 
 
 def _unpack_t(q, scale):
-    return q.to(torch.bfloat16) * scale                 # caller feeds st.forward (handles device)
+    """fp8 [b,s,hc,dim] + bf16 [b,s,hc] -> bf16, in bf16 throughout. Deliberately NOT via fp32: the
+    product is exact either way (an e4m3 value is 4 significant bits, a bf16 holds 8), and a fp32
+    intermediate would transiently double the biggest tensor on the ring — a 8192-token prefill's h
+    is 268 MB bf16 against 537 MB fp32, on a stage that is already holding weights."""
+    return q.to(torch.bfloat16) * scale.unsqueeze(-1)
 
 
 def _wire_bytes(h, ids, hs):
     """Deterministic bytes of a payload AS TRANSMITTED on the fp8 wire: the fp8 hidden bytes, the
-    (unpacked, int64) ids, and the scale. Sender hashes what it packs, receiver hashes what it got ->
-    out_root == in_root exactly."""
-    return _tbytes(h) + _tbytes(ids) + struct.pack("<d", hs)
+    (unpacked, int64) ids, and the scales. Sender hashes what it packs, receiver hashes what it got
+    -> out_root == in_root exactly."""
+    return _tbytes(h) + _tbytes(ids) + _tbytes(hs)
 
 
 def _recv_hids(msg, signer):
     """Take (h, ids) off a received step frame, upcasting h from fp8 when the wire carried it.
     Returns (h, ids, in_bytes) where in_bytes is the receipt in_root digest over the EXACT received
-    wire bytes (None when not signing)."""
+    wire bytes (None when not signing).
+
+    The frame, not the local V4_FP8_WIRE, decides — a stage decodes whatever its predecessor sent,
+    so the two do not have to agree. That is what makes a mixed ring merely inefficient instead of
+    wrong, and it is also why `h8` and `h.dtype` MUST be cross-checked here: an fp8 `h` whose scale
+    sidecar went missing would otherwise sail through `st.forward`'s `h.to(self.dtype)` as a tensor
+    scaled by ~1/scale, with no exception, no NaN, and an intact receipt chain (both sides hash the
+    same bytes). ValueError is in _STRAY, so a malformed frame resets the edge like any other."""
     h, ids = msg["h"], _ids_tensor(msg["ids"])
-    if "h8" in msg:                                     # fp8 wire
-        in_b = _wire_bytes(h, ids, msg["h8"]) if signer is not None else None
-        return _unpack_t(h, msg["h8"]), ids, in_b
+    packed = torch.is_tensor(h) and h.dtype == torch.float8_e4m3fn
+    if packed != ("h8" in msg):
+        raise ValueError(f"step frame: h is {getattr(h, 'dtype', type(h))} but h8 is "
+                         f"{'present' if 'h8' in msg else 'absent'}")
+    if packed:
+        hs = msg["h8"]
+        if not torch.is_tensor(hs) or hs.shape != h.shape[:-1]:
+            raise ValueError(f"step frame: h8 {getattr(hs, 'shape', type(hs))} does not scale "
+                             f"h {tuple(h.shape)} per (position, stream)")
+        in_b = _wire_bytes(h, ids, hs) if signer is not None else None
+        return _unpack_t(h, hs), ids, in_b
     return h, ids, (_payload_bytes(h, ids) if signer is not None else None)
 
 

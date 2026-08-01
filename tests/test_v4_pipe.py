@@ -1162,3 +1162,141 @@ def test_bf16_cannot_prefill_v4s_own_max_seq_in_one_frame_but_fp8_can():
     assert WB._wire_len(WB._frames(VP.V4_MAX_SEQ, V4_DIM, V4_HC)[1]) < T.MAX_FRAME
     assert WB.max_single_frame_prefill(V4_DIM, V4_HC, False) < VP.V4_MAX_SEQ
     assert WB.max_single_frame_prefill(V4_DIM, V4_HC, True) > VP.V4_MAX_SEQ
+
+
+def _packed_bytes(t):
+    q, s = VP._pack_t(t)
+    return q.view(torch.uint8).numpy().tobytes(), s.view(torch.uint8).numpy().tobytes()
+
+
+def test_fp8_scale_axis_makes_the_packing_chunk_size_invariant():
+    """THE reason the scale reduces over `dim` alone, and it is a correctness property.
+
+    DSpark sends the SAME position inside chunks of different lengths — the first round of a
+    generation is a bare [cur] chunk (s=1), every round after carries a whole block
+    (s=dspark_block_size+1). If the scale reduced over the sequence axis, a position's transmitted
+    bytes would depend on which other positions happened to share its frame, and the drafted stream
+    would stop being bit-identical to the greedy stream for a reason that has nothing to do with the
+    model. Reducing over `dim` makes position p's packing a function of position p alone."""
+    torch.manual_seed(0)
+    h = torch.randn(1, 6, HC, 128, dtype=torch.bfloat16)
+    h[0, 3, 1, 7] = 60.0                                     # an outlier that only ONE position owns
+    h[0, 0, 0, 0] = -250.0                                   # and another, on a different position
+    whole_q, whole_s = _packed_bytes(h)
+    per = V4_HC and h[0, 0].numel()                          # bytes of one position's packed hidden
+    for p in range(h.size(1)):
+        alone_q, alone_s = _packed_bytes(h[:, p:p + 1])
+        assert whole_q[p * per:(p + 1) * per] == alone_q, \
+            f"position {p} packs differently inside a 6-chunk than alone — spec != greedy"
+        assert whole_s[p * HC * 2:(p + 1) * HC * 2] == alone_s
+
+    # the contrast, so the choice is documented by a failing alternative: a scale reduced over the
+    # WHOLE tensor (what a per-tensor codec does) is NOT invariant, and the outliers above are
+    # exactly the case that breaks it.
+    def pertensor(t):
+        f = t.detach().float()
+        sc = (f.abs().amax() / 448.0).clamp(min=1e-8).to(torch.bfloat16)
+        return (f / sc.float()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn) \
+            .view(torch.uint8).numpy().tobytes()
+    assert pertensor(h)[3 * per:4 * per] != pertensor(h[:, 3:4]), \
+        "the per-tensor contrast is supposed to differ — this test proves nothing if it does not"
+
+
+def test_fp8_pack_saturates_and_survives_zeros_and_hostile_dtypes():
+    """Numerics the codec must not get wrong, none of which the happy path exercises.
+
+    The dtype cases are the subtle ones: `clamp(min=1e-8)` coerces its bound to the tensor's dtype,
+    and in float16 1e-8 underflows to 0.0 — so an all-but-zero row would divide by zero and ship a
+    frame of NaN. Taking the amax in fp32 is what makes the floor mean 1e-8 in every input dtype."""
+    for dt in (torch.bfloat16, torch.float32, torch.float16):
+        z = torch.zeros(1, 2, HC, 64, dtype=dt)
+        q, s = VP._pack_t(z)
+        assert not q.float().isnan().any(), f"all-zeros packed to NaN in {dt}"
+        assert torch.equal(VP._unpack_t(q, s).float(), torch.zeros(1, 2, HC, 64)), \
+            f"zeros must round-trip EXACTLY in {dt}"
+        tiny_vals = torch.full((1, 1, HC, 64), 1e-7, dtype=dt)
+        q, s = VP._pack_t(tiny_vals)
+        assert not q.float().isnan().any(), f"denormal-scale input packed to NaN in {dt}"
+
+    # saturation: the division maps amax to exactly 448, and torch's e4m3fn cast turns anything
+    # past ~464 into NaN rather than clamping. The clamp is what makes that unreachable.
+    torch.manual_seed(0)
+    for mag in (1e-4, 1.0, 1e4, 1e30):
+        t = (torch.randn(1, 2, HC, 64) * mag).to(torch.bfloat16)
+        q, s = VP._pack_t(t)
+        assert not q.float().isnan().any(), f"magnitude {mag} produced NaN"
+        assert q.float().abs().max() <= 448.0
+        assert not VP._unpack_t(q, s).float().isnan().any()
+
+    # ONE inf must stay CONTAINED. An infinite amax makes that scale infinite, and then every finite
+    # value sharing it divides to 0 while the inf itself divides to NaN. Its own (position, stream)
+    # row cannot be saved — the scale has to cover the inf — but the blast radius must stop there,
+    # which is a second dividend of reducing over `dim`: a scale reduced over the whole tensor would
+    # take the entire chunk, every position and every stream, down with it.
+    t = torch.randn(1, 2, HC, 64, dtype=torch.bfloat16)
+    clean = VP._unpack_t(*VP._pack_t(t)).float()
+    t[0, 0, 0, 5] = float("inf")
+    got = VP._unpack_t(*VP._pack_t(t)).float()
+    assert not got.isnan().any(), "one inf turned its row into NaN instead of saturating"
+    spoiled = torch.zeros(1, 2, HC, dtype=torch.bool)
+    spoiled[0, 0, 0] = True
+    assert torch.equal(got[~spoiled], clean[~spoiled]), \
+        "one inf changed the packing of rows it does not share a scale with"
+
+    # a chunk spanning a huge dynamic range still round-trips finite
+    t = torch.randn(1, 4, HC, 64, dtype=torch.bfloat16)
+    t[0, 0] *= 2.0 ** 30
+    q, s = VP._pack_t(t)
+    assert not VP._unpack_t(q, s).float().isnan().any()
+
+
+def test_recv_refuses_a_step_frame_whose_scale_sidecar_does_not_match():
+    """A dropped or mismatched `h8` must be a dead edge, not a silent 1/scale corruption.
+
+    Without the cross-check an fp8 `h` that arrived with no scale would sail through
+    Stage.forward's `h.to(self.dtype)` as a tensor scaled by ~1/scale — no exception, no NaN, and an
+    INTACT receipt chain (both sides hash the same bytes, so the chain cannot see it). ValueError is
+    in _STRAY, so the serve loop resets the edge like any other malformed frame."""
+    h, ids = _h(), _ids()
+    frame, _ = VP._make_step_frame(h, ids, 0, None)
+    assert "h8" not in frame                                 # default OFF: the bf16 wire is untouched
+    VP.V4_FP8_WIRE = True
+    try:
+        frame, _ = VP._make_step_frame(h, ids, 0, None)
+    finally:
+        VP.V4_FP8_WIRE = False
+    assert VP._recv_hids(dict(frame), None)[0].dtype == torch.bfloat16, "the happy path must decode"
+
+    stripped = {k: v for k, v in frame.items() if k != "h8"}
+    with pytest.raises(ValueError, match="h8"):
+        VP._recv_hids(stripped, None)
+    with pytest.raises(ValueError, match="h8"):               # a bf16 h with a scale is just as wrong
+        VP._recv_hids({**frame, "h": h}, None)
+    with pytest.raises(ValueError, match="h8"):               # right dtype, wrong shape
+        VP._recv_hids({**frame, "h8": frame["h8"][:, :1]}, None)
+    with pytest.raises(ValueError, match="h8"):               # the old scalar-scale wire
+        VP._recv_hids({**frame, "h8": 0.25}, None)
+
+
+def test_dspark_stream_still_equals_the_greedy_stream_under_the_fp8_wire(tiny, monkeypatch):
+    """THE speculation question, and the one a lossy wire can genuinely break.
+
+    coordinate_dspark's whole contract is that the drafted stream is bit-identical to the greedy
+    one. The fp8 wire is lossy, so that can only survive RELATIVE to the same wire — and it does,
+    because the drafter is tail-LOCAL and eats the post-wire tensor: the quantization lands once,
+    upstream of the fork into (verify rows, drafter taps), so drafter and verifier are perturbed
+    identically and the accept rule never rejects on account of the codec. What would break it is a
+    scale that depends on chunk length, since a bare [cur] round is s=1 and a drafted round is
+    s=block_size+1; test_fp8_scale_axis_makes_the_packing_chunk_size_invariant pins that axis."""
+    d, args, _ref = tiny
+    monkeypatch.setattr(VP, "V4_FP8_WIRE", True)             # the stage threads read the module global
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    try:
+        drafted = ring.dspark(list(PROMPT), NEW)
+        greedy = ring.coordinate(list(PROMPT), NEW)["tokens"]
+    finally:
+        ring.close()
+    assert drafted["tokens"] == greedy, (
+        f"the fp8 wire desynced speculation from greedy: {drafted['tokens']} != {greedy}")
+    assert drafted["g"] >= 1.0
+
