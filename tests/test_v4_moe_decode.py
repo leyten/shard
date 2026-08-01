@@ -97,6 +97,23 @@ def test_repeated_expert_falls_back(args, oracle, monkeypatch):
     assert torch.equal(ref, fast)
 
 
+def test_tensor_parallel_falls_back(args, oracle, monkeypatch):
+    """Under world_size > 1 the reference all_reduces the routed sum across ranks before adding the
+    shared expert. The fast path has no all_reduce, so skipping another rank's experts would drop
+    them silently — it must defer instead."""
+    MOE_ = sys.modules["v4_moe_decode"]
+    g = torch.Generator().manual_seed(SEED + 3)
+    x, ids = _x(args, 1, g, oracle), _ids(args, 1, g)
+    monkeypatch.setattr(MOE_, "_WORLD_SIZE", 2)
+    calls = []
+    real = MOE_._REF_FORWARD
+    monkeypatch.setattr(MOE_, "_REF_FORWARD",
+                        lambda s, xx, ii: (calls.append(1), real(s, xx, ii))[1])
+    with torch.no_grad():
+        MOE_.decode_forward(oracle.layers[-1].ffn, x, ids)
+    assert calls, "world_size > 1 must take the reference path"
+
+
 def test_install_is_idempotent(oracle):
     """load_ref memoizes, but a second install must not chain the fast path onto itself and lose
     the reference it needs for the fallbacks."""

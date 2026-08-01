@@ -40,14 +40,20 @@ import torch
 V4_MOE_DECODE = os.environ.get("V4_MOE_DECODE", "1") not in ("", "0")
 
 _REF_FORWARD = None                     # the reference's own MoE.forward, kept for the fallbacks
+_WORLD_SIZE = 1                         # model.py's, read at install (see the world_size fallback)
 
 
 def decode_forward(self, x, input_ids):
     """MoE.forward with the decode-shape host syncs removed. See the module docstring."""
     shape = x.size()
     xv = x.view(-1, self.dim)
-    if xv.size(0) != 1:                                 # prefill / a verified chunk: reference path
-        return _REF_FORWARD(self, x, input_ids)
+    if xv.size(0) != 1 or _WORLD_SIZE > 1:              # prefill / a verified chunk: reference path.
+        return _REF_FORWARD(self, x, input_ids)         # world_size > 1 too: the reference all_reduces
+                                                        # the routed sum across ranks before the shared
+                                                        # expert, and skipping a rank's experts without
+                                                        # that reduction silently drops them. A stage
+                                                        # refuses world_size != 1 anyway, but load_ref()
+                                                        # is a lower-level door with no such guard.
     weights, indices = self.gate(xv, input_ids.flatten())
     sel = indices[0].tolist()                           # the ONE host sync a decode step needs
     if len(set(sel)) != len(sel):                       # a repeated expert: `y[idx] +=` with duplicate
@@ -68,10 +74,11 @@ def install(mod):
     Unlike install_sm120 this runs AFTER model.py is executed: it replaces a method on a class the
     exec created, so there is nothing to rebind before. Idempotent, and a no-op under
     V4_MOE_DECODE=0 or on a module already installed (load_ref memoizes, but a test may not)."""
-    global _REF_FORWARD
+    global _REF_FORWARD, _WORLD_SIZE
     if not V4_MOE_DECODE or getattr(mod.MoE.forward, "_v4_decode_fast", False):
         return False
     _REF_FORWARD = mod.MoE.forward
+    _WORLD_SIZE = int(getattr(mod, "world_size", 1) or 1)
     decode_forward._v4_decode_fast = True
     mod.MoE.forward = decode_forward
     return True
