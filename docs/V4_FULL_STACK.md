@@ -255,7 +255,19 @@ are routine (23 of 120 decode steps). A bucketed or fixed-width read could there
 
 ---
 
-## The two bugs the composition found
+## What the composition found
+
+Six things, none of which any lever's own worktree could have seen, because each is a property of two
+levers meeting. Two were bugs and are fixed; four are properties and are now pinned by tests.
+
+| # | finding | kind | where it lives now |
+|---|---|---|---|
+| 1 | `v4_ref_slim` leaked its overrides across the whole test process | **bug, fixed** | `v4_ref_slim.uninstall()` + fixture teardown |
+| 2 | `V4_CUDA_GRAPH` was defined twice after the merge; the dead bool copy read as live | **bug, fixed** | removed in `v4_stage` |
+| 3 | `stage_launch_cmd` could only ever emit island mode | **gap, fixed** | `cuda_graph=` takes the mode and refuses a bad one |
+| 4 | `V4_REF_SLIM_NOQAT` changes the served tokens | property | asserted divergent, excluded from the recipe |
+| 5 | `V4_REF_SLIM` is bypassed by `whole` graphs (prefill only) | property | pinned; recipe note above |
+| 6 | a pipelined rollback replays EAGER, so graphs need Tier-1 | property | pinned; section above |
 
 **1. `v4_ref_slim` leaked across the whole test process.** `tests/test_v4_ref_slim.py` armed the slim
 overrides in a module-scoped fixture and never removed them, and `v4_ref_cpu.load_ref()` caches the
