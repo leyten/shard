@@ -64,7 +64,10 @@ def load_ref():
     ORDER IS LOAD-BEARING: install() before the file is read, because `from kernel import ...` is
     resolved at model.py's module scope and never again. INFERENCE_DIR goes on sys.path for the
     tilelang backend, where install() deliberately does nothing and that flat import has to find the
-    real kernel.py sitting next to model.py.
+    real kernel.py sitting next to model.py. install_sm120() is in the same window and for the same
+    reason: it swaps ONE of those kernels (sparse_attn, whose vendored tiling asks for 138 KiB of
+    shared memory and cannot launch on sm_120) and a swap made after the exec would bind nothing.
+    It no-ops on the CPU backend and on any device with room for the vendored kernel.
 
     Loaded under the name `dsv4_model` rather than `model` -- `model` is far too generic a top-level
     name to claim in a process that also imports shard's own modules."""
@@ -73,6 +76,9 @@ def load_ref():
         v4_kernels_cpu.install()
         if INFERENCE_DIR not in sys.path:
             sys.path.insert(0, INFERENCE_DIR)
+        if v4_kernels_cpu.backend() == "tilelang":
+            import v4_sparse_attn_sm120
+            v4_sparse_attn_sm120.install_sm120()
         spec = importlib.util.spec_from_file_location("dsv4_model", os.path.join(INFERENCE_DIR, "model.py"))
         mod = importlib.util.module_from_spec(spec)
         sys.modules["dsv4_model"] = mod

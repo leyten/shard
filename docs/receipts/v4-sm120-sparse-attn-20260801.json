@@ -1,0 +1,105 @@
+{
+  "title": "DeepSeek-V4-Flash sparse attention on sm_120 — the shared-memory retile, measured",
+  "date": "2026-08-01",
+  "note": "V4's vendored sparse_attn_kernel asks for 141312 B of dynamic shared memory at the real attention shape (h=64, d=512, block=64) and sm_120 caps at 101376 — the launch is refused, and it is the ONLY one of the six vendored kernels that fails on consumer Blackwell. phase0/v4_sparse_attn_sm120.py lifts the head axis out of the thread block (grid (m, b, ceil(h/h_block))); every other line is DeepSeek's. All numbers below were measured on the box named in `box`, not modelled.",
+  "box": {
+    "gpu": "NVIDIA GeForce RTX 5090 (sm_120)",
+    "vram_mib": 32607,
+    "driver": "595.84",
+    "torch": "2.10.0+cu128",
+    "tilelang": "0.1.12",
+    "shared_memory_per_block": 49152,
+    "shared_memory_per_block_optin": 101376,
+    "shared_memory_per_multiprocessor": 102400
+  },
+  "smem_model": {
+    "formula": "2*(h_block*d + block*d + h_block*block) + 8*threads",
+    "note": "o_shared aliases q_shared at offset 0 (confirmed in the generated CUDA); the 8 B/thread is tilelang's cross-warp reduction workspace. Exact against every launch-failure number the box printed.",
+    "checks": {
+      "vendored h=64 d=512 block=64 t256": 141312,
+      "h_block=16 block=128 t256": 153600,
+      "h_block=32 block=64 t256": 104448,
+      "h_block=32 block=64 t128": 103424
+    }
+  },
+  "tiling_sweep": {
+    "shape": "b=1, h=64, d=512, topk=640, n_kv=640; decode s=1 / prefill s=33; 50 and 20 reps",
+    "unit": "us per call",
+    "chosen": "h_block=16, block=64, threads=256, num_stages=2 — 86016 B",
+    "results": [
+      {"tile": "16,64,t256", "smem": 86016, "decode": 49.7, "prefill33": 51.3, "status": "SHIPPED"},
+      {"tile": "16,64,t128", "smem": 84992, "decode": 54.1, "prefill33": 54.8, "status": "ok"},
+      {"tile": "16,32,t128", "smem": 50176, "decode": 62.3, "prefill33": 63.1, "status": "ok, shipped as the small-smem fallback"},
+      {"tile": "32,32,t256", "smem": 69632, "decode": 84.4, "prefill33": 86.0, "status": "ok, slower"},
+      {"tile": "32,32,t128", "smem": 68608, "decode": 107.2, "prefill33": 109.9, "status": "ok, slower"},
+      {"tile": "16,64,t64", "smem": 82432, "decode": 109.9, "prefill33": 111.9, "status": "ok, slower"},
+      {"tile": "32,32,t64", "smem": 68096, "decode": 733.9, "prefill33": 768.8, "status": "ok, 15x slower"},
+      {"tile": "32,64,t256", "smem": 104448, "decode": null, "prefill33": null, "status": "FAIL — over the 101376 limit"},
+      {"tile": "16,128,t256", "smem": 153600, "decode": null, "prefill33": null, "status": "FAIL — over the limit"},
+      {"tile": "8,64 / 8,32 / 4,64", "smem": null, "decode": null, "prefill33": null, "status": "FAIL — tilelang: M must be divisible by 16 (MMA atom). h_block < 16 does not exist."},
+      {"tile": "16,32,t256 / 16,64,t512", "smem": null, "decode": null, "prefill33": null, "status": "FAIL — tilelang: warp_col_tiles must be divisible by 8. block/(threads/32) >= 8 and a multiple of 8."}
+    ]
+  },
+  "equivalence_vs_eager": {
+    "reference": "v4_kernels_cpu.sparse_attn (fp32, on device) — the same function the CPU backend runs",
+    "real_shape": [
+      {"case": "decode s=1 topk=640 window+compressed, 219 masked", "max_abs": 1.953e-3, "bf16_ulp_of_range": 1.21},
+      {"case": "prefill s=33 topk=640, 20439 masked", "max_abs": 1.562e-2, "bf16_ulp_of_range": 1.44},
+      {"case": "decode s=1 topk=633 (not a multiple of block)", "max_abs": 1.953e-3, "bf16_ulp_of_range": 1.14}
+    ],
+    "randomized": {
+      "draws": 1200,
+      "shapes": "h in {1,4,8,15,16,32,64} x d in {64,128,256,512}, b in {1,2}, s in {1..5}, n_kv 32..300, topk 8..200, 4 mask patterns",
+      "modes": {"auto-tile": 600, "forced 16,64,256 retile": 600},
+      "max_abs_median": 3.91e-3,
+      "max_abs_p90": 7.81e-3,
+      "max_abs_p99": 7.89e-3,
+      "max_abs_max": 1.5625e-2,
+      "bf16_ulp_of_range_median": 0.97,
+      "bf16_ulp_of_range_max": 1.92,
+      "note": "auto and forced-retile distributions are IDENTICAL to the last digit — the retile is numerically neutral. The residual is the kernel's bf16 round-trip of the probabilities through acc_s_cast, which the fp32 reference does not do."
+    }
+  },
+  "cross_check_vs_vendored_kernel": {
+    "note": "Both kernels run in one process on the box, at shapes where the VENDORED tiling still fits 99 KiB. 30 cases each, mixed batch/seq/topk/mask patterns.",
+    "results": [
+      {"h": 16, "d": 256, "head_chunks": 1, "exact": "430080/430080", "rate": 1.0, "max_abs": 0.0},
+      {"h": 8, "d": 256, "head_chunks": 1, "exact": "215040/215040", "rate": 1.0, "max_abs": 0.0},
+      {"h": 16, "d": 512, "head_chunks": 1, "exact": "860160/860160", "rate": 1.0, "max_abs": 0.0},
+      {"h": 32, "d": 128, "head_chunks": 2, "exact": "430079/430080", "rate": 0.9999977, "max_abs": 9.766e-4},
+      {"h": 32, "d": 256, "head_chunks": 2, "exact": "860156/860160", "rate": 0.9999953, "max_abs": 1.953e-3},
+      {"h": 64, "d": 128, "head_chunks": 4, "exact": "860159/860160", "rate": 0.9999988, "max_abs": 1.953e-3},
+      {"h": 64, "d": 256, "head_chunks": 4, "exact": "1720315/1720320", "rate": 0.9999971, "max_abs": 4.883e-4}
+    ],
+    "verdict": "BITWISE identical to DeepSeek's own kernel whenever the retile does not change the warp partitioning (h <= h_block). Where it does chunk, 5 elements in 1.7M differ by at most one bf16 ulp — that is T.gemm's fp32 accumulation order under a different warp tiling, not the head split, which is exact by construction."
+  },
+  "jit_smoke": {
+    "script": "v4_jit_smoke.py, one subprocess per kernel, 300 s deadline",
+    "before": {"act_quant": "OK 1.3", "fp4_act_quant": "OK 1.1", "fp8_gemm": "OK 1.2", "fp4_gemm": "OK 1.2", "sparse_attn": "FAIL InternalError: Failed to set the allowed dynamic shared memory size to 141312", "hc_split_sinkhorn": "OK 1.2"},
+    "after_install_sm120": {"act_quant": "OK 1.3", "fp4_act_quant": "OK 1.1", "fp8_gemm": "OK 1.2", "fp4_gemm": "OK 1.2", "sparse_attn": "OK 1.2", "hc_split_sinkhorn": "OK 1.2"},
+    "note": "tile-ai/tilelang#2328 (the indefinite JIT hang feared on RTX Pro 6000) does NOT occur on this stack. Every kernel compiles in ~1.2 s."
+  },
+  "end_to_end_toy_gpu": {
+    "setup": "v4_ref_cpu.cpu_args() model, full-range Stage(head+tail+dspark) + DSparkTail, prefill 33 + 20 greedy decode steps with a forward_spec draft every step. Weights generated once on CPU and loaded into both runs, so the streams are comparable.",
+    "finite": "every payload, tap, logit, draft and confidence finite on both devices; no crash",
+    "h4_d128": {
+      "cpu": [257, 151, 453, 266, 38, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 414, 256],
+      "cuda": [257, 398, 374, 374, 58, 374, 414, 414, 414, 414, 414, 414, 374, 414, 414, 414, 414, 414, 414, 279, 136],
+      "first_divergence": 1
+    },
+    "h32_d128": {
+      "cpu": [143, 143, 143, 493, 493, 493, 493, 493, 193, 193, 173, 116, 116, 403, 403, 403, 403, 403, 403, 403, 403],
+      "cuda_vendored_tiling": [143, 143, 143, 493, 493, 493, 493, 493, 193, 193, 173, 116, 116, 116, 116, 116, 116, 5, 66, 66, 66],
+      "cuda_forced_2_head_chunks": [143, 143, 143, 493, 493, 493, 493, 493, 193, 193, 173, 116, 116, 116, 116, 116, 116, 5, 66, 66, 66],
+      "first_divergence_cpu_vs_cuda": 13,
+      "retile_vs_vendored_on_gpu": "IDENTICAL, all 21 tokens"
+    },
+    "verdict": "The engine's GPU path runs end to end. CPU-vs-GPU divergence is the documented fp32-stand-in-vs-bf16-kernel effect on a random-weight toy whose argmax is near-degenerate (v4_ref_cpu already records the same effect between the reference's OWN prefill and decode branches); the sharp test is retile-vs-vendored ON the GPU, which is token-identical."
+  },
+  "ring_bringup_warnings": [
+    "fast_hadamard_transform is NOT installable on this image: pip build fails with 'The detected CUDA version (13.2) mismatches the version that was used to compile PyTorch (12.8)', and there is no prebuilt wheel for torch 2.10/cu128 (404). model.py's rotate_activation needs it for every Indexer layer, and v4_kernels_cpu.install() deliberately does NOTHING on the tilelang backend — so a GPU ring node will die at the first compress_ratio==4 layer unless a cu12.8 toolkit is provisioned or the torch butterfly in v4_kernels_cpu is registered for it. The e2e above used the torch butterfly.",
+    "safetensors was not installed on the base image; v4_stage imports it at module scope.",
+    "h_block < 16 is impossible (MMA atom), so a device tighter than 99 KiB cannot be reached by shrinking the head chunk further — only by shrinking `block`, which costs ~20%.",
+    "threads=64 is legal and 2.2x slower than threads=256 at the same tile; do not tune threads down to buy shared memory."
+  ]
+}

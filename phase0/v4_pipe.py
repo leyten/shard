@@ -472,6 +472,22 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     dev = device or getattr(V4, "dev", "cuda")
     receipts = RECEIPTS if receipts is None else receipts
     key_path = key_path or NODE_KEY_PATH
+    if str(dev).startswith("cuda"):
+        # generate.py:92 does this and the reference NEEDS it: model.py's lru_cached index helpers
+        # (get_window_topk_idxs:261, get_compress_topk_idxs:275, get_dspark_topk_idxs:744) build
+        # their topk_idxs with a bare `torch.arange` at FORWARD time, on the AMBIENT default device
+        # — outside any `with torch.device(...)` the Stage's constructor used. Without this the
+        # first attention hands a CPU int32 tensor to a CUDA kernel. It is process-wide and it is
+        # set HERE, in the serve path, rather than at import: a library import that moves every
+        # caller's default device is a trap, and the CPU parity suite shares this process.
+        torch.set_default_device(dev)
+        # generate.py:77's other half, equally load-bearing at FORWARD time: kernel.py's GEMM
+        # wrappers allocate their output at torch.get_default_dtype() (fp8_gemm:270, fp4_gemm:533),
+        # and the tilelang kernels are compiled for bf16 C — under the fp32 process default the
+        # first quantized linear dies with "input C dtype mismatch, expected bfloat16" (observed:
+        # it killed the head stage's prefill on the first live ring, 2026-08-01). Guarded by the
+        # same cuda condition so the CPU suite keeps its fp32 default.
+        torch.set_default_dtype(torch.bfloat16)
     with _BUILD_LOCK:                                   # process-wide torch/reference globals — see the lock
         st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=(dspark and tail), device=dev)
         if ckpt_dir is not None:
