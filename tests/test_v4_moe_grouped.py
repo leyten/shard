@@ -21,6 +21,7 @@ The numeric parity test is GPU-gated and skips here. Run: python3 -m pytest test
 """
 import os
 import sys
+import weakref
 
 import pytest
 
@@ -260,15 +261,17 @@ def test_load_ref_installs_grouped_after_decode():
 _KINDS = ("w1", "w2", "w3")
 
 
-def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4"):
+def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4", dim=64, inter=32):
     """A tiny MoE built from the REFERENCE's own classes with fp4 routed experts.
 
     Not a stub: the layout repoints real `nn.Parameter`s and the loader test drives a real
     `load_state_dict`, so anything less than the reference's `MoE`/`Expert`/`Linear` would prove
     nothing about the stage. fp4 needs `dim` a multiple of `fp4_block_size` (32); everything else is
-    as small as the constructor's asserts allow. Takes `oracle` only to force `dsv4_model` loaded."""
+    as small as the constructor's asserts allow. Takes `oracle` only to force `dsv4_model` loaded.
+    `dim`/`inter` are widened to 128 by the one test that RUNS the thing — `v4_kernels_cpu.act_quant`
+    needs the activation's last dim to be a multiple of `block_size` (128)."""
     mod = sys.modules["dsv4_model"]
-    a = mod.ModelArgs(dim=64, moe_inter_dim=32, n_routed_experts=n_experts, n_activated_experts=2,
+    a = mod.ModelArgs(dim=dim, moe_inter_dim=inter, n_routed_experts=n_experts, n_activated_experts=2,
                       n_shared_experts=1, n_hash_layers=1, expert_dtype=expert_dtype,
                       dtype="bf16", scale_fmt=None, scale_dtype="fp32", vocab_size=32)
     with mod.set_dtype(torch.bfloat16):
@@ -417,14 +420,240 @@ def test_expert_bank_uses_the_load_time_bank_and_never_stacks(oracle, monkeypatc
 def test_stage_lays_out_the_bank_between_construction_and_load():
     """The seam, pinned as source: the layout has to run AFTER the Blocks exist (there is nothing to
     repoint before) and BEFORE `load()` (so the checkpoint writes through the views into the bank).
-    Relayout after the load would mean copying — the duplicate this change removes. v4_stage is
+    Relayout after the load would mean copying — the duplicate this change removes. And it has to ask
+    for `preserve=False`, which is the whole of the memory fix: the Blocks are two statements old, so
+    the routed-expert bytes are still the constructor's uninitialised `torch.empty` and the layout is
+    free to RELEASE each layer's per-expert run before it allocates that layer's banks. v4_stage is
     GPU-shaped and cannot be instantiated at V4's dims here, so the ordering is checked in the text."""
     import inspect
+    call = "v4_moe_grouped.bank_layout(self.layers, preserve=False)"
     src = inspect.getsource(pytest.importorskip("v4_stage").Stage)
-    assert "v4_moe_grouped.bank_layout(self.layers)" in src, "Stage never lays out the bank"
+    assert call in src, "Stage must lay out the bank, and must lay it out release-first"
     init = src.index("def __init__")
-    assert init < src.index("v4_moe_grouped.bank_layout(self.layers)") < src.index("def load("), \
+    assert init < src.index(call) < src.index("def load("), \
         "the bank layout must sit in __init__, i.e. after construction and before load()"
+
+
+# ── the layout's memory timeline: what it may hold, and when ─────────────────────────────────────
+#
+# The bank layout's ONLY justification is that it costs nothing on the card, and the first version of
+# it was measured the way that claim invites: `torch.cuda.memory_allocated` before and after, on a
+# 3-layer stage, where it is flat to the byte. It is flat because the release is real — every
+# per-expert storage genuinely goes away. What is NOT flat is the moment in between. Allocating a
+# [256, N, K] bank and only then walking the experts that it replaces means asking the driver for
+# 1024 MiB the layer is still holding, and the blocks that come back are 256 scattered 4 MiB
+# per-expert allocations sharing large-pool segments with the kinds not yet relaid — the wrong shape
+# to satisfy the request that freed them, and not wholly-free segments, so `empty_cache` cannot
+# return them either. `memory_reserved` therefore climbs by every bank built so far and only falls at
+# the END of the layer. An 8-layer stage on a 32 GiB card dies there.
+#
+# These tests put a meter on that interval. `_Meter` tracks LIVE STORAGE BYTES exactly — a weakref
+# finalizer on each `UntypedStorage`'s PyObject, which torch keeps pinned to the c10::StorageImpl, so
+# a storage is counted out at the instant its last reference dies and not one statement later — and
+# runs the ledger the failure was really about: bytes REQUESTED from the allocator against bytes
+# RELEASED to it. `torch.cuda` is not available here and the numbers are not the point; the ORDERING
+# is, and it is dimension-independent.
+
+
+class _Meter:
+    """Live storage bytes + the request-vs-release ledger, over a region of code.
+
+    `orig` blocks are the constructor's per-expert tensors, `bank` blocks are what the layout asks
+    for. `debt` is how far the layout has outrun itself: bytes it has taken from the allocator that
+    the bytes it replaces had not yet given back. A debt of D means the process must be able to hold
+    D bytes MORE than the model does, at that instant, in memory the allocator cannot recycle."""
+
+    def __init__(self):
+        self.live = self.peak = self.released = self.requested = self.worst_debt = 0
+        self.banks = []
+
+    def watch(self, t, kind):
+        st = t.untyped_storage()
+        n = st.nbytes()
+        if n == 0:                      # the release-first path's void placeholders — nothing to meter
+            return t
+        self.live += n
+        self.peak = max(self.peak, self.live)
+        if kind == "bank":
+            self.requested += n
+            self.banks.append(n)
+            self.worst_debt = max(self.worst_debt, self.requested - self.released)
+        m = self
+
+        def gone():
+            m.live -= n
+            if kind == "orig":
+                m.released += n
+        weakref.finalize(st, gone)
+        return t
+
+    def watch_experts(self, moe):
+        for e in moe.experts:
+            for k in _KINDS:
+                self.watch(getattr(e, k).weight, "orig")
+                self.watch(getattr(e, k).scale, "orig")
+        return self.live
+
+
+def _layout_metered(moe, preserve, monkeypatch):
+    """Run the layout with every routed-expert storage and every bank allocation on a meter.
+
+    `_relayout_moe` is the only python-level `torch.empty` caller inside the layout, so patching it
+    for the width of the call catches the banks and nothing else."""
+    m = _Meter()
+    baseline = m.watch_experts(moe)
+    m.released = m.requested = 0
+    real_empty = torch.empty
+    monkeypatch.setattr(torch, "empty", lambda *a, **k: m.watch(real_empty(*a, **k), "bank"))
+    n = GROUPED.bank_layout(moe, preserve=preserve)
+    monkeypatch.undo()
+    return m, baseline, n
+
+
+def test_the_toy_dims_are_proportional_to_the_shipped_layer(oracle):
+    """These tests run at 256 experts and toy widths; this pins that the SHAPE of the memory problem
+    is the shipped one, so the ratios the next two tests assert are the ratios on the card.
+
+    A routed expert is w1/w3 [inter, dim] + w2 [dim, inter] in packed fp4 (2 values per byte) plus an
+    e8m0 scale per 32 fp4 elements along K, so per kind scale:weight is exactly 1:16 and the layer's
+    six banks are 3 x 16/51 + 3 x 1/51 of the routed total whatever dim and inter are. At the shipped
+    dim=4096 / moe_inter_dim=2048 / 256 experts that reads 3 x 1024.00 MiB + 3 x 64.00 MiB = 3.1875
+    GiB per layer; here it is the same fractions of 816.00 KiB. Only the scale factor differs."""
+    moe = _fp4_moe(oracle, n_experts=256)
+    per_kind = {}
+    for k in _KINDS:
+        lin = getattr(moe.experts[0], k)
+        per_kind[k] = lin.weight.untyped_storage().nbytes() * 256
+        per_kind[k + "_s"] = lin.scale.untyped_storage().nbytes() * 256
+    routed = sum(per_kind.values())
+    assert len(moe.experts) == 256, "the shipped n_routed_experts, not a toy count"
+    for k in _KINDS:
+        assert per_kind[k] == 16 * per_kind[k + "_s"], "fp4 packs 2/byte, e8m0 is 1 per 32 — 1:16"
+        assert per_kind[k] * 51 == routed * 16, "each weight bank is 16/51 of the layer's experts"
+    # The shipped layer, from deepseek_v4_ref/inference/config.json: moe_inter_dim=2048, dim=4096,
+    # n_routed_experts=256, expert_dtype=fp4.
+    MiB = 1 << 20
+    shipped_weight_bank = 2048 * (4096 // 2) * 256
+    shipped_routed = 3 * shipped_weight_bank + 3 * (shipped_weight_bank // 16)
+    assert shipped_weight_bank == 1024 * MiB, "the shipped weight bank is 1024.00 MiB"
+    assert shipped_routed == 3264 * MiB, "the shipped layer's routed experts are 3.1875 GiB"
+    assert routed * (shipped_weight_bank // per_kind["w1"]) == shipped_routed, \
+        "the toy layer is the shipped 3.1875 GiB layer scaled, not a differently shaped one"
+
+
+def test_bank_layout_never_outruns_what_it_released(oracle, monkeypatch):
+    """THE REGRESSION GATE. On the stage's own path the layout must never hold a byte twice.
+
+    Three claims, all exact, none of them a tolerance:
+      * it ends holding exactly what it started with — the banks ARE the experts, nothing leaked,
+      * its PEAK equals that too: at no instant is the layer resident twice, not even one kind of it,
+      * and the ledger never goes into debt: every bank is allocated out of memory the layout has
+        ALREADY handed back, so the allocator can satisfy it by recycling rather than by growing.
+    The third is the one the card enforces and the one the first implementation failed. A debt of D
+    is D bytes of `memory_reserved` above the model's own footprint, in blocks of the wrong shape to
+    be reused; at the shipped dims the old ordering ran a debt of 1024 MiB per weight kind and left
+    the layer's released run stranded behind it, which is 3.19 GiB of reserved-but-unusable per layer
+    and the 8-layer OOM."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle, n_experts=256)
+    m, baseline, n = _layout_metered(moe, False, monkeypatch)
+    assert n == 1 and len(m.banks) == 6, "six banks: three weights, three scales"
+    assert m.live == baseline, f"steady state moved by {m.live - baseline} B — the layout leaked"
+    assert m.peak == baseline, (
+        f"peak {m.peak} B against a steady {baseline} B: the layout held "
+        f"{m.peak - baseline} B twice, i.e. {(m.peak - baseline) / max(m.banks):.2f} of a whole bank")
+    assert m.worst_debt == 0, (
+        f"the layout asked the allocator for {m.worst_debt} B it had not released — "
+        f"{(m.worst_debt / max(m.banks)):.2f} of a bank, {m.worst_debt / baseline:.1%} of the layer")
+    # and the banks really are the experts, at the right slot, after a release-first layout
+    for i, e in enumerate(moe.experts):
+        for k in _KINDS:
+            assert getattr(e, k).weight.data_ptr() == moe._grouped_bank[k][i].data_ptr()
+            assert getattr(e, k).scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+
+
+def test_preserving_the_bytes_costs_a_whole_kind_which_is_why_the_stage_does_not(oracle, monkeypatch):
+    """The other half of the gate: the copy-preserving order is measured, not assumed to be cheap.
+
+    `preserve=True` cannot release before it allocates — it has to read the tensors it is replacing —
+    so its peak is the layer plus one whole bank and its debt is one whole bank, every kind. That is
+    the correct trade for the GPU parity harness (one layer, a card with room) and the wrong one for
+    an 8-layer stage, and pinning the number here is what stops the two being confused again."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle, n_experts=256)
+    m, baseline, n = _layout_metered(moe, True, monkeypatch)
+    biggest = max(m.banks)
+    assert n == 1
+    assert m.live == baseline, "preserve=True must also end with exactly one copy"
+    assert m.peak == baseline + biggest, (
+        "preserve=True is expected to hold one whole bank on top of the layer — if that changed, "
+        "the stage's preserve=False path may no longer be the thing that saves it")
+    assert m.worst_debt == biggest
+    assert biggest * 51 == baseline * 16, "the overshoot is a full weight kind, 16/51 of the layer"
+
+
+def test_the_loader_still_writes_through_a_release_first_layout(oracle, monkeypatch):
+    """The shipped path end to end: release-first layout, then `Stage.load`'s `load_state_dict`.
+
+    Releasing the constructor's tensors is only safe because nothing readable is in them yet and the
+    loader is strict — so the thing that has to hold is that the checkpoint still lands IN the bank,
+    through the view, at the loaded expert's own slot and nowhere else."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle, n_experts=8)
+    assert GROUPED.bank_layout(moe, preserve=False) == 1
+    bank = moe._grouped_bank
+    tgt = 5
+    sd = {k: torch.zeros_like(v) for k, v in moe.experts[tgt].state_dict().items()}
+    sd["w2.weight"] = torch.full(tuple(moe.experts[tgt].w2.weight.shape), 7,
+                                 dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    moe.experts[tgt].load_state_dict(sd, strict=True)
+    assert bool((bank["w2"][tgt].view(torch.uint8) == 7).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w2.weight.data_ptr() == bank["w2"][tgt].data_ptr(), "the view was replaced"
+    assert moe.experts[tgt].w2.weight.scale is moe.experts[tgt].w2.scale, "weight.scale did not survive"
+    for i in range(len(moe.experts)):
+        if i != tgt:
+            assert not bool((bank["w2"][i].view(torch.uint8) == 7).all()), "a neighbour was written"
+
+
+def test_a_release_first_layout_serves_bit_identically_to_no_layout(oracle, monkeypatch):
+    """The correctness bar for throwing the constructor's tensors away, RUN rather than asserted.
+
+    Two MoEs from one state dict — one plain, one given the release-first layout before it was
+    loaded — driven through the reference's own `MoE.forward` on real fp4 weights. `torch.equal`, not
+    a tolerance, at a decode shape and two chunk shapes, which is every shape a stage takes: the
+    grouped kernel claims s == 1 only, and everything else reads these same parameters as the
+    reference always did. If releasing the uninitialised tensors could ever cost a byte, this is
+    where it would show. (The grouped KERNEL's own parity is CUDA-only and lives in the two
+    `@pytest.mark.hardware` tests below; this is the layout's.)"""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    from kernel import fp4_act_quant
+    mod = sys.modules["dsv4_model"]
+    dim = inter = 128                       # act_quant's block_size, the CPU kernels' one constraint
+    g = torch.Generator().manual_seed(SEED)
+    plain = _fp4_moe(oracle, n_experts=8, dim=dim, inter=inter)
+    sd = {}
+    for i in range(8):
+        for k, out_f, in_f in (("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)):
+            w, s = fp4_act_quant(torch.randn(out_f, in_f, generator=g, dtype=torch.bfloat16),
+                                 mod.fp4_block_size)
+            sd[f"experts.{i}.{k}.weight"], sd[f"experts.{i}.{k}.scale"] = w.clone(), s.clone()
+    for k, out_f, in_f in (("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)):
+        sd[f"shared_experts.{k}.weight"] = torch.randn(out_f, in_f, generator=g, dtype=torch.bfloat16)
+    sd["gate.weight"] = torch.randn(*plain.gate.weight.shape, generator=g, dtype=torch.bfloat16)
+    if plain.gate.bias is not None:
+        sd["gate.bias"] = torch.randn(*plain.gate.bias.shape, generator=g, dtype=torch.float32)
+
+    banked = _fp4_moe(oracle, n_experts=8, dim=dim, inter=inter)
+    assert GROUPED.bank_layout(banked, preserve=False) == 1, "the layout must take before the load"
+    for m in (plain, banked):
+        m.load_state_dict(sd, strict=True)
+        m.eval()
+    for s in (1, 3, 9):
+        x = torch.randn(1, s, dim, generator=g, dtype=torch.bfloat16)
+        ids = torch.randint(0, 32, (1, s), generator=g)
+        with torch.no_grad():
+            want, got = plain(x, ids), banked(x, ids)
+        assert torch.equal(want, got), f"the banked layout is not bit-exact at s={s}"
 
 
 @pytest.mark.hardware
