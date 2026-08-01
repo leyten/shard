@@ -165,18 +165,24 @@ class _NoTimer:
 _NO_TIMER = _NoTimer()
 
 
-def _frame_bytes(obj):
-    """The tensor bytes a message carries — what actually crosses the wire, give or take the ~150 B
-    JSON header. An int passes straight through, because send_msg already returns the exact count."""
-    if isinstance(obj, int):
-        return obj
+def _tensor_bytes(obj):
+    """Bytes of the tensor blobs inside a decoded message — what actually crossed the wire, give or
+    take the ~150 B JSON header. Scalars count as ZERO: they ride the header, and counting an int's
+    VALUE as a byte count is the obvious trap here — the head's `ids` arrive as a plain list of token
+    ids (the coordinator sends no tensor), so summing them reported a 1.5 KB frame as 189 KB."""
     if torch.is_tensor(obj):
         return obj.numel() * obj.element_size()
     if isinstance(obj, dict):
-        return sum(_frame_bytes(v) for v in obj.values())
+        return sum(_tensor_bytes(v) for v in obj.values())
     if isinstance(obj, (list, tuple)):
-        return sum(_frame_bytes(v) for v in obj)
+        return sum(_tensor_bytes(v) for v in obj)
     return 0
+
+
+def _frame_bytes(obj):
+    """Byte count for a timed phase: an int is send_msg's own exact on-the-wire count and is taken
+    as-is; anything else is a decoded message to size."""
+    return obj if isinstance(obj, int) else _tensor_bytes(obj)
 
 
 class _StepTimer:
