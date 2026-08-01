@@ -31,6 +31,7 @@ everything above.
 Run: python3 -m pytest tests/test_v4_pipe.py -q
 """
 import os
+import re
 import select
 import socket
 import struct
@@ -1818,3 +1819,295 @@ def test_swarm_token_value_is_actually_compared(monkeypatch):
     monkeypatch.setattr(VP, "SWARM_TOKEN", None)
     assert VP._is_pred_hello({"op": "hello_pred"}), "token-less ring accepts on shape"
     assert VP._is_pred_hello({"op": "hello_pred", "token": "ignored"})
+
+
+# ── 10. the fp8 activation wire (V4_FP8_WIRE): bytes, scale axis, and what it refuses ──────────────
+# The lever is opt-in and default OFF. Three things have to hold for it to be worth switching on:
+# it must actually halve the hop AT V4's shape (not be eaten by framing overhead), its scale axis
+# must keep the drafted stream identical to the greedy one, and a frame whose scale sidecar does not
+# match its hidden must be refused rather than silently applied.
+
+V4_DIM, V4_HC, V4_BLOCK = 4096, 4, 5          # phase0/deepseek_v4_ref/inference/config.json
+
+
+def _bench():
+    return pytest.importorskip("v4_wire_bench")
+
+
+def test_fp8_wire_halves_the_hop_and_framing_overhead_does_not_eat_it():
+    """The bytes, at the SHIPPED config, through the real transport codec.
+
+    The s=1 PIPELINED DECODE frame is the one to be suspicious about: it is the smallest frame the
+    ring sends, so it is where fixed per-frame overhead would have the best chance of swamping the
+    saving. It does not — V4's boundary is 4 hyper-connection streams x 4096 x 2 B = 32 KiB for a
+    SINGLE token, against a 168 B JSON header. That is the V4 difference: on a model with one
+    residual stream this frame would be 8 KiB and the argument would be closer."""
+    WB = _bench()
+    for s, floor in ((1, 1.95), (V4_BLOCK + 1, 1.95), (2048, 1.99)):
+        bf16, fp8 = WB._frames(s, V4_DIM, V4_HC)
+        nb, nf = WB._wire_len(bf16), WB._wire_len(fp8)
+        assert nb / nf >= floor, f"s={s}: fp8 wire only {nb/nf:.3f}x ({nb} -> {nf})"
+    bf16, _ = WB._frames(1, V4_DIM, V4_HC)
+    payload = V4_HC * V4_DIM * 2 + 8                        # h + one int64 id
+    overhead = WB._wire_len(bf16) - payload
+    assert overhead < 0.01 * WB._wire_len(bf16), \
+        f"framing overhead {overhead} B is >1% of the s=1 decode frame — metadata would dominate"
+
+
+def test_bf16_cannot_prefill_v4s_own_max_seq_in_one_frame_but_fp8_can():
+    """A live constraint, not a curiosity: V4_MAX_SEQ defaults to 8192 and one bf16 prefill frame at
+    8192 positions is 268,501,190 B against transport's 268,435,456 B MAX_FRAME. The ring cannot
+    prefill its own advertised context in a single frame on the bf16 wire; recv_msg refuses the
+    length before it ever allocates. fp8 moves the ceiling past it with room to spare."""
+    WB = _bench()
+    T = WB.T
+    assert WB._wire_len(WB._frames(VP.V4_MAX_SEQ, V4_DIM, V4_HC)[0]) > T.MAX_FRAME
+    assert WB._wire_len(WB._frames(VP.V4_MAX_SEQ, V4_DIM, V4_HC)[1]) < T.MAX_FRAME
+    assert WB.max_single_frame_prefill(V4_DIM, V4_HC, False) < VP.V4_MAX_SEQ
+    assert WB.max_single_frame_prefill(V4_DIM, V4_HC, True) > VP.V4_MAX_SEQ
+
+
+def _packed_bytes(t):
+    q, s = VP._pack_t(t)
+    return q.view(torch.uint8).numpy().tobytes(), s.view(torch.uint8).numpy().tobytes()
+
+
+def test_fp8_scale_axis_makes_the_packing_chunk_size_invariant():
+    """THE reason the scale reduces over `dim` alone, and it is a correctness property.
+
+    DSpark sends the SAME position inside chunks of different lengths — the first round of a
+    generation is a bare [cur] chunk (s=1), every round after carries a whole block
+    (s=dspark_block_size+1). If the scale reduced over the sequence axis, a position's transmitted
+    bytes would depend on which other positions happened to share its frame, and the drafted stream
+    would stop being bit-identical to the greedy stream for a reason that has nothing to do with the
+    model. Reducing over `dim` makes position p's packing a function of position p alone."""
+    torch.manual_seed(0)
+    h = torch.randn(1, 6, HC, 128, dtype=torch.bfloat16)
+    h[0, 3, 1, 7] = 60.0                                     # an outlier that only ONE position owns
+    h[0, 0, 0, 0] = -250.0                                   # and another, on a different position
+    whole_q, whole_s = _packed_bytes(h)
+    per = V4_HC and h[0, 0].numel()                          # bytes of one position's packed hidden
+    for p in range(h.size(1)):
+        alone_q, alone_s = _packed_bytes(h[:, p:p + 1])
+        assert whole_q[p * per:(p + 1) * per] == alone_q, \
+            f"position {p} packs differently inside a 6-chunk than alone — spec != greedy"
+        assert whole_s[p * HC * 2:(p + 1) * HC * 2] == alone_s
+
+    # the contrast, so the choice is documented by a failing alternative: a scale reduced over the
+    # WHOLE tensor (what a per-tensor codec does) is NOT invariant, and the outliers above are
+    # exactly the case that breaks it.
+    def pertensor(t):
+        f = t.detach().float()
+        sc = (f.abs().amax() / 448.0).clamp(min=1e-8).to(torch.bfloat16)
+        return (f / sc.float()).clamp(-448.0, 448.0).to(torch.float8_e4m3fn) \
+            .view(torch.uint8).numpy().tobytes()
+    assert pertensor(h)[3 * per:4 * per] != pertensor(h[:, 3:4]), \
+        "the per-tensor contrast is supposed to differ — this test proves nothing if it does not"
+
+
+def test_fp8_pack_saturates_and_survives_zeros_and_hostile_dtypes():
+    """Numerics the codec must not get wrong, none of which the happy path exercises.
+
+    The dtype cases are the subtle ones: `clamp(min=1e-8)` coerces its bound to the tensor's dtype,
+    and in float16 1e-8 underflows to 0.0 — so an all-but-zero row would divide by zero and ship a
+    frame of NaN. Taking the amax in fp32 is what makes the floor mean 1e-8 in every input dtype."""
+    for dt in (torch.bfloat16, torch.float32, torch.float16):
+        z = torch.zeros(1, 2, HC, 64, dtype=dt)
+        q, s = VP._pack_t(z)
+        assert not q.float().isnan().any(), f"all-zeros packed to NaN in {dt}"
+        assert torch.equal(VP._unpack_t(q, s).float(), torch.zeros(1, 2, HC, 64)), \
+            f"zeros must round-trip EXACTLY in {dt}"
+        tiny_vals = torch.full((1, 1, HC, 64), 1e-7, dtype=dt)
+        q, s = VP._pack_t(tiny_vals)
+        assert not q.float().isnan().any(), f"denormal-scale input packed to NaN in {dt}"
+
+    # saturation: the division maps amax to exactly 448, and torch's e4m3fn cast turns anything
+    # past ~464 into NaN rather than clamping. The clamp is what makes that unreachable.
+    torch.manual_seed(0)
+    for mag in (1e-4, 1.0, 1e4, 1e30):
+        t = (torch.randn(1, 2, HC, 64) * mag).to(torch.bfloat16)
+        q, s = VP._pack_t(t)
+        assert not q.float().isnan().any(), f"magnitude {mag} produced NaN"
+        assert q.float().abs().max() <= 448.0
+        assert not VP._unpack_t(q, s).float().isnan().any()
+
+    # ONE inf must stay CONTAINED. An infinite amax makes that scale infinite, and then every finite
+    # value sharing it divides to 0 while the inf itself divides to NaN. Its own (position, stream)
+    # row cannot be saved — the scale has to cover the inf — but the blast radius must stop there,
+    # which is a second dividend of reducing over `dim`: a scale reduced over the whole tensor would
+    # take the entire chunk, every position and every stream, down with it.
+    t = torch.randn(1, 2, HC, 64, dtype=torch.bfloat16)
+    clean = VP._unpack_t(*VP._pack_t(t)).float()
+    t[0, 0, 0, 5] = float("inf")
+    got = VP._unpack_t(*VP._pack_t(t)).float()
+    assert not got.isnan().any(), "one inf turned its row into NaN instead of saturating"
+    spoiled = torch.zeros(1, 2, HC, dtype=torch.bool)
+    spoiled[0, 0, 0] = True
+    assert torch.equal(got[~spoiled], clean[~spoiled]), \
+        "one inf changed the packing of rows it does not share a scale with"
+
+    # a chunk spanning a huge dynamic range still round-trips finite
+    t = torch.randn(1, 4, HC, 64, dtype=torch.bfloat16)
+    t[0, 0] *= 2.0 ** 30
+    q, s = VP._pack_t(t)
+    assert not VP._unpack_t(q, s).float().isnan().any()
+
+
+def test_recv_refuses_a_step_frame_whose_scale_sidecar_does_not_match():
+    """A dropped or mismatched `h8` must be a dead edge, not a silent 1/scale corruption.
+
+    Without the cross-check an fp8 `h` that arrived with no scale would sail through
+    Stage.forward's `h.to(self.dtype)` as a tensor scaled by ~1/scale — no exception, no NaN, and an
+    INTACT receipt chain (both sides hash the same bytes, so the chain cannot see it). ValueError is
+    in _STRAY, so the serve loop resets the edge like any other malformed frame."""
+    h, ids = _h(), _ids()
+    frame, _ = VP._make_step_frame(h, ids, 0, None)
+    assert "h8" not in frame                                 # default OFF: the bf16 wire is untouched
+    VP.V4_FP8_WIRE = True
+    try:
+        frame, _ = VP._make_step_frame(h, ids, 0, None)
+    finally:
+        VP.V4_FP8_WIRE = False
+    assert VP._recv_hids(dict(frame), None)[0].dtype == torch.bfloat16, "the happy path must decode"
+
+    stripped = {k: v for k, v in frame.items() if k != "h8"}
+    with pytest.raises(ValueError, match="h8"):
+        VP._recv_hids(stripped, None)
+    with pytest.raises(ValueError, match="h8"):               # a bf16 h with a scale is just as wrong
+        VP._recv_hids({**frame, "h": h}, None)
+    with pytest.raises(ValueError, match="h8"):               # right dtype, wrong shape
+        VP._recv_hids({**frame, "h8": frame["h8"][:, :1]}, None)
+    with pytest.raises(ValueError, match="h8"):               # the old scalar-scale wire
+        VP._recv_hids({**frame, "h8": 0.25}, None)
+
+
+def test_dspark_stream_still_equals_the_greedy_stream_under_the_fp8_wire(tiny, monkeypatch):
+    """THE speculation question, and the one a lossy wire can genuinely break.
+
+    coordinate_dspark's whole contract is that the drafted stream is bit-identical to the greedy
+    one. The fp8 wire is lossy, so that can only survive RELATIVE to the same wire — and it does,
+    because the drafter is tail-LOCAL and eats the post-wire tensor: the quantization lands once,
+    upstream of the fork into (verify rows, drafter taps), so drafter and verifier are perturbed
+    identically and the accept rule never rejects on account of the codec. What would break it is a
+    scale that depends on chunk length, since a bare [cur] round is s=1 and a drafted round is
+    s=block_size+1; test_fp8_scale_axis_makes_the_packing_chunk_size_invariant pins that axis."""
+    d, args, _ref = tiny
+    monkeypatch.setattr(VP, "V4_FP8_WIRE", True)             # the stage threads read the module global
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    try:
+        drafted = ring.dspark(list(PROMPT), NEW)
+        greedy = ring.coordinate(list(PROMPT), NEW)["tokens"]
+    finally:
+        ring.close()
+    assert drafted["tokens"] == greedy, (
+        f"the fp8 wire desynced speculation from greedy: {drafted['tokens']} != {greedy}")
+    assert drafted["g"] >= 1.0
+
+
+def test_the_fp8_wire_lever_reaches_a_launched_stage(monkeypatch):
+    """V4 reads its levers once per process at import, so a lever exported only on the launcher box
+    configures NOTHING on the stages. The fp8 wire is the worst case for that bug: a ring where only
+    some processes have it still WORKS (_recv_hids dispatches on the frame, not on the local flag),
+    so the miss is invisible except in the byte counters. m25_scatter_pipe's ENG_ENV exists because
+    M2.5 was burned by exactly this."""
+    monkeypatch.delenv("V4_FP8_WIRE", raising=False)
+    assert "V4_FP8_WIRE" not in VP.stage_launch_cmd(0, 3, 0, 15), "unset must stay unset"
+    monkeypatch.setenv("V4_FP8_WIRE", "1")
+    cmd = VP.stage_launch_cmd(0, 3, 0, 15)
+    assert "V4_FP8_WIRE=1 " in cmd, f"the lever never reaches the stage process: {cmd}"
+    assert cmd.index("V4_FP8_WIRE=1") < cmd.index("setsid"), "env must precede the launched command"
+
+
+# The modules a `v4_pipe.py stage` process imports, directly or through v4_stage. Every V4_* flag any
+# of them reads is read ONCE, at import, INSIDE that process — so this list is the domain over which
+# "did the lever reach the stage?" is even a question.
+_STAGE_IMPORT_CLOSURE = [
+    "v4_pipe.py", "v4_stage.py", "v4_moe_grouped.py", "v4_moe_decode.py", "v4_dspark_fast.py",
+    "v4_ref_slim.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py", "v4_dspark_draft.py",
+]
+# Emitted by stage_launch_cmd itself, so they cannot ride ENG_ENV as well: the first two are built
+# from its arguments, and V4_CUDA_GRAPH is the validated `cuda_graph=` mode.
+_EMITTED_DIRECTLY = {"V4_DIR", "V4_DEV", "V4_CUDA_GRAPH"}
+
+
+def _levers_the_stage_process_reads():
+    """Every V4_* env var read anywhere in the stage's import closure, scraped from the SOURCE."""
+    here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    found = set()
+    for name in _STAGE_IMPORT_CLOSURE:
+        p = os.path.join(here, "phase0", name)
+        if os.path.exists(p):
+            with open(p) as f:
+                found |= set(re.findall(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""", f.read()))
+    return found
+
+
+def test_every_v4_lever_reaches_a_launched_stage(monkeypatch):
+    """THE PROPAGATION GATE, over every lever rather than the one that was noticed.
+
+    The fp8 miss was not special: stage_launch_cmd hand-builds the remote environment, so ANY lever
+    absent from it is a lever the operator sets on the launcher box and nowhere else. That produces a
+    ring which runs the BASELINE while the bench reports the lever — no error, no warning, and for
+    the fp8 wire not even a wrong answer.
+
+    So the list is not maintained by hand here. The set is re-derived from the source of every module
+    the stage process imports, and a lever must be either in ENG_ENV or emitted by stage_launch_cmd
+    directly. Add a flag to any of those modules without routing it and this test fails."""
+    read = _levers_the_stage_process_reads()
+    assert {"V4_FP8_WIRE", "V4_MOE_GROUPED", "V4_PIPELINED_SPEC", "V4_REF_SLIM",
+            "V4_DSPARK_FAST", "V4_CUDA_GRAPH"} <= read, f"the scraper stopped seeing levers: {read}"
+    unrouted = read - set(VP.ENG_ENV) - _EMITTED_DIRECTLY
+    assert not unrouted, (
+        f"{sorted(unrouted)} are read by a stage process but never sent to one — exporting them on "
+        f"the launcher configures nothing. Add them to v4_pipe.ENG_ENV.")
+    # and every name in ENG_ENV is really a lever something in the closure reads, not a dead string
+    assert not set(VP.ENG_ENV) - read, f"ENG_ENV carries names nothing reads: {sorted(set(VP.ENG_ENV) - read)}"
+
+
+def test_each_lever_actually_lands_in_the_launch_command(monkeypatch):
+    """The list being right is half of it; this runs the builder and reads the command back.
+
+    One lever at a time, because a lever that only survives when its neighbours are also set is not
+    propagated, it is lucky. Checks the value too, not just the name — a flag that arrives as the
+    wrong string is the same measurement bug in a different costume."""
+    for lever in VP.ENG_ENV:
+        for v in VP.ENG_ENV:
+            monkeypatch.delenv(v, raising=False)
+        assert lever not in VP.stage_launch_cmd(0, 3, 0, 15), f"{lever} unset must stay unset"
+        monkeypatch.setenv(lever, "7")
+        cmd = VP.stage_launch_cmd(0, 3, 0, 15)
+        assert f"{lever}=7 " in cmd, f"{lever} never reaches the stage process: {cmd}"
+        assert cmd.index(f"{lever}=7 ") < cmd.index("setsid"), f"{lever} must precede the command"
+
+
+def test_the_multigpu_builder_carries_the_levers_too(monkeypatch):
+    """The path a real ring actually launches through. box_ring_launch calls stage_launch_cmd
+    without threading a single lever, so if propagation lived in the CALLERS rather than in the
+    builder, every multi-GPU box would come up on the baseline."""
+    for v in VP.ENG_ENV:
+        monkeypatch.delenv(v, raising=False)
+    monkeypatch.setenv("V4_MOE_GROUPED", "1")
+    monkeypatch.setenv("V4_PIPELINED_SPEC", "1")
+    nodes = [{"id": f"box{i}", "lo": lo, "hi": hi}
+             for i, (lo, hi) in enumerate(VP.even_tiling(VP.N_LAYERS, 3))]
+    maddrs = [f"/ip4/10.0.0.{k}/tcp/29600/p2p/PEER{k}" for k in range(3)]
+    out = VP.box_ring_launch(nodes, 2, maddrs, receipts=True, token="tok")
+    assert len(out["stages"]) == 6, "no stages built"
+    for st in out["stages"]:
+        assert "V4_MOE_GROUPED=1 " in st["cmd"] and "V4_PIPELINED_SPEC=1 " in st["cmd"], \
+            f"a multi-GPU stage launched without the levers: {st['cmd']}"
+
+
+def test_an_exported_graph_mode_that_disagrees_with_the_launch_refuses(monkeypatch):
+    """V4_CUDA_GRAPH is the one lever not on ENG_ENV — stage_launch_cmd always writes it from
+    `cuda_graph=`, so it can never be DROPPED, only ever ambiguous. Both silent resolutions are the
+    failure the flag exists to prevent (an export of `whole` measured as island, or an explicit
+    `cuda_graph=False` A/B secretly graphed), so a disagreement raises and the operator picks."""
+    monkeypatch.delenv("V4_CUDA_GRAPH", raising=False)
+    assert "V4_CUDA_GRAPH=1 " in VP.stage_launch_cmd(0, 3, 0, 15), "unset keeps the launch default"
+    monkeypatch.setenv("V4_CUDA_GRAPH", "whole")
+    with pytest.raises(ValueError, match="V4_CUDA_GRAPH"):
+        VP.stage_launch_cmd(0, 3, 0, 15)
+    assert "V4_CUDA_GRAPH=whole " in VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph="whole")
+    monkeypatch.setenv("V4_CUDA_GRAPH", "1")
+    assert "V4_CUDA_GRAPH=1 " in VP.stage_launch_cmd(0, 3, 0, 15), "agreement is not a conflict"
