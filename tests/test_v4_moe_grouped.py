@@ -119,18 +119,23 @@ def test_world_size_falls_back(args, oracle, monkeypatch):
     assert calls, "world_size > 1 must take the reference path"
 
 
-def test_hash_layer_falls_back(args, oracle, monkeypatch):
-    """Hash-routed layers (layer_id < n_hash_layers) can name the same expert twice, and the
-    duplicate-index `y[idx] +=` is the reference's semantics — so the whole hash layer defers. This
-    is also the ONLY place a repeat can occur (top-k routing cannot), so it subsumes the
-    repeated-expert fallback without a per-step host-side dedup."""
+def test_hash_layer_is_claimed_not_deferred(args, oracle, monkeypatch):
+    """Hash-routed layers used to defer wholesale, and on a head stage that was half the layers.
+
+    They defer no longer: `_keep_last_of_each` reproduces the duplicate-index `y[idx] +=` on device,
+    so the only thing left in the way was the guard itself. This pins that the guard is GONE — the
+    step must not reach the fallback. (What it computes is `test_hash_layer_is_bit_exact_*` below;
+    this one is about which path it takes, and it uses a bf16 oracle layer that never gets that far,
+    so the fallback spy would fire on the guard alone.)"""
     ffn = oracle.layers[0].ffn                        # hash-routed (layer 0 < n_hash_layers)
     assert ffn.gate.hash
     calls = _spy(monkeypatch)
     g = torch.Generator().manual_seed(SEED + 2)
     x, ids = _x(args, 1, g, oracle), _ids(args, 1, g)
+    monkeypatch.setattr(GROUPED, "_expert_bank", lambda moe: None)   # stop before the fp4-only kernel
     GROUPED.grouped_forward(ffn, x, ids)
-    assert calls, "a hash-routed layer must take the reference path"
+    assert [w for w in ffn._grouped_declined] == ["bank-would-not-fit"], \
+        f"a hash layer must reach the bank, not be turned away first: {ffn._grouped_declined}"
 
 
 def _stub_mod():
@@ -261,21 +266,39 @@ def test_load_ref_installs_grouped_after_decode():
 _KINDS = ("w1", "w2", "w3")
 
 
-def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4", dim=64, inter=32):
+def _slot(moe, i, kind, attr="weight"):
+    """The bank rows expert `i`'s `kind` Linear is supposed to BE, as a tensor.
+
+    w1 and w3 share the `w13` bank — w1's rows then w3's — because they share a grouped launch, so
+    "which slot" is now a (bank, row range) rather than a bank index, and the tests have to ask the
+    layout rather than assume `bank[kind][i]`."""
+    bank = moe._grouped_bank
+    for key, kinds in GROUPED._BANK_GROUPS:
+        if kind not in kinds:
+            continue
+        b = bank[key + ("" if attr == "weight" else "_s")]
+        off = sum(getattr(getattr(moe.experts[i], k), attr).shape[0] for k in kinds[:kinds.index(kind)])
+        return b[i, off:off + getattr(getattr(moe.experts[i], kind), attr).shape[0]]
+    raise KeyError(kind)
+
+
+def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4", dim=64, inter=32, layer_id=7, topk=2):
     """A tiny MoE built from the REFERENCE's own classes with fp4 routed experts.
 
     Not a stub: the layout repoints real `nn.Parameter`s and the loader test drives a real
     `load_state_dict`, so anything less than the reference's `MoE`/`Expert`/`Linear` would prove
     nothing about the stage. fp4 needs `dim` a multiple of `fp4_block_size` (32); everything else is
     as small as the constructor's asserts allow. Takes `oracle` only to force `dsv4_model` loaded.
-    `dim`/`inter` are widened to 128 by the one test that RUNS the thing — `v4_kernels_cpu.act_quant`
-    needs the activation's last dim to be a multiple of `block_size` (128)."""
+    `dim`/`inter` are widened to 128 by the tests that RUN the thing — `v4_kernels_cpu.act_quant`
+    needs the activation's last dim to be a multiple of `block_size` (128). `layer_id=0` is under
+    `n_hash_layers`, i.e. the hash-routed gate whose ids can repeat."""
     mod = sys.modules["dsv4_model"]
-    a = mod.ModelArgs(dim=dim, moe_inter_dim=inter, n_routed_experts=n_experts, n_activated_experts=2,
+    a = mod.ModelArgs(dim=dim, moe_inter_dim=inter, n_routed_experts=n_experts,
+                      n_activated_experts=topk, swiglu_limit=10.0, route_scale=1.5,
                       n_shared_experts=1, n_hash_layers=1, expert_dtype=expert_dtype,
                       dtype="bf16", scale_fmt=None, scale_dtype="fp32", vocab_size=32)
     with mod.set_dtype(torch.bfloat16):
-        return mod.MoE(7, a)
+        return mod.MoE(layer_id, a)
 
 
 def _paint(moe):
@@ -317,26 +340,32 @@ def test_bank_layout_is_a_noop_with_the_flag_off(oracle, monkeypatch):
 def test_bank_layout_leaves_one_copy_of_the_weights_not_two(oracle, monkeypatch):
     """THE POINT OF THE WHOLE CHANGE, as a storage-identity claim.
 
-    After the layout there is exactly ONE allocation per weight kind — the bank — and every routed
-    expert's parameter is a VIEW into it, at its own offset, in expert order. Nothing was duplicated,
-    so the bank the grouped kernel gathers from costs zero extra bytes and a seven-layer stage on a
-    32 GiB card can hold it. The old lazy stack would have doubled these tensors instead."""
+    After the layout there is exactly ONE allocation per BANK — and w1 and w3 now share one, since
+    they share a grouped launch — and every routed expert's parameter is a VIEW into it, at its own
+    row range, in expert order. Nothing was duplicated, so the bank the grouped kernel gathers from
+    costs zero extra bytes and a seven-layer stage on a 32 GiB card can hold it. The old lazy stack
+    would have doubled these tensors instead."""
     monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
     moe = _fp4_moe(oracle)
     assert GROUPED.bank_layout(moe) == 1
     bank = moe._grouped_bank
-    for k, skey in (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s")):
-        for attr, key in (("weight", k), ("scale", skey)):
-            b = bank[key]
+    assert set(bank) == {"w13", "w13_s", "w2", "w2_s"}, \
+        f"w1 and w3 must share a bank so they can share a launch; got {sorted(bank)}"
+    for key, kinds in GROUPED._BANK_GROUPS:
+        for attr, suffix in (("weight", ""), ("scale", "_s")):
+            b = bank[key + suffix]
             assert b.shape[0] == len(moe.experts) and b.is_contiguous()
             store = b.untyped_storage()
             for i, e in enumerate(moe.experts):
-                p = getattr(getattr(e, k), attr)
-                assert p.data_ptr() == b[i].data_ptr(), f"{k}.{attr}[{i}] is not the bank's slot {i}"
-                assert p.untyped_storage().data_ptr() == store.data_ptr(), "a second allocation"
-                assert p.is_contiguous(), "the s > 1 reference path needs contiguous expert weights"
+                for k in kinds:
+                    p = getattr(getattr(e, k), attr)
+                    assert p.data_ptr() == _slot(moe, i, k, attr).data_ptr(), \
+                        f"{k}.{attr}[{i}] is not its row range of the {key} bank"
+                    assert p.untyped_storage().data_ptr() == store.data_ptr(), "a second allocation"
+                    assert p.is_contiguous(), "the s > 1 reference path needs contiguous expert weights"
             assert store.nbytes() == sum(getattr(getattr(e, k), attr).numel()
-                                         for e in moe.experts), "the bank is not exactly one copy"
+                                         for e in moe.experts
+                                         for k in kinds), "the bank is not exactly one copy"
 
 
 def test_bank_layout_carries_the_bytes_across(oracle, monkeypatch):
@@ -350,7 +379,9 @@ def test_bank_layout_carries_the_bytes_across(oracle, monkeypatch):
     assert _painted(moe), "the layout moved an expert's bytes to the wrong slot"
     bank = moe._grouped_bank
     for i, e in enumerate(moe.experts):
-        assert bool((bank["w1"][i].view(torch.uint8) == e.w1.weight.view(torch.uint8)).all())
+        for k in _KINDS:
+            assert bool((_slot(moe, i, k).view(torch.uint8)
+                         == getattr(e, k).weight.view(torch.uint8)).all())
 
 
 def test_the_loader_writes_through_the_views_into_the_bank(oracle, monkeypatch):
@@ -370,11 +401,19 @@ def test_the_loader_writes_through_the_views_into_the_bank(oracle, monkeypatch):
     sd["w1.weight"] = torch.full(tuple(moe.experts[tgt].w1.weight.shape), 9,
                                  dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
     moe.experts[tgt].load_state_dict(sd, strict=True)
-    assert bool((bank["w1"][tgt].view(torch.uint8) == 9).all()), "the load did not reach the bank"
-    assert moe.experts[tgt].w1.weight.data_ptr() == bank["w1"][tgt].data_ptr(), "the view was replaced"
+    assert bool((_slot(moe, tgt, "w1").view(torch.uint8) == 9).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w1.weight.data_ptr() == _slot(moe, tgt, "w1").data_ptr(), \
+        "the view was replaced"
+    # w3 shares w1's bank, one row range along. The state dict zeroes it, and it was painted 19, so
+    # this pins that the SECOND half of the shared bank is addressed too — a wrong offset would leave
+    # the paint standing or would have let w1's 9s spill into it.
+    assert bool((_slot(moe, tgt, "w3").view(torch.uint8) == 0).all()), \
+        "w3's rows of the shared bank did not take the load"
     for i in range(len(moe.experts)):
         if i != tgt:
-            assert bool((bank["w1"][i].view(torch.uint8) == 1 + i * 8).all()), "a neighbour moved"
+            assert bool((_slot(moe, i, "w1").view(torch.uint8) == 1 + i * 8).all()), "a neighbour moved"
+            assert bool((_slot(moe, i, "w3").view(torch.uint8) == 1 + i * 8 + 2).all()), \
+                "a neighbour's w3 rows moved"
 
 
 def test_banked_experts_keep_the_scale_the_reference_path_reads(oracle, monkeypatch):
@@ -388,7 +427,7 @@ def test_banked_experts_keep_the_scale_the_reference_path_reads(oracle, monkeypa
         for k in _KINDS:
             lin = getattr(e, k)
             assert lin.weight.scale is lin.scale, "weight.scale must still BE the scale parameter"
-            assert lin.scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+            assert lin.scale.data_ptr() == _slot(moe, i, k, "scale").data_ptr()
 
 
 def test_bank_layout_leaves_non_fp4_experts_alone(oracle, monkeypatch):
@@ -467,8 +506,8 @@ def test_a_real_stage_lays_its_layers_out_release_first(monkeypatch):
         for i, e in enumerate(L.ffn.experts):
             for k in _KINDS:
                 lin = getattr(e, k)
-                assert lin.weight.data_ptr() == bank[k][i].data_ptr()
-                assert lin.scale.data_ptr() == bank[k + "_s"][i].data_ptr()
+                assert lin.weight.data_ptr() == _slot(L.ffn, i, k).data_ptr()
+                assert lin.scale.data_ptr() == _slot(L.ffn, i, k, "scale").data_ptr()
                 assert lin.weight.scale is lin.scale, "the reference reads the scale off the weight"
 
 
@@ -595,7 +634,7 @@ def test_bank_layout_never_outruns_what_it_released(oracle, monkeypatch):
     monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
     moe = _fp4_moe(oracle, n_experts=256)
     m, baseline, n = _layout_metered(moe, False, monkeypatch)
-    assert n == 1 and len(m.banks) == 6, "six banks: three weights, three scales"
+    assert n == 1 and len(m.banks) == 4, "four banks: w13 + w2, each with its scale"
     assert m.live == baseline, f"steady state moved by {m.live - baseline} B — the layout leaked"
     assert m.peak == baseline, (
         f"peak {m.peak} B against a steady {baseline} B: the layout held "
@@ -606,8 +645,8 @@ def test_bank_layout_never_outruns_what_it_released(oracle, monkeypatch):
     # and the banks really are the experts, at the right slot, after a release-first layout
     for i, e in enumerate(moe.experts):
         for k in _KINDS:
-            assert getattr(e, k).weight.data_ptr() == moe._grouped_bank[k][i].data_ptr()
-            assert getattr(e, k).scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+            assert getattr(e, k).weight.data_ptr() == _slot(moe, i, k).data_ptr()
+            assert getattr(e, k).scale.data_ptr() == _slot(moe, i, k, "scale").data_ptr()
 
 
 def test_preserving_the_bytes_costs_a_whole_kind_which_is_why_the_stage_does_not(oracle, monkeypatch):
@@ -627,7 +666,8 @@ def test_preserving_the_bytes_costs_a_whole_kind_which_is_why_the_stage_does_not
         "preserve=True is expected to hold one whole bank on top of the layer — if that changed, "
         "the stage's preserve=False path may no longer be the thing that saves it")
     assert m.worst_debt == biggest
-    assert biggest * 51 == baseline * 16, "the overshoot is a full weight kind, 16/51 of the layer"
+    assert biggest * 51 == baseline * 32, ("the overshoot is the fused w13 weight bank, 32/51 of the "
+                                           "layer — it was 16/51 while w1 and w3 banked separately")
 
 
 def test_the_loader_still_writes_through_a_release_first_layout(oracle, monkeypatch):
@@ -645,12 +685,13 @@ def test_the_loader_still_writes_through_a_release_first_layout(oracle, monkeypa
     sd["w2.weight"] = torch.full(tuple(moe.experts[tgt].w2.weight.shape), 7,
                                  dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
     moe.experts[tgt].load_state_dict(sd, strict=True)
-    assert bool((bank["w2"][tgt].view(torch.uint8) == 7).all()), "the load did not reach the bank"
-    assert moe.experts[tgt].w2.weight.data_ptr() == bank["w2"][tgt].data_ptr(), "the view was replaced"
+    assert bool((_slot(moe, tgt, "w2").view(torch.uint8) == 7).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w2.weight.data_ptr() == _slot(moe, tgt, "w2").data_ptr(), \
+        "the view was replaced"
     assert moe.experts[tgt].w2.weight.scale is moe.experts[tgt].w2.scale, "weight.scale did not survive"
     for i in range(len(moe.experts)):
         if i != tgt:
-            assert not bool((bank["w2"][i].view(torch.uint8) == 7).all()), "a neighbour was written"
+            assert not bool((_slot(moe, i, "w2").view(torch.uint8) == 7).all()), "a neighbour was written"
 
 
 def test_a_release_first_layout_serves_bit_identically_to_no_layout(oracle, monkeypatch):
