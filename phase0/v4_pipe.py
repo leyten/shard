@@ -501,6 +501,48 @@ def sample_token(logits_row, temp=0.0, gen=None):
 TAIL_DRAFTER = None
 
 
+# ── the job horizon: what v4_ref_slim's indexer skip needs from the serve path ─────────────────────
+# v4_ref_slim (V4_REF_SLIM) skips the Indexer's SCORING while every compressed slot is selected
+# anyway, and may additionally skip the Indexer's COMPRESSOR — which is STATE, not a query — but only
+# for a job guaranteed never to leave that regime. Guess that wrong in the SHORT direction and the
+# indexer re-engages past `index_topk * ratio` against a half-filled cache and picks the wrong keys,
+# silently. So the horizon travels with the job, in the reset frame that already opens it, and every
+# stage sets it before the first step of that job lands.
+#
+# THE SAFETY DIRECTION IS ASYMMETRIC, AND EVERYTHING HERE LEANS THE SAFE WAY:
+#   over-declare  -> the compressor keeps advancing -> correct at ANY length, costs 2 cheap GEMMs.
+#   under-declare -> the compressor is skipped and the indexer may still re-engage -> WRONG.
+#   absent (None) -> "unknown", which v4_ref_slim already treats as keep-advanced, i.e. the safe end.
+# So a reset frame from an older coordinator (no "max_pos" key) degrades to correct-but-unoptimised,
+# never to wrong, and a margin that is too FAT costs nothing but a missed optimisation.
+
+# Speculative overshoot: a spec/dspark round feeds `[cur] + drafts` at the committed position, so the
+# ring transiently touches positions past the last COMMITTED one even though a rejected draft is
+# rolled back. The committed length is prompt + max_new; this covers the draft block on top of it.
+# 64 is far above any block the ring actually offers (coordinate_spec defaults K=4, the shipped DSpark
+# MTP drafts 3) and is deliberately fat: see the asymmetry above.
+_SPEC_POS_MARGIN = 64
+
+
+def _job_max_pos(prompt_ids, max_new, spec_margin=0):
+    """The job's GUARANTEED-not-to-be-exceeded maximum absolute position, for the reset frame.
+
+    Upper bound, never an estimate — `prompt + max_new` is the committed ceiling the coordinator loops
+    enforce, and `spec_margin` covers the draft tokens a speculative round puts on the wire above it."""
+    return len(prompt_ids) + int(max_new) + int(spec_margin)
+
+
+def _set_job_horizon(max_pos):
+    """Hand v4_ref_slim this job's horizon (None = unknown, which it treats as the safe answer).
+
+    Called on EVERY reset, including with None, so one job's horizon can never leak into the next: the
+    value is process-wide, matching model.py's other globals. Unconditional — v4_ref_slim is import-
+    light and pure-Python, and with V4_REF_SLIM off nothing reads what this sets, so the cost of not
+    branching on the env here is one module-global assignment per job."""
+    import v4_ref_slim
+    v4_ref_slim.set_job_max_pos(max_pos)
+
+
 # ── stage server: one V4 layer block, fire-forward ────────────────────────────────────────────────
 
 def _dial_window(timeout):
@@ -698,14 +740,21 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     if ready is not None:
         ready.set()
 
-    if tail:
-        _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
-                                                                           else None))
-    elif ret_relay is not None:
-        _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
-                             timeout, ret_relay)
-    else:
-        _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout)
+    try:
+        if tail:
+            _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
+                                                                               else None))
+        elif ret_relay is not None:
+            _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
+                                 timeout, ret_relay)
+        else:
+            _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout)
+    finally:
+        # Teardown: this stage serves no more jobs, so drop the horizon it was carrying. In a real
+        # ring that is one process per stage and the clear is cosmetic; in the IN-PROCESS shape (the
+        # selftest runs every stage as a thread beside the coordinator and the oracle) the horizon is
+        # a shared global, and a dead stage thread must not leave one job's value behind it.
+        _set_job_horizon(None)
 
 
 _STRAY = (ConnectionError, OSError, ValueError, KeyError, TypeError, struct.error)
@@ -780,21 +829,35 @@ def _warm_until_accept(nxt_sock, period=5.0):
 
 
 def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout):
-    """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe."""
+    """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe.
+
+    The HEAD's predecessor IS the coordinator, so it gets a `reaccept` closure: a coordinator that
+    exits (a bench that finished, a restart) must not take the ring down with it — the head re-accepts
+    a reconnecting one and the rest of the ring stays warm behind it (see _forward_loop). A middle
+    stage passes no reaccept: its predecessor is the head, which now survives, so a predecessor loss
+    there is a genuine upstream death and should still cascade."""
     stop_warm = _warm_until_accept(nxt_sock)   # keep the just-dialed forward leg warm through accept-wait
     try:
         conn, queued = _accept_pred(srv, timeout)
     finally:
         stop_warm()                            # stop BEFORE the forward loop touches nxt_sock
     print(f"[s{stage}] predecessor connected", flush=True)
-    _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout)
+    reaccept = (lambda: _accept_pred(srv, timeout)) if head else None
+    _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout,
+                  reaccept=reaccept)
 
 
 def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued,
-                  timeout=600.0):
+                  timeout=600.0, reaccept=None):
     """The head/middle process-and-forward loop over an already-accepted predecessor `conn` (with an
     optional already-read first frame `queued`). Split out of _serve_forward so the box-ingress relay
-    reuses it verbatim for the DOWN direction while a pump thread carries the return UP."""
+    reuses it verbatim for the DOWN direction while a pump thread carries the return UP.
+
+    `reaccept` (head only) makes a predecessor disconnect SURVIVABLE instead of fatal: the head reads
+    only from the coordinator and writes only down the ring, so a lost predecessor is a lost
+    coordinator, and re-accepting one keeps the whole ring warm across a bench exit or a coordinator
+    restart. Left None (middles, the relay ingress) a disconnect re-raises and cascades, which is the
+    right answer for a real upstream death."""
     signer = None
     kw = _KeepWarm(nxt_sock)                                   # cwnd keep-warm on the forward leg (opt-in)
     tag = f"[s{stage}]"
@@ -802,14 +865,36 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
     timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None))
     with torch.no_grad():
         while True:
-            msg = queued if queued is not None else recv_msg(conn)
-            queued = None
+            if queued is not None:
+                msg, queued = queued, None
+            else:
+                try:
+                    msg = recv_msg(conn)
+                except _LEG_ERRORS as e:
+                    if reaccept is None:                       # genuine upstream death: cascade (correct)
+                        raise
+                    # The head's predecessor IS the coordinator. It exited (a finished bench) or is
+                    # restarting; the forward leg to the rest of the ring is still up (kept warm, and
+                    # _fwd_open heals it if it idled out), so DO NOT die — re-accept a reconnecting
+                    # coordinator and keep every stage warm. A reset opens each job, so nothing partial
+                    # survives the gap. This is the head half of surviving a coordinator restart; the
+                    # tail's return channel is the other half (_serve_tail's re-accept thread).
+                    print(f"{tag} coordinator disconnected ({type(e).__name__}); re-accepting "
+                          f"— ring stays warm", flush=True)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    conn, queued = reaccept()
+                    print(f"{tag} coordinator reconnected", flush=True)
+                    continue
             op = msg.get("op")
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             if op == "reset":
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
+                _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
                 st._spec = bool(msg.get("spec"))              # arm the stage snapshot/rollback (step 5)
                 st._dspark = bool(msg.get("dspark"))          # arm the tail's DSpark drafter (step 4)
                 epoch = 0
@@ -941,15 +1026,104 @@ def _tail_drafter(st, ckpt_dir, cache):
     return cache["drafter"]
 
 
+class _RetChannel:
+    """The tail's coordinator-return socket, SWAPPABLE under a lock. The serve loop blocks reading its
+    predecessor, so it cannot itself accept a reconnecting coordinator; a background thread does, and
+    swaps the live socket in here while the loop keeps sending through `send()`. A send to a channel
+    whose coordinator has gone is DROPPED, not fatal — the coordinator that died is not reading it, and
+    the next reset on a freshly accepted channel re-opens the job. One lock, held across the send, so a
+    swap never races a half-written frame onto the wire."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.lock = threading.Lock()
+
+    def send(self, msg):
+        with self.lock:
+            try:
+                return send_msg(self.sock, msg)
+            except _LEG_ERRORS:
+                return 0                                       # coordinator gone; the loop keeps serving
+
+    def swap(self, sock):
+        with self.lock:
+            old, self.sock = self.sock, sock
+        return old
+
+    def close(self):
+        with self.lock:
+            sock = self.sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _tail_return_reaccept(srv, chan, timeout):
+    """Own srv.accept() after bring-up so a coordinator RESTART is survivable. A restarting
+    coordinator re-dials the return channel (hello_return); the tail's serve loop is blocked reading
+    its predecessor and cannot accept it, and without this the coordinator's connect_ring would hang
+    forever waiting on a ret_ok — the ring would be alive but unreachable. This daemon accepts the
+    reconnect, SWAPS it into `chan` FIRST (so by the time the coordinator has its ret_ok, the tail is
+    already answering on the new socket) and only then acks. The predecessor never re-connects here
+    (the upstream stage stays up while the head survives); a stray/scanner frame is dropped."""
+    while True:
+        try:
+            ready, _, _ = select.select([srv], [], [])
+            if srv not in ready:
+                continue
+            conn, _ = srv.accept()
+            conn.setsockopt(*NODELAY)
+            conn.settimeout(timeout)
+        except OSError:
+            return                                             # srv closed on stop/teardown: thread exits
+        try:
+            first = recv_msg(conn)
+        except _STRAY as e:
+            print(f"[tail] dropped stray reconnect: {type(e).__name__}", flush=True)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        if not _is_return_hello(first):
+            print("[tail] dropped non-return reconnect on the tail port", flush=True)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        old = chan.swap(conn)                                  # visible BEFORE the coordinator proceeds
+        try:
+            send_msg(conn, "ret_ok")                           # the coordinator's connect_ring blocks on this
+        except _LEG_ERRORS:
+            pass
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
+        print("[tail] coordinator-return re-accepted — ring survived a coordinator restart", flush=True)
+
+
 def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
     """Tail serve loop. Accepts BOTH inbound streams (predecessor + coordinator-return) on the one
     engine port, classified by the hello_return greeting, then serves: run the block, collapse the
     hyper-connections, sample, and send the token id back on the return channel.
 
+    The return channel is a swappable `_RetChannel`: a background thread re-accepts a reconnecting
+    coordinator and swaps its socket in, so the ring survives a coordinator restart instead of dying
+    the moment the first coordinator's return socket closes (the tail half of the resilience the head's
+    predecessor re-accept provides).
+
     `ckpt_dir` is set only when the stage was built --dspark: it is where the drafter's `mtp.*` come
     from, and passing it is what makes a drafted ring possible at all."""
     ret, pred, queued = _tail_bringup(srv, timeout)
     print("[tail] predecessor + coord-return connected", flush=True)
+    chan = _RetChannel(ret)
+    threading.Thread(target=_tail_return_reaccept, args=(srv, chan, timeout), daemon=True,
+                     name="v4-tail-reaccept").start()
 
     signer = None
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
@@ -967,6 +1141,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "reset":
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
+                _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
                 st._spec = bool(msg.get("spec"))              # arm the stage's snapshot/rollback
                 st._dspark = bool(msg.get("dspark"))          # arm the taps the drafter consumes
                 epoch = 0
@@ -981,7 +1156,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                     # so it would see a stall on this job and on every job after it. The reset ack is
                     # the one channel back, and a non-"ok" ack is already a hard failure there.
                     print(f"[tail] dspark unavailable: {type(e).__name__}: {e}", flush=True)
-                    send_msg(ret, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                    chan.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
                     continue
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
@@ -989,13 +1164,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 temp = float(msg.get("temp", 0.0))
                 gen = (torch.Generator(device="cpu").manual_seed(int(msg["seed"]))
                        if temp > 0 and msg.get("seed") is not None else None)
-                send_msg(ret, "ok")
+                chan.send("ok")
                 continue
             if op == "receipt":
                 timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
                     msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
-                send_msg(ret, msg.get("receipts", []))
+                chan.send(msg.get("receipts", []))
                 continue
             if op == "step":
                 timer.lap("recv", msg)
@@ -1027,17 +1202,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                     out.update(drafter.on_chunk(msg, st, out) or {})
                 timer.sync()
                 timer.lap("draft")
-                timer.lap("send", send_msg(ret, out))
+                timer.lap("send", chan.send(out))
                 timer.frame(h.shape[1])
                 continue
             if op == "stop":
-                try:
-                    send_msg(ret, {"token": None})
-                except OSError:
-                    pass
+                chan.send({"token": None})
                 pred.close()
-                if ret is not None:
-                    ret.close()
+                chan.close()
                 return
             raise RuntimeError(f"tail: unknown op {op!r}")
 
@@ -1148,7 +1319,8 @@ def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_
     the end and verifies coverage against `layer_count` and the job nonce (fail-closed, C10)."""
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": float(temp), "seed": int(seed)})
+                    "temp": float(temp), "seed": int(seed),
+                    "max_pos": _job_max_pos(prompt_ids, max_new)})   # greedy: no draft overshoot
     ack = recv_msg(ret)                                       # the tail acks the whole ring is reset
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 ring reset not acked: {ack!r}")
@@ -1218,7 +1390,8 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     propose = _drafter_propose(drafter, ng)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": 0.0, "seed": 0, "spec": True})
+                    "temp": 0.0, "seed": 0, "spec": True,
+                    "max_pos": _job_max_pos(prompt_ids, max_new, K + 1)})   # + the draft chunk
     ack = recv_msg(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 spec ring reset not acked: {ack!r}")
@@ -1271,8 +1444,54 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
 
 
+# CONFIDENCE-GATED ADAPTIVE SEND-LENGTH (coordinate_dspark). The DSpark drafter emits a per-position
+# confidence score with every block (`conf`, RingDrafter ships it). On a round the drafter itself
+# expects to lose early, sending the whole block spends chunk positions the ring will compute and
+# throw away; on a round it expects a long run, sending the whole block banks the most tokens per
+# traversal. So this gate TRUNCATES the block the coordinator OFFERS to the confidence-predicted
+# survival prefix. It is LOSSLESS by construction and not by luck: the tail verifies exactly the
+# chunk it receives and both ends run plan_verify_round over the SAME sent drafts, so the committed
+# stream is byte-identical whatever the send-length — the gate can only ever change HOW MANY tokens a
+# round banks, never WHICH. That makes it a pure throughput knob: a mis-set threshold costs
+# acceptance, never a wrong token.
+#
+# THE THRESHOLD NEEDS CALIBRATION AND THE GATE IS OFF UNTIL IT HAS IT. Measured on the CPU reference,
+# `conf` is a RAW score near 0 that goes NEGATIVE — it is the confidence head's logit, not a
+# probability — so there is no universal cutoff and a cumulative-product-of-probabilities rule would
+# be meaningless on it. The rule here is therefore a per-position raw-score floor (keep the leading
+# run whose conf stays >= thresh, stop at the first below — a later low score cannot matter once an
+# earlier position is predicted to reject), and the floor is what an operator calibrates to the REAL
+# model's conf distribution. TODO(calibrate): on a live GPU ring run coordinate_dspark UNGATED with a
+# `conf_probe` and accumulate (conf_i, accepted?) pairs — accepted positions are 0..n-1, the rejected
+# one is n — then set V4_DSPARK_CONF_THRESH to the conf below which P(accept) falls under ~0.5 (or
+# wherever the round-cost/accept trade crosses). Research puts the win at ~+15-25%; that number is a
+# measurement this gate makes reachable, not a promise it keeps on its own.
+V4_DSPARK_CONF_GATE = os.environ.get("V4_DSPARK_CONF_GATE", "0") not in ("", "0")   # OFF until calibrated
+V4_DSPARK_CONF_THRESH = float(os.environ.get("V4_DSPARK_CONF_THRESH", "0") or 0)    # raw-score floor
+V4_DSPARK_CONF_MIN = int(os.environ.get("V4_DSPARK_CONF_MIN", "1") or 1)            # always offer >= this many
+
+
+def _conf_send_len(confs, thresh, min_send):
+    """How many of a drafted block's tokens to SEND this round, from its per-position confidence.
+
+    `confs[i]` is the drafter's raw confidence for draft `i` (see the note above — a logit, can be
+    negative). Keep the longest leading prefix whose conf stays >= `thresh`; stop at the first draft
+    below it (a survival prefix — once a position is predicted to reject, every later one is moot).
+    Floored at `min_send` (0 lets a low-confidence round fall back to a bare greedy step) and capped
+    at the block length. An empty block (round 1) sends 0. Lossless whatever it returns."""
+    if not confs:
+        return 0
+    k = 0
+    for c in confs:
+        if float(c) < thresh:
+            break
+        k += 1
+    return min(len(confs), max(min_send, k))
+
+
 def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
-                      job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None):
+                      job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
+                      conf_gate=None, conf_thresh=None, conf_min=None, conf_probe=None):
     """DSPARK speculative decode over the fire-forward ring — the headline drafted path.
 
     Same propose->verify->accept->rollback contract coordinate_spec proves, with the proposer moved
@@ -1295,13 +1514,28 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     never took. That is a job-killing bug, not a degradation, and it fails loudly here rather than
     surfacing as quietly worse acceptance forever after.
 
+    CONFIDENCE GATE (see the note above `_conf_send_len`). When armed, the block the coordinator
+    OFFERS each round is truncated to the drafter's own confidence-predicted survival prefix — fewer
+    positions on a round it expects to lose early, the full block on a round it expects a long run.
+    Lossless (the tail verifies only what it receives); off unless `conf_gate` / V4_DSPARK_CONF_GATE
+    says so, because the raw-score threshold has to be calibrated to the real model first. `conf_probe`,
+    if given, is called `conf_probe(confs, n)` each drafted round with the FULL block's confidence and
+    the number accepted — the hook a calibration run records the conf-vs-accept curve through.
+
     Returns coordinate()'s dict plus spec stats {rounds, drafted, generated, accepted, g,
-    accept_hist} — `drafted` being the rounds that carried a real block, which is how a selftest
-    tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"."""
+    accept_hist, sent, send_hist} — `drafted` being the rounds that carried a real block, `sent` the
+    total draft tokens actually offered (< the drafted total when the gate trims), which is how a
+    selftest tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"
+    and how a bench reads the gate's effect."""
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
+    gate = V4_DSPARK_CONF_GATE if conf_gate is None else bool(conf_gate)
+    thresh = V4_DSPARK_CONF_THRESH if conf_thresh is None else float(conf_thresh)
+    min_send = V4_DSPARK_CONF_MIN if conf_min is None else int(conf_min)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True})
+                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True,
+                    # the tail's MTP block size is not knowable here — the fat margin is the answer
+                    "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN)})
     ack = recv_msg(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
@@ -1322,11 +1556,16 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     if on_token is not None:
         on_token(cur)
 
-    drafts = []                                               # round 1 is the bare [cur] chunk
-    drafted = 0                                               # rounds that actually carried a block
+    block, confs = [], []                                     # round 1 is the bare [cur] chunk (no block)
+    drafted, sent = 0, 0                                       # rounds that carried a block; drafts offered
+    send_hist = {}
     while len(toks) < max_new and cur not in eos:
         rounds += 1
+        # Offer the whole block, or — armed and calibrated — its confidence-predicted survival prefix.
+        drafts = block[:_conf_send_len(confs, thresh, min_send)] if gate else block
         drafted += bool(drafts)
+        sent += len(drafts)
+        send_hist[len(drafts)] = send_hist.get(len(drafts), 0) + 1
         send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
         rep = recv_msg(ret)
         if "n" not in rep:
@@ -1342,6 +1581,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                 f"history the ring is not taking — one accept rule, and it is plan_verify_round.")
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
+        if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
+            conf_probe(list(confs), n)
         stop = False
         for t in committed:
             toks.append(int(t))
@@ -1353,7 +1594,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                 break
         cur = ids[-1]
         pos = len(ids) - 1                                    # `cur` sits here — the stage rewinds to it
-        drafts = [int(t) for t in (rep.get("draft") or [])]   # the block drafted off what we committed
+        block = [int(t) for t in (rep.get("draft") or [])]    # the block drafted off what we committed
+        confs = [float(c) for c in (rep.get("conf") or [])]   # its per-position confidence (gate input)
         if stop:
             break
 
@@ -1364,7 +1606,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
-            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
+            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist,
+            "sent": sent, "send_hist": send_hist}
 
 
 # ── PIPELINED speculation: stream the block as s=1 frames instead of verifying it as one chunk ──────
@@ -1753,7 +1996,7 @@ def _peerid_of(maddr):
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
-                     ret_relay=None, dspark=False):
+                     ret_relay=None, dspark=False, cuda_graph=True):
     """The shell command a launcher runs to start ONE v4 engine stage over the sidecar. Fully
     DETACHED in every shape (setsid + fd redirect), mirroring k3_pipe.stage_launch_cmd /
     m25_scatter_pipe.stage_cmd — see the note by the return.
@@ -1771,6 +2014,23 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
       * `ret_relay` — set ONLY on the ingress of a G>1 TAIL box: the loopback 127.0.0.1:<box tail local
                      port> it bridges the coordinator-return to (--ret-relay). Unset everywhere else.
       * `dspark`   — build the tail's MTP speculator stages at load (step 4).
+
+    `cuda_graph` (V4_CUDA_GRAPH) is ON by default because the ring is CPU-launch-bound: the partial
+    island graphs (v4_stage's _BlockGraphs — the hc_pre/hc_post/norm islands, bit-exact per
+    test_v4_stage_graph.py) collapse ~68 of ~240 kernel launches per layer and buy ~+12% steady-state
+    single-stream, which is real money on a dispatch-bound serial pipe. It is OFF in the module
+    default (a bare import, the CPU parity suite, an in-process ring) and turned ON *here*, in the
+    launch path, where it belongs.
+
+    THE COST IS ONE-TIME AND FRONT-LOADED. The first decode token pays a capture cascade — measured
+    ~533s on the first live ring — that is NOT the CUDA-graph capture (microseconds) but the tilelang
+    JIT autotuning + compiling the sparse-attn / fp8 / fp4 kernels at V4's real shapes, triggered the
+    first time each fires inside a capture's warm-up. tilelang memoises those compiled artifacts to
+    its on-disk cache, so the compile half is paid ONCE PER BOX and a re-warm (re-launch on the same
+    still-rented box) reuses them; only a genuinely fresh box pays it again. The graph capture itself
+    is per-process and unavoidable, but it is a fixed first-token tax amortised over the whole
+    generation. A launcher that wants the cold first token faster (e.g. a latency A/B) sets
+    `cuda_graph=False`; a value passed through `extra_env` still wins over this default.
     """
     port = port or ENG_IN
     if nxt_addr is not None:
@@ -1782,6 +2042,9 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
     cvd = f"CUDA_VISIBLE_DEVICES={int(gpu)} " if gpu is not None else ""
+    # graphs ON by default for a GPU launch; placed BEFORE extra_env so an explicit override there
+    # (V4_CUDA_GRAPH=0) still wins — bash takes the rightmost assignment of a repeated name.
+    gp = f"V4_CUDA_GRAPH={1 if cuda_graph else 0} "
     # DETACH (K3 ring Bug 1, 2026-07-29): a bare `nohup <cmd> &` over ssh kept the channel open on the
     # engine's child fds and HUNG the launcher, so a parallel launch of all B*G stages never returned
     # the ssh session. setsid + a full fd redirect fully detaches the engine and ssh returns instantly;
@@ -1789,7 +2052,7 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     log = f"/root/v4_stage_{port}.log"
     inner = (f"python3 /root/v4_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
              f"--port {port} {nxt} {rr}{ds}--dir {model_dir} > {log} 2>&1")
-    return (f"{rc}{tk}{cvd}{extra_env}V4_DIR={model_dir} V4_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
+    return (f"{rc}{tk}{cvd}{gp}{extra_env}V4_DIR={model_dir} V4_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
             f"setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 
@@ -2153,7 +2416,18 @@ def _encode_prompt(tok, job):
 
 def _coord_cli(a):
     """The node-daemon serving entrypoint (mirrors shard.coordinate): dial the ring, read jobs as
-    JSON lines on stdin, drive decode, and emit the SHARD_JOB_* stdout contract."""
+    JSON lines on stdin, drive decode, and emit the SHARD_JOB_* stdout contract.
+
+    THE PERSISTENT-COORDINATOR PATTERN. This is meant to be a LONG-LIVED process fed a STREAM of job
+    lines and never sent EOF: the node daemon holds it open and writes each job as it arrives, so one
+    warm coordinator serves the ring for its whole lifetime — no reconnect, no re-reset between jobs.
+    A single job's fault keeps it alive (see the except below). And now, crucially, EOF is survivable
+    too: when stdin closes this returns and its sockets drop, but the ring no longer cascades — the
+    head re-accepts a reconnecting coordinator and the tail re-accepts its return channel (see
+    _serve_forward / _serve_tail). So a bench that runs, exits, and re-runs reconnects to the SAME
+    warm ring instead of paying a full ~25min re-warm each time — the biggest iteration-speed win on
+    the V4 path. To stream jobs by hand rather than tear down between them, keep stdin open (e.g. feed
+    a FIFO) rather than piping a here-doc that EOFs after the last line."""
     os.environ.setdefault("V4_DIR", a.dir)
     layer_count = ring_args(a.dir).n_layers                   # same view of the config the stages built
     try:
@@ -2193,12 +2467,33 @@ def _coord_cli(a):
             if job.get("dspark"):                             # V4's own trained speculator, on the tail
                 # PIPELINED is opt-in per job or per process, and the serial path stays the default:
                 # the two emit the same stream, but only one of them has been measured on a real ring.
-                drive = (coordinate_dspark_pipelined
-                         if (V4_PIPELINED_SPEC or job.get("pipelined")) else coordinate_dspark)
-                r = drive(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
-                          nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
-                          job_id=job_id, layer_count=layer_count, receipts=a.receipts,
-                          timeout=a.timeout, on_token=_on_token)
+                # The confidence gate trims the tail's OFFERED BLOCK LENGTH, which only the serial
+                # path has -- pipelined streams one s=1 frame per position and never sends a block --
+                # so the conf_* knobs are passed to the serial coordinator only. They are not
+                # silently dropped: a job that asks for both is told, because a gate that does
+                # nothing would read on the ring as "confidence gating did not help".
+                pipelined = bool(V4_PIPELINED_SPEC or job.get("pipelined"))
+                wants_conf = (job.get("confGate") if job.get("confGate") is not None
+                              else V4_DSPARK_CONF_GATE)
+                if pipelined and wants_conf:
+                    raise ValueError(
+                        "confGate/V4_DSPARK_CONF_GATE gates the serial DSpark path's block length; "
+                        "the pipelined coordinator streams s=1 frames and has no block to trim. "
+                        "Run one or the other, not both.")
+                if pipelined:
+                    r = coordinate_dspark_pipelined(
+                        pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                        nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
+                        job_id=job_id, layer_count=layer_count, receipts=a.receipts,
+                        timeout=a.timeout, on_token=_on_token)
+                else:
+                    r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                                          nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
+                                          job_id=job_id, layer_count=layer_count, receipts=a.receipts,
+                                          timeout=a.timeout, on_token=_on_token,
+                                          conf_gate=job.get("confGate"),  # None -> V4_DSPARK_CONF_* env
+                                          conf_thresh=job.get("confThresh"),
+                                          conf_min=job.get("confMin"))
             elif job.get("spec"):                             # coordinator-side drafter (n-gram)
                 r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
                                     nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",

@@ -36,6 +36,11 @@ WHAT MAKES V4 DIFFERENT FROM EVERY STAGE WE HAVE SHIPPED
    order sequential decode would. tests/test_v4_stage.py::test_chunk_loop_equals_stepwise is the
    proof, and it is the test that has to stay green for the verify path to mean anything.
 
+   That loop is the REFERENCE PATH and stays the default. `V4_FAST_VERIFY=1` opts a stage into the
+   CHUNKED path instead -- one pass per layer over all s positions -- which is the whole content of
+   the "── the chunked verify path ──" section below, and the reason a g≈4 speculation can be worth
+   more than 1.0x. See that section's header for what it does and what it costs.
+
 THE MATH IS RENTED, NOT REWRITTEN (docs/MODEL_RUNTIME.md). This file instantiates DeepSeek's
 `Block`, `RMSNorm`, `ParallelEmbedding` and `ParallelHead` and calls them; it reimplements no
 attention, no compressor, no hyper-connection, and not one line of the `hc_head` collapse (which is
@@ -96,6 +101,37 @@ dev = os.environ.get("V4_DEV", "cuda")
 # the kv_cache `torch.zeros` pick up. It is NOT the weight format: that comes from `args.dtype`
 # (fp8/bf16) and `args.expert_dtype` (fp4) through the module globals below.
 V4_DTYPE = os.environ.get("V4_DTYPE", "bfloat16")
+# The chunked verify path (below). OFF by default: the per-token loop is the reference path and the
+# thing everything else is graded against, so the fast one is opted into per stage, never inherited.
+V4_FAST_VERIFY = bool(int(os.environ.get("V4_FAST_VERIFY", "0") or 0))
+# How many chunk positions a fast stage reserves room for. It is the width of the scratch region
+# appended to every `Attention.kv_cache` (see `_chunk_attention`), so it is paid in VRAM once per
+# layer -- 16 rows against a 128-row window is noise, and a chunk wider than this simply falls back
+# to the loop rather than reallocating mid-job.
+V4_FAST_VERIFY_MAX = int(os.environ.get("V4_FAST_VERIFY_MAX", "16") or 16)
+
+# CUDA graphs over a decode step, opt-in, default OFF (the default path stays byte-identical and the
+# CPU parity suite never touches this). UNLIKE K3, a V4 layer CANNOT be captured whole: three of its
+# pieces bake position or data into a graph and are wrong on replay --
+#   * the attention core writes `kv_cache[:, start_pos % win]` (a ROTATING ring slot), reads a
+#     COMPRESSED region whose valid width GROWS with position, and the Indexer's score einsum runs
+#     over `kv_cache[:, :end_pos // ratio]` (a growing slice); a graph freezes all three at capture.
+#   * the Compressor's `should_compress = (start_pos+1) % ratio == 0` is a per-position PYTHON branch,
+#     and its compressed write slot `kv_cache[:, start_pos // ratio]` grows.
+#   * the MoE picks its experts per token (`indices[0].tolist()` — a host sync even on the decode fast
+#     path), so a captured graph runs ONE token's expert set.
+# So the capture is PARTIAL: it graphs the POSITION- and DATA-INDEPENDENT islands the reference
+# exposes as pure Block methods -- the two `hc_pre` (mix + Sinkhorn), the two `hc_post`, and the two
+# attn/ffn RMSNorms -- and leaves `attn` and `ffn` eager between them (measured: ~68 of ~240
+# launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
+# Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
+# through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
+V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0") not in ("", "0")
+# Every captured graph pins its own workspace pool; cap the set process-wide (3 graphs per layer).
+# Past the cap a layer stays EAGER (counted, never a crash), exactly like K3's K3_GRAPH_MAX.
+V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
+_GRAPH_COUNT = 0        # island graphs captured so far, across every Stage in this process
+_GRAPH_SKIPPED = 0      # island graphs a layer skipped because the cap was hit or a capture failed
 
 _REF = None
 _ARGS = {}
@@ -196,6 +232,355 @@ def _set_globals(M, args):
     return new
 
 
+# ── the chunked verify path ──────────────────────────────────────────────────────────────────────
+#
+# WHAT IT BUYS. A verify chunk of s tokens costs, on the per-token loop, s TIMES a single-token
+# traversal -- measured at 3.93x for s=6 on the first live 7x5090 ring, which is why g≈4 speculation
+# netted ~1.0x end to end. Nothing about that is arithmetic: at s=1 every layer is dispatch- and
+# weight-streaming-bound, so the SECOND token through a layer is nearly free if it rides the same
+# pass.
+#
+# WHAT IT MEASURED, on one real V4 layer on a 5090 at ctx 1024, s = 6 (ms per call, chunk vs the
+# loop vs a single token):
+#
+#   layer 41 (ratio 128), attention + HC only      loop 5.73x   chunk 1.38x    <- the mechanism
+#   layer 40 (ratio 4 + indexer), attention + HC   loop 5.81x   chunk 1.92x
+#   layer 41, whole layer                          loop 5.88x   chunk 4.08x
+#   layer 40, whole layer                          loop 5.84x   chunk 3.94x    <- 1.48x end to end
+#
+# So the chunk mechanics deliver what they promised -- six positions of attention and
+# hyper-connections for 1.4 single-token traversals -- and the MoE eats most of it back. That is not
+# a defect in this path: a 256-expert MoE routing 6 tokens to 6 experts each touches up to 36 experts
+# instead of 6, and the reference's `MoE.forward` walks them in a PYTHON LOOP, one fp4 GEMM triple
+# per expert. It is the next lever (a grouped expert GEMM), it is bigger than this one, and it is
+# orthogonal: nothing here has to change for it to land.
+#
+# WHY IT CANNOT BE RENTED. `Attention.forward`'s decode branch is a hard `seqlen == 1`
+# (`kv_cache[:bsz, start_pos % win] = kv.squeeze(1)`, model.py:535) and so is `Compressor.forward`'s
+# (`kv_state[:bsz, start_pos % ratio] = kv.squeeze(1)`, :353/:362). DeepSeek's own loop never decodes
+# more than one token, so there is no multi-token decode branch to call -- not a version skew, an
+# absent feature. This is therefore a DELIBERATE, documented exception to rent-don't-rewrite
+# (docs/MODEL_RUNTIME.md): the chunk MECHANICS are written here, driving the reference's own weights
+# and calling its own `Block.forward`, `hc_pre`/`hc_post`, `MoE`, norms and `Compressor.forward`.
+# The exception is kept honest by the parity bar, and the surface is deliberately one function:
+# everything except `Attention.forward` is multi-token-correct in the reference already.
+#
+# WHAT ONE CHUNK PASS DOES, AND WHY EACH PIECE IS SHAPED THE WAY IT IS
+#
+#   window attention   position p attends the 128 ring slots holding p-win+1..p. The ring cannot
+#       simply be written for all s positions first: chunk position p+i lands on slot (p+i) % win,
+#       which is exactly the slot holding the OLDEST entry of p's own window, so a pre-written ring
+#       answers p's oldest window slots with tokens from p's FUTURE. So the chunk's kv goes to a
+#       SCRATCH region appended to kv_cache, the ring keeps its pre-chunk contents for the whole
+#       attention, and the per-position index rows point at scratch for the chunk's own positions and
+#       at the ring for everything earlier (`_ChunkPlan.window_rows`). The ring is committed AFTER
+#       the read, which reproduces the reference's write-before-read within a position exactly (p
+#       reads its own kv -- out of scratch, same bits) while keeping the earlier positions' view
+#       intact. sparse_attn is already per-position (`T.Kernel(m, b)`, kernel.py:301 -- one thread
+#       block per position), so s positions in one call is the SAME arithmetic per position.
+#
+#   compressor state   `kv_state`/`score_state` are fp32 accumulators advanced one position at a
+#       time with an emit at (p+1) % ratio == 0, and the overlap variant shifts its own window on
+#       every emit. That is genuinely sequential, so it stays a python loop over s calls to the
+#       REFERENCE's own `Compressor.forward` -- at [b, 1, dim] each, the same shapes the per-token
+#       path uses, hence bit-identical by construction (and measured so, on the GPU too: kv_state
+#       and score_state come back torch.equal there while everything around them has drifted).
+#
+#   indexer            `index_score`'s kv read is `kv_cache[:bsz, :end_pos // ratio]`, and end_pos is
+#       PER POSITION -- a chunk that crosses a compression boundary has positions with different read
+#       lengths AND different topk widths (`min(index_topk, end_pos // ratio)`). Batching those with
+#       one masked topk would silently change which slots win. So the chunk is split into the
+#       CONTIGUOUS RUNS that share a read length (at most ceil(s/ratio)+1 of them; one for a chunk
+#       that crosses nothing) and each run runs the reference's own einsum+topk at exactly the width
+#       that run's positions would have had alone. Rows are then right-padded to a common width with
+#       -1, which sparse_attn treats as "no position" -- on the GPU kernel a padded 64-block is
+#       provably a no-op (scores_max unchanged, scores_scale = exp(0) = 1, gemm adds 0).
+#
+#   MoE / hyper-connections / norms   per-position by construction and already multi-token: rented
+#       verbatim through `Block.forward`. This is where most of the s-fold saving lands.
+#
+# THE ONE THING THIS PATH IS NOT: BIT-IDENTICAL TO THE LOOP. Every mechanism above is exact -- same
+# operands, same indices, same state, same order -- but torch picks its kernels by tensor SIZE, and a
+# batched pass hands it bigger ones. MKL uses a different sgemm for M = 1 than for M = 6 (the
+# reassociation `_tail_logit_rows`, v4_pipe.py:698, already keeps away from the logits, measured
+# there at ~4e-7); cuBLAS and tilelang do the same; and it is not only the GEMMs -- bf16 `rsqrt`
+# rounds one ulp differently once a tensor is big enough to take its vectorized path. No
+# implementation of a batched pass avoids that, so "bit-exact against the loop" is not on the menu
+# and pretending otherwise would be the lie. What IS provable is that nothing else differs, and that
+# is what tests/test_v4_stage.py's section 9 proves, exactly:
+#
+#   every chunk position attends the same PLACES as the loop, in the same order, and those places
+#   hold the same BYTES (the gathered kv are compared, which is what catches a ring written before
+#   it is read -- the meanings alone would not), and after the chunk the window ring, the compressed
+#   region and both fp32 accumulators are torch.equal to the loop's, per layer, on an identical input
+#
+# with what is left measured rather than waved at: <= 24 bf16 ulps of payload drift at s <= 6 and an
+# identical greedy token stream over 90/90 swept chunks (9/18 at s = 8, where this toy's tensors
+# start crossing torch's kernel thresholds). Default OFF is what makes that an honest trade rather
+# than a silent one.
+#
+# ON THE GPU IT IS BETTER THAN THAT, AND THE SPLIT IS INSTRUCTIVE. Run on a 5090 against the real
+# fp8/fp4 checkpoint, with the layer input held identical, the whole chunked ATTENTION comes back
+# torch.equal to the loop -- output, window ring, compressed region, indexer cache, both fp32
+# accumulators, on a ratio-4 layer and a ratio-128 one. tilelang's GEMMs tile K identically whatever
+# M is and sparse_attn is one thread block per position, so the part written here is exactly
+# invariant where it actually runs. What still drifts there is the RENTED half: cuBLAS picks a gemv
+# for M = 1 and a gemm for M = 6, so hc_pre and the MoE reassociate (measured directly: fp32
+# K=16384 linear differs at 6e-5, bf16 4096x4096 at 5e-1). Batching costs ulps in the parts nobody
+# wrote and nothing in the parts we did.
+
+
+class _ChunkPlan:
+    """The index geometry of one s-token chunk at `start_pos` -- what the reference builds one
+    position at a time, built once for the whole chunk and shared by every layer in the stage.
+
+    Everything here is integer bookkeeping over `window_size`, `compress_ratio` and the positions
+    themselves; nothing depends on the weights, so one plan serves all layers (the per-layer part is
+    the scratch base, which is why `window_rows` is keyed by it -- a ratio-0 layer's kv_cache is
+    shorter than a ratio-4 layer's, so its scratch starts somewhere else).
+
+    Built on the host and moved once: these are a few hundred int32 per chunk, and building them
+    with device ops would cost more launches than the pass is trying to save."""
+
+    def __init__(self, args, start_pos, s, bsz, device, cap):
+        self.start_pos, self.s, self.bsz, self.device, self.cap = start_pos, s, bsz, device, cap
+        self.win = args.window_size
+        self._win_rows, self._comp_rows, self._slots = {}, {}, None
+
+    def _to(self, rows):
+        """[s][k] python ints -> the reference's own topk_idxs shape/dtype: [bsz, s, k] int32."""
+        t = torch.tensor(rows, dtype=torch.int32).view(self.s, -1)
+        return t.unsqueeze(0).expand(self.bsz, -1, -1).contiguous().to(self.device)
+
+    def ring_slots(self):
+        """The window-ring slot each chunk position owns: [s] long, for the post-attention commit."""
+        if self._slots is None:
+            self._slots = torch.tensor([(self.start_pos + i) % self.win for i in range(self.s)],
+                                       dtype=torch.long, device=self.device)
+        return self._slots
+
+    def window_rows(self, base):
+        """`get_window_topk_idxs` (model.py:261) for every chunk position, retargeted at `base`.
+
+        The reference's decode row is the ring in TEMPORAL order -- for p >= win-1,
+        `[sp+1..win-1, 0..sp]` with sp = p % win, whose k-th entry holds absolute position
+        p - win + 1 + k; for 0 < p < win-1 it is `[0..p]` right-padded with -1, whose k-th entry
+        holds position k. Both are reproduced exactly, and then every entry whose position belongs
+        to THIS chunk (>= start_pos) is pointed at the scratch row that holds it instead of at the
+        ring slot it will eventually occupy. That single substitution is what makes one pass legal:
+        the ring still holds the pre-chunk tokens for the whole attention, so a chunk position's
+        oldest window entries are the tokens that were really there, not the chunk's own tail."""
+        if base not in self._win_rows:
+            win, sp0, rows = self.win, self.start_pos, []
+            for j in range(self.s):
+                p = sp0 + j
+                if p >= win - 1:
+                    sp = p % win
+                    slots = list(range(sp + 1, win)) + list(range(sp + 1))
+                    pos = [p - win + 1 + k for k in range(win)]
+                else:
+                    slots = list(range(p + 1)) + [-1] * (win - p - 1)
+                    pos = list(slots)
+                rows.append([base + (q - sp0) if q >= sp0 else v for v, q in zip(slots, pos)])
+            self._win_rows[base] = self._to(rows)
+        return self._win_rows[base]
+
+    def lengths(self, ratio):
+        """How many compressed slots each chunk position may read: `(p + 1) // ratio`, per position.
+
+        This is the reference's `end_pos // ratio` with end_pos = p + 1 (model.py:413,426,433) -- the
+        prefix of the compressed region that exists AT p, whose last slot is the one p itself just
+        wrote. Non-decreasing across the chunk, which is what makes `groups` contiguous."""
+        return [(self.start_pos + j + 1) // ratio for j in range(self.s)]
+
+    def groups(self, ratio):
+        """The chunk split into contiguous runs sharing a compressed read length. -> [(j0, j1, n)].
+
+        One run for a chunk that crosses no compression boundary, one more per boundary crossed."""
+        n, out, j0 = self.lengths(ratio), [], 0
+        for j in range(1, self.s + 1):
+            if j == self.s or n[j] != n[j0]:
+                out.append((j0, j, n[j0]))
+                j0 = j
+        return out
+
+    def compress_rows(self, ratio, offset):
+        """`get_compress_topk_idxs` (model.py:275) for every chunk position, padded to one width.
+
+        The reference's decode row is the whole prefix `arange((p+1) // ratio) + offset`, so the rows
+        of a chunk that crosses a boundary differ in LENGTH. They are right-padded with -1 (sparse
+        attention's "no position") to the widest, which is the last position's -- the pad is a
+        masked-out column, never a slot."""
+        if (ratio, offset) not in self._comp_rows:
+            n = self.lengths(ratio)
+            wide = n[-1]
+            rows = [[offset + t for t in range(k)] + [-1] * (wide - k) for k in n]
+            self._comp_rows[(ratio, offset)] = (
+                self._to(rows) if wide else
+                torch.zeros(self.bsz, self.s, 0, dtype=torch.int32, device=self.device))
+        return self._comp_rows[(ratio, offset)]
+
+
+def _chunk_compressor(c, x, start_pos):
+    """Advance a Compressor over a chunk: the REFERENCE's own decode branch, one position at a time.
+
+    Deliberately not batched. `kv_state`/`score_state` are running fp32 accumulators with a boundary
+    emit at `(p + 1) % ratio == 0`, and the ratio-4 overlap variant copies its second half over its
+    first ON that emit (model.py:359-360) -- a genuinely sequential recurrence over at most s steps.
+    Batching it would mean reimplementing the emit schedule; looping it costs s pairs of small fp32
+    GEMMs and is bit-identical to the per-token path by construction, because the shapes it hands the
+    reference ([b, 1, dim]) are the ones the per-token path hands it.
+
+    `.contiguous()` because a [b, s, dim] slice is not the freshly-allocated [b, 1, dim] the loop
+    would have passed, and F.linear is entitled to notice."""
+    for j in range(x.size(1)):
+        c(x[:, j:j + 1].contiguous(), start_pos + j)
+
+
+def _chunk_indexer(self, x, qr, start_pos, offset, plan):
+    """`Indexer.forward` (model.py:408) for a whole chunk. -> topk_idxs [b, s, k] (right-padded -1).
+
+    q, the weights projection and the compressor are position-independent or sequential, so they run
+    once for the chunk. The SCORING is the part a chunk cannot do in one shot: `end_pos // ratio` is
+    the read length AND (through `min(index_topk, ...)`) the topk width, and both change mid-chunk
+    at every compression boundary. Masking a common-width score to fake the shorter reads would
+    change which slots a topk near-tie picks, so instead the chunk is split into runs that share a
+    length (`_ChunkPlan.groups`) and each run runs the reference's own einsum + topk at exactly its
+    own width -- identical arithmetic to what those positions would have got alone, one call per
+    boundary crossed instead of one per position."""
+    M = ref()
+    bsz, seqlen, _ = x.size()
+    freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+    ratio, rd = self.compress_ratio, self.rope_head_dim
+    if self.compressor.kv_cache is None:
+        self.compressor.kv_cache = self.kv_cache
+        self.compressor.freqs_cis = self.freqs_cis
+    q = self.wq_b(qr)
+    q = q.unflatten(-1, (self.n_local_heads, self.head_dim))
+    M.apply_rotary_emb(q[..., -rd:], freqs_cis)
+    q = M.rotate_activation(q)
+    M.fp4_act_quant(q, M.fp4_block_size, True)
+    _chunk_compressor(self.compressor, x, start_pos)
+    weights = self.weights_proj(x) * (self.softmax_scale * self.n_heads ** -0.5)
+    rows, wide = [], 0
+    for j0, j1, n in plan.groups(ratio):
+        k = min(self.index_topk, n)
+        if k == 0:                                          # nothing compressed yet: no rows to pick
+            rows.append(torch.zeros(bsz, j1 - j0, 0, dtype=torch.long, device=x.device))
+            continue
+        score = torch.einsum("bshd,btd->bsht", q[:, j0:j1].contiguous(), self.kv_cache[:bsz, :n])
+        score = (score.relu_() * weights[:, j0:j1].unsqueeze(-1)).sum(dim=2)
+        rows.append(score.topk(k, dim=-1)[1] + offset)
+        wide = max(wide, k)
+    if len(rows) == 1:
+        return rows[0]
+    return torch.cat([r if r.size(-1) == wide else
+                      torch.cat([r, r.new_full((bsz, r.size(1), wide - r.size(-1)), -1)], dim=-1)
+                      for r in rows], dim=1)
+
+
+def _chunk_attention(self, x, start_pos, plan):
+    """`Attention.forward`'s decode branch (model.py:490-548) for a WHOLE s-token chunk at once.
+
+    Line for line the reference's, with three substitutions and nothing else:
+
+      the window write   the chunk's kv goes to the SCRATCH rows at the end of kv_cache BEFORE the
+                         attention and to the ring AFTER it, instead of to the ring before it. The
+                         index rows (`_ChunkPlan.window_rows`) send each position at its own kv in
+                         scratch, so write-before-read still holds per position -- while the ring
+                         still answers earlier positions with the tokens that were really there.
+                         Both writes carry the same bits; the ring commit is what the NEXT chunk and
+                         the rollback snapshot read.
+
+      the compressor     s sequential calls into the reference's own decode branch
+                         (`_chunk_compressor`), all of them before the attention, because a position
+                         reads the compressed slot it just wrote. A later chunk position can only
+                         write slots at or beyond an earlier one's read bound `(p+1) // ratio`, so
+                         doing all of them first cannot contaminate an earlier position -- the same
+                         zero-margin argument `Stage._snapshot` makes for not snapshotting the
+                         compressed region, one chunk further along.
+
+      the index rows     built for s positions instead of one, per-position exact (see _ChunkPlan).
+
+    Everything else -- q/kv projections, rope, the fp8 QAT quantizers, sparse_attn, the grouped o
+    projection -- is the reference's own code on a [b, s, ...] tensor, which is the shape its prefill
+    branch already feeds it."""
+    M = ref()
+    bsz, seqlen, _ = x.size()
+    freqs_cis = self.freqs_cis[start_pos:start_pos + seqlen]
+    win, ratio, rd = self.window_size, self.compress_ratio, self.rope_head_dim
+    if self.compress_ratio and self.compressor.kv_cache is None:
+        self.compressor.kv_cache = self.kv_cache[:, win:]
+        self.compressor.freqs_cis = self.freqs_cis
+        if self.indexer is not None:
+            self.indexer.freqs_cis = self.freqs_cis
+    # q
+    qr = q = self.q_norm(self.wq_a(x))
+    q = self.wq_b(q).unflatten(-1, (self.n_local_heads, self.head_dim))
+    q *= torch.rsqrt(q.square().mean(-1, keepdim=True) + self.eps)
+    M.apply_rotary_emb(q[..., -rd:], freqs_cis)
+
+    # win kv & topk_idxs
+    kv = self.wkv(x)
+    kv = self.kv_norm(kv)
+    M.apply_rotary_emb(kv[..., -rd:], freqs_cis)
+    M.act_quant(kv[..., :-rd], 64, M.scale_fmt, M.scale_dtype, True)
+    base = self.kv_cache.size(1) - plan.cap                 # the scratch region, past every real slot
+    topk_idxs = plan.window_rows(base)
+    if self.compress_ratio:
+        offset = win
+        if self.indexer is not None:
+            compress_topk_idxs = _chunk_indexer(self.indexer, x, qr, start_pos, offset, plan).int()
+        else:
+            compress_topk_idxs = plan.compress_rows(ratio, offset)
+        topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
+
+    # compress kv & attn
+    self.kv_cache[:bsz, base:base + seqlen] = kv            # every position's own kv, readable now
+    if self.compress_ratio:
+        _chunk_compressor(self.compressor, x, start_pos)
+    o = M.sparse_attn(q, self.kv_cache[:bsz], self.attn_sink, topk_idxs, self.softmax_scale)
+    self.kv_cache[:bsz, plan.ring_slots()] = kv            # commit the ring AFTER every read of it
+    M.apply_rotary_emb(o[..., -rd:], freqs_cis, True)
+
+    # o
+    o = o.view(bsz, seqlen, self.n_local_groups, -1)
+    wo_a = self.wo_a.weight.view(self.n_local_groups, self.o_lora_rank, -1)
+    o = torch.einsum("bsgd,grd->bsgr", o, wo_a)
+    return self.wo_b(o.flatten(2))
+
+
+_CHUNK_BLOCK = None
+
+
+def chunk_block_cls(M):
+    """`Block` with a chunk-capable attention (memoized per process).
+
+    A SUBCLASS, not a monkeypatch, and chosen at construction: a stage built without the fast path
+    holds the reference's own `Block` and cannot take a branch that does not exist in it, which is
+    what makes "OFF by default changes nothing" checkable rather than promised. The submodule tree,
+    the parameter names and therefore every state_dict are identical, so `load()` and the tests'
+    in-process weight transfer neither know nor care.
+
+    `_chunk` is armed by `Stage._run_chunk` for the duration of one pass and is None everywhere else
+    -- including inside `_replay`, which is why a rollback replays through the reference path."""
+    global _CHUNK_BLOCK
+    if _CHUNK_BLOCK is None or _CHUNK_BLOCK.__mro__[1] is not M.Block:
+        class _ChunkAttention(M.Attention):
+            _chunk = None
+
+            def forward(self, x, start_pos):
+                if self._chunk is None:
+                    return super().forward(x, start_pos)
+                return _chunk_attention(self, x, start_pos, self._chunk)
+
+        class _ChunkBlock(M.Block):
+            attention_cls = _ChunkAttention
+
+        _CHUNK_BLOCK = _ChunkBlock
+    return _CHUNK_BLOCK
+
+
 # ── the stage ────────────────────────────────────────────────────────────────────────────────────
 
 class Stage:
@@ -216,23 +601,26 @@ class Stage:
     is for: it loads the embedding on a stage that would otherwise have no use for it."""
 
     def __init__(self, lo, hi, args=None, *, head=False, tail=False, dspark=False,
-                 device=None, dtype=None, spec_depth=None):
+                 device=None, dtype=None, spec_depth=None, fast_verify=None):
         self.lo, self.hi = lo, hi
         self.args = args if args is not None else config()
         self.device = device or dev
         self.dtype = dtype or getattr(torch, V4_DTYPE)
         self.head, self.tail, self._dspark = head, tail, dspark
+        self._fast = V4_FAST_VERIFY if fast_verify is None else bool(fast_verify)
+        self._chunk_cap = V4_FAST_VERIFY_MAX if self._fast else 0
         M = ref()
         self.globals = _set_globals(M, self.args)
         a = self.args
         if not 0 <= lo < hi <= a.n_layers:
             raise RuntimeError(f"v4 stage[{lo}:{hi}) is not a range inside 0..{a.n_layers}")
+        block_cls = chunk_block_cls(M) if self._fast else M.Block
         # `with torch.device(...)` + the reference's own set_dtype contextmanager is generate.py's
         # construction environment (generate.py:77,87) reproduced exactly. Both matter: the dtype
         # decides what the bare `torch.empty`/`torch.zeros` parameters and kv buffers come out as,
         # the device keeps a 158 GiB model from being built on the host and then copied.
         with torch.device(self.device), M.set_dtype(self.dtype):
-            self.layers = torch.nn.ModuleList([M.Block(li, a) for li in range(lo, hi)])
+            self.layers = torch.nn.ModuleList([block_cls(li, a) for li in range(lo, hi)])
             self.embed_tokens = M.ParallelEmbedding(a.vocab_size, a.dim) if (head or dspark) else None
             if tail:
                 self.norm = M.RMSNorm(a.dim, a.norm_eps)
@@ -245,6 +633,8 @@ class Stage:
                     self.hc_head_fn = torch.nn.Parameter(torch.empty(a.hc_mult, a.hc_mult * a.dim))
                     self.hc_head_base = torch.nn.Parameter(torch.empty(a.hc_mult))
                     self.hc_head_scale = torch.nn.Parameter(torch.empty(1))
+        if self._fast:
+            self._reserve_chunk_scratch()
         for m in self._owned_modules():
             m.eval()
         # Ascending layer order, NOT the tuple's -- the reference appends a tap inside its own
@@ -259,7 +649,27 @@ class Stage:
         self._spec_ckpts = deque(maxlen=self._spec_depth)
         self._last_tap = {}
         self._pos = 0
+        self._replaying = False
         self.reset()
+        # One _BlockGraphs per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH).
+        # A stage that cannot graph stays fully eager and says why -- never a silent half-capture.
+        self._block_graphs = None
+        if V4_CUDA_GRAPH:
+            why = self._graph_refusal()
+            if why:
+                print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
+            else:
+                self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
+
+    def _graph_refusal(self):
+        """Why this stage cannot graph its decode islands, or None. Loud and specific, never silent.
+
+        The captured regions are the position- and data-INDEPENDENT Block methods (hc_pre/hc_post/the
+        norms), so unlike K3 there is no growing KV or per-position branch INSIDE a graph to refuse
+        over -- the only hard requirement is a CUDA device to capture on."""
+        if not str(self.device).startswith("cuda"):
+            return f"device is {self.device} (CUDA graphs are a GPU-only capture)"
+        return None
 
     @property
     def _spec_ckpt(self):
@@ -272,6 +682,29 @@ class Stage:
         for n in ("embed_tokens", "norm", "lm_head"):
             if getattr(self, n, None) is not None:
                 yield getattr(self, n)
+
+    def _reserve_chunk_scratch(self):
+        """Append `_chunk_cap` rows to every `Attention.kv_cache` for the chunked path to write into.
+
+        The chunk's own kv has to live in the SAME tensor sparse_attn is reading (its indices are
+        offsets into one buffer), and the alternative -- concatenating the chunk onto the cache per
+        layer per chunk -- copies the entire compressed region, which at V4's shape is the largest
+        buffer in the stage. Widening the buffer once costs `cap` rows per layer and copies nothing.
+
+        Safe against the reference path by construction: the added rows sit PAST every index the
+        reference can produce (window indices are < win, compressed indices are < win + max_seq_len /
+        ratio), so a stage that never takes the chunk branch cannot read or write them. The lazily
+        bound aliases follow, because they are taken from `self.kv_cache` on the first forward and
+        this runs in the constructor: `compressor.kv_cache = kv_cache[:, win:]` simply ends with
+        `cap` unused slots on the end, past the `max_seq_len // ratio` it can address.
+
+        MUST run before the first forward, for the same reason: an alias bound to the OLD buffer
+        would leave the compressor writing into a tensor nothing else reads."""
+        with torch.no_grad():
+            for L in self.layers:
+                a = L.attn
+                b, n, d = a.kv_cache.shape
+                a.kv_cache = a.kv_cache.new_zeros(b, n + self._chunk_cap, d)
 
     # ---- state ----
 
@@ -399,9 +832,13 @@ class Stage:
             is never re-driven from a replay, so re-recording here would hand it its own history back.
             (The taps are recomputed into a throwaway dict and dropped -- a mean over 4 streams.)
           * NO prefill branch. A replay is by construction at start_pos > 0."""
-        with torch.no_grad():
-            for i in range(h.shape[1]):
-                self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, {})
+        self._replaying = True
+        try:
+            with torch.no_grad():
+                for i in range(h.shape[1]):
+                    self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, {})
+        finally:
+            self._replaying = False
         self._pos = start_pos + h.shape[1]
 
     def _seek(self, start_pos):
@@ -487,12 +924,50 @@ class Stage:
             return h.unsqueeze(2).repeat(1, 1, self.args.hc_mult, 1)
 
     def _run(self, h, ids, start_pos, taps):
-        """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps."""
-        for li, L in zip(range(self.lo, self.hi), self.layers):
-            h = L(h, start_pos, ids)
+        """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps.
+
+        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its
+        _BlockGraphs when the stage is armed: the graph replays the hc_pre/hc_post/norm islands and
+        runs `attn`/`ffn` eager between them. Prefill, a multi-token chunk, and a rollback replay
+        (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
+        the reference's own decode branch is the thing it is proven against."""
+        bg = self._block_graphs
+        graphed = bg is not None and not self._replaying and start_pos > 0 and h.shape[1] == 1
+        for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
+            h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
             if self._dspark and li in self._tap_ids:
                 taps.setdefault(li, []).append(h.mean(dim=2).detach().clone())
-        return h
+        # A graphed layer's output ALIASES its hc_post graph's static buffer; the last layer's escapes
+        # the stage (onto the wire, or into logits) and must not be overwritten by the next step's
+        # replay. One clone of [1,1,4,dim] per token, only on the graphed path.
+        return h.clone() if graphed else h
+
+    def _chunk_ok(self, s):
+        """Can this chunk go through the fast path? Anything else falls back to the per-token loop.
+
+        Two bounds, both real: the scratch region is `_chunk_cap` rows wide, and a chunk wider than
+        the window would wrap the ring onto itself (two chunk positions on one slot), which the
+        single index_copy_ commit does not define. Falling back rather than refusing keeps the fast
+        flag a PERFORMANCE switch -- a stage that meets an oversized chunk answers it correctly and
+        slowly, which is the right failure for a knob a coordinator sets."""
+        return self._fast and 1 < s <= min(self._chunk_cap, self.args.window_size)
+
+    def _run_chunk(self, h, ids, start_pos, taps):
+        """The whole chunk through every layer in ONE pass each. See "the chunked verify path".
+
+        The plan is per CHUNK, not per layer: window geometry and compression lengths depend only on
+        positions, so all layers share it (`window_rows` is keyed by the layer's scratch base, the
+        one part that differs). Arming is a plain attribute on each attention and is dropped in a
+        `finally` -- a fault mid-pass must not leave a stale plan that the next single-token forward
+        would then read as "this is a chunk"."""
+        plan = _ChunkPlan(self.args, start_pos, h.shape[1], h.shape[0], self.device, self._chunk_cap)
+        for L in self.layers:
+            L.attn._chunk = plan
+        try:
+            return self._run(h, ids, start_pos, taps)
+        finally:
+            for L in self.layers:
+                L.attn._chunk = None
 
     def forward(self, h, ids, start_pos):
         """Run this stage's layers. BOTH `h` and `ids` are inputs -- see the module docstring.
@@ -503,6 +978,10 @@ class Stage:
         `seqlen == 1` (model.py:353,362,535) and would silently write only the chunk's last token
         otherwise. Exact, not approximate: HC mixing is per-position, and the loop advances the KV
         and compressor state in exactly the order sequential decode would.
+
+        A stage built with `fast_verify` (V4_FAST_VERIFY=1) runs that chunk in ONE pass per layer
+        instead -- same state, same order, ~s times fewer dispatches. It is opt-in and it is not the
+        reference: see "the chunked verify path" for the mechanism and for the one thing it gives up.
 
         VALIDATE FIRST, SEEK SECOND. `_seek` MUTATES -- a rewind restores, replays and spends the
         checkpoint -- so a frame that is going to be rejected must be rejected before it can do that.
@@ -536,6 +1015,8 @@ class Stage:
         with torch.no_grad():
             if start_pos == 0 or s == 1:
                 out = self._run(h, ids, start_pos, taps)
+            elif self._chunk_ok(s):
+                out = self._run_chunk(h, ids, start_pos, taps)
             else:
                 out = torch.cat([self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, taps)
                                  for i in range(s)], dim=1)
@@ -633,7 +1114,128 @@ class Stage:
                 f"{self.dtype} on {self.device} pos={self._pos} "
                 f"kernels={v4_kernels_cpu.backend()} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
-                f"spec={'on' if self._spec else 'off'}>")
+                f"spec={'on' if self._spec else 'off'} "
+                f"graph={'on' if self._block_graphs is not None else 'off'} "
+                f"fast_verify={f'<={self._chunk_cap}' if self._fast else 'off'}>")
+
+
+# ── partial CUDA graphs over a decode step ─────────────────────────────────────────────────────────
+
+class _Graphlet:
+    """Capture + replay ONE pure, fixed-shape function of tensors -- a hyper-connection or a norm.
+
+    `fn` must be side-effect free and position/data-independent in STRUCTURE: it may read the layer's
+    (constant) parameters by closure and it consumes only the tensors passed to `run`, which arrive
+    through static input buffers, so the same captured kernels produce the right answer for any step's
+    data. The captured outputs are allocated INSIDE the graph and alias its pool -- consume or clone
+    them before the next replay of this same graphlet (the caller does, layer to layer).
+
+    Warm-up runs `fn` three times on a side stream before the capture: a tilelang kernel (the fused
+    hc_split_sinkhorn) autotunes and SYNCS on its first call, and a sync inside a capture is fatal."""
+
+    def __init__(self, fn, examples):
+        global _GRAPH_COUNT
+        self.fn = fn
+        self.ins = tuple(e.clone() for e in examples)          # static input buffers, fixed addresses
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.no_grad():
+            for _ in range(3):
+                self.fn(*self.ins)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            outs = self.fn(*self.ins)
+        self.outs = outs if isinstance(outs, tuple) else (outs,)
+        torch.cuda.synchronize()
+        _GRAPH_COUNT += 1
+
+    def run(self, *args):
+        for buf, a in zip(self.ins, args):
+            buf.copy_(a)
+        self.graph.replay()
+        return self.outs if len(self.outs) > 1 else self.outs[0]
+
+
+class _BlockGraphs:
+    """The three decode-step island graphs for one Block, with `attn` and `ffn` eager between them.
+
+    A Block's decode forward is, in order:
+        residual = h
+        x, post, comb = hc_pre(h, attn_params);  x = attn_norm(x)      << GRAPH g1
+        x = attn(x, start_pos)                                          << EAGER (rotating KV, sparse)
+        x = hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = hc_pre(x, ffn_params);   x = ffn_norm(x)       << GRAPH g2 (with the hc_post)
+        x = ffn(x, ids)                                                 << EAGER (data-routed MoE)
+        x = hc_post(x, residual, post, comb)                           << GRAPH g3
+    g1 ends at the attention input; g2 spans the attn hc_post through the ffn input; g3 is the ffn
+    hc_post. Everything a graph captures is a pure function of its inputs (no start_pos, no KV, no
+    routing) so the shape is a fixed b=1,s=1 and one capture serves every decode position.
+
+    Capture happens ALL AT ONCE on the first decode step, from zero-filled example tensors of the
+    known shapes, BEFORE the real `attn`/`ffn` run -- so a capture that fails leaves the per-stage KV
+    state untouched and the step falls back to a whole-Block eager call with nothing double-advanced."""
+
+    def __init__(self, L, stage):
+        self.L = L
+        self.st = stage
+        self.g = None
+        self.eager = False
+
+    def _g1_fn(self, h):
+        y, post, comb = self.L.hc_pre(h, self.L.hc_attn_fn, self.L.hc_attn_scale, self.L.hc_attn_base)
+        return self.L.attn_norm(y), post, comb
+
+    def _g2_fn(self, attn_out, residual, post_a, comb_a):
+        x2 = self.L.hc_post(attn_out, residual, post_a, comb_a)
+        y, post_f, comb_f = self.L.hc_pre(x2, self.L.hc_ffn_fn, self.L.hc_ffn_scale, self.L.hc_ffn_base)
+        return self.L.ffn_norm(y), x2, post_f, comb_f
+
+    def _g3_fn(self, ffn_out, residual, post_f, comb_f):
+        return self.L.hc_post(ffn_out, residual, post_f, comb_f)
+
+    def _build(self):
+        """Derive every graph's example inputs from a zero hidden state (the island fns are stateless,
+        so running them for shapes touches nothing), then capture all three."""
+        a = self.st.args
+        dt, dev = self.st.dtype, self.st.device
+        h = torch.zeros(1, 1, a.hc_mult, a.dim, dtype=dt, device=dev)
+        with torch.no_grad():
+            attn_in, post_a, comb_a = self._g1_fn(h)
+            attn_out = torch.zeros_like(attn_in)               # attn returns the attn-input's shape
+            ffn_in, x2, post_f, comb_f = self._g2_fn(attn_out, h, post_a, comb_a)
+            ffn_out = torch.zeros_like(ffn_in)                 # ffn returns the ffn-input's shape
+        self.g = (_Graphlet(self._g1_fn, (h,)),
+                  _Graphlet(self._g2_fn, (attn_out, h, post_a, comb_a)),
+                  _Graphlet(self._g3_fn, (ffn_out, x2, post_f, comb_f)))
+
+    def run(self, h, ids, start_pos):
+        """One graphed decode step for this Block, or a whole-Block eager fallback. Never raises."""
+        global _GRAPH_SKIPPED
+        if self.eager:
+            return self.L(h, start_pos, ids)
+        if self.g is None:
+            if _GRAPH_COUNT + 3 > V4_GRAPH_MAX:
+                self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + 3
+                print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
+                      f"{self.L.layer_id} stays eager", flush=True)
+                return self.L(h, start_pos, ids)
+            try:
+                self._build()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()
+                self.eager, self.g, _GRAPH_SKIPPED = True, None, _GRAPH_SKIPPED + 3
+                print(f"[v4] graph capture failed for layer {self.L.layer_id}: "
+                      f"{type(e).__name__}: {e} — layer stays eager", flush=True)
+                return self.L(h, start_pos, ids)
+        g1, g2, g3 = self.g
+        attn_in, post_a, comb_a = g1.run(h)
+        attn_out = self.L.attn(attn_in, start_pos)
+        ffn_in, x2, post_f, comb_f = g2.run(attn_out, h, post_a, comb_a)
+        ffn_out = self.L.ffn(ffn_in, ids)
+        return g3.run(ffn_out, x2, post_f, comb_f)
 
 
 def _selftest(lo, hi, d):

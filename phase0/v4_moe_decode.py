@@ -73,9 +73,17 @@ def install(mod):
 
     Unlike install_sm120 this runs AFTER model.py is executed: it replaces a method on a class the
     exec created, so there is nothing to rebind before. Idempotent, and a no-op under
-    V4_MOE_DECODE=0 or on a module already installed (load_ref memoizes, but a test may not)."""
+    V4_MOE_DECODE=0 or on a module already installed (load_ref memoizes, but a test may not).
+
+    It also refuses when v4_moe_grouped is ALREADY on top, which is not an idempotence check but a
+    CYCLE guard: grouped installs after this one and captures `decode_forward` as its fallback, so
+    re-installing over it would capture `grouped_forward` here and make the two call each other
+    forever. load_ref runs the pair exactly once, so nothing reaches this today — it is the trap any
+    second install path would otherwise fall into."""
     global _REF_FORWARD, _WORLD_SIZE
     if not V4_MOE_DECODE or getattr(mod.MoE.forward, "_v4_decode_fast", False):
+        return False
+    if getattr(mod.MoE.forward, "_v4_grouped", False):
         return False
     _REF_FORWARD = mod.MoE.forward
     _WORLD_SIZE = int(getattr(mod, "world_size", 1) or 1)

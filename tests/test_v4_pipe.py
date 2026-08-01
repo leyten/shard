@@ -493,6 +493,7 @@ class _ScriptedRing:
         self.first_token = first_token
         self.replies = list(replies)
         self.chunks = []                                  # (ids, start_pos) per step frame seen
+        self.reset_msg = None                             # the frame that opened the job
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -502,6 +503,7 @@ class _ScriptedRing:
                 msg = recv_msg(self.pipe_b)
                 op = msg.get("op")
                 if op == "reset":
+                    self.reset_msg = msg
                     send_msg(self.ret_a, "ok")
                 elif op == "step":
                     self.chunks.append((list(msg["ids"][0]), int(msg["start_pos"])))
@@ -620,6 +622,7 @@ class _ScriptedDsparkRing(_ScriptedRing):
                 msg = recv_msg(self.pipe_b)
                 op = msg.get("op")
                 if op == "reset":
+                    self.reset_msg = msg
                     send_msg(self.ret_a, "ok")
                 elif op == "step":
                     ids, pos = list(msg["ids"][0]), int(msg["start_pos"])
@@ -952,6 +955,74 @@ def test_sender_side_epoch_fence_drops_queued_frames_without_stranding_the_recei
         assert state.unsent == 1 and list(state.outstanding) == [(9, 1)]
     for s in (a, b):
         s.close()
+# ── 7d. the job horizon the reset frame carries for v4_ref_slim ───────────────────────────────────
+# v4_ref_slim's indexer skip may drop the Indexer's COMPRESSOR — which is state, not a query — but
+# only for a job that provably never leaves the select-all regime. Under-declare the horizon and the
+# indexer re-engages against a half-filled cache and picks the wrong keys, silently. So the bar these
+# pin is one-directional: the declared `max_pos` must UPPER-BOUND every absolute position the ring is
+# actually asked for, on all three coordinators, including the speculative overshoot a rejected draft
+# puts on the wire before it is rolled back.
+
+def _max_end_pos(chunks):
+    """The furthest absolute position the ring was actually driven to, over every step frame seen."""
+    return max(pos + len(ids) for ids, pos in chunks)
+
+
+def test_greedy_reset_declares_a_horizon_that_bounds_every_position():
+    ring = _ScriptedRing(first_token=10, replies=[[11], [12], [13]])   # one per post-prefill step
+    try:
+        VP.coordinate(ring.pipe_a, ring.ret_b, [1, 2, 3], 4, timeout=10)
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 4, "greedy has no draft overshoot: prompt + max_new, exact"
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks)
+
+
+def test_spec_reset_horizon_covers_the_draft_chunk_on_top_of_max_new():
+    """A spec round puts `[cur] + K drafts` on the wire at the committed position, so the ring touches
+    positions past the last COMMITTED one even when the draft is rejected. K+1 covers exactly that."""
+    drafts = [[11, 12, 13, 14], [21, 22, 23, 24]]
+    replies = [[11, 12, 13, 14, 15], [21, 22, 23, 24, 25]]
+    ring = _ScriptedRing(first_token=10, replies=replies)
+    script = list(drafts)
+    try:
+        VP.coordinate_spec(ring.pipe_a, ring.ret_b, [1, 2, 3], 6, K=4, timeout=10,
+                           drafter=lambda ids, k: list(script.pop(0)))
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 6 + 5
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks), "horizon must bound the wire"
+
+
+def test_dspark_reset_horizon_bounds_a_tail_drafted_block_of_unknown_size():
+    """The coordinator does not own the drafter here — the tail's MTP block size is not knowable at
+    reset — so the margin is deliberately fat rather than derived. Over-declaring only forgoes an
+    optimisation; under-declaring is a silent wrong answer."""
+    script = [([21], [31, 32, 33]), ([31, 32, 33, 44], [51, 52, 53])]
+    ring = _ScriptedDsparkRing(first_token=10, script=script)
+    try:
+        VP.coordinate_dspark(ring.pipe_a, ring.ret_b, [1, 2, 3], 6, timeout=10)
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 6 + VP._SPEC_POS_MARGIN
+    assert VP._SPEC_POS_MARGIN >= 8, "the margin must clear any block a real tail drafts"
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks)
+
+
+def test_job_horizon_absent_from_the_frame_is_the_SAFE_answer():
+    """A reset frame with no `max_pos` — an older coordinator, or a hand-built frame — must land as
+    None, which v4_ref_slim reads as "horizon unknown" and answers by KEEPING the compressor advanced.
+    Correct at any length; only the guaranteed-short optimisation is forgone."""
+    slim = pytest.importorskip("v4_ref_slim")
+    try:
+        VP._set_job_horizon({"op": "reset"}.get("max_pos"))
+        assert slim._JOB_MAX_POS is None
+        VP._set_job_horizon(512)
+        assert slim._JOB_MAX_POS == 512
+        VP._set_job_horizon(None)                          # teardown clears it: no leak into next job
+        assert slim._JOB_MAX_POS is None
+    finally:
+        slim.set_job_max_pos(None)
 
 
 # ── 8. the pure builders: tiling, per-GPU split, sidecar wiring, planner seam ──────────────────────
@@ -1051,6 +1122,19 @@ def test_box_ring_launch_emits_detached_per_gpu_commands():
     assert "--ret-relay" in out["stages"][4]["cmd"], "the tail box ingress bridges the return"
 
 
+def test_launch_defaults_cuda_graph_on_with_an_opt_out():
+    """A GPU ring launch turns the partial island graphs ON by default (the ring is CPU-launch-bound
+    and the graphs are bit-exact, per test_v4_stage_graph.py) while the module default stays OFF for
+    a bare import / the CPU parity suite / an in-process ring. The env is placed BEFORE extra_env, so
+    an explicit V4_CUDA_GRAPH there still wins — bash takes the rightmost assignment of a name."""
+    on = VP.stage_launch_cmd(0, 3, 0, 15)
+    assert "V4_CUDA_GRAPH=1 " in on and on.index("V4_CUDA_GRAPH=1 ") < on.index("V4_DIR=")
+    off = VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph=False)
+    assert "V4_CUDA_GRAPH=0 " in off
+    override = VP.stage_launch_cmd(0, 3, 0, 15, extra_env="V4_CUDA_GRAPH=0 ")
+    assert override.index("V4_CUDA_GRAPH=1 ") < override.index("V4_CUDA_GRAPH=0 ")
+
+
 def test_plan_layer_ranges_names_the_missing_v4_profile():
     """shard/plan.py keys engine profiles by catalog model id and REFUSES an unknown one rather than
     planning V4 at another model's calibration (the admit-then-OOM failure the measured numbers exist
@@ -1125,8 +1209,9 @@ class _Ring:
             assert e.wait(120), "a stage never came up"
         # the coordinator-return terminates at the tail box INGRESS (the relay), not the global tail
         tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]
-        self.pipe, self.ret = VP.connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{tail_port}",
-                                              timeout=60)
+        self.head_addr = f"127.0.0.1:{ports[0]}"
+        self.tail_addr = f"127.0.0.1:{tail_port}"
+        self.pipe, self.ret = VP.connect_ring(self.head_addr, self.tail_addr, timeout=60)
 
     def coordinate(self, prompt, max_new, nonce=None):
         return VP.coordinate(self.pipe, self.ret, prompt, max_new, nonce=nonce,
@@ -1137,10 +1222,10 @@ class _Ring:
                                   receipts=self.receipts, layer_count=self.layer_count,
                                   timeout=60, **kw)
 
-    def dspark(self, prompt, max_new, nonce=None):
+    def dspark(self, prompt, max_new, nonce=None, **kw):
         return VP.coordinate_dspark(self.pipe, self.ret, prompt, max_new, nonce=nonce,
                                     receipts=self.receipts, layer_count=self.layer_count,
-                                    timeout=60)
+                                    timeout=60, **kw)
 
     def pipelined(self, prompt, max_new, nonce=None, **kw):
         return VP.coordinate_dspark_pipelined(self.pipe, self.ret, prompt, max_new, nonce=nonce,
@@ -1193,6 +1278,34 @@ def test_full_ring_receipts_settle_and_c10(tiny):
     verify_coverage(wired, args.n_layers, expected_nonce="settle-nonce-abc", check_chain=True)
     with pytest.raises(ReceiptError, match="nonce"):           # and it binds to THIS job's nonce
         verify_coverage(wired, args.n_layers, expected_nonce="another-nonce", check_chain=True)
+
+
+def test_ring_survives_a_coordinator_disconnect(tiny):
+    """A coordinator that DROPS its sockets — a finished bench, a crash, an EOF, a restart — must not
+    take the warm ring down with it. The head reads only from the coordinator and the tail answers
+    only it, so before this guard the first coordinator's close cascaded the whole ring (a ~25min
+    re-warm per bench, the single biggest iteration tax). Now the head re-accepts a reconnecting
+    coordinator's pipe and the tail's background thread re-accepts its return channel and swaps it in,
+    so a BRAND-NEW coordinator dialed onto the SAME still-running stages decodes the same stream.
+
+    The disconnect is modelled exactly as the real one: the sockets are closed with NO stop op (a
+    stop would tear the ring down on purpose), then connect_ring re-dials the very same head/tail
+    addresses — which is what a re-run bench or a restarted node daemon does."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, [(0, 3), (3, 6), (6, 8)])
+    try:
+        assert ring.coordinate(list(PROMPT), NEW)["tokens"] == ref, "baseline job diverged"
+        # the coordinator vanishes WITHOUT a stop op: just drop both sockets, as a crash/EOF does
+        ring.pipe.close()
+        ring.ret.close()
+        # a fresh coordinator dials the SAME warm ring — head re-accept + tail return re-accept
+        ring.pipe, ring.ret = VP.connect_ring(ring.head_addr, ring.tail_addr, timeout=60)
+        assert ring.coordinate(list(PROMPT), NEW, nonce="after-reconnect")["tokens"] == ref, \
+            "the ring did not survive the coordinator reconnect"
+        # and it is genuinely still warm: a THIRD job on the reconnected coordinator still answers
+        assert ring.coordinate(list(PROMPT), NEW)["tokens"] == ref, "second post-reconnect job diverged"
+    finally:
+        ring.close()
 
 
 def test_fp8_wire_keeps_the_receipt_chain_on_a_real_ring(tiny, monkeypatch):
@@ -1280,6 +1393,50 @@ def test_full_ring_dspark_matches_reference(tiny):
     assert r["receipts_ok"] is True, "a drafted job must still settle its receipts"
     assert r["rounds"] > 1 and r["drafted"] == r["rounds"] - 1, \
         f"the drafter never proposed a block: {r['rounds']} rounds, {r['drafted']} drafted"
+
+
+def test_conf_send_len_is_a_survival_prefix():
+    """The gate's arithmetic, in isolation: keep the leading run of drafts whose raw confidence stays
+    >= thresh, stop at the first below (once a position is predicted to reject, the rest is moot),
+    floored at min_send and capped at the block. `conf` is a raw score, so this thresholds it
+    directly rather than treating it as a probability."""
+    L = VP._conf_send_len
+    assert L([], 0.0, 1) == 0                                  # round 1: no block, nothing to send
+    assert L([0.9, 0.8, 0.7], -9.9, 1) == 3                   # all above the floor: the whole block
+    assert L([0.9, -0.1, 0.8], 0.0, 1) == 1                   # position 2 predicted to reject: send 1
+    assert L([-0.2, 0.9, 0.9], 0.0, 1) == 1                   # position 1 low but min_send holds it at 1
+    assert L([-0.2, 0.9, 0.9], 0.0, 0) == 0                   # min_send 0: a bare greedy round
+    assert L([0.9, 0.9, 0.9], 9.9, 1) == 1                    # nothing clears a high floor: min_send
+    assert L([0.5, 0.5], 0.5, 1) == 2                         # the floor is inclusive (>=)
+
+
+def test_dspark_confidence_gate_is_lossless_and_adapts_send_length(tiny):
+    """The confidence gate truncates the OFFERED block, never the answer. Run the SAME drafted ring
+    three ways — ungated, gated with an unreachable floor (every block trims to min_send=1), and
+    gated with a floor nothing clears from below (every block sent whole) — and all three must emit
+    the reference's greedy stream. That is losslessness by construction: the tail verifies exactly
+    what it receives, so the send-length is a throughput knob and can never move a token. The `sent`
+    counts prove the knob actually MOVED: trimming sends strictly fewer draft tokens than sending the
+    blocks whole."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    probe = []
+    try:
+        base = ring.dspark(list(PROMPT), NEW)
+        trim = ring.dspark(list(PROMPT), NEW, conf_gate=True, conf_thresh=float("inf"), conf_min=1,
+                           conf_probe=lambda confs, n: probe.append((len(confs), n)))
+        whole = ring.dspark(list(PROMPT), NEW, conf_gate=True, conf_thresh=float("-inf"))
+    finally:
+        ring.close()
+    for name, r in (("ungated", base), ("trimmed", trim), ("whole-block", whole)):
+        assert r["tokens"] == ref, f"{name} dspark stream {r['tokens']} != greedy {ref}"
+    # the floor is unreachable, so every drafted round trimmed to exactly one offered draft
+    assert max(trim["send_hist"], default=0) <= 1 and trim["sent"] == trim["drafted"]
+    # and nothing clears -inf from below, so the whole-block run offered strictly more than the trim
+    assert whole["sent"] > trim["sent"], f"the gate did not vary send-length: {whole['sent']} vs {trim['sent']}"
+    # the probe saw every drafted round's FULL block confidence and its accept count
+    assert probe and len(probe) == trim["drafted"]
+    assert all(clen == args.dspark_block_size and 0 <= n <= clen for clen, n in probe)
 
 
 def test_a_second_dspark_job_on_a_warm_ring_is_a_cold_rings_answer(tiny):
@@ -1595,6 +1752,24 @@ def test_reset_gives_a_warm_ring_a_cold_rings_answer(tiny):
     finally:
         ring.close()
     assert warm == ref, f"warm-after-reset {warm} != cold {ref}"
+
+
+def test_job_horizon_reaches_the_stages_and_is_dropped_at_teardown(tiny):
+    """The SEAM, end to end: a job's horizon has to arrive at every stage's reference, not just at the
+    coordinator's frame. The stages here are threads beside the test, so v4_ref_slim's process-wide
+    global IS the thing they set — after the job it holds this job's horizon, and after the stages are
+    torn down it is back to None, so nothing leaks into whatever runs next in the process."""
+    slim = pytest.importorskip("v4_ref_slim")
+    d, args, ref = tiny
+    slim.set_job_max_pos(None)
+    ring = _Ring(d, args, [(0, 4), (4, 8)])
+    try:
+        got = ring.coordinate(list(PROMPT), NEW)["tokens"]
+        assert got == ref, "the horizon must not change the answer"
+        assert slim._JOB_MAX_POS == len(PROMPT) + NEW, "the stages never saw the job's horizon"
+    finally:
+        ring.close()
+    assert slim._JOB_MAX_POS is None, "a torn-down stage left a horizon behind it"
 
 
 def test_swarm_token_value_is_actually_compared(monkeypatch):
