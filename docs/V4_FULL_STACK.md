@@ -16,9 +16,13 @@ out-of-process, reproducible to 0.4%. The accept histogram shows rounds committi
 — impossible serially, where a round is capped at `block_size + 1 = 6` — so the pipeline genuinely
 fills. **That build carried no compute levers at all.** This branch adds them.
 
-Every lever is opt-in and default OFF. With no `V4_*` set this branch emits, token for token, what
-`v4/pipelined-coord` emits — asserted, not assumed
-(`tests/test_v4_full_stack.py::test_the_ring_recipe_serves_exactly_what_the_default_serves`).
+Every lever is opt-in and default OFF, and two separate things follow from that, verified separately:
+
+- **The recipe serves what the default serves** — asserted every run, in
+  `tests/test_v4_full_stack.py::test_the_ring_recipe_serves_exactly_what_the_default_serves`.
+- **The composed default serves what the pre-merge base served** — a one-time check against
+  `v4/pipelined-coord`'s own captured selftest output, taken before the first merge and re-compared
+  after the last. 0 mismatches on all five paths, both selftests. See the test matrix at the bottom.
 
 ---
 
@@ -48,8 +52,9 @@ fails at launch instead of producing a ring that runs eager while the launch lin
 V4_PIPELINED_SPEC=1
 ```
 
-`V4_PIPELINED_SPEC` is read by the **coordinator** — it chooses which coordinate function drives the
-job. Setting it on the stages too is harmless.
+`V4_PIPELINED_SPEC` is read by the **coordinator only** — it chooses which coordinate function drives
+the job. A stage never reads it: the stage's snapshot/rollback is armed by the `spec` flag on the
+**reset frame** the coordinator sends. Setting it on the stages is harmless and does nothing.
 
 **`V4_SPEC_DEPTH` is read by BOTH sides and they must agree.** It is the coordinator's in-flight
 window `W` (`coordinate_dspark_pipelined`) *and* the stage's rollback checkpoint ring depth
