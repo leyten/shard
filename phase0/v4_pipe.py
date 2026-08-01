@@ -2087,7 +2087,7 @@ GRAPH_MODE_VALUES = frozenset({"0", "1", "island", "on", "whole", "2", "eager"})
 ENG_ENV = [
     "V4_FP8_WIRE",                                                              # wire codec
     "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH",                                       # pipelined speculation
-    "V4_MOE_GROUPED", "V4_MOE_DECODE",                                          # MoE kernels
+    "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
     "V4_GRAPH_MAX",                                                             # graph budget
     "V4_DSPARK_FAST", "V4_DSPARK_GRAPH",                                        # drafter
     "V4_DSPARK_CONF_GATE", "V4_DSPARK_CONF_MIN", "V4_DSPARK_CONF_THRESH",       # adaptive send-length

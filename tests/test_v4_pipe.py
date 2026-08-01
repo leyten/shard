@@ -2022,8 +2022,9 @@ def test_the_fp8_wire_lever_reaches_a_launched_stage(monkeypatch):
 # of them reads is read ONCE, at import, INSIDE that process — so this list is the domain over which
 # "did the lever reach the stage?" is even a question.
 _STAGE_IMPORT_CLOSURE = [
-    "v4_pipe.py", "v4_stage.py", "v4_moe_grouped.py", "v4_moe_decode.py", "v4_dspark_fast.py",
-    "v4_ref_slim.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py", "v4_dspark_draft.py",
+    "v4_pipe.py", "v4_stage.py", "v4_moe_grouped.py", "v4_moe_decode.py", "v4_moe_multi.py",
+    "v4_dspark_fast.py", "v4_ref_slim.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py",
+    "v4_dspark_draft.py",
 ]
 # Emitted by stage_launch_cmd itself, so they cannot ride ENG_ENV as well: the first two are built
 # from its arguments, and V4_CUDA_GRAPH is the validated `cuda_graph=` mode.

@@ -99,6 +99,13 @@ def load_ref():
         # it would never run — this line's position is the whole wiring.
         import v4_moe_grouped
         v4_moe_grouped.install(mod)
+        # LAST of the three, and again the position IS the precedence. Both levers above are gated on
+        # ONE token, so the DSpark drafter — whose MoEs run at `dspark_block_size` rows, never 1 —
+        # falls through both and lands on the vendored dispatch loop, on the tail, every drafted
+        # round. This claims that small-block shape and hands every single-token step DOWN to the
+        # chain above, so the main decode path is untouched. V4_MOE_MULTI=1 to arm it; default OFF.
+        import v4_moe_multi
+        v4_moe_multi.install(mod)
         # Same window, same reason: reference-compute "slim" overrides that remove removable per-layer
         # work (the indexer while context is short; the inplace KV/Q QAT sim). Both behind default-OFF
         # env flags (V4_REF_SLIM / V4_REF_SLIM_NOQAT), so this is a no-op — reference byte-identical —
