@@ -545,7 +545,14 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
 
     `ckpt_dir=None` skips the load, which is the in-process path where the weights were transferred
     by hand; a serving tail always passes the dir it loaded its own layers from, and a checkpoint
-    without `mtp.*` raises there rather than drafting out of uninitialised memory."""
+    without `mtp.*` raises there rather than drafting out of uninitialised memory.
+
+    Under `V4_DSPARK_FAST=1` this installs v4_dspark_fast, which rebinds `advance_and_draft` to the
+    cache-advance-only fast path (the intermediate committed positions cost one KV write each instead
+    of a full MoE forward). Default OFF and a no-op otherwise — the reference loop is bit-exact and
+    the baseline every A/B measures against."""
+    import v4_dspark_fast
+    v4_dspark_fast.install(sys.modules[__name__])
     tail = DSparkTail(stage, temperature=temperature)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
