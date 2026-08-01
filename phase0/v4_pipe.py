@@ -460,6 +460,48 @@ def sample_token(logits_row, temp=0.0, gen=None):
 TAIL_DRAFTER = None
 
 
+# ── the job horizon: what v4_ref_slim's indexer skip needs from the serve path ─────────────────────
+# v4_ref_slim (V4_REF_SLIM) skips the Indexer's SCORING while every compressed slot is selected
+# anyway, and may additionally skip the Indexer's COMPRESSOR — which is STATE, not a query — but only
+# for a job guaranteed never to leave that regime. Guess that wrong in the SHORT direction and the
+# indexer re-engages past `index_topk * ratio` against a half-filled cache and picks the wrong keys,
+# silently. So the horizon travels with the job, in the reset frame that already opens it, and every
+# stage sets it before the first step of that job lands.
+#
+# THE SAFETY DIRECTION IS ASYMMETRIC, AND EVERYTHING HERE LEANS THE SAFE WAY:
+#   over-declare  -> the compressor keeps advancing -> correct at ANY length, costs 2 cheap GEMMs.
+#   under-declare -> the compressor is skipped and the indexer may still re-engage -> WRONG.
+#   absent (None) -> "unknown", which v4_ref_slim already treats as keep-advanced, i.e. the safe end.
+# So a reset frame from an older coordinator (no "max_pos" key) degrades to correct-but-unoptimised,
+# never to wrong, and a margin that is too FAT costs nothing but a missed optimisation.
+
+# Speculative overshoot: a spec/dspark round feeds `[cur] + drafts` at the committed position, so the
+# ring transiently touches positions past the last COMMITTED one even though a rejected draft is
+# rolled back. The committed length is prompt + max_new; this covers the draft block on top of it.
+# 64 is far above any block the ring actually offers (coordinate_spec defaults K=4, the shipped DSpark
+# MTP drafts 3) and is deliberately fat: see the asymmetry above.
+_SPEC_POS_MARGIN = 64
+
+
+def _job_max_pos(prompt_ids, max_new, spec_margin=0):
+    """The job's GUARANTEED-not-to-be-exceeded maximum absolute position, for the reset frame.
+
+    Upper bound, never an estimate — `prompt + max_new` is the committed ceiling the coordinator loops
+    enforce, and `spec_margin` covers the draft tokens a speculative round puts on the wire above it."""
+    return len(prompt_ids) + int(max_new) + int(spec_margin)
+
+
+def _set_job_horizon(max_pos):
+    """Hand v4_ref_slim this job's horizon (None = unknown, which it treats as the safe answer).
+
+    Called on EVERY reset, including with None, so one job's horizon can never leak into the next: the
+    value is process-wide, matching model.py's other globals. Unconditional — v4_ref_slim is import-
+    light and pure-Python, and with V4_REF_SLIM off nothing reads what this sets, so the cost of not
+    branching on the env here is one module-global assignment per job."""
+    import v4_ref_slim
+    v4_ref_slim.set_job_max_pos(max_pos)
+
+
 # ── stage server: one V4 layer block, fire-forward ────────────────────────────────────────────────
 
 def _dial_window(timeout):
@@ -657,14 +699,21 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
     if ready is not None:
         ready.set()
 
-    if tail:
-        _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
-                                                                           else None))
-    elif ret_relay is not None:
-        _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
-                             timeout, ret_relay)
-    else:
-        _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout)
+    try:
+        if tail:
+            _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=(ckpt_dir if dspark
+                                                                               else None))
+        elif ret_relay is not None:
+            _serve_relay_ingress(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts,
+                                 timeout, ret_relay)
+        else:
+            _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout)
+    finally:
+        # Teardown: this stage serves no more jobs, so drop the horizon it was carrying. In a real
+        # ring that is one process per stage and the clear is cosmetic; in the IN-PROCESS shape (the
+        # selftest runs every stage as a thread beside the coordinator and the oracle) the horizon is
+        # a shared global, and a dead stage thread must not leave one job's value behind it.
+        _set_job_horizon(None)
 
 
 _STRAY = (ConnectionError, OSError, ValueError, KeyError, TypeError, struct.error)
@@ -803,6 +852,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "reset":
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
+                _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
                 st._spec = bool(msg.get("spec"))              # arm the stage snapshot/rollback (step 5)
                 st._dspark = bool(msg.get("dspark"))          # arm the tail's DSpark drafter (step 4)
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
@@ -1037,6 +1087,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "reset":
                 timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
+                _set_job_horizon(msg.get("max_pos"))          # v4_ref_slim; absent key => None => safe
                 st._spec = bool(msg.get("spec"))              # arm the stage's snapshot/rollback
                 st._dspark = bool(msg.get("dspark"))          # arm the taps the drafter consumes
                 try:
@@ -1202,7 +1253,8 @@ def coordinate(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_
     the end and verifies coverage against `layer_count` and the job nonce (fail-closed, C10)."""
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": float(temp), "seed": int(seed)})
+                    "temp": float(temp), "seed": int(seed),
+                    "max_pos": _job_max_pos(prompt_ids, max_new)})   # greedy: no draft overshoot
     ack = recv_msg(ret)                                       # the tail acks the whole ring is reset
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 ring reset not acked: {ack!r}")
@@ -1272,7 +1324,8 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
     propose = _drafter_propose(drafter, ng)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": 0.0, "seed": 0, "spec": True})
+                    "temp": 0.0, "seed": 0, "spec": True,
+                    "max_pos": _job_max_pos(prompt_ids, max_new, K + 1)})   # + the draft chunk
     ack = recv_msg(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 spec ring reset not acked: {ack!r}")
@@ -1414,7 +1467,9 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     min_send = V4_DSPARK_CONF_MIN if conf_min is None else int(conf_min)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
-                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True})
+                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True,
+                    # the tail's MTP block size is not knowable here — the fat margin is the answer
+                    "max_pos": _job_max_pos(prompt_ids, max_new, _SPEC_POS_MARGIN)})
     ack = recv_msg(ret)
     if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
         raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")

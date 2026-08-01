@@ -486,6 +486,7 @@ class _ScriptedRing:
         self.first_token = first_token
         self.replies = list(replies)
         self.chunks = []                                  # (ids, start_pos) per step frame seen
+        self.reset_msg = None                             # the frame that opened the job
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
@@ -495,6 +496,7 @@ class _ScriptedRing:
                 msg = recv_msg(self.pipe_b)
                 op = msg.get("op")
                 if op == "reset":
+                    self.reset_msg = msg
                     send_msg(self.ret_a, "ok")
                 elif op == "step":
                     self.chunks.append((list(msg["ids"][0]), int(msg["start_pos"])))
@@ -613,6 +615,7 @@ class _ScriptedDsparkRing(_ScriptedRing):
                 msg = recv_msg(self.pipe_b)
                 op = msg.get("op")
                 if op == "reset":
+                    self.reset_msg = msg
                     send_msg(self.ret_a, "ok")
                 elif op == "step":
                     ids, pos = list(msg["ids"][0]), int(msg["start_pos"])
@@ -687,6 +690,76 @@ def test_coordinate_dspark_stops_at_eos_inside_a_commit():
     script = [([21], [31, 32, 33]), ([31, 32, 33, 44], [51, 52, 53])]
     r, _ = _dspark_round(first_token=10, script=script, max_new=10, eos_ids=(32,))
     assert r["tokens"] == [10, 21, 31, 32] and r["generated"] == 4
+
+
+# ── 7b. the job horizon the reset frame carries for v4_ref_slim ───────────────────────────────────
+# v4_ref_slim's indexer skip may drop the Indexer's COMPRESSOR — which is state, not a query — but
+# only for a job that provably never leaves the select-all regime. Under-declare the horizon and the
+# indexer re-engages against a half-filled cache and picks the wrong keys, silently. So the bar these
+# pin is one-directional: the declared `max_pos` must UPPER-BOUND every absolute position the ring is
+# actually asked for, on all three coordinators, including the speculative overshoot a rejected draft
+# puts on the wire before it is rolled back.
+
+def _max_end_pos(chunks):
+    """The furthest absolute position the ring was actually driven to, over every step frame seen."""
+    return max(pos + len(ids) for ids, pos in chunks)
+
+
+def test_greedy_reset_declares_a_horizon_that_bounds_every_position():
+    ring = _ScriptedRing(first_token=10, replies=[[11], [12], [13]])   # one per post-prefill step
+    try:
+        VP.coordinate(ring.pipe_a, ring.ret_b, [1, 2, 3], 4, timeout=10)
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 4, "greedy has no draft overshoot: prompt + max_new, exact"
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks)
+
+
+def test_spec_reset_horizon_covers_the_draft_chunk_on_top_of_max_new():
+    """A spec round puts `[cur] + K drafts` on the wire at the committed position, so the ring touches
+    positions past the last COMMITTED one even when the draft is rejected. K+1 covers exactly that."""
+    drafts = [[11, 12, 13, 14], [21, 22, 23, 24]]
+    replies = [[11, 12, 13, 14, 15], [21, 22, 23, 24, 25]]
+    ring = _ScriptedRing(first_token=10, replies=replies)
+    script = list(drafts)
+    try:
+        VP.coordinate_spec(ring.pipe_a, ring.ret_b, [1, 2, 3], 6, K=4, timeout=10,
+                           drafter=lambda ids, k: list(script.pop(0)))
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 6 + 5
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks), "horizon must bound the wire"
+
+
+def test_dspark_reset_horizon_bounds_a_tail_drafted_block_of_unknown_size():
+    """The coordinator does not own the drafter here — the tail's MTP block size is not knowable at
+    reset — so the margin is deliberately fat rather than derived. Over-declaring only forgoes an
+    optimisation; under-declaring is a silent wrong answer."""
+    script = [([21], [31, 32, 33]), ([31, 32, 33, 44], [51, 52, 53])]
+    ring = _ScriptedDsparkRing(first_token=10, script=script)
+    try:
+        VP.coordinate_dspark(ring.pipe_a, ring.ret_b, [1, 2, 3], 6, timeout=10)
+    finally:
+        ring.close()
+    assert ring.reset_msg["max_pos"] == 3 + 6 + VP._SPEC_POS_MARGIN
+    assert VP._SPEC_POS_MARGIN >= 8, "the margin must clear any block a real tail drafts"
+    assert ring.reset_msg["max_pos"] >= _max_end_pos(ring.chunks)
+
+
+def test_job_horizon_absent_from_the_frame_is_the_SAFE_answer():
+    """A reset frame with no `max_pos` — an older coordinator, or a hand-built frame — must land as
+    None, which v4_ref_slim reads as "horizon unknown" and answers by KEEPING the compressor advanced.
+    Correct at any length; only the guaranteed-short optimisation is forgone."""
+    slim = pytest.importorskip("v4_ref_slim")
+    try:
+        VP._set_job_horizon({"op": "reset"}.get("max_pos"))
+        assert slim._JOB_MAX_POS is None
+        VP._set_job_horizon(512)
+        assert slim._JOB_MAX_POS == 512
+        VP._set_job_horizon(None)                          # teardown clears it: no leak into next job
+        assert slim._JOB_MAX_POS is None
+    finally:
+        slim.set_job_max_pos(None)
 
 
 # ── 8. the pure builders: tiling, per-GPU split, sidecar wiring, planner seam ──────────────────────
@@ -1185,6 +1258,24 @@ def test_reset_gives_a_warm_ring_a_cold_rings_answer(tiny):
     finally:
         ring.close()
     assert warm == ref, f"warm-after-reset {warm} != cold {ref}"
+
+
+def test_job_horizon_reaches_the_stages_and_is_dropped_at_teardown(tiny):
+    """The SEAM, end to end: a job's horizon has to arrive at every stage's reference, not just at the
+    coordinator's frame. The stages here are threads beside the test, so v4_ref_slim's process-wide
+    global IS the thing they set — after the job it holds this job's horizon, and after the stages are
+    torn down it is back to None, so nothing leaks into whatever runs next in the process."""
+    slim = pytest.importorskip("v4_ref_slim")
+    d, args, ref = tiny
+    slim.set_job_max_pos(None)
+    ring = _Ring(d, args, [(0, 4), (4, 8)])
+    try:
+        got = ring.coordinate(list(PROMPT), NEW)["tokens"]
+        assert got == ref, "the horizon must not change the answer"
+        assert slim._JOB_MAX_POS == len(PROMPT) + NEW, "the stages never saw the job's horizon"
+    finally:
+        ring.close()
+    assert slim._JOB_MAX_POS is None, "a torn-down stage left a horizon behind it"
 
 
 def test_swarm_token_value_is_actually_compared(monkeypatch):
