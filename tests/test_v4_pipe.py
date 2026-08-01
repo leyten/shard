@@ -1962,6 +1962,35 @@ def test_lazy_drafting_on_a_real_ring_is_bit_identical_at_every_depth(tiny, long
         f"eager paid {e['drafts_issued']}"
 
 
+def test_the_audit_observes_the_lazy_lever_a_real_round_actually_used(tiny, long_ref):
+    """A COORDINATOR LEVER IS AN ARGUMENT TO A LOOP, so the only honest observation of it is what the
+    loop ran with — not a second read of the env that was already believed.
+
+    V4_LAZY_DRAFT is the lever that was set on six stages for a night and did nothing, because it is
+    read here and nowhere else. `coordinate_dspark_pipelined` now states what it resolved, and this
+    drives two real rounds over real sockets with opposite settings and requires the audit to follow
+    the ROUND both ways. An observation that only ever echoed the flag would pass one and fail the
+    other."""
+    import v4_levers as VL
+    d, args, _ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=False, dspark=True)
+    try:
+        for lazy in (True, False):
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(VP, "TAIL_DRAFTER", _BlockScriptDrafter(d, _oracle_blocks(long_ref)))
+                ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"audit-{lazy}", depth=4, lazy=lazy)
+            assert VL.notes()["V4_LAZY_DRAFT"] == ("on" if lazy else "off"), \
+                f"the audit did not follow a round that ran lazy={lazy}"
+            with pytest.MonkeyPatch.context() as mp:
+                mp.setattr(VP, "V4_LAZY_DRAFT", True)     # the env says on, whatever the round did
+                found = {f.env: f for f in VL.audit(VL.COORDINATOR)}["V4_LAZY_DRAFT"]
+            assert found.observed == ("on" if lazy else "off"), found
+            assert (found.verdict == "OK") is lazy, \
+                f"an env that disagrees with the round must be a MISMATCH, got {found.verdict}"
+    finally:
+        ring.close()
+
+
 @pytest.mark.parametrize("boundary", [7, 11])
 def test_lazy_drafting_on_a_real_ring_refills_from_the_rejection(tiny, long_ref, boundary):
     """THE REJECTION PATH, on real stages: a poisoned draft at a compression boundary, which is where
@@ -2361,11 +2390,10 @@ def test_the_fp8_wire_lever_reaches_a_launched_stage(monkeypatch):
 # The modules a `v4_pipe.py stage` process imports, directly or through v4_stage. Every V4_* flag any
 # of them reads is read ONCE, at import, INSIDE that process — so this list is the domain over which
 # "did the lever reach the stage?" is even a question.
-_STAGE_IMPORT_CLOSURE = [
-    "v4_pipe.py", "v4_stage.py", "v4_moe_grouped.py", "v4_moe_decode.py", "v4_moe_multi.py",
-    "v4_dspark_fast.py", "v4_ref_slim.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py",
-    "v4_dspark_draft.py",
-]
+# One source of truth with the lever registry, which scrapes the same files to prove itself total
+# (tests/test_v4_levers.py). Two hand-kept copies of "what a stage imports" is one copy too many:
+# the copy nobody updated is the one that stops seeing the new lever.
+_STAGE_IMPORT_CLOSURE = list(__import__("v4_levers").ENGINE_MODULES)
 # Emitted by stage_launch_cmd itself, so they cannot ride ENG_ENV as well: the first two are built
 # from its arguments, and V4_CUDA_GRAPH is the validated `cuda_graph=` mode.
 _EMITTED_DIRECTLY = {"V4_DIR", "V4_DEV", "V4_CUDA_GRAPH"}
