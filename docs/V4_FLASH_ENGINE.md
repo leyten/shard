@@ -6,7 +6,7 @@ never reimplemented. This file is the cross-session anchor: read it first, updat
 
 ## RESUME HERE (2026-08-01)
 
-Best measured single-stream number on a real scattered ring: **3.68 tok/s**, pipelined
+Best measured single-stream number on a real scattered ring: **3.68 tok/s end-to-end / 5.35 decode-only**, pipelined
 speculative decode, output **bit-identical to greedy**, receipts verified out-of-process.
 Target is 20 tok/s. The open work is listed under "What is actually blocking 20" below.
 
@@ -77,8 +77,12 @@ launch latency, not bandwidth, which is exactly the regime CUDA graphs address.
 An exact max-stage-minimising planner (verified against brute force on 4000 pools, zero
 mismatches) prices the best possible re-tiling at only **1.151x**; with caps lifted the same boxes
 reach 1.61x better, a gap no tiling can close. Straggler **ejection is infeasible**, not merely
-unhelpful: every 5-box subset holds 37 layers < 43. The fix is a **wider ring**, which lowers
-max-stage-time and adds VRAM headroom in one move.
+unhelpful: every 5-box subset holds 37 layers < 43.
+
+A wider ring looks like the fix here — it lowers max-stage-time and adds VRAM headroom in one move
+— and that reasoning is **wrong**; see §3. It was acted on, a 10-box ring was provisioned, and it
+came out slower. Both this section and "ceiling = 1/max-stage" argue for width, and both omit the
+fill cap. Size a ring by `min(fill cap, VRAM floor)`, which for block 5 is 6 either way.
 
 **3. Ring WIDTH is capped by the draft block — width and block size are ONE knob.** In-flight
 frames saturate at **block_size + 1 = 6**, proven by depth 6 / 8 / 12 returning byte-identical
