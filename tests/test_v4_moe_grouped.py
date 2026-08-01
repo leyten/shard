@@ -30,6 +30,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 torch = pytest.importorskip("torch")
 REFCPU = pytest.importorskip("v4_ref_cpu")
 GROUPED = pytest.importorskip("v4_moe_grouped")
+KERNELS = pytest.importorskip("v4_kernels_cpu")
 
 SEED = 5
 
@@ -119,18 +120,23 @@ def test_world_size_falls_back(args, oracle, monkeypatch):
     assert calls, "world_size > 1 must take the reference path"
 
 
-def test_hash_layer_falls_back(args, oracle, monkeypatch):
-    """Hash-routed layers (layer_id < n_hash_layers) can name the same expert twice, and the
-    duplicate-index `y[idx] +=` is the reference's semantics — so the whole hash layer defers. This
-    is also the ONLY place a repeat can occur (top-k routing cannot), so it subsumes the
-    repeated-expert fallback without a per-step host-side dedup."""
+def test_hash_layer_is_claimed_not_deferred(args, oracle, monkeypatch):
+    """Hash-routed layers used to defer wholesale, and on a head stage that was half the layers.
+
+    They defer no longer: `_keep_last_of_each` reproduces the duplicate-index `y[idx] +=` on device,
+    so the only thing left in the way was the guard itself. This pins that the guard is GONE — the
+    step must not reach the fallback. (What it computes is `test_hash_layer_is_bit_exact_*` below;
+    this one is about which path it takes, and it uses a bf16 oracle layer that never gets that far,
+    so the fallback spy would fire on the guard alone.)"""
     ffn = oracle.layers[0].ffn                        # hash-routed (layer 0 < n_hash_layers)
     assert ffn.gate.hash
     calls = _spy(monkeypatch)
     g = torch.Generator().manual_seed(SEED + 2)
     x, ids = _x(args, 1, g, oracle), _ids(args, 1, g)
+    monkeypatch.setattr(GROUPED, "_expert_bank", lambda moe: None)   # stop before the fp4-only kernel
     GROUPED.grouped_forward(ffn, x, ids)
-    assert calls, "a hash-routed layer must take the reference path"
+    assert [w for w in ffn._grouped_declined] == ["bank-would-not-fit"], \
+        f"a hash layer must reach the bank, not be turned away first: {ffn._grouped_declined}"
 
 
 def _stub_mod():
@@ -261,21 +267,74 @@ def test_load_ref_installs_grouped_after_decode():
 _KINDS = ("w1", "w2", "w3")
 
 
-def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4", dim=64, inter=32):
+def _slot(moe, i, kind, attr="weight"):
+    """The bank rows expert `i`'s `kind` Linear is supposed to BE, as a tensor.
+
+    w1 and w3 share the `w13` bank — w1's rows then w3's — because they share a grouped launch, so
+    "which slot" is now a (bank, row range) rather than a bank index, and the tests have to ask the
+    layout rather than assume `bank[kind][i]`."""
+    bank = moe._grouped_bank
+    for key, kinds in GROUPED._BANK_GROUPS:
+        if kind not in kinds:
+            continue
+        b = bank[key + ("" if attr == "weight" else "_s")]
+        off = sum(getattr(getattr(moe.experts[i], k), attr).shape[0] for k in kinds[:kinds.index(kind)])
+        return b[i, off:off + getattr(getattr(moe.experts[i], kind), attr).shape[0]]
+    raise KeyError(kind)
+
+
+def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4", dim=64, inter=32, layer_id=7, topk=2):
     """A tiny MoE built from the REFERENCE's own classes with fp4 routed experts.
 
     Not a stub: the layout repoints real `nn.Parameter`s and the loader test drives a real
     `load_state_dict`, so anything less than the reference's `MoE`/`Expert`/`Linear` would prove
     nothing about the stage. fp4 needs `dim` a multiple of `fp4_block_size` (32); everything else is
     as small as the constructor's asserts allow. Takes `oracle` only to force `dsv4_model` loaded.
-    `dim`/`inter` are widened to 128 by the one test that RUNS the thing — `v4_kernels_cpu.act_quant`
-    needs the activation's last dim to be a multiple of `block_size` (128)."""
+    `dim`/`inter` are widened to 128 by the tests that RUN the thing — `v4_kernels_cpu.act_quant`
+    needs the activation's last dim to be a multiple of `block_size` (128). `layer_id=0` is under
+    `n_hash_layers`, i.e. the hash-routed gate whose ids can repeat."""
     mod = sys.modules["dsv4_model"]
-    a = mod.ModelArgs(dim=dim, moe_inter_dim=inter, n_routed_experts=n_experts, n_activated_experts=2,
+    a = mod.ModelArgs(dim=dim, moe_inter_dim=inter, n_routed_experts=n_experts,
+                      n_activated_experts=topk, swiglu_limit=10.0, route_scale=1.5,
                       n_shared_experts=1, n_hash_layers=1, expert_dtype=expert_dtype,
                       dtype="bf16", scale_fmt=None, scale_dtype="fp32", vocab_size=32)
     with mod.set_dtype(torch.bfloat16):
-        return mod.MoE(7, a)
+        return mod.MoE(layer_id, a)
+
+
+def _loaded_fp4_moe(oracle, layer_id, n_experts=8, topk=4, dim=128, inter=128, seed=SEED, bank=True):
+    """A tiny fp4 MoE with REAL quantized weights, ready to run through the CPU kernels.
+
+    Weights go through the reference's own `fp4_act_quant`, so the routed experts are valid packed
+    fp4 + e8m0 rather than reinterpreted noise (which would dequantize to inf and make every
+    comparison vacuously equal). `bank=True` applies the shipped release-first layout; `bank=False`
+    leaves the experts standalone so the fast path has to build the LAZY stack instead — the two are
+    different code and both have to gather the same rows."""
+    from kernel import fp4_act_quant
+    mod = sys.modules["dsv4_model"]
+    moe = _fp4_moe(oracle, n_experts=n_experts, dim=dim, inter=inter, layer_id=layer_id, topk=topk)
+    g = torch.Generator().manual_seed(seed)
+    if bank:
+        # `_relayout_moe` rather than `bank_layout` so the helper does not depend on the env flag —
+        # what the flag gates is covered by test_bank_layout_is_a_noop_with_the_flag_off.
+        assert GROUPED._relayout_moe(moe, preserve=False), "the layout must take before the load"
+    sd = {}
+    for i in range(n_experts):
+        for k, out_f, in_f in (("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)):
+            w, s = fp4_act_quant(torch.randn(out_f, in_f, generator=g, dtype=torch.bfloat16),
+                                 mod.fp4_block_size)
+            sd[f"experts.{i}.{k}.weight"], sd[f"experts.{i}.{k}.scale"] = w.clone(), s.clone()
+    for k, out_f, in_f in (("w1", inter, dim), ("w2", dim, inter), ("w3", inter, dim)):
+        sd[f"shared_experts.{k}.weight"] = torch.randn(out_f, in_f, generator=g,
+                                                       dtype=torch.bfloat16) * 0.02
+    sd["gate.weight"] = torch.randn(*moe.gate.weight.shape, generator=g, dtype=torch.bfloat16) * 0.02
+    if moe.gate.bias is not None:
+        sd["gate.bias"] = torch.randn(*moe.gate.bias.shape, generator=g, dtype=torch.float32) * 0.02
+    if moe.gate.hash:
+        sd["gate.tid2eid"] = torch.randint(0, n_experts, tuple(moe.gate.tid2eid.shape),
+                                           generator=g, dtype=torch.int32)
+    moe.load_state_dict(sd, strict=True)
+    return moe.eval()
 
 
 def _paint(moe):
@@ -317,26 +376,32 @@ def test_bank_layout_is_a_noop_with_the_flag_off(oracle, monkeypatch):
 def test_bank_layout_leaves_one_copy_of_the_weights_not_two(oracle, monkeypatch):
     """THE POINT OF THE WHOLE CHANGE, as a storage-identity claim.
 
-    After the layout there is exactly ONE allocation per weight kind — the bank — and every routed
-    expert's parameter is a VIEW into it, at its own offset, in expert order. Nothing was duplicated,
-    so the bank the grouped kernel gathers from costs zero extra bytes and a seven-layer stage on a
-    32 GiB card can hold it. The old lazy stack would have doubled these tensors instead."""
+    After the layout there is exactly ONE allocation per BANK — and w1 and w3 now share one, since
+    they share a grouped launch — and every routed expert's parameter is a VIEW into it, at its own
+    row range, in expert order. Nothing was duplicated, so the bank the grouped kernel gathers from
+    costs zero extra bytes and a seven-layer stage on a 32 GiB card can hold it. The old lazy stack
+    would have doubled these tensors instead."""
     monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
     moe = _fp4_moe(oracle)
     assert GROUPED.bank_layout(moe) == 1
     bank = moe._grouped_bank
-    for k, skey in (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s")):
-        for attr, key in (("weight", k), ("scale", skey)):
-            b = bank[key]
+    assert set(bank) == {"w13", "w13_s", "w2", "w2_s"}, \
+        f"w1 and w3 must share a bank so they can share a launch; got {sorted(bank)}"
+    for key, kinds in GROUPED._BANK_GROUPS:
+        for attr, suffix in (("weight", ""), ("scale", "_s")):
+            b = bank[key + suffix]
             assert b.shape[0] == len(moe.experts) and b.is_contiguous()
             store = b.untyped_storage()
             for i, e in enumerate(moe.experts):
-                p = getattr(getattr(e, k), attr)
-                assert p.data_ptr() == b[i].data_ptr(), f"{k}.{attr}[{i}] is not the bank's slot {i}"
-                assert p.untyped_storage().data_ptr() == store.data_ptr(), "a second allocation"
-                assert p.is_contiguous(), "the s > 1 reference path needs contiguous expert weights"
+                for k in kinds:
+                    p = getattr(getattr(e, k), attr)
+                    assert p.data_ptr() == _slot(moe, i, k, attr).data_ptr(), \
+                        f"{k}.{attr}[{i}] is not its row range of the {key} bank"
+                    assert p.untyped_storage().data_ptr() == store.data_ptr(), "a second allocation"
+                    assert p.is_contiguous(), "the s > 1 reference path needs contiguous expert weights"
             assert store.nbytes() == sum(getattr(getattr(e, k), attr).numel()
-                                         for e in moe.experts), "the bank is not exactly one copy"
+                                         for e in moe.experts
+                                         for k in kinds), "the bank is not exactly one copy"
 
 
 def test_bank_layout_carries_the_bytes_across(oracle, monkeypatch):
@@ -350,7 +415,9 @@ def test_bank_layout_carries_the_bytes_across(oracle, monkeypatch):
     assert _painted(moe), "the layout moved an expert's bytes to the wrong slot"
     bank = moe._grouped_bank
     for i, e in enumerate(moe.experts):
-        assert bool((bank["w1"][i].view(torch.uint8) == e.w1.weight.view(torch.uint8)).all())
+        for k in _KINDS:
+            assert bool((_slot(moe, i, k).view(torch.uint8)
+                         == getattr(e, k).weight.view(torch.uint8)).all())
 
 
 def test_the_loader_writes_through_the_views_into_the_bank(oracle, monkeypatch):
@@ -370,11 +437,19 @@ def test_the_loader_writes_through_the_views_into_the_bank(oracle, monkeypatch):
     sd["w1.weight"] = torch.full(tuple(moe.experts[tgt].w1.weight.shape), 9,
                                  dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
     moe.experts[tgt].load_state_dict(sd, strict=True)
-    assert bool((bank["w1"][tgt].view(torch.uint8) == 9).all()), "the load did not reach the bank"
-    assert moe.experts[tgt].w1.weight.data_ptr() == bank["w1"][tgt].data_ptr(), "the view was replaced"
+    assert bool((_slot(moe, tgt, "w1").view(torch.uint8) == 9).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w1.weight.data_ptr() == _slot(moe, tgt, "w1").data_ptr(), \
+        "the view was replaced"
+    # w3 shares w1's bank, one row range along. The state dict zeroes it, and it was painted 19, so
+    # this pins that the SECOND half of the shared bank is addressed too — a wrong offset would leave
+    # the paint standing or would have let w1's 9s spill into it.
+    assert bool((_slot(moe, tgt, "w3").view(torch.uint8) == 0).all()), \
+        "w3's rows of the shared bank did not take the load"
     for i in range(len(moe.experts)):
         if i != tgt:
-            assert bool((bank["w1"][i].view(torch.uint8) == 1 + i * 8).all()), "a neighbour moved"
+            assert bool((_slot(moe, i, "w1").view(torch.uint8) == 1 + i * 8).all()), "a neighbour moved"
+            assert bool((_slot(moe, i, "w3").view(torch.uint8) == 1 + i * 8 + 2).all()), \
+                "a neighbour's w3 rows moved"
 
 
 def test_banked_experts_keep_the_scale_the_reference_path_reads(oracle, monkeypatch):
@@ -388,7 +463,7 @@ def test_banked_experts_keep_the_scale_the_reference_path_reads(oracle, monkeypa
         for k in _KINDS:
             lin = getattr(e, k)
             assert lin.weight.scale is lin.scale, "weight.scale must still BE the scale parameter"
-            assert lin.scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+            assert lin.scale.data_ptr() == _slot(moe, i, k, "scale").data_ptr()
 
 
 def test_bank_layout_leaves_non_fp4_experts_alone(oracle, monkeypatch):
@@ -467,8 +542,8 @@ def test_a_real_stage_lays_its_layers_out_release_first(monkeypatch):
         for i, e in enumerate(L.ffn.experts):
             for k in _KINDS:
                 lin = getattr(e, k)
-                assert lin.weight.data_ptr() == bank[k][i].data_ptr()
-                assert lin.scale.data_ptr() == bank[k + "_s"][i].data_ptr()
+                assert lin.weight.data_ptr() == _slot(L.ffn, i, k).data_ptr()
+                assert lin.scale.data_ptr() == _slot(L.ffn, i, k, "scale").data_ptr()
                 assert lin.weight.scale is lin.scale, "the reference reads the scale off the weight"
 
 
@@ -595,7 +670,7 @@ def test_bank_layout_never_outruns_what_it_released(oracle, monkeypatch):
     monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
     moe = _fp4_moe(oracle, n_experts=256)
     m, baseline, n = _layout_metered(moe, False, monkeypatch)
-    assert n == 1 and len(m.banks) == 6, "six banks: three weights, three scales"
+    assert n == 1 and len(m.banks) == 4, "four banks: w13 + w2, each with its scale"
     assert m.live == baseline, f"steady state moved by {m.live - baseline} B — the layout leaked"
     assert m.peak == baseline, (
         f"peak {m.peak} B against a steady {baseline} B: the layout held "
@@ -606,8 +681,8 @@ def test_bank_layout_never_outruns_what_it_released(oracle, monkeypatch):
     # and the banks really are the experts, at the right slot, after a release-first layout
     for i, e in enumerate(moe.experts):
         for k in _KINDS:
-            assert getattr(e, k).weight.data_ptr() == moe._grouped_bank[k][i].data_ptr()
-            assert getattr(e, k).scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+            assert getattr(e, k).weight.data_ptr() == _slot(moe, i, k).data_ptr()
+            assert getattr(e, k).scale.data_ptr() == _slot(moe, i, k, "scale").data_ptr()
 
 
 def test_preserving_the_bytes_costs_a_whole_kind_which_is_why_the_stage_does_not(oracle, monkeypatch):
@@ -627,7 +702,8 @@ def test_preserving_the_bytes_costs_a_whole_kind_which_is_why_the_stage_does_not
         "preserve=True is expected to hold one whole bank on top of the layer — if that changed, "
         "the stage's preserve=False path may no longer be the thing that saves it")
     assert m.worst_debt == biggest
-    assert biggest * 51 == baseline * 16, "the overshoot is a full weight kind, 16/51 of the layer"
+    assert biggest * 51 == baseline * 32, ("the overshoot is the fused w13 weight bank, 32/51 of the "
+                                           "layer — it was 16/51 while w1 and w3 banked separately")
 
 
 def test_the_loader_still_writes_through_a_release_first_layout(oracle, monkeypatch):
@@ -645,12 +721,13 @@ def test_the_loader_still_writes_through_a_release_first_layout(oracle, monkeypa
     sd["w2.weight"] = torch.full(tuple(moe.experts[tgt].w2.weight.shape), 7,
                                  dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
     moe.experts[tgt].load_state_dict(sd, strict=True)
-    assert bool((bank["w2"][tgt].view(torch.uint8) == 7).all()), "the load did not reach the bank"
-    assert moe.experts[tgt].w2.weight.data_ptr() == bank["w2"][tgt].data_ptr(), "the view was replaced"
+    assert bool((_slot(moe, tgt, "w2").view(torch.uint8) == 7).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w2.weight.data_ptr() == _slot(moe, tgt, "w2").data_ptr(), \
+        "the view was replaced"
     assert moe.experts[tgt].w2.weight.scale is moe.experts[tgt].w2.scale, "weight.scale did not survive"
     for i in range(len(moe.experts)):
         if i != tgt:
-            assert not bool((bank["w2"][i].view(torch.uint8) == 7).all()), "a neighbour was written"
+            assert not bool((_slot(moe, i, "w2").view(torch.uint8) == 7).all()), "a neighbour was written"
 
 
 def test_a_release_first_layout_serves_bit_identically_to_no_layout(oracle, monkeypatch):
@@ -692,6 +769,293 @@ def test_a_release_first_layout_serves_bit_identically_to_no_layout(oracle, monk
         with torch.no_grad():
             want, got = plain(x, ids), banked(x, ids)
         assert torch.equal(want, got), f"the banked layout is not bit-exact at s={s}"
+
+
+# ── what the grouped path actually claims, RUN on CPU ────────────────────────────────────────────
+#
+# The tilelang kernel is CUDA-only, so the numeric bar against real fp4 GEMMs lives in the two
+# `@pytest.mark.hardware` tests below. Everything ABOVE the kernel, though — which expert lands in
+# which bank row, that w1 and w3 come back out of one fused launch in the right halves, that a hash
+# gate's repeated ids drop the way the reference drops them, the ascending-id fold, and how many
+# launches the step actually issues — is dispatch, and a CPU box can run all of it exactly.
+#
+# It does so because `grouped_fp4_gemm` off CUDA is a per-slot loop over the installed
+# `kernel.fp4_gemm` (see its docstring), which is what the grid-indexed kernel computes. That makes
+# these `torch.equal` and not `allclose`: both sides run the SAME GEMM on the same operands, so any
+# difference is the dispatch, which is the thing under test.
+
+
+def _runnable(monkeypatch):
+    """Wire the module globals `install()` would have set, without installing. Returns the model.
+
+    Skips off the CPU backend: these tests RUN the MoE, and on a box where `kernel` resolved to the
+    real tilelang file its GEMMs cannot take a CPU tensor. The GPU box proves the same claims through
+    the `@pytest.mark.hardware` tests instead."""
+    if KERNELS.backend() != "cpu":
+        pytest.skip("runs the MoE through the CPU stand-in kernels")
+    mod = sys.modules["dsv4_model"]
+    monkeypatch.setattr(GROUPED, "_MOD", mod)
+    monkeypatch.setattr(GROUPED, "_WORLD_SIZE", 1)
+    monkeypatch.setattr(GROUPED, "_REF_FORWARD", mod.MoE.forward)
+    return mod
+
+
+@pytest.mark.parametrize("sel,want", [([3, 1, 3, 0], [False, True, True, True]),
+                                      ([2, 2, 2, 2], [False, False, False, True]),
+                                      ([0, 1, 2, 3], [True, True, True, True]),
+                                      ([5, 4, 4, 5], [False, False, True, True])])
+def test_keep_mask_reproduces_the_reference_duplicate_drop(sel, want):
+    """The hash-layer claim, isolated from every GEMM.
+
+    `y[idx] += v` with a repeated index is NOT a repeated add: it reads the row once per duplicate,
+    adds, and scatters them all back, so the last write wins and every earlier duplicate is thrown
+    away. `_keep_last_of_each` has to name exactly the survivors. This drives the reference's own
+    statement — `torch.where(indices == i)` then `y[idx] += ...`, ascending i — against the mask, at
+    values chosen so an accidental sum could not coincide with the drop."""
+    ids = torch.tensor(sel, dtype=torch.int32)
+    keep = GROUPED._keep_last_of_each(ids)
+    assert keep.tolist() == want, "the survivor is the LAST slot naming each expert"
+    v = (torch.arange(1.0, len(sel) + 1.0) ** 3)[:, None] * torch.ones(1, 3)
+    indices = ids.view(1, -1)
+    y = torch.zeros(1, 3)
+    for i in sorted(set(sel)):                       # the reference's loop, ascending expert id
+        idx, top = torch.where(indices == i)
+        y[idx] += v[top]
+    got = torch.zeros(1, 3)                          # what the grouped fold does with the mask
+    for k in torch.argsort(ids, stable=True).tolist():
+        got += v[k:k + 1] * keep[k]
+    assert torch.equal(y, got), f"mask {keep.tolist()} does not reproduce the reference's drop"
+
+
+@pytest.mark.parametrize("banked", [True, False])
+@pytest.mark.parametrize("layer_id", [7, 0])
+def test_the_grouped_step_is_bit_exact_on_cpu(oracle, monkeypatch, layer_id, banked):
+    """`torch.equal` against the reference MoE, on real fp4 weights, for BOTH routings.
+
+    layer_id 7 is score-routed (what the path already claimed) and layer_id 0 is hash-routed (what
+    it now claims). `banked` runs it over the shipped load-time layout and over the lazy stack, which
+    build the fused w13 bank by different code — aliasing vs `cat`+`stack` — and must agree."""
+    mod = _runnable(monkeypatch)
+    moe = _loaded_fp4_moe(oracle, layer_id, bank=banked)
+    assert moe.gate.hash is (layer_id == 0)
+    g = torch.Generator().manual_seed(SEED + layer_id)
+    for t in range(6):
+        x = torch.randn(1, 1, 128, generator=g, dtype=torch.bfloat16)
+        ids = torch.randint(0, 32, (1, 1), generator=g)
+        with torch.no_grad():
+            want = mod.MoE.forward(moe, x, ids)
+            got = GROUPED.grouped_forward(moe, x, ids)
+        assert not getattr(moe, "_grouped_declined", None), \
+            f"the step declined instead of grouping: {moe._grouped_declined}"
+        assert torch.equal(want, got), \
+            f"layer {layer_id} draw {t}: max|d| = {(want.float() - got.float()).abs().max()}"
+
+
+def _rowwise_fp4_gemm(a, a_s, b, b_s, scale_dtype=torch.float32):
+    """`fp4_gemm` made ROW-INVARIANT — the property the tilelang kernel has and BLAS does not.
+
+    The vendored kernel computes every output element from its own A row and B tile, so an M-row GEMM
+    and M one-row GEMMs agree bit for bit. `torch.matmul` picks its blocking from M, so they do not:
+    on this box `a[0:1] @ b.t()` and `(a[0:2] @ b.t())[0]` already differ in the last bits. That
+    matters in exactly one place — the reference runs a DUPLICATED hash expert as a 2-row GEMM while
+    the grouped path runs it as two 1-row grid blocks — so the duplicate test installs this to hold
+    the emulator to the kernel's property instead of to OpenBLAS's."""
+    rows = a.reshape(-1, a.size(-1))
+    scales = a_s.reshape(-1, a_s.size(-1))
+    out = torch.cat([KERNELS.fp4_gemm(rows[i:i + 1], scales[i:i + 1], b, b_s, scale_dtype)
+                     for i in range(rows.size(0))])
+    return out.view(*a.shape[:-1], b.size(0))
+
+
+def test_a_repeated_hash_expert_is_dropped_exactly_as_the_reference_drops_it(oracle, monkeypatch):
+    """The duplicate case itself, forced rather than waited for.
+
+    A random `tid2eid` repeats often but not always, and "often" is not a test. This pins every
+    token's routing to `[2, 2, 5, 2]` — expert 2 named three times — so the reference discards slots
+    0 and 1 outright and keeps only slot 3, and the grouped path has to discard the same two. A path
+    that summed the duplicates instead would be wrong by two whole experts and still look plausible."""
+    mod = _runnable(monkeypatch)
+    monkeypatch.setattr(sys.modules["kernel"], "fp4_gemm", _rowwise_fp4_gemm)
+    monkeypatch.setattr(mod, "fp4_gemm", _rowwise_fp4_gemm)
+    moe = _loaded_fp4_moe(oracle, layer_id=0)
+    with torch.no_grad():
+        moe.gate.tid2eid.copy_(torch.tensor([2, 2, 5, 2], dtype=torch.int32).expand_as(moe.gate.tid2eid))
+    g = torch.Generator().manual_seed(SEED + 9)
+    for t in range(4):
+        x = torch.randn(1, 1, 128, generator=g, dtype=torch.bfloat16)
+        ids = torch.randint(0, 32, (1, 1), generator=g)
+        with torch.no_grad():
+            want = mod.MoE.forward(moe, x, ids)
+            got = GROUPED.grouped_forward(moe, x, ids)
+        assert torch.equal(want, got), \
+            f"draw {t}: max|d| = {(want.float() - got.float()).abs().max()}"
+
+
+def test_a_discarded_hash_slot_cannot_poison_the_token_whatever_it_holds(oracle, monkeypatch):
+    """The reference never EVALUATES a discarded slot, so its contents must not reach the sum.
+
+    That is stronger than "it contributes zero", and the difference is not academic: masking by
+    multiplying makes `inf * 0.0` a NaN, which would poison the whole token instead of dropping the
+    slot. A select cannot. This spikes the discarded rows of the w2 launch with inf and NaN and
+    demands the SAME token back, bit for bit, as the unspiked run — the discarded slots are not
+    merely weighted out, they are not read.
+
+    inf is reachable on a real card: the routed output is bf16, and an e8m0 weight scale times an
+    fp4 magnitude can overflow it on a checkpoint we do not control."""
+    mod = _runnable(monkeypatch)
+    moe = _loaded_fp4_moe(oracle, layer_id=0)
+    with torch.no_grad():                            # expert 2 named three times: slots 0 and 1 die
+        moe.gate.tid2eid.copy_(torch.tensor([2, 2, 5, 2], dtype=torch.int32).expand_as(moe.gate.tid2eid))
+    g = torch.Generator().manual_seed(SEED + 11)
+    x = torch.randn(1, 1, 128, generator=g, dtype=torch.bfloat16)
+    ids = torch.randint(0, 32, (1, 1), generator=g)
+    assert GROUPED._keep_last_of_each(torch.tensor([2, 2, 5, 2])).tolist() == [False, False, True, True]
+
+    with torch.no_grad():
+        want = GROUPED.grouped_forward(moe, x, ids)
+
+    real, calls = GROUPED.grouped_fp4_gemm, []
+
+    def spiked(*a, **k):
+        out = real(*a, **k)
+        calls.append(1)
+        if len(calls) == 2:                          # the w2 launch — the rows that get discarded
+            out = out.clone()
+            out[0], out[1] = float("inf"), float("nan")
+        return out
+
+    monkeypatch.setattr(GROUPED, "grouped_fp4_gemm", spiked)
+    with torch.no_grad():
+        got = GROUPED.grouped_forward(moe, x, ids)
+    assert torch.isfinite(got.float()).all(), "a discarded slot's inf/NaN reached the token"
+    assert torch.equal(want, got), "the discarded slots were read, not dropped"
+
+def test_the_kernel_wrapper_refuses_shapes_its_store_loop_cannot_hold(oracle, monkeypatch):
+    """The grouped kernel's store is UNPREDICATED — a precondition, not a preference.
+
+    The vendored fp4 GEMM writes its tile with a bounds-checked `T.copy`; the grouped one writes row
+    g with a raw `for j in T.Parallel(block_N)` loop, so an N that is not a whole number of 128-wide
+    tiles makes the last block write past the row, and more expert slots than the block_M=32 A tile
+    holds cannot be stored at all. Neither raises on a card: both are silent memory stomps. The
+    wrapper asserts instead, and this pins that it does — the docstring said `G <= block_M` for
+    months while nothing checked it."""
+    def fp4(*shape):                       # torch.zeros has no fp4 CPU kernel; a uint8 view does
+        return torch.zeros(*shape, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+
+    act = torch.zeros(4, 128, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="whole number of 128-wide tiles"):
+        GROUPED.grouped_fp4_gemm(act, torch.zeros(4, 1), fp4(4, 192, 64), torch.zeros(4, 192, 4))
+    big = torch.zeros(33, 128, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="exceeds the block_M"):
+        GROUPED.grouped_fp4_gemm(big, torch.zeros(33, 1), fp4(33, 128, 64), torch.zeros(33, 128, 4))
+
+
+# ── the coverage gate: a matrix kind that silently un-groups must FAIL, not just get slower ──────
+
+
+def _count_launches(monkeypatch, mod):
+    """Count the launches a step issues, split by which path issued them.
+
+    `dsv4_model.act_quant` / `dsv4_model.fp4_gemm` are the names `linear()` resolves, so they count
+    the REFERENCE's per-expert work — one act_quant + one fp4_gemm per expert per matrix. The grouped
+    path reaches its GEMM through `v4_moe_grouped.grouped_fp4_gemm` (and its CPU emulator imports
+    `kernel.fp4_gemm` directly, which is deliberately NOT one of these names), so the two are
+    distinguishable and 'the lever silently stopped covering w2' shows up as per-expert calls
+    reappearing rather than as a number nobody reads."""
+    log = {"act_quant": 0, "per_expert_fp4": 0, "grouped": []}
+    real_q, real_g, real_grouped = mod.act_quant, mod.fp4_gemm, GROUPED.grouped_fp4_gemm
+
+    def q(*a, **k):
+        log["act_quant"] += 1
+        return real_q(*a, **k)
+
+    def gemm(*a, **k):
+        log["per_expert_fp4"] += 1
+        return real_g(*a, **k)
+
+    def grouped(a, a_s, w, w_s, *rest, **k):
+        log["grouped"].append((a.size(0), w.size(1)))
+        return real_grouped(a, a_s, w, w_s, *rest, **k)
+
+    monkeypatch.setattr(mod, "act_quant", q)
+    monkeypatch.setattr(mod, "fp4_gemm", gemm)
+    monkeypatch.setattr(GROUPED, "grouped_fp4_gemm", grouped)
+    return log
+
+
+@pytest.mark.parametrize("layer_id", [7, 0])
+def test_every_routed_expert_matrix_is_grouped_and_none_is_left_per_expert(oracle, monkeypatch, layer_id):
+    """THE REGRESSION GATE, and the one this whole change came out of.
+
+    A real-GPU profile of a 6-layer stage read `fp4_gemm_kernel 72 calls` beside
+    `grouped_fp4_gemm_kernel 6 calls`, which looks like partial coverage and is not: 72 is 4 x 18,
+    i.e. FOUR whole layers that never grouped at all, and 18 is 6 experts x 3 matrices. Nothing in
+    the kernel table says so. This makes the same statement testable at the layer:
+
+      * a grouped decode step issues ZERO per-expert fp4 GEMMs — not one for w2, not one for anything;
+      * it issues exactly TWO grouped launches, the first [G, 2*inter] (w1 and w3 fused) and the
+        second [G, dim] (w2), so a kind that quietly fell back off the fused bank changes the shape;
+      * and it quantizes exactly TWICE, against the reference's 3 per expert, which is the
+        act_quant column of that same profile.
+    The reference numbers are measured in the same run rather than hardcoded, so the ratio survives
+    a change of expert count."""
+    mod = _runnable(monkeypatch)
+    moe = _loaded_fp4_moe(oracle, layer_id)
+    G, inter, dim = moe.n_activated_experts, 128, 128
+    g = torch.Generator().manual_seed(SEED + 4)
+    x = torch.randn(1, 1, dim, generator=g, dtype=torch.bfloat16)
+    ids = torch.randint(0, 32, (1, 1), generator=g)
+    with torch.no_grad():                              # the reference's loop runs once per DISTINCT
+        routed = moe.gate(x.view(-1, dim), ids.flatten())[1][0].tolist()   # expert, so a hash layer's
+    distinct = len(set(routed))                        # repeats collapse iterations on that side only
+
+    log = _count_launches(monkeypatch, mod)
+    with torch.no_grad():
+        mod.MoE.forward(moe, x, ids)
+    ref = dict(log, grouped=list(log["grouped"]))
+    assert ref["per_expert_fp4"] == 3 * distinct, "the reference runs w1, w3 and w2 once per expert"
+    assert ref["act_quant"] == 3 * distinct, "and quantizes its input once per those"
+    assert ref["grouped"] == []
+
+    log.update(act_quant=0, per_expert_fp4=0)
+    log["grouped"].clear()
+    with torch.no_grad():
+        GROUPED.grouped_forward(moe, x, ids)
+    assert log["per_expert_fp4"] == 0, (
+        f"{log['per_expert_fp4']} routed-expert GEMMs still ran one expert at a time — a matrix kind "
+        f"has silently un-grouped (the reference issues {ref['per_expert_fp4']})")
+    assert log["grouped"] == [(G, 2 * inter), (G, dim)], (
+        f"expected one fused w1+w3 launch then one w2 launch over {G} experts, got {log['grouped']}")
+    assert log["act_quant"] == 2, (
+        f"the grouped step must quantize the token once and the intermediates once, not "
+        f"{log['act_quant']} times (the reference: {ref['act_quant']})")
+
+
+def test_coverage_names_the_layers_that_never_grouped(oracle, monkeypatch):
+    """`coverage()` is the profiler-facing half of the same gate.
+
+    Kernel counts can only say how many layers grouped by division; this says WHICH, and why the
+    others did not. A stage whose every layer grouped reads all-nonzero, and one layer left on the
+    reference path is a named entry with its reason, not a silently smaller speedup."""
+    mod = _runnable(monkeypatch)
+    fast = _loaded_fp4_moe(oracle, layer_id=7)
+    fast.layer_id = 7
+    slow = _loaded_fp4_moe(oracle, layer_id=0, seed=SEED + 1)
+    slow.layer_id = 0
+    holder = torch.nn.ModuleList([fast, slow])
+    assert GROUPED.coverage(holder) == {7: (0, {}), 0: (0, {})}, "nothing has run yet"
+
+    g = torch.Generator().manual_seed(SEED + 5)
+    x1 = torch.randn(1, 1, 128, generator=g, dtype=torch.bfloat16)
+    x3 = torch.randn(1, 3, 128, generator=g, dtype=torch.bfloat16)
+    with torch.no_grad():
+        GROUPED.grouped_forward(fast, x1, torch.randint(0, 32, (1, 1), generator=g))
+        GROUPED.grouped_forward(fast, x1, torch.randint(0, 32, (1, 1), generator=g))
+        GROUPED.grouped_forward(slow, x3, torch.randint(0, 32, (1, 3), generator=g))
+    cov = GROUPED.coverage(holder)
+    assert cov[7] == (2, {}), f"the score layer grouped both steps: {cov[7]}"
+    assert cov[0] == (0, {"s>1": 1}), f"the s > 1 step must be named and counted: {cov[0]}"
+
 
 
 @pytest.mark.hardware
@@ -749,3 +1113,41 @@ def test_bit_exact_on_gpu_over_the_bank_layout(monkeypatch):
             ref = ref_forward(ref_moe, x, ids)
             got = GROUPED.grouped_forward(bank_moe, x, ids)
         assert torch.equal(ref, got), f"prefill s={s}: max|d| = {(ref.float() - got.float()).abs().max()}"
+
+
+@pytest.mark.hardware
+def test_bit_exact_on_gpu_with_a_duplicated_hash_expert(monkeypatch):
+    """The one claim that CANNOT be checked off a card, forced instead of hoped for.
+
+    The hash path's correctness rests on the tilelang fp4 GEMM being ROW-INVARIANT: the reference
+    runs a duplicated expert as an n-row GEMM and the grouped path runs n one-row grid blocks. That
+    is a property of the kernel, so only a GPU can measure it — and until this test the GPU never
+    saw a hash layer at all (both parity tests build `layer_id=7`, and `_smoke`'s random `tid2eid`
+    draws contain no duplicate at all about 62% of the time at 256 experts and topk 6).
+
+    So the routing is PINNED, not drawn: expert 3 named three times and 17 twice, which is the
+    reference discarding three of six slots. If `torch.matmul`-style M-dependent blocking were ever
+    true of the tilelang kernel, this is where it would show, and nothing else would."""
+    if not torch.cuda.is_available():
+        pytest.skip("grouped MoE parity needs a CUDA device (tilelang)")
+    mod = GROUPED._load_model_module()
+    args = GROUPED.real_dims_args(mod)
+    ref_moe = GROUPED.build_real_dims_moe(mod, args, seed=3, layer_id=0)
+    bank_moe = GROUPED.build_real_dims_moe(mod, args, seed=3, layer_id=0, bank=True)
+    assert ref_moe.gate.hash and bank_moe._grouped_bank
+    pattern = torch.tensor([3, 3, 17, 3, 200, 17], dtype=torch.int32, device="cuda")
+    assert pattern.numel() == args.n_activated_experts
+    with torch.no_grad():
+        for m in (ref_moe, bank_moe):
+            m.gate.tid2eid.data.copy_(pattern.expand_as(m.gate.tid2eid))
+    ref_forward = mod.MoE.forward
+    monkeypatch.setattr(GROUPED, "_REF_FORWARD", ref_forward)
+    monkeypatch.setattr(GROUPED, "_MOD", mod)
+    monkeypatch.setattr(GROUPED, "_WORLD_SIZE", 1)
+    for t in range(4):
+        x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
+        with torch.no_grad():
+            ref = ref_forward(ref_moe, x, ids)
+            got = GROUPED.grouped_forward(bank_moe, x, ids)
+        assert torch.equal(ref, got), f"dup {t}: max|d| = {(ref.float() - got.float()).abs().max()}"

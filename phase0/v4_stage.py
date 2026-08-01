@@ -1187,7 +1187,13 @@ class Stage:
         OBSERVED, not declared: it reads the function bound on the reference class, not the env flag,
         because the whole point of this line is to answer "did the lever fire?" on a live ring. The
         grouped install declines silently off-CUDA and the bank layout declines per layer, so
-        `V4_MOE_GROUPED=1` alone proves nothing -- `grouped/8` does."""
+        `V4_MOE_GROUPED=1` alone proves nothing.
+
+        BUT `grouped/8` DOES NOT PROVE IT EITHER, which this docstring used to claim. The N counts
+        layers that were BANKED at load, and a banked layer can still decline every decode step --
+        which is exactly what a 6-layer profile caught: `grouped/6` in the repr, and four of the six
+        on the reference path all night. Banked is a load-time fact; whether a layer grouped is a
+        run-time one, and the run-time answer is `v4_moe_grouped.coverage(self.layers)`."""
         M = ref()
         fwd = M.MoE.forward
         kind = ("grouped" if getattr(fwd, "_v4_grouped", False) else

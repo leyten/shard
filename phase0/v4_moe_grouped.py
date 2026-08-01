@@ -15,16 +15,25 @@ This deletes the launch count too, and the last host sync with it. At b*s == 1 o
 layer the six routed expert ids are a six-element device tensor, and every GEMV they name has the
 SAME left operand (the one token). So:
 
-    w1,w3,w2 = gather(w*_bank, ids)                # device gather of the six routed experts, no sync
+    w13,w2 = gather(w*_bank, ids)                  # device gather of the six routed experts, no sync
     xq, xs = act_quant(x)                          # ONE quant of the token, shared by all experts
-    gate6  = grouped_fp4_gemm(xq, w1)              # ONE launch: all six w1 as a grid-indexed batch
-    up6    = grouped_fp4_gemm(xq, w3)              # ONE launch: all six w3
+    both   = grouped_fp4_gemm(xq, w13)             # ONE launch: all six w1 AND all six w3
+    gate6, up6 = both[:, :inter], both[:, inter:]  # a view split, not a copy
     h6     = weight * (silu(clamp(gate6)) * clamp(up6))   # batched SwiGLU, torch, all six at once
     hq, hs = act_quant(h6)                         # ONE quant of the six intermediates
     out6   = grouped_fp4_gemm(hq, w2)              # ONE launch: all six w2
     y      = sum(out6 in ascending-expert-id order) + shared_expert(x)
 
-Three routed-GEMM launches instead of ~120, and — crucially — ZERO `.tolist()`. The slot->expert map
+W1 AND W3 SHARE ONE LAUNCH because they are the same GEMM — both are dim -> inter_dim against the
+SAME quantized token — so the bank stores them as one [E, 2*inter_dim, dim] block (w1's rows then
+w3's) and one grouped call fills both halves. That is not a micro-optimisation on this card: the
+grouped kernel's grid is `(ceildiv(N, 128), G)`, i.e. 16 x 6 = 96 blocks at N = inter_dim, against
+an RTX 5090's 170 SMs — it does not fill the machine, so DOUBLING N is very nearly free while
+halving the launches. The w2 group cannot join them: it contracts inter_dim -> dim (a different K)
+and its input is the SwiGLU of the first group's output, so it is necessarily a second launch after
+an activation. Two launches per layer is the floor this structure allows, and this hits it.
+
+Two routed-GEMM launches instead of ~120, and — crucially — ZERO `.tolist()`. The slot->expert map
 never touches the host: the six ids gather the routed experts out of the bank with a device index
 (`_gather_fp`), the kernel is then a plain grid-indexed batched GEMM over that gathered [G, N, K]
 bank, and the ascending-id accumulation order is a device `argsort` gather plus a fixed six-add loop,
@@ -35,7 +44,8 @@ three things blocking a CUDA-graph capture of the decode layer.
 — does not survive this sm_120 tilelang build: a per-block data-dependent leading index into a
 packed-fp4 bank mis-addresses, uniform eids work but distinct eids collapse every slot onto one
 weight. The torch gather is the working equivalent; it is a handful of extra device launches, still
-no host sync, still CUDA-graph-capturable, still ~8 launches against the reference's ~120.)
+no host sync, still CUDA-graph-capturable, and with w1/w3 fused it is 2 GEMMs + 4 gathers against
+the reference's ~120.)
 
 BIT-EXACT AT s == 1, BY CONSTRUCTION, NOT BY TOLERANCE — the bar is `torch.equal` against the
 reference MoE, and this reaches it the same way `v4_sparse_attn_sm120` reaches it against its
@@ -48,6 +58,14 @@ vendored kernel: the arithmetic is transcribed, not re-derived.
     (the full row-0-aligned A tile, only row g stored) — a per-output-element dot product that
     depends on nothing but that block's A row and B tile, so the block_K=32 = fp4 weight-scale group
     alignment means no scale reassociation and the result is the same fp32 word.
+  * FUSING w1 AND w3 INTO ONE LAUNCH CANNOT MOVE A BIT, for that same reason: `C[g, j]` depends on
+    the A row and on W row j alone, never on N or on which N-tile j fell in. Concatenating the two
+    weight blocks only changes how many N-tiles the grid walks, so `both[:, :inter]` is the fp32
+    word `grouped_fp4_gemm(xq, w1)` would have produced and `both[:, inter:]` is w3's. (Nothing here
+    needs inter_dim to be a multiple of block_N — a tile straddling the w1/w3 seam still computes
+    each of its output elements from its own W row. The KERNEL does need the fused N to be a whole
+    number of block_N tiles, because its store loop is unpredicated; the fusion RELAXES that from
+    inter_dim % 128 to inter_dim % 64, and `grouped_fp4_gemm` asserts it either way.)
   * The SwiGLU, the routing-weight multiply, the `.to(dtype)` and the two `act_quant`s stay in the
     reference's own torch / tilelang code, run on the SAME operands, batched over the expert axis.
     Elementwise and per-row reductions are batch-invariant, so row g of the batch is bit-identical to
@@ -70,11 +88,34 @@ the same reasons:
   world_size > 1                          the reference all-reduces the routed sum across ranks
                                           before the shared expert; skipping a rank's experts without
                                           that reduction silently drops them.
-  hash-routed layers (layer_id < 3)       `tid2eid` can name the same expert twice, and the
-                                          duplicate-index `y[idx] +=` is the reference's semantics.
-                                          Top-k routing cannot repeat, so on a score-routed decode
-                                          step the six ids are distinct and no host-side dedup — and
-                                          so no sync — is needed.
+
+HASH-ROUTED LAYERS (layer_id < n_hash_layers) ARE CLAIMED TOO, which they were not before. They were
+excluded because `tid2eid` can name the same expert twice and the reference's duplicate-index
+`y[idx] +=` is not a repeated add — and on a stage that owns the head that exclusion is expensive:
+layers 0, 1 and 2 of a 43-layer model are a HALF of a 6-layer head stage, and they were paying the
+reference's ~120 launches while their score-routed neighbours paid 8.
+
+What the reference actually does with a repeat is worth spelling out, because it is not addition.
+`y[idx] += v` with `idx = [0, 0]` reads row 0 TWICE, adds the two expert outputs to those two copies,
+and scatters both back to row 0 — where the LAST write wins. So a duplicated expert contributes
+exactly ONE of its slots, the one with the largest slot index, and every earlier duplicate is
+DISCARDED. (Verified against torch, not inferred: `y[[0,0]] += [[1],[10]]` from zero leaves 10.)
+
+That is a pure function of the six ids, so it reproduces on device with no host sync:
+
+    keep[k] = not any(ids[k'] == ids[k] for k' > k)      # a [G, G] compare, 36 elements
+    out6    = where(keep[:, None], out6, 0)              # the discarded slots are NOT READ
+
+and a discarded slot then adds exactly zero into the fp32 accumulator, which is exact. A SELECT and
+not a multiply by the mask, because the reference never evaluates those slots at all: `inf * 0.0` is
+NaN, and a routed output that overflowed bf16 would poison the token rather than be skipped. The surviving
+slots carry distinct expert ids, so the ascending-id fold is unchanged and the order still matches
+the reference's `for i in range(...)`. The one thing this leans on that a CPU emulator does not give
+for free is that the vendored fp4 GEMM is ROW-INVARIANT — the reference runs the duplicated expert as
+a 2-row GEMM and we run it as two 1-row grid blocks — which is true of the tilelang kernel (each
+block computes each output element from its own A row) and NOT true of `torch.matmul`, whose BLAS
+blocking depends on M. See
+`tests/test_v4_moe_grouped.py::test_a_repeated_hash_expert_is_dropped_exactly_as_the_reference_drops_it`.
 
 WEIGHT BANK — THE LOAD-TIME LAYOUT, WHICH IS WHAT LETS THIS RUN ON A FULL STAGE. The per-step gather
 slices the routed experts out of ONE contiguous [n_experts, N, K] fp4 bank (+ its scale bank), not
@@ -120,10 +161,11 @@ Those are END-STATE numbers on the PRE-FIX code, and end state was never the bin
 ARITHMETIC, NOT MEASUREMENT -- everything from here to the speed table is computed from
 config.json (dim 4096, moe_inter_dim 2048, 256 fp4 experts) by building the real Blocks on the meta
 device, and NOTHING below has been run on a card yet. Per layer the routed experts are 3.1875 GiB in
-1536 blocks (3 weight banks of 1024.00 MiB, 3 e8m0 scale banks of 64.00 MiB); the layers run
+1536 blocks, held as FOUR banks since w1 and w3 fused (w13 2048.00 MiB + its scale 128.00 MiB, w2
+1024.00 MiB + its scale 64.00 MiB); the layers run
 3.352-3.402 GiB; eight of them plus the head embedding is 27.98 GiB resident (26.998 + 0.986).
 Building a layer's banks BEFORE releasing what they replace peaks at steady + 3200 MiB (the stranded
-run at the w2 request, the worst of the six); releasing first peaks at steady. Against a 30.76 GiB
+run at the last request, the worst of them); releasing first peaks at steady. Against a 30.76 GiB
 budget (31.36 usable less the ~0.6 GiB CUDA context) that is the whole difference:
     head stage    steady     OLD peak      NEW peak
       [0:7)       24.62      27.74  fits    24.62     <- why seven layers measured clean
@@ -162,6 +204,15 @@ _MOD = None            # the loaded dsv4_model module — source of scale_fmt / 
 _WORLD_SIZE = 1
 
 _KERNELS = {}          # (N, K, tl_scale_dtype) -> compiled grouped kernel, memoized like the vendored
+
+# The kernel's tile dims, hoisted because the WRAPPER has to enforce them. The vendored fp4 GEMM
+# stores its tile with a bounds-checked `T.copy`; the grouped one stores row g with a raw
+# `for j in T.Parallel(block_N)` loop, which is UNPREDICATED — so N must be a whole number of
+# block_N tiles or the last block writes past the row. And the A tile is block_M rows, so a launch
+# can carry at most that many expert slots. Both hold at the shipped dims and at every call this
+# module makes; they are asserted rather than commented because the failure is a silent memory
+# stomp, not an exception.
+_BLOCK_M, _BLOCK_N = 32, 128
 
 
 # ── the kernel ───────────────────────────────────────────────────────────────────────────────────
@@ -205,8 +256,8 @@ def grouped_fp4_gemm_kernel(N, K, scale_dtype="float32"):
     out_dtype, accum_dtype = BF16, FP32
     act_group_size = 128
     weight_group_size = 32
-    block_M = 32
-    block_N = 128
+    block_M = _BLOCK_M
+    block_N = _BLOCK_N
     block_K = 32                       # == weight_group_size: one scale per K-block, no reassociation
     n_sub = act_group_size // block_K  # 4 K-blocks per act-scale group
 
@@ -274,9 +325,26 @@ def grouped_fp4_gemm(a, a_s, w, w_s, scale_dtype=torch.float32):
 
     a  [G, K] fp8, a_s [G, K//128];  w [G, N, K//2] float4_e2m1fn_x2 (logical [G, N, K]) ALREADY
     gathered to the routed experts, w_s [G, N, K//32] e8m0.  Mirrors `kernel.fp4_gemm`'s wrapper
-    (contiguity asserts, fp32-vs-e8m0 scale dtype, output in the process default dtype)."""
+    (contiguity asserts, fp32-vs-e8m0 scale dtype, output in the process default dtype).
+
+    OFF CUDA it runs the same function as a per-slot loop over the installed `kernel.fp4_gemm` — one
+    G-element `for`, not a re-derivation — which is exactly what the grid-indexed kernel computes and
+    is how a CPU box proves the DISPATCH (routing, the ascending fold, the hash keep-mask, which bank
+    rows reach which expert) without a card. It does NOT prove the tilelang kernel's numerics; those
+    are argued in the module docstring and gated by the `@pytest.mark.hardware` parity tests. The
+    import is local so the CPU stand-ins (`v4_kernels_cpu.install`) can be swapped in per test."""
     assert a.is_contiguous() and w.is_contiguous(), "grouped fp4: a and w must be contiguous"
     assert a_s.is_contiguous() and w_s.is_contiguous(), "grouped fp4: scales must be contiguous"
+    assert w.size(1) % _BLOCK_N == 0, (
+        f"grouped fp4: N={w.size(1)} is not a whole number of {_BLOCK_N}-wide tiles — the kernel's "
+        f"store loop is unpredicated and the last block would write past the row")
+    assert a.size(0) <= _BLOCK_M, (
+        f"grouped fp4: {a.size(0)} expert slots exceeds the block_M={_BLOCK_M} A tile the kernel "
+        f"copies; only rows below it can be stored")
+    if not a.is_cuda:
+        import kernel
+        return torch.cat([kernel.fp4_gemm(a[g:g + 1], a_s[g:g + 1], w[g], w_s[g], scale_dtype)
+                          for g in range(a.size(0))])
     tl_dtype = "float8_e8m0fnu" if scale_dtype == torch.float8_e8m0fnu else "float32"
     G, K = a.shape
     N = w.size(1)
@@ -300,8 +368,15 @@ def _gather_fp(t, ids):
 
 # ── the load-time bank layout: the experts ARE the bank ──────────────────────────────────────────
 
-# (weight key, scale key) per expert Linear, in the order the bank stores them.
-_BANK_KINDS = (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s"))
+# (bank key, the expert Linears whose rows that bank concatenates, in bank row order). w1 and w3 share
+# a bank because they share a GEMM: same K (dim), same left operand, so one [E, 2*inter, dim] block
+# feeds one grouped launch and the halves split back out as views. w2 contracts the other way
+# (inter -> dim) and consumes the SwiGLU of the first, so it is necessarily its own bank and its own
+# launch. Each entry yields two banks, `key` for the weights and `key + "_s"` for the e8m0 scales.
+_BANK_GROUPS = (("w13", ("w1", "w3")), ("w2", ("w2",)))
+# Every routed-expert Linear, in the reference's own attribute names — the keys the lazy stack and
+# the tests walk.
+_EXPERT_KINDS = tuple(k for _key, kinds in _BANK_GROUPS for k in kinds)
 
 
 def _relayout_moe(moe, preserve=True):
@@ -313,10 +388,15 @@ def _relayout_moe(moe, preserve=True):
     experts live. Per weight kind it allocates the [E, N, K] bank and repoints that expert's
     parameter at its slice:
 
-        p.data = bank[j]        # zero-copy: slice j of a contiguous [E, N, K] bank is contiguous
+        p.data = bank[j, r0:r1]  # zero-copy: a row range of slot j of a contiguous bank is contiguous
 
     which drops the last reference to the tensor the constructor allocated. Net VRAM is one copy of
     the weights — exactly what the non-grouped path holds — and the bank adds nothing.
+
+    The row range is what lets w1 and w3 SHARE a bank (`_BANK_GROUPS`) without either of them losing
+    the property the reference path depends on: `bank[j, 0:inter]` and `bank[j, inter:2*inter]` are
+    each contiguous, each keep their own `.scale` attribute, and each are exactly the tensor
+    `linear()` would have read. One bank, one grouped launch, two Linears that cannot tell.
 
     NEVER ASK THE DRIVER FOR A BYTE YOU HAVE NOT ALREADY HANDED BACK. That is the whole content of
     `preserve=False`, and it is what the first version of this function got wrong. Freeing the
@@ -336,11 +416,13 @@ def _relayout_moe(moe, preserve=True):
     arithmetic says 27.98 for an 8-layer head stage — and it is FLAT, because the release IS real),
     2.13 GiB reserved but unallocated (the freed originals of the four kinds already relaid, which by
     symmetry is the same 1024 + 64 + 1024 + 64 = 2176 MiB their banks cost), 669 MiB free, and a
-    1024.00 MiB request — the w2 weight bank, the fifth of six in `_BANK_KINDS` order — unmeetable.
+    1024.00 MiB request — the w2 weight bank, the fifth of the six banks that layout used — unmeetable.
+    (It is four banks now that w1 and w3 share one; the ordering argument is unchanged, and the
+    numbers above are the six-bank run that produced the OOM.)
 
     `preserve=False` inverts the order and the excursion disappears: release EVERY routed-expert
     block of the layer first (rebind each parameter to a void tensor), `empty_cache`, and only THEN
-    allocate the six banks — into the 3.19 GiB the layer just vacated. Peak allocated and peak
+    allocate the banks — into the 3.19 GiB the layer just vacated. Peak allocated and peak
     reserved both equal the steady state; nothing is ever resident twice, in the model or in the
     allocator.
 
@@ -354,7 +436,7 @@ def _relayout_moe(moe, preserve=True):
         layers rather than only when something is about to fail.
       * The pools do not net out exactly. A layer releases 3072 MiB of 4 MiB weight blocks into the
         LARGE pool and 192 MiB of 256 KiB scale blocks into the SMALL pool (the 1 MiB threshold), but
-        all six banks — including the three 64 MiB scale banks — are large-pool requests. So 192 MiB
+        every bank — including the 128 MiB and 64 MiB scale banks — is a large-pool request. So 192 MiB
         per layer has to make the round trip through the driver, which is exactly what the
         `empty_cache` above is for: the layer's scale blocks are freed together and are contiguous
         within the small pool (the weights went elsewhere), so their segments are wholly free and do
@@ -369,10 +451,12 @@ def _relayout_moe(moe, preserve=True):
     the constructor would have left.)
 
     `preserve=True` keeps the copy, for the caller that has already written the weights (the GPU
-    parity harness's standalone layer, `build_real_dims_moe(bank=True)`). One layer on a card with
-    room can afford the +1 kind transient; a full stage is what `preserve=False` exists for. The
-    copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and e8m0 are
-    1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and always present.
+    parity harness's standalone layer, `build_real_dims_moe(bank=True)`). Its transient is one whole
+    bank, which since the w1/w3 fusion is 32/51 of the layer rather than 16/51 — 2 GiB at the shipped
+    dims. One layer on a card with room can afford that; a full stage is what `preserve=False` exists
+    for. The copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and
+    e8m0 are 1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and
+    always present.
 
     Declines, leaving the module untouched, when: the experts are not fp4 (the grouped kernel is
     fp4-only, and a bf16 CPU parity model must stay byte-identical), or something already put a bank
@@ -388,38 +472,46 @@ def _relayout_moe(moe, preserve=True):
     experts = [moe.experts[i] for i in range(lo, hi)]
     if not experts or experts[0].w1.weight.dtype != torch.float4_e2m1fn_x2:
         return False
-    # One entry per bank the layer will own: the parameters that become its slices, and the shape /
-    # dtype / device to allocate it with. Built up front so `preserve=False` can release every one of
-    # them before the first bank is asked for.
+    # One entry per bank the layer will own: the parameters that become its row ranges, where each
+    # one starts, and the shape / dtype / device to allocate it with. A bank concatenates its group's
+    # Linears along dim 0 per expert, so `rows` carries the split point (w13 = w1's rows then w3's).
+    # Built up front so `preserve=False` can release every one of them before the first bank is asked.
     plan = []
-    for kind, skey in _BANK_KINDS:
-        for attr, key in (("weight", kind), ("scale", skey)):
-            params = [getattr(getattr(e, kind), attr) for e in experts]
-            t0 = params[0]
-            plan.append((key, params, (len(params),) + tuple(t0.shape), t0.dtype, t0.device))
+    for key, kinds in _BANK_GROUPS:
+        for attr, suffix in (("weight", ""), ("scale", "_s")):
+            first = [getattr(getattr(experts[0], k), attr) for k in kinds]
+            rows = [t.shape[0] for t in first]
+            t0 = first[0]
+            params = [[getattr(getattr(e, k), attr) for k in kinds] for e in experts]
+            shape = (len(experts), sum(rows)) + tuple(t0.shape[1:])
+            plan.append((key + suffix, params, rows, shape, t0.dtype, t0.device))
     cuda = experts[0].w1.weight.is_cuda
     if not preserve:
         # Hand the whole layer's per-expert run back FIRST. One void tensor per (dtype, device) is
         # shared by every parameter of that kind -- these are placeholders for the width of one
         # `empty_cache`, and each is replaced by its bank slice below.
         void = {}
-        for _key, params, _shape, dtype, device in plan:
+        for _key, params, _rows, _shape, dtype, device in plan:
             v = void.setdefault((dtype, device), torch.empty(0, dtype=dtype, device=device))
-            for p in params:
-                p.data = v
+            for group in params:
+                for p in group:
+                    p.data = v
         if cuda:
             torch.cuda.empty_cache()   # the run is wholly free now, so the segments actually return
     bank = {}
     with torch.no_grad():
-        for key, params, shape, dtype, device in plan:
+        for key, params, rows, shape, dtype, device in plan:
             b = torch.empty(shape, dtype=dtype, device=device)
             bu = b.view(torch.uint8)
-            for j, p in enumerate(params):
-                if preserve:
-                    bu[j].copy_(p.detach().view(torch.uint8))
-                p.data = b[j]          # the parameter now ADDRESSES the bank; its old block frees
+            for j, group in enumerate(params):
+                off = 0
+                for n, p in zip(rows, group):
+                    if preserve:
+                        bu[j, off:off + n].copy_(p.detach().view(torch.uint8))
+                    p.data = b[j, off:off + n]   # the parameter now ADDRESSES the bank; its old
+                    off += n                     # block frees
             bank[key] = b
-            if preserve and cuda:      # hand the freed per-expert blocks back before the next kind
+            if preserve and cuda:      # hand the freed per-expert blocks back before the next bank
                 torch.cuda.empty_cache()
     moe._grouped_bank = bank
     return True
@@ -461,8 +553,8 @@ def _bank_fits(experts):
     if not torch.cuda.is_available():
         return True
     need = sum(t.numel() * t.element_size()
-               for e in experts for t in (e.w1.weight, e.w1.scale, e.w3.weight, e.w3.scale,
-                                          e.w2.weight, e.w2.scale))
+               for e in experts for k in _EXPERT_KINDS
+               for t in (getattr(e, k).weight, getattr(e, k).scale))
     free, _total = torch.cuda.mem_get_info()
     return free - need >= _BANK_HEADROOM_BYTES
 
@@ -496,54 +588,86 @@ def _expert_bank(moe):
               f"decode path. A stage gets the bank from bank_layout() at load and never reaches "
               f"this; an MoE built outside Stage does.", flush=True)
         return None
-    bank = {
-        "w1": torch.stack([e.w1.weight for e in experts]).contiguous(),
-        "w1_s": torch.stack([e.w1.scale for e in experts]).contiguous(),
-        "w3": torch.stack([e.w3.weight for e in experts]).contiguous(),
-        "w3_s": torch.stack([e.w3.scale for e in experts]).contiguous(),
-        "w2": torch.stack([e.w2.weight for e in experts]).contiguous(),
-        "w2_s": torch.stack([e.w2.scale for e in experts]).contiguous(),
-    }
+    # Same grouping the load-time layout builds, stacked instead of aliased: w1's rows then w3's, so
+    # the fast path reads one bank per grouped launch either way. Through `.view(torch.uint8)` for the
+    # same reason `_gather_fp` is: fp4 and e8m0 are 1-byte dtypes with thin cat/stack kernel coverage.
+    bank = {}
+    for key, kinds in _BANK_GROUPS:
+        for attr, suffix in (("weight", ""), ("scale", "_s")):
+            dtype = getattr(getattr(experts[0], kinds[0]), attr).dtype
+            stacked = torch.stack([torch.cat([getattr(getattr(e, k), attr).view(torch.uint8)
+                                              for k in kinds]) for e in experts])
+            bank[key + suffix] = stacked.contiguous().view(dtype)
     moe._grouped_bank = bank
     return bank
 
 
 # ── the forward ──────────────────────────────────────────────────────────────────────────────────
 
+def _decline(moe, why, x, input_ids):
+    """Hand this step to the captured forward and RECORD that we did, per layer, per reason.
+
+    A lever that silently does nothing is the failure mode this engine keeps paying for: the profile
+    that motivated the hash-layer work read `fp4_gemm_kernel 72 calls` and `grouped_fp4_gemm_kernel
+    6 calls` on a 6-layer stage, which is FOUR layers that never grouped at all — invisible in the
+    kernel table, and only recoverable by dividing by 18. `coverage()` turns that into a number the
+    profiler and `tests/test_v4_moe_grouped.py::test_every_layer_of_a_stage_is_grouped` can read
+    directly. Host-side counters only: no device work, nothing to sync, nothing in a graph."""
+    tally = getattr(moe, "_grouped_declined", None)
+    if tally is None:
+        tally = moe._grouped_declined = {}
+    tally[why] = tally.get(why, 0) + 1
+    return _REF_FORWARD(moe, x, input_ids)
+
+
+def _keep_last_of_each(ids):
+    """Which routed slots survive the reference's duplicate-index `y[idx] +=`. See the module doc.
+
+    `y[idx] += v` with a repeated index scatters every duplicate to the same row and the LAST write
+    wins, so an expert named by several slots contributes only its highest slot and the rest are
+    discarded outright. keep[k] is False exactly when some later slot names the same expert. Pure
+    device arithmetic on a [G, G] compare — G is 6, so this is 36 elements and no host sync."""
+    same = ids[:, None] == ids[None, :]
+    return ~same.triu(1).any(dim=1)
+
+
 def grouped_forward(self, x, input_ids):
-    """MoE.forward for a single-token, score-routed, single-rank step — three grouped launches, no
-    host sync. Every other shape falls through to the captured reference forward. See module doc."""
+    """MoE.forward for a single-token, single-rank step — two grouped launches, no host sync.
+    Every other shape falls through to the captured reference forward. See module doc."""
     shape = x.size()
     xv = x.view(-1, self.dim)
-    if xv.size(0) != 1 or _WORLD_SIZE > 1 or self.gate.hash:
-        return _REF_FORWARD(self, x, input_ids)
+    if xv.size(0) != 1:
+        return _decline(self, "s>1", x, input_ids)
+    if _WORLD_SIZE > 1:
+        return _decline(self, "world_size>1", x, input_ids)
 
     weights, indices = self.gate(xv, input_ids.flatten())
     ids = indices[0].to(torch.int32)                       # [G] on device — no .tolist()
     bank = _expert_bank(self)
     if bank is None:                                       # the bank would not fit — decline, loudly
-        return _REF_FORWARD(self, x, input_ids)
+        return _decline(self, "bank-would-not-fit", x, input_ids)
 
     # Gather the six routed experts into contiguous [G, N, K] banks (device-side, no host sync — see
     # `_gather_fp` on why a torch gather rather than a device-side kernel index). One gather per
-    # weight, then the kernel is a plain grid-indexed batched GEMM.
-    w1, w1_s = _gather_fp(bank["w1"], ids), _gather_fp(bank["w1_s"], ids)
-    w3, w3_s = _gather_fp(bank["w3"], ids), _gather_fp(bank["w3_s"], ids)
+    # bank — w1 and w3 share theirs — then the kernel is a plain grid-indexed batched GEMM.
+    w13, w13_s = _gather_fp(bank["w13"], ids), _gather_fp(bank["w13_s"], ids)
     w2, w2_s = _gather_fp(bank["w2"], ids), _gather_fp(bank["w2_s"], ids)
 
     scale_fmt, scale_dtype = _MOD.scale_fmt, _MOD.scale_dtype
     block = _MOD.block_size
     act_quant = _MOD.act_quant
 
-    # w1 / w3: one act_quant of the token, broadcast to the G expert slots, two grouped GEMMs. The
-    # token is quantized ONCE and its G identical rows are what per-expert `w1(x)` would each
-    # quantize, so row g stays bit-identical to the reference's expert-g call.
+    # w1 / w3: one act_quant of the token, broadcast to the G expert slots, ONE grouped GEMM over the
+    # fused [G, 2*inter, dim] bank. The token is quantized ONCE and its G identical rows are what
+    # per-expert `w1(x)` would each quantize, so row g stays bit-identical to the reference's
+    # expert-g call; the N-split back into gate/up is a view, and cannot move a bit (module doc).
     G = ids.numel()
     xq1, xs1 = act_quant(xv, block, scale_fmt, scale_dtype)
     xq = xq1.expand(G, -1).contiguous()
     xs = xs1.expand(G, -1).contiguous()
-    gate6 = grouped_fp4_gemm(xq, xs, w1, w1_s, scale_dtype)
-    up6 = grouped_fp4_gemm(xq, xs, w3, w3_s, scale_dtype)
+    both = grouped_fp4_gemm(xq, xs, w13, w13_s, scale_dtype)
+    inter = both.size(1) // 2
+    gate6, up6 = both[:, :inter], both[:, inter:]
 
     # SwiGLU-with-clamp + routing weight + cast, batched over experts — the reference's own torch ops
     # (Expert.forward), one row per expert, so bit-identical per row.
@@ -561,14 +685,50 @@ def grouped_forward(self, x, input_ids):
     hq, hs = act_quant(h, block, scale_fmt, scale_dtype)
     out6 = grouped_fp4_gemm(hq, hs, w2, w2_s, scale_dtype)
 
+    # A hash gate can name the same expert twice, and the reference DISCARDS all but that expert's
+    # last slot (module doc). Zeroing the discarded rows reproduces it exactly: they then add +0.0
+    # into the fp32 accumulator, which is not an approximation of skipping them, it IS skipping them.
+    # `where` and NOT a multiply by the mask: the reference never evaluates the discarded slot at all,
+    # so whatever it would have contained must not reach the sum -- and `inf * 0.0` is NaN, which
+    # would poison the token instead of dropping the slot. A select cannot, whatever the row holds.
+    # Top-k routing cannot repeat, so a score-routed layer skips the compare entirely.
+    if self.gate.hash:
+        keep = _keep_last_of_each(ids)[:, None]
+        out6 = torch.where(keep, out6, torch.zeros_like(out6))
+
     # Accumulate in ascending expert id — the reference's loop order — via a device argsort gather and
     # a fixed six-add fold. fp32 add is not associative, so the order is what keeps this bit-exact.
-    out_sorted = out6[torch.argsort(ids)]
+    # `stable=True` so a repeated id (hash layers) has a defined slot order; the discarded slots add
+    # zero either way, so stability is for determinism, not for the equality.
+    out_sorted = out6[torch.argsort(ids, stable=True)]
     y = torch.zeros_like(xv, dtype=torch.float32)
     for slot in range(out_sorted.size(0)):
         y += out_sorted[slot:slot + 1]
     y += self.shared_experts(xv)
+    self._grouped_steps = getattr(self, "_grouped_steps", 0) + 1
     return y.type_as(xv).view(shape)
+
+
+def coverage(module):
+    """Per-MoE grouping coverage under `module`: {layer_id: (grouped steps, {reason: declines})}.
+
+    The answer to "did the lever actually fire, on every layer?" — the question the profile's kernel
+    table could only answer by arithmetic, and the one three levers in a row have got wrong. A layer
+    that never grouped shows 0 grouped steps and the reason it did not; a stage where every layer
+    grouped shows every entry non-zero. Duck-typed like `bank_layout`, so a test can pass a bare MoE
+    or a stand-in and a profiler can pass `stage.layers`.
+
+    READ IT AS "DID THIS LAYER EVER GROUP", NOT AS A STEP COUNT, under CUDA graphs. The counters are
+    host-side python, so a captured region runs them once at capture and never on replay — a graphed
+    stage would report 1 step where it served hundreds. WHICH layers grouped stays exact, and that is
+    the question this exists to answer; the per-step number is only honest eager. (v4_stage runs the
+    real routed MoE eager in both graph modes today, so nothing captures this yet.)"""
+    out = {}
+    for m in module.modules() if hasattr(module, "modules") else [module]:
+        if hasattr(m, "experts") and hasattr(m, "experts_start_idx"):
+            out[getattr(m, "layer_id", len(out))] = (getattr(m, "_grouped_steps", 0),
+                                                     dict(getattr(m, "_grouped_declined", {})))
+    return out
 
 
 def install(mod):
@@ -651,7 +811,10 @@ def build_real_dims_moe(mod, args, seed=0, layer_id=7, bank=False):
             lin.weight.data.copy_(w)
             lin.scale.data.copy_(s)
         moe.gate.weight.data.copy_(rand(args.n_routed_experts, args.dim).to(moe.gate.weight.dtype))
-        moe.gate.bias.data.normal_(0, 0.02)
+        if moe.gate.hash:                        # layer_id < n_hash_layers: an expert-id table, and
+            moe.gate.tid2eid.data.random_(0, args.n_routed_experts)   # its ids may REPEAT
+        else:
+            moe.gate.bias.data.normal_(0, 0.02)
     if bank:
         assert _relayout_moe(moe), "the bank layout must take on a shipped-dims fp4 MoE"
     return moe.eval()
@@ -697,15 +860,27 @@ def _smoke():
     assert bank_moe._grouped_bank, "the bank layout did not take"
     ref_forward = mod.MoE.forward
     install(mod)
-    for t in range(8):
-        x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
-        ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
-        with torch.no_grad():
-            ref = ref_forward(ref_moe, x, ids)
-            got = grouped_forward(bank_moe, x, ids)
-        eq = torch.equal(ref, got)
-        print(f"decode draw {t}  equal={eq}  max|d|={(ref.float() - got.float()).abs().max().item():.3e}")
-        assert eq, "grouped MoE on the bank layout is not bit-exact to the reference"
+    hash_ref = build_real_dims_moe(mod, args, seed=1, layer_id=0)
+    hash_bank = build_real_dims_moe(mod, args, seed=1, layer_id=0, bank=True)
+    # PIN a duplicated routing rather than hoping a random `tid2eid` draws one: at 256 experts and
+    # topk 6 a draw repeats only ~5.7% of the time, so eight random draws miss the duplicate branch
+    # — the branch that needs the kernel to be row-invariant — about 62% of runs. Expert 3 named
+    # three times and 17 twice is the reference discarding three of the six slots.
+    pattern = torch.tensor([3, 3, 17, 3, 200, 17], dtype=torch.int32, device="cuda")
+    with torch.no_grad():
+        for m in (hash_ref, hash_bank):
+            m.gate.tid2eid.data.copy_(pattern.expand_as(m.gate.tid2eid))
+    for tag, (a, b) in (("decode", (ref_moe, bank_moe)), ("hash", (hash_ref, hash_bank))):
+        for t in range(8):
+            x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
+            ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
+            with torch.no_grad():
+                ref = ref_forward(a, x, ids)
+                got = grouped_forward(b, x, ids)
+            eq = torch.equal(ref, got)
+            d = (ref.float() - got.float()).abs().max().item()
+            print(f"{tag} draw {t}  equal={eq}  max|d|={d:.3e}")
+            assert eq, f"grouped MoE ({tag}) on the bank layout is not bit-exact to the reference"
     for t, s in enumerate((2, 5, 17)):
         x = torch.randn(1, s, args.dim, dtype=torch.bfloat16, device="cuda")
         ids = torch.randint(0, args.vocab_size, (1, s), device="cuda")
@@ -715,7 +890,8 @@ def _smoke():
         eq = torch.equal(ref, got)
         print(f"prefill s={s}  equal={eq}  max|d|={(ref.float() - got.float()).abs().max().item():.3e}")
         assert eq, "the s > 1 fallback over banked experts is not bit-exact to the reference"
-    print("bit-exact over 8 decode draws + 3 prefill shapes, on the bank layout")
+    print("bit-exact over 8 score-routed + 8 hash-routed decode draws + 3 prefill shapes, "
+          "on the bank layout")
 
 
 if __name__ == "__main__":
