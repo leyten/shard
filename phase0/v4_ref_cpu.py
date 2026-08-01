@@ -83,6 +83,12 @@ def load_ref():
         mod = importlib.util.module_from_spec(spec)
         sys.modules["dsv4_model"] = mod
         spec.loader.exec_module(mod)
+        # AFTER the exec, unlike the two above: this one replaces a method on a class the exec
+        # created. It strips the 1+k device drains the reference's expert-dispatch loop costs per
+        # layer per decoded token, bit-exactly, and falls back to the reference for every other
+        # shape (V4_MOE_DECODE=0 to A/B it).
+        import v4_moe_decode
+        v4_moe_decode.install(mod)
         _REF = mod
     return _REF
 
