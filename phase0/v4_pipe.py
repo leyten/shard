@@ -1383,7 +1383,7 @@ def _peerid_of(maddr):
 
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
-                     ret_relay=None, dspark=False):
+                     ret_relay=None, dspark=False, cuda_graph=True):
     """The shell command a launcher runs to start ONE v4 engine stage over the sidecar. Fully
     DETACHED in every shape (setsid + fd redirect), mirroring k3_pipe.stage_launch_cmd /
     m25_scatter_pipe.stage_cmd — see the note by the return.
@@ -1401,6 +1401,23 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
       * `ret_relay` — set ONLY on the ingress of a G>1 TAIL box: the loopback 127.0.0.1:<box tail local
                      port> it bridges the coordinator-return to (--ret-relay). Unset everywhere else.
       * `dspark`   — build the tail's MTP speculator stages at load (step 4).
+
+    `cuda_graph` (V4_CUDA_GRAPH) is ON by default because the ring is CPU-launch-bound: the partial
+    island graphs (v4_stage's _BlockGraphs — the hc_pre/hc_post/norm islands, bit-exact per
+    test_v4_stage_graph.py) collapse ~68 of ~240 kernel launches per layer and buy ~+12% steady-state
+    single-stream, which is real money on a dispatch-bound serial pipe. It is OFF in the module
+    default (a bare import, the CPU parity suite, an in-process ring) and turned ON *here*, in the
+    launch path, where it belongs.
+
+    THE COST IS ONE-TIME AND FRONT-LOADED. The first decode token pays a capture cascade — measured
+    ~533s on the first live ring — that is NOT the CUDA-graph capture (microseconds) but the tilelang
+    JIT autotuning + compiling the sparse-attn / fp8 / fp4 kernels at V4's real shapes, triggered the
+    first time each fires inside a capture's warm-up. tilelang memoises those compiled artifacts to
+    its on-disk cache, so the compile half is paid ONCE PER BOX and a re-warm (re-launch on the same
+    still-rented box) reuses them; only a genuinely fresh box pays it again. The graph capture itself
+    is per-process and unavoidable, but it is a fixed first-token tax amortised over the whole
+    generation. A launcher that wants the cold first token faster (e.g. a latency A/B) sets
+    `cuda_graph=False`; a value passed through `extra_env` still wins over this default.
     """
     port = port or ENG_IN
     if nxt_addr is not None:
@@ -1412,6 +1429,9 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     rc = "SHARD_RECEIPTS=1 " if receipts else ""
     tk = f"SHARD_SWARM_TOKEN={token} " if token else ""
     cvd = f"CUDA_VISIBLE_DEVICES={int(gpu)} " if gpu is not None else ""
+    # graphs ON by default for a GPU launch; placed BEFORE extra_env so an explicit override there
+    # (V4_CUDA_GRAPH=0) still wins — bash takes the rightmost assignment of a repeated name.
+    gp = f"V4_CUDA_GRAPH={1 if cuda_graph else 0} "
     # DETACH (K3 ring Bug 1, 2026-07-29): a bare `nohup <cmd> &` over ssh kept the channel open on the
     # engine's child fds and HUNG the launcher, so a parallel launch of all B*G stages never returned
     # the ssh session. setsid + a full fd redirect fully detaches the engine and ssh returns instantly;
@@ -1419,7 +1439,7 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     log = f"/root/v4_stage_{port}.log"
     inner = (f"python3 /root/v4_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
              f"--port {port} {nxt} {rr}{ds}--dir {model_dir} > {log} 2>&1")
-    return (f"{rc}{tk}{cvd}{extra_env}V4_DIR={model_dir} V4_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
+    return (f"{rc}{tk}{cvd}{gp}{extra_env}V4_DIR={model_dir} V4_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
             f"setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 

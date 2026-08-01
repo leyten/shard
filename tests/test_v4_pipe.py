@@ -786,6 +786,19 @@ def test_box_ring_launch_emits_detached_per_gpu_commands():
     assert "--ret-relay" in out["stages"][4]["cmd"], "the tail box ingress bridges the return"
 
 
+def test_launch_defaults_cuda_graph_on_with_an_opt_out():
+    """A GPU ring launch turns the partial island graphs ON by default (the ring is CPU-launch-bound
+    and the graphs are bit-exact, per test_v4_stage_graph.py) while the module default stays OFF for
+    a bare import / the CPU parity suite / an in-process ring. The env is placed BEFORE extra_env, so
+    an explicit V4_CUDA_GRAPH there still wins — bash takes the rightmost assignment of a name."""
+    on = VP.stage_launch_cmd(0, 3, 0, 15)
+    assert "V4_CUDA_GRAPH=1 " in on and on.index("V4_CUDA_GRAPH=1 ") < on.index("V4_DIR=")
+    off = VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph=False)
+    assert "V4_CUDA_GRAPH=0 " in off
+    override = VP.stage_launch_cmd(0, 3, 0, 15, extra_env="V4_CUDA_GRAPH=0 ")
+    assert override.index("V4_CUDA_GRAPH=1 ") < override.index("V4_CUDA_GRAPH=0 ")
+
+
 def test_plan_layer_ranges_names_the_missing_v4_profile():
     """shard/plan.py keys engine profiles by catalog model id and REFUSES an unknown one rather than
     planning V4 at another model's calibration (the admit-then-OOM failure the measured numbers exist
