@@ -731,12 +731,15 @@ class _ScriptedPipeRing:
         self.frames = []                                  # (ids, start_pos, epoch) per step frame seen
         self.fenced = []                                  # the frames the fence dropped
         self.lie = None                                   # force an `acc` divergence
+        self.lazy = False                                 # obey the lazy-draft hint, as a real tail does
+        self.hints = {}                                   # start_pos -> the `dnxt` hint it carried
+        self.dprev = {}                                   # start_pos -> did it carry `dprev`
         self.err = None
         self.thread = threading.Thread(target=self._run, daemon=True)
         self.thread.start()
 
     def _run(self):
-        cfront = mfront = None
+        cfront = mfront = last = None
         epoch = 0
         try:
             while True:
@@ -766,9 +769,16 @@ class _ScriptedPipeRing:
                        "acc": (self.lie if self.lie is not None else acc)}
                 if acc:
                     cfront, mfront = pos, m
-                    blk = self.blocks(pos)
-                    if blk is not None:
-                        out["draft"] = list(blk)
+                    self.hints[pos] = msg.get("dnxt")
+                    self.dprev[pos] = bool(msg.get("dprev"))
+                    # A LAZY TAIL, and it runs the SHIPPED predicate — not a restatement of it — so
+                    # this harness grades v4_dspark_draft.wants_block against the real coordinator,
+                    # `dprev` dereference included (`last` is what this tail returned one frame ago).
+                    if not self.lazy or VP._dspark().wants_block(msg, m, last):
+                        blk = self.blocks(pos)
+                        if blk is not None:
+                            out["draft"] = list(blk)
+                            last = (pos, list(blk))
                 send_msg(self.ret_a, out)
         except (OSError, EOFError) as e:                  # the coordinator closed: the run is over
             self.err = e
@@ -932,6 +942,187 @@ def test_pipelined_needs_a_tail_that_is_actually_drafting():
     try:
         with pytest.raises(RuntimeError, match="carries no `acc`"):
             VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 4, timeout=10)
+    finally:
+        ring.close()
+
+
+# ── 7d. LAZY DRAFTING: the round consumes one block and the eager tail pays for `g` ───────────────
+#
+# Measured on the 6-stage EU ring (grouped MoE, whole-layer graphs, V4_MOE_MULTI): the tail's three
+# layers cost 7.33 ms of its 37.37 ms on-box, a greedy job on the same ring puts lm_head + sampling at
+# ~2.1 ms, and the ~28 ms left is the drafter — on EVERY committed frame, for a round that streams ONE
+# block. The tail is the ring's binding stage; the next slowest is 26.0 ms. These tests hold the
+# lever's two halves: that the eager path really does pay per frame, and that the lazy path stops
+# paying without moving a single token or a single block the round actually consumed.
+
+
+_WRONG_DRAFT = 424242                                     # a token the scripted model never produces
+
+
+def _accept_pattern(r):
+    """Everything a pipelined round did EXCEPT how much drafting the tail was billed for.
+
+    `stale_replies` and `unsent_frames` are summed rather than compared apart: which of the two a
+    fenced frame lands in is a race between the receiver bumping the epoch and the sender thread
+    reaching that frame on the wire, so only their total is a property of the round."""
+    d = {k: r[k] for k in ("tokens", "frames", "drafted", "generated", "accepted", "cancels",
+                           "cycles", "g", "accept_hist", "max_inflight", "mean_inflight")}
+    d["fenced"] = r["stale_replies"] + r["unsent_frames"]
+    return d
+
+
+def test_the_eager_pipelined_round_pays_for_a_block_on_every_committed_frame():
+    """THE HYPOTHESIS, gated. A pipelined round consumes ONE block per cycle and the tail drafts one
+    on every frame it judges committed, so `drafts_issued` tracks the tokens generated while
+    `drafted` tracks the cycles — and the gap between them is drafting the coordinator throws away.
+
+    This is the RED half of the lazy-draft lever: if it ever goes green by itself, the tail stopped
+    drafting per frame and the lever below is measuring nothing."""
+    r, _ = _pipelined(_perfect_block, max_new=12)
+    assert r["lazy"] is False, "the eager path is the default"
+    # One block per COMMITTED FRAME THE ROUND READ: the prefill reply drafts nothing, and the reply
+    # that lands the last token is never read for a block (the run stops on it), so it is exactly
+    # `generated - 2` for a run that ends on max_new.
+    assert r["drafts_issued"] == r["generated"] - 2, \
+        f"the eager tail drafted {r['drafts_issued']} blocks for {r['generated']} tokens — the " \
+        f"waste this lever removes is not there to remove"
+    assert r["drafted"] * 2 <= r["drafts_issued"], \
+        f"{r['drafted']} of {r['drafts_issued']} blocks consumed — too small a gap to be worth a lever"
+
+
+def test_lazy_drafting_emits_the_same_stream_off_a_fraction_of_the_blocks():
+    """THE LEVER. Same coordinator, same scripted tail, same accept pattern — the tail simply does not
+    draft where the hint proves the block would be discarded. Every observable of the round except
+    the number of blocks the tail was billed for must be IDENTICAL, block for block and frame for
+    frame: lazy drafting is allowed to change what the tail computes and nothing else."""
+    eager, _ = _pipelined(_perfect_block, max_new=12)
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    ring.lazy = True
+    try:
+        lazy = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 12,
+                                              timeout=10, lazy=True)
+    finally:
+        ring.close()
+    assert _accept_pattern(lazy) == _accept_pattern(eager), \
+        "lazy drafting moved something other than the drafting"
+    assert lazy["drafts_issued"] < eager["drafts_issued"], \
+        f"nothing was skipped: {lazy['drafts_issued']} blocks, same as eager"
+    # THE OPTIMUM, and the gate that keeps it: a round consumes one block per cycle, so a tail that
+    # drafts exactly `drafted` of them is drafting nothing it does not use. Anything above this is a
+    # frame paying ~28 ms on the real ring for a block the coordinator discards.
+    assert lazy["drafts_issued"] == lazy["drafted"], \
+        f"{lazy['drafts_issued']} blocks issued for {lazy['drafted']} consumed — the tail is still " \
+        f"paying for drafting the round throws away"
+
+
+@pytest.mark.parametrize("bad_at", [5, 6, 8, 11])
+def test_lazy_drafting_still_carries_the_fresh_block_with_the_rejection(bad_at):
+    """THE PROPERTY THAT MAY NOT BE LOST, at every position in the block a rejection can land on.
+
+    The reply that reveals a rejection is the reply the coordinator refills from — it commits the
+    correction and streams `[correction] + block` in the same breath. A lazy tail that skipped the
+    block THERE would drain the pipeline and idle a full ring traversal, which costs more than all
+    the drafting it saves. So the round must cancel the same number of times, consume the same number
+    of blocks and reach the same depth as the eager one, on the same tokens."""
+    def blocks(q):
+        return [(_WRONG_DRAFT if q + 2 + i == bad_at else TRUTH[q + 2 + i]) for i in range(3)]
+
+    eager, _ = _pipelined(blocks, max_new=12)
+    ring = _ScriptedPipeRing(TRUTH, blocks)
+    ring.lazy = True
+    try:
+        lazy = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 12,
+                                              timeout=10, lazy=True)
+    finally:
+        ring.close()
+    assert eager["cancels"] > 0, f"a draft poisoned at {bad_at} never caused a rejection"
+    assert _accept_pattern(lazy) == _accept_pattern(eager), \
+        f"the rejection at {bad_at} did not refill the pipeline the way the eager round does"
+    assert lazy["drafts_issued"] < eager["drafts_issued"], "nothing was skipped even so"
+    assert lazy["drafts_issued"] == lazy["drafted"], \
+        f"a poisoned round drafted {lazy['drafts_issued']} blocks for {lazy['drafted']} consumed"
+
+
+@pytest.mark.parametrize("depth", [2, 3, 4, 16])
+def test_lazy_drafting_holds_at_every_pipeline_depth(depth):
+    """The in-flight cap truncates the block, which moves WHICH frame drains the pipeline — and the
+    hint is derived from the truncated span for exactly that reason. depth=2 leaves one frame behind
+    the frontier (the degenerate case where the frame at the frontier IS the drain)."""
+    eager, _ = _pipelined(_perfect_block, max_new=10, depth=depth)
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    ring.lazy = True
+    try:
+        lazy = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 10,
+                                              timeout=10, depth=depth, lazy=True)
+    finally:
+        ring.close()
+    assert _accept_pattern(lazy) == _accept_pattern(eager), f"depth {depth} diverged"
+    assert lazy["drafts_issued"] == lazy["drafted"], \
+        f"depth {depth}: {lazy['drafts_issued']} blocks issued for {lazy['drafted']} consumed"
+
+
+def test_a_hint_only_ever_names_the_token_actually_streamed_at_the_next_position():
+    """THE PROOF `_hints` STANDS ON, audited against the frames themselves rather than restated.
+
+    A hint is a claim about a DIFFERENT frame — "position p+1 is already decided, and this is what is
+    there" — so a hint that names anything else would have the tail testing acceptance against a token
+    the ring never streamed, and skipping a block on the answer. Every hint the coordinator emitted is
+    checked against the frame that actually arrived at that position, in that epoch."""
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    ring.lazy = True
+    try:
+        r = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 14,
+                                           timeout=10, lazy=True)
+    finally:
+        ring.close()
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 17)]
+    hinted = {p: h for p, h in ring.hints.items() if h is not None}
+    assert hinted, "no frame was hinted at all — the lever never armed"
+    # EVERY FRAME BUT THE DRAIN. `dnxt` covers the ones whose successor is already streamed; `dprev`
+    # covers the one whose successor comes out of the block the drain has not returned yet. What is
+    # left unhinted is the drain itself — whose block the round does consume, which is why
+    # `drafts_issued == drafted` above is the same statement counted from the other end.
+    assert any(ring.dprev.values()), "`dprev` never armed — only half the lever is running"
+    unhinted = [p for p in ring.hints if p not in hinted and not ring.dprev.get(p)]
+    assert len(unhinted) <= r["drafted"] + 1, \
+        f"{len(unhinted)} frames unhinted against {r['drafted']} blocks the round consumed"
+    streamed = {}                                          # position -> the LAST token fed there
+    for ids, p, _ep in ring.frames:
+        streamed[p] = ids[0] if len(ids) == 1 else None
+    for p, h in hinted.items():
+        assert streamed.get(p + 1) == h, \
+            f"the frame at {p} was hinted {h} for position {p + 1}, which was fed " \
+            f"{streamed.get(p + 1)!r}"
+
+
+def test_lazy_drafting_is_off_by_default_and_puts_no_hint_on_the_wire():
+    """Default OFF, and invisible when off: an eager round's frames carry no `dnxt` at all, so a tail
+    of any vintage reads them exactly as it did before the lever existed."""
+    assert VP.V4_LAZY_DRAFT is False, "the lever must ship off"
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    try:
+        VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 8, timeout=10)
+    finally:
+        ring.close()
+    assert ring.hints and set(ring.hints.values()) == {None}, \
+        "the eager path put a lazy-draft hint on the wire"
+    assert not any(ring.dprev.values()), "the eager path put a `dprev` hint on the wire"
+
+
+def test_a_tail_that_skips_a_block_the_round_needed_fails_loudly():
+    """The anti-silence check. A lazy tail whose skip is wrong does not corrupt a token — the round
+    just falls back to feeding the truth one position at a time — so the failure mode is a silent
+    collapse to greedy on a ring that still answers correctly. It must be loud instead."""
+    class _NeverDrafts(_ScriptedPipeRing):
+        def __init__(self, *a, **kw):
+            super().__init__(*a, **kw)
+            self.blocks = lambda q: None                  # answers every frame with no `draft` key
+
+    ring = _NeverDrafts(TRUTH, _perfect_block)
+    try:
+        with pytest.raises(RuntimeError, match="carries no block and this round needs one"):
+            VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 6,
+                                           timeout=10, lazy=True)
     finally:
         ring.close()
 
@@ -1587,6 +1778,11 @@ class _BlockScriptDrafter:
         r = self._inner.on_chunk(msg, st, out) or {}
         if r.get("draft"):
             r = dict(r, draft=list(self.block_for(int(msg["start_pos"]), r["draft"])))
+            # What it PROPOSED is now the substituted block, so the drafter's record of its own last
+            # proposal has to say so — that record is what a `dprev` hint dereferences, and leaving
+            # the real drafter's discarded block there would make this double refuse every one of
+            # them and silently measure the lever with half of it switched off.
+            self._inner._last = (int(msg["start_pos"]), list(r["draft"]))
         return r
 
 
@@ -1672,6 +1868,108 @@ def test_pipelined_cancel_on_a_compression_boundary_is_lossless(tiny, long_ref, 
     assert r["tokens"] == long_ref, f"rewind onto boundary {boundary}: {r['tokens']} != {long_ref}"
     assert r["cancels"] == 1, "the poisoned draft did not cause exactly one rewind"
     assert r["receipts_ok"] is True
+
+
+def _drafter_state(double):
+    """The drafter's ENTIRE persistent state, as bytes: the mtp KV window of every DSpark stage, plus
+    the cursor that says which position it stands on. Nothing else in a DSparkBlock survives a call
+    (v4_dspark_draft's WHY THE MTP CACHE NEVER NEEDS A ROLLBACK)."""
+    t = double._inner.tail
+    return t.pos, [b.attn.kv_cache.clone() for b in t.mtp]
+
+
+def _same_state(a, b):
+    return a[0] == b[0] and len(a[1]) == len(b[1]) and all(torch.equal(x, y) for x, y in zip(a[1], b[1]))
+
+
+@pytest.mark.parametrize("depth", [3, 4, 16])
+def test_lazy_drafting_on_a_real_ring_is_bit_identical_at_every_depth(tiny, long_ref, depth):
+    """LOSSLESSNESS, on real stages over real sockets, at three pipeline depths — the bar every
+    speculative lever in this engine has to clear before anything else about it matters.
+
+    Forced full accept, so the drafting the lever skips is the drafting the eager round threw away
+    (at zero accept every reply is the round's last and there is nothing to skip). The tokens must be
+    the reference Transformer's own greedy stream, and the round must consume exactly as many blocks
+    off exactly as many frames as the eager one."""
+    d, args, _ref = tiny
+    eager = _BlockScriptDrafter(d, _oracle_blocks(long_ref))
+    lazy = _BlockScriptDrafter(d, _oracle_blocks(long_ref))
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", eager)
+            e = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"eager-d{depth}", depth=depth)
+        e_state = _drafter_state(eager)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", lazy)
+            r = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"lazy-d{depth}", depth=depth, lazy=True)
+        r_state = _drafter_state(lazy)
+    finally:
+        ring.close()
+    assert r["tokens"] == long_ref, f"lazy depth {depth}: {r['tokens']} != greedy {long_ref}"
+    assert _accept_pattern(r) == _accept_pattern(e), f"lazy depth {depth} changed the round itself"
+    assert r["receipts_ok"] is True, "a lazy round must still settle its receipts"
+    # THE STATEFUL TRAP. Skipping a block skips a `forward_spec`, and that call is what advances the
+    # mtp KV window — so a drafter that skips must land on the same bytes AND the same cursor as one
+    # that did not. Anything else raises inside `_serve_tail`'s step handler, where there is no
+    # try/except: it would kill the tail and every job the ring runs after it.
+    assert _same_state(r_state, e_state), \
+        f"lazy depth {depth}: the drafter's mtp window/cursor diverged from the eager run's"
+    assert r["drafts_issued"] == r["drafted"] < e["drafts_issued"], \
+        f"lazy depth {depth}: {r['drafts_issued']} blocks issued, {r['drafted']} consumed, " \
+        f"eager paid {e['drafts_issued']}"
+
+
+@pytest.mark.parametrize("boundary", [7, 11])
+def test_lazy_drafting_on_a_real_ring_refills_from_the_rejection(tiny, long_ref, boundary):
+    """THE REJECTION PATH, on real stages: a poisoned draft at a compression boundary, which is where
+    the W-deep rewind has zero margin. The reply that reveals it must still carry a block drafted off
+    the CORRECTED history — the coordinator streams `[correction] + block` in one breath — so the
+    lazy round has to cancel the same number of times, consume the same number of blocks and reach
+    the same depth as the eager one, on the reference's own tokens."""
+    d, args, _ref = tiny
+    eager = _BlockScriptDrafter(d, _oracle_blocks(long_ref, poison_at=(boundary,)))
+    lazy = _BlockScriptDrafter(d, _oracle_blocks(long_ref, poison_at=(boundary,)))
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", eager)
+            e = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"eager-b{boundary}")
+        e_state = _drafter_state(eager)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", lazy)
+            r = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"lazy-b{boundary}", lazy=True)
+        r_state = _drafter_state(lazy)
+    finally:
+        ring.close()
+    assert e["cancels"] == 1, f"the draft poisoned at {boundary} never caused a rewind"
+    assert r["tokens"] == long_ref, f"lazy rewind onto {boundary}: {r['tokens']} != {long_ref}"
+    assert _accept_pattern(r) == _accept_pattern(e), \
+        f"the rejection at {boundary} did not refill the pipeline the way the eager round does"
+    assert _same_state(r_state, e_state), "the drafter's state diverged across a lazy rewind"
+    assert r["drafts_issued"] == r["drafted"] < e["drafts_issued"], \
+        f"a rewinding round drafted {r['drafts_issued']} blocks for {r['drafted']} consumed, " \
+        f"against the eager round's {e['drafts_issued']}"
+    assert r["receipts_ok"] is True
+
+
+def test_lazy_drafting_is_a_noop_in_the_zero_accept_regime(tiny):
+    """The toy model's OWN drafter, which at random weights is wrong essentially every time. Every
+    reply is then the round's last, so there is nothing the hint can license skipping — the lever
+    must cost nothing, change nothing, and above all still emit greedy's stream through a rewind on
+    every single round."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        e = ring.pipelined(list(PROMPT), NEW, nonce="zero-eager")
+        r = ring.pipelined(list(PROMPT), NEW, nonce="zero-lazy", lazy=True)
+    finally:
+        ring.close()
+    assert r["tokens"] == ref == e["tokens"], f"zero-accept lazy ring {r['tokens']} != {ref}"
+    assert _accept_pattern(r) == _accept_pattern(e), "the lever moved a round it cannot help"
+    assert r["cancels"] > 0, "the rejection path never ran"
+    assert r["drafts_issued"] == e["drafts_issued"], \
+        "a round that consumes every block it is given must still be billed for every one"
 
 
 def _drive_pipelined(ring, prompt, steps, *, stale_at=None):
