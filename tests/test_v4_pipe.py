@@ -886,10 +886,10 @@ class _Ring:
                                   receipts=self.receipts, layer_count=self.layer_count,
                                   timeout=60, **kw)
 
-    def dspark(self, prompt, max_new, nonce=None):
+    def dspark(self, prompt, max_new, nonce=None, **kw):
         return VP.coordinate_dspark(self.pipe, self.ret, prompt, max_new, nonce=nonce,
                                     receipts=self.receipts, layer_count=self.layer_count,
-                                    timeout=60)
+                                    timeout=60, **kw)
 
     def close(self):
         try:
@@ -1052,6 +1052,50 @@ def test_full_ring_dspark_matches_reference(tiny):
     assert r["receipts_ok"] is True, "a drafted job must still settle its receipts"
     assert r["rounds"] > 1 and r["drafted"] == r["rounds"] - 1, \
         f"the drafter never proposed a block: {r['rounds']} rounds, {r['drafted']} drafted"
+
+
+def test_conf_send_len_is_a_survival_prefix():
+    """The gate's arithmetic, in isolation: keep the leading run of drafts whose raw confidence stays
+    >= thresh, stop at the first below (once a position is predicted to reject, the rest is moot),
+    floored at min_send and capped at the block. `conf` is a raw score, so this thresholds it
+    directly rather than treating it as a probability."""
+    L = VP._conf_send_len
+    assert L([], 0.0, 1) == 0                                  # round 1: no block, nothing to send
+    assert L([0.9, 0.8, 0.7], -9.9, 1) == 3                   # all above the floor: the whole block
+    assert L([0.9, -0.1, 0.8], 0.0, 1) == 1                   # position 2 predicted to reject: send 1
+    assert L([-0.2, 0.9, 0.9], 0.0, 1) == 1                   # position 1 low but min_send holds it at 1
+    assert L([-0.2, 0.9, 0.9], 0.0, 0) == 0                   # min_send 0: a bare greedy round
+    assert L([0.9, 0.9, 0.9], 9.9, 1) == 1                    # nothing clears a high floor: min_send
+    assert L([0.5, 0.5], 0.5, 1) == 2                         # the floor is inclusive (>=)
+
+
+def test_dspark_confidence_gate_is_lossless_and_adapts_send_length(tiny):
+    """The confidence gate truncates the OFFERED block, never the answer. Run the SAME drafted ring
+    three ways — ungated, gated with an unreachable floor (every block trims to min_send=1), and
+    gated with a floor nothing clears from below (every block sent whole) — and all three must emit
+    the reference's greedy stream. That is losslessness by construction: the tail verifies exactly
+    what it receives, so the send-length is a throughput knob and can never move a token. The `sent`
+    counts prove the knob actually MOVED: trimming sends strictly fewer draft tokens than sending the
+    blocks whole."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    probe = []
+    try:
+        base = ring.dspark(list(PROMPT), NEW)
+        trim = ring.dspark(list(PROMPT), NEW, conf_gate=True, conf_thresh=float("inf"), conf_min=1,
+                           conf_probe=lambda confs, n: probe.append((len(confs), n)))
+        whole = ring.dspark(list(PROMPT), NEW, conf_gate=True, conf_thresh=float("-inf"))
+    finally:
+        ring.close()
+    for name, r in (("ungated", base), ("trimmed", trim), ("whole-block", whole)):
+        assert r["tokens"] == ref, f"{name} dspark stream {r['tokens']} != greedy {ref}"
+    # the floor is unreachable, so every drafted round trimmed to exactly one offered draft
+    assert max(trim["send_hist"], default=0) <= 1 and trim["sent"] == trim["drafted"]
+    # and nothing clears -inf from below, so the whole-block run offered strictly more than the trim
+    assert whole["sent"] > trim["sent"], f"the gate did not vary send-length: {whole['sent']} vs {trim['sent']}"
+    # the probe saw every drafted round's FULL block confidence and its accept count
+    assert probe and len(probe) == trim["drafted"]
+    assert all(clen == args.dspark_block_size and 0 <= n <= clen for clen, n in probe)
 
 
 def test_a_second_dspark_job_on_a_warm_ring_is_a_cold_rings_answer(tiny):

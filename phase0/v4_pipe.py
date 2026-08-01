@@ -1325,8 +1325,54 @@ def coordinate_spec(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, s
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
 
 
+# CONFIDENCE-GATED ADAPTIVE SEND-LENGTH (coordinate_dspark). The DSpark drafter emits a per-position
+# confidence score with every block (`conf`, RingDrafter ships it). On a round the drafter itself
+# expects to lose early, sending the whole block spends chunk positions the ring will compute and
+# throw away; on a round it expects a long run, sending the whole block banks the most tokens per
+# traversal. So this gate TRUNCATES the block the coordinator OFFERS to the confidence-predicted
+# survival prefix. It is LOSSLESS by construction and not by luck: the tail verifies exactly the
+# chunk it receives and both ends run plan_verify_round over the SAME sent drafts, so the committed
+# stream is byte-identical whatever the send-length — the gate can only ever change HOW MANY tokens a
+# round banks, never WHICH. That makes it a pure throughput knob: a mis-set threshold costs
+# acceptance, never a wrong token.
+#
+# THE THRESHOLD NEEDS CALIBRATION AND THE GATE IS OFF UNTIL IT HAS IT. Measured on the CPU reference,
+# `conf` is a RAW score near 0 that goes NEGATIVE — it is the confidence head's logit, not a
+# probability — so there is no universal cutoff and a cumulative-product-of-probabilities rule would
+# be meaningless on it. The rule here is therefore a per-position raw-score floor (keep the leading
+# run whose conf stays >= thresh, stop at the first below — a later low score cannot matter once an
+# earlier position is predicted to reject), and the floor is what an operator calibrates to the REAL
+# model's conf distribution. TODO(calibrate): on a live GPU ring run coordinate_dspark UNGATED with a
+# `conf_probe` and accumulate (conf_i, accepted?) pairs — accepted positions are 0..n-1, the rejected
+# one is n — then set V4_DSPARK_CONF_THRESH to the conf below which P(accept) falls under ~0.5 (or
+# wherever the round-cost/accept trade crosses). Research puts the win at ~+15-25%; that number is a
+# measurement this gate makes reachable, not a promise it keeps on its own.
+V4_DSPARK_CONF_GATE = os.environ.get("V4_DSPARK_CONF_GATE", "0") not in ("", "0")   # OFF until calibrated
+V4_DSPARK_CONF_THRESH = float(os.environ.get("V4_DSPARK_CONF_THRESH", "0") or 0)    # raw-score floor
+V4_DSPARK_CONF_MIN = int(os.environ.get("V4_DSPARK_CONF_MIN", "1") or 1)            # always offer >= this many
+
+
+def _conf_send_len(confs, thresh, min_send):
+    """How many of a drafted block's tokens to SEND this round, from its per-position confidence.
+
+    `confs[i]` is the drafter's raw confidence for draft `i` (see the note above — a logit, can be
+    negative). Keep the longest leading prefix whose conf stays >= `thresh`; stop at the first draft
+    below it (a survival prefix — once a position is predicted to reject, every later one is moot).
+    Floored at `min_send` (0 lets a low-confidence round fall back to a bare greedy step) and capped
+    at the block length. An empty block (round 1) sends 0. Lossless whatever it returns."""
+    if not confs:
+        return 0
+    k = 0
+    for c in confs:
+        if float(c) < thresh:
+            break
+        k += 1
+    return min(len(confs), max(min_send, k))
+
+
 def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None, swarm_id="swarm",
-                      job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None):
+                      job_id="job", layer_count=None, receipts=False, timeout=600.0, on_token=None,
+                      conf_gate=None, conf_thresh=None, conf_min=None, conf_probe=None):
     """DSPARK speculative decode over the fire-forward ring — the headline drafted path.
 
     Same propose->verify->accept->rollback contract coordinate_spec proves, with the proposer moved
@@ -1349,10 +1395,23 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     never took. That is a job-killing bug, not a degradation, and it fails loudly here rather than
     surfacing as quietly worse acceptance forever after.
 
+    CONFIDENCE GATE (see the note above `_conf_send_len`). When armed, the block the coordinator
+    OFFERS each round is truncated to the drafter's own confidence-predicted survival prefix — fewer
+    positions on a round it expects to lose early, the full block on a round it expects a long run.
+    Lossless (the tail verifies only what it receives); off unless `conf_gate` / V4_DSPARK_CONF_GATE
+    says so, because the raw-score threshold has to be calibrated to the real model first. `conf_probe`,
+    if given, is called `conf_probe(confs, n)` each drafted round with the FULL block's confidence and
+    the number accepted — the hook a calibration run records the conf-vs-accept curve through.
+
     Returns coordinate()'s dict plus spec stats {rounds, drafted, generated, accepted, g,
-    accept_hist} — `drafted` being the rounds that carried a real block, which is how a selftest
-    tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"."""
+    accept_hist, sent, send_hist} — `drafted` being the rounds that carried a real block, `sent` the
+    total draft tokens actually offered (< the drafted total when the gate trims), which is how a
+    selftest tells "the drafter proposed nothing" apart from "the drafter proposed and was rejected"
+    and how a bench reads the gate's effect."""
     plan_verify_round = _dspark().plan_verify_round        # ONE accept rule, shared with the tail
+    gate = V4_DSPARK_CONF_GATE if conf_gate is None else bool(conf_gate)
+    thresh = V4_DSPARK_CONF_THRESH if conf_thresh is None else float(conf_thresh)
+    min_send = V4_DSPARK_CONF_MIN if conf_min is None else int(conf_min)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True})
@@ -1376,11 +1435,16 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     if on_token is not None:
         on_token(cur)
 
-    drafts = []                                               # round 1 is the bare [cur] chunk
-    drafted = 0                                               # rounds that actually carried a block
+    block, confs = [], []                                     # round 1 is the bare [cur] chunk (no block)
+    drafted, sent = 0, 0                                       # rounds that carried a block; drafts offered
+    send_hist = {}
     while len(toks) < max_new and cur not in eos:
         rounds += 1
+        # Offer the whole block, or — armed and calibrated — its confidence-predicted survival prefix.
+        drafts = block[:_conf_send_len(confs, thresh, min_send)] if gate else block
         drafted += bool(drafts)
+        sent += len(drafts)
+        send_hist[len(drafts)] = send_hist.get(len(drafts), 0) + 1
         send_msg(pipe, {"op": "step", "ids": [[cur] + drafts], "start_pos": pos})
         rep = recv_msg(ret)
         if "n" not in rep:
@@ -1396,6 +1460,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                 f"history the ring is not taking — one accept rule, and it is plan_verify_round.")
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
+        if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
+            conf_probe(list(confs), n)
         stop = False
         for t in committed:
             toks.append(int(t))
@@ -1407,7 +1473,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                 break
         cur = ids[-1]
         pos = len(ids) - 1                                    # `cur` sits here — the stage rewinds to it
-        drafts = [int(t) for t in (rep.get("draft") or [])]   # the block drafted off what we committed
+        block = [int(t) for t in (rep.get("draft") or [])]    # the block drafted off what we committed
+        confs = [float(c) for c in (rep.get("conf") or [])]   # its per-position confidence (gate input)
         if stop:
             break
 
@@ -1418,7 +1485,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
-            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
+            "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist,
+            "sent": sent, "send_hist": send_hist}
 
 
 # ── layer tiling: consume a V4 profile via plan_ring ───────────────────────────────────────────────
@@ -1961,7 +2029,10 @@ def _coord_cli(a):
                 r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
                                       nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
                                       job_id=job_id, layer_count=layer_count, receipts=a.receipts,
-                                      timeout=a.timeout, on_token=_on_token)
+                                      timeout=a.timeout, on_token=_on_token,
+                                      conf_gate=job.get("confGate"),      # None -> V4_DSPARK_CONF_* env
+                                      conf_thresh=job.get("confThresh"),
+                                      conf_min=job.get("confMin"))
             elif job.get("spec"):                             # coordinator-side drafter (n-gram)
                 r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
                                     nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
