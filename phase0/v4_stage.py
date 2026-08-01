@@ -91,6 +91,29 @@ dev = os.environ.get("V4_DEV", "cuda")
 # (fp8/bf16) and `args.expert_dtype` (fp4) through the module globals below.
 V4_DTYPE = os.environ.get("V4_DTYPE", "bfloat16")
 
+# CUDA graphs over a decode step, opt-in, default OFF (the default path stays byte-identical and the
+# CPU parity suite never touches this). UNLIKE K3, a V4 layer CANNOT be captured whole: three of its
+# pieces bake position or data into a graph and are wrong on replay --
+#   * the attention core writes `kv_cache[:, start_pos % win]` (a ROTATING ring slot), reads a
+#     COMPRESSED region whose valid width GROWS with position, and the Indexer's score einsum runs
+#     over `kv_cache[:, :end_pos // ratio]` (a growing slice); a graph freezes all three at capture.
+#   * the Compressor's `should_compress = (start_pos+1) % ratio == 0` is a per-position PYTHON branch,
+#     and its compressed write slot `kv_cache[:, start_pos // ratio]` grows.
+#   * the MoE picks its experts per token (`indices[0].tolist()` — a host sync even on the decode fast
+#     path), so a captured graph runs ONE token's expert set.
+# So the capture is PARTIAL: it graphs the POSITION- and DATA-INDEPENDENT islands the reference
+# exposes as pure Block methods -- the two `hc_pre` (mix + Sinkhorn), the two `hc_post`, and the two
+# attn/ffn RMSNorms -- and leaves `attn` and `ffn` eager between them (measured: ~68 of ~240
+# launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
+# Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
+# through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
+V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0") not in ("", "0")
+# Every captured graph pins its own workspace pool; cap the set process-wide (3 graphs per layer).
+# Past the cap a layer stays EAGER (counted, never a crash), exactly like K3's K3_GRAPH_MAX.
+V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
+_GRAPH_COUNT = 0        # island graphs captured so far, across every Stage in this process
+_GRAPH_SKIPPED = 0      # island graphs a layer skipped because the cap was hit or a capture failed
+
 _REF = None
 _ARGS = {}
 _WM = {}
@@ -249,7 +272,27 @@ class Stage:
         self._spec_ckpt = None
         self._last_tap = {}
         self._pos = 0
+        self._replaying = False
         self.reset()
+        # One _BlockGraphs per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH).
+        # A stage that cannot graph stays fully eager and says why -- never a silent half-capture.
+        self._block_graphs = None
+        if V4_CUDA_GRAPH:
+            why = self._graph_refusal()
+            if why:
+                print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
+            else:
+                self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
+
+    def _graph_refusal(self):
+        """Why this stage cannot graph its decode islands, or None. Loud and specific, never silent.
+
+        The captured regions are the position- and data-INDEPENDENT Block methods (hc_pre/hc_post/the
+        norms), so unlike K3 there is no growing KV or per-position branch INSIDE a graph to refuse
+        over -- the only hard requirement is a CUDA device to capture on."""
+        if not str(self.device).startswith("cuda"):
+            return f"device is {self.device} (CUDA graphs are a GPU-only capture)"
+        return None
 
     def _owned_modules(self):
         yield self.layers
@@ -369,9 +412,13 @@ class Stage:
             is never re-driven from a replay, so re-recording here would hand it its own history back.
             (The taps are recomputed into a throwaway dict and dropped -- a mean over 4 streams.)
           * NO prefill branch. A replay is by construction at start_pos > 0."""
-        with torch.no_grad():
-            for i in range(h.shape[1]):
-                self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, {})
+        self._replaying = True
+        try:
+            with torch.no_grad():
+                for i in range(h.shape[1]):
+                    self._run(h[:, i:i + 1], ids[:, i:i + 1], start_pos + i, {})
+        finally:
+            self._replaying = False
         self._pos = start_pos + h.shape[1]
 
     def _seek(self, start_pos):
@@ -434,12 +481,23 @@ class Stage:
             return h.unsqueeze(2).repeat(1, 1, self.args.hc_mult, 1)
 
     def _run(self, h, ids, start_pos, taps):
-        """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps."""
-        for li, L in zip(range(self.lo, self.hi), self.layers):
-            h = L(h, start_pos, ids)
+        """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps.
+
+        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its
+        _BlockGraphs when the stage is armed: the graph replays the hc_pre/hc_post/norm islands and
+        runs `attn`/`ffn` eager between them. Prefill, a multi-token chunk, and a rollback replay
+        (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
+        the reference's own decode branch is the thing it is proven against."""
+        bg = self._block_graphs
+        graphed = bg is not None and not self._replaying and start_pos > 0 and h.shape[1] == 1
+        for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
+            h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
             if self._dspark and li in self._tap_ids:
                 taps.setdefault(li, []).append(h.mean(dim=2).detach().clone())
-        return h
+        # A graphed layer's output ALIASES its hc_post graph's static buffer; the last layer's escapes
+        # the stage (onto the wire, or into logits) and must not be overwritten by the next step's
+        # replay. One clone of [1,1,4,dim] per token, only on the graphed path.
+        return h.clone() if graphed else h
 
     def forward(self, h, ids, start_pos):
         """Run this stage's layers. BOTH `h` and `ids` are inputs -- see the module docstring.
@@ -576,7 +634,127 @@ class Stage:
                 f"{self.dtype} on {self.device} pos={self._pos} "
                 f"kernels={v4_kernels_cpu.backend()} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
-                f"spec={'on' if self._spec else 'off'}>")
+                f"spec={'on' if self._spec else 'off'} "
+                f"graph={'on' if self._block_graphs is not None else 'off'}>")
+
+
+# ── partial CUDA graphs over a decode step ─────────────────────────────────────────────────────────
+
+class _Graphlet:
+    """Capture + replay ONE pure, fixed-shape function of tensors -- a hyper-connection or a norm.
+
+    `fn` must be side-effect free and position/data-independent in STRUCTURE: it may read the layer's
+    (constant) parameters by closure and it consumes only the tensors passed to `run`, which arrive
+    through static input buffers, so the same captured kernels produce the right answer for any step's
+    data. The captured outputs are allocated INSIDE the graph and alias its pool -- consume or clone
+    them before the next replay of this same graphlet (the caller does, layer to layer).
+
+    Warm-up runs `fn` three times on a side stream before the capture: a tilelang kernel (the fused
+    hc_split_sinkhorn) autotunes and SYNCS on its first call, and a sync inside a capture is fatal."""
+
+    def __init__(self, fn, examples):
+        global _GRAPH_COUNT
+        self.fn = fn
+        self.ins = tuple(e.clone() for e in examples)          # static input buffers, fixed addresses
+        side = torch.cuda.Stream()
+        side.wait_stream(torch.cuda.current_stream())
+        with torch.cuda.stream(side), torch.no_grad():
+            for _ in range(3):
+                self.fn(*self.ins)
+        torch.cuda.current_stream().wait_stream(side)
+        torch.cuda.synchronize()
+        self.graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(self.graph), torch.no_grad():
+            outs = self.fn(*self.ins)
+        self.outs = outs if isinstance(outs, tuple) else (outs,)
+        torch.cuda.synchronize()
+        _GRAPH_COUNT += 1
+
+    def run(self, *args):
+        for buf, a in zip(self.ins, args):
+            buf.copy_(a)
+        self.graph.replay()
+        return self.outs if len(self.outs) > 1 else self.outs[0]
+
+
+class _BlockGraphs:
+    """The three decode-step island graphs for one Block, with `attn` and `ffn` eager between them.
+
+    A Block's decode forward is, in order:
+        residual = h
+        x, post, comb = hc_pre(h, attn_params);  x = attn_norm(x)      << GRAPH g1
+        x = attn(x, start_pos)                                          << EAGER (rotating KV, sparse)
+        x = hc_post(x, residual, post, comb)
+        residual = x
+        x, post, comb = hc_pre(x, ffn_params);   x = ffn_norm(x)       << GRAPH g2 (with the hc_post)
+        x = ffn(x, ids)                                                 << EAGER (data-routed MoE)
+        x = hc_post(x, residual, post, comb)                           << GRAPH g3
+    g1 ends at the attention input; g2 spans the attn hc_post through the ffn input; g3 is the ffn
+    hc_post. Everything a graph captures is a pure function of its inputs (no start_pos, no KV, no
+    routing) so the shape is a fixed b=1,s=1 and one capture serves every decode position.
+
+    Capture happens ALL AT ONCE on the first decode step, from zero-filled example tensors of the
+    known shapes, BEFORE the real `attn`/`ffn` run -- so a capture that fails leaves the per-stage KV
+    state untouched and the step falls back to a whole-Block eager call with nothing double-advanced."""
+
+    def __init__(self, L, stage):
+        self.L = L
+        self.st = stage
+        self.g = None
+        self.eager = False
+
+    def _g1_fn(self, h):
+        y, post, comb = self.L.hc_pre(h, self.L.hc_attn_fn, self.L.hc_attn_scale, self.L.hc_attn_base)
+        return self.L.attn_norm(y), post, comb
+
+    def _g2_fn(self, attn_out, residual, post_a, comb_a):
+        x2 = self.L.hc_post(attn_out, residual, post_a, comb_a)
+        y, post_f, comb_f = self.L.hc_pre(x2, self.L.hc_ffn_fn, self.L.hc_ffn_scale, self.L.hc_ffn_base)
+        return self.L.ffn_norm(y), x2, post_f, comb_f
+
+    def _g3_fn(self, ffn_out, residual, post_f, comb_f):
+        return self.L.hc_post(ffn_out, residual, post_f, comb_f)
+
+    def _build(self):
+        """Derive every graph's example inputs from a zero hidden state (the island fns are stateless,
+        so running them for shapes touches nothing), then capture all three."""
+        a = self.st.args
+        dt, dev = self.st.dtype, self.st.device
+        h = torch.zeros(1, 1, a.hc_mult, a.dim, dtype=dt, device=dev)
+        with torch.no_grad():
+            attn_in, post_a, comb_a = self._g1_fn(h)
+            attn_out = torch.zeros_like(attn_in)               # attn returns the attn-input's shape
+            ffn_in, x2, post_f, comb_f = self._g2_fn(attn_out, h, post_a, comb_a)
+            ffn_out = torch.zeros_like(ffn_in)                 # ffn returns the ffn-input's shape
+        self.g = (_Graphlet(self._g1_fn, (h,)),
+                  _Graphlet(self._g2_fn, (attn_out, h, post_a, comb_a)),
+                  _Graphlet(self._g3_fn, (ffn_out, x2, post_f, comb_f)))
+
+    def run(self, h, ids, start_pos):
+        """One graphed decode step for this Block, or a whole-Block eager fallback. Never raises."""
+        global _GRAPH_SKIPPED
+        if self.eager:
+            return self.L(h, start_pos, ids)
+        if self.g is None:
+            if _GRAPH_COUNT + 3 > V4_GRAPH_MAX:
+                self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + 3
+                print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
+                      f"{self.L.layer_id} stays eager", flush=True)
+                return self.L(h, start_pos, ids)
+            try:
+                self._build()
+            except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
+                torch.cuda.synchronize()
+                self.eager, self.g, _GRAPH_SKIPPED = True, None, _GRAPH_SKIPPED + 3
+                print(f"[v4] graph capture failed for layer {self.L.layer_id}: "
+                      f"{type(e).__name__}: {e} — layer stays eager", flush=True)
+                return self.L(h, start_pos, ids)
+        g1, g2, g3 = self.g
+        attn_in, post_a, comb_a = g1.run(h)
+        attn_out = self.L.attn(attn_in, start_pos)
+        ffn_in, x2, post_f, comb_f = g2.run(attn_out, h, post_a, comb_a)
+        ffn_out = self.L.ffn(ffn_in, ids)
+        return g3.run(ffn_out, x2, post_f, comb_f)
 
 
 def _selftest(lo, hi, d):
