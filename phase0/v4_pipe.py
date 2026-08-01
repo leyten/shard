@@ -2829,6 +2829,15 @@ def _coord_cli(a):
                                job_id=job_id, layer_count=layer_count, receipts=a.receipts,
                                temp=float(job.get("temperature", 0.0)), timeout=a.timeout,
                                on_token=_on_token)
+            if not audited:
+                # Once, and BEFORE the result is emitted: the coordinator levers are ARGUMENTS to a
+                # loop, so only a completed round turns "requested" into an observed fact
+                # (v4_levers.note). Before this the startup audit could only report what the env
+                # resolved to. Placed ahead of SHARD_JOB_DONE so that under V4_LEVERS_STRICT the job
+                # whose configuration cannot be trusted is reported FATAL rather than reported done
+                # and then contradicted.
+                v4_levers.report(side=v4_levers.COORDINATOR)
+                audited = True
             elapsed = time.time() - state["t0"]
             ngen = len(r["tokens"])
             _emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
@@ -2841,12 +2850,6 @@ def _coord_cli(a):
                   g=r.get("g"), rounds=r.get("rounds"), acceptHist=r.get("accept_hist"),
                   receipts=[wire_receipt(rr) for rr in (r["receipts"] or [])],
                   receiptsOk=r["receipts_ok"], nonce=job.get("nonce"))
-            if not audited:
-                # Once, after the first job: the coordinator levers are ARGUMENTS to a loop, so only
-                # a completed job turns "requested" into an observed fact (v4_levers.note). Before
-                # this the startup audit could only report what the env resolved to.
-                v4_levers.report(side=v4_levers.COORDINATOR)
-                audited = True
         except Exception as e:  # noqa: BLE001
             # Keep the persistent coordinator ALIVE on a single job fault (do not exit): exiting closes
             # the pipe to the head, which disconnects it and cascades the ring down. A fresh reset on
