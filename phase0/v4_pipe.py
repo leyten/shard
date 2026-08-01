@@ -739,29 +739,64 @@ def _warm_until_accept(nxt_sock, period=5.0):
 
 
 def _serve_forward(st, stage, srv, nxt_sock, nxt, head, lo, hi, node_key, receipts, timeout):
-    """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe."""
+    """Head/middle serve loop: process a frame, forward it down the ring, never answer the pipe.
+
+    The HEAD's predecessor IS the coordinator, so it gets a `reaccept` closure: a coordinator that
+    exits (a bench that finished, a restart) must not take the ring down with it — the head re-accepts
+    a reconnecting one and the rest of the ring stays warm behind it (see _forward_loop). A middle
+    stage passes no reaccept: its predecessor is the head, which now survives, so a predecessor loss
+    there is a genuine upstream death and should still cascade."""
     stop_warm = _warm_until_accept(nxt_sock)   # keep the just-dialed forward leg warm through accept-wait
     try:
         conn, queued = _accept_pred(srv, timeout)
     finally:
         stop_warm()                            # stop BEFORE the forward loop touches nxt_sock
     print(f"[s{stage}] predecessor connected", flush=True)
-    _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout)
+    reaccept = (lambda: _accept_pred(srv, timeout)) if head else None
+    _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued, timeout,
+                  reaccept=reaccept)
 
 
 def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, conn, queued,
-                  timeout=600.0):
+                  timeout=600.0, reaccept=None):
     """The head/middle process-and-forward loop over an already-accepted predecessor `conn` (with an
     optional already-read first frame `queued`). Split out of _serve_forward so the box-ingress relay
-    reuses it verbatim for the DOWN direction while a pump thread carries the return UP."""
+    reuses it verbatim for the DOWN direction while a pump thread carries the return UP.
+
+    `reaccept` (head only) makes a predecessor disconnect SURVIVABLE instead of fatal: the head reads
+    only from the coordinator and writes only down the ring, so a lost predecessor is a lost
+    coordinator, and re-accepting one keeps the whole ring warm across a bench exit or a coordinator
+    restart. Left None (middles, the relay ingress) a disconnect re-raises and cascades, which is the
+    right answer for a real upstream death."""
     signer = None
     kw = _KeepWarm(nxt_sock)                                   # cwnd keep-warm on the forward leg (opt-in)
     tag = f"[s{stage}]"
     timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None))
     with torch.no_grad():
         while True:
-            msg = queued if queued is not None else recv_msg(conn)
-            queued = None
+            if queued is not None:
+                msg, queued = queued, None
+            else:
+                try:
+                    msg = recv_msg(conn)
+                except _LEG_ERRORS as e:
+                    if reaccept is None:                       # genuine upstream death: cascade (correct)
+                        raise
+                    # The head's predecessor IS the coordinator. It exited (a finished bench) or is
+                    # restarting; the forward leg to the rest of the ring is still up (kept warm, and
+                    # _fwd_open heals it if it idled out), so DO NOT die — re-accept a reconnecting
+                    # coordinator and keep every stage warm. A reset opens each job, so nothing partial
+                    # survives the gap. This is the head half of surviving a coordinator restart; the
+                    # tail's return channel is the other half (_serve_tail's re-accept thread).
+                    print(f"{tag} coordinator disconnected ({type(e).__name__}); re-accepting "
+                          f"— ring stays warm", flush=True)
+                    try:
+                        conn.close()
+                    except OSError:
+                        pass
+                    conn, queued = reaccept()
+                    print(f"{tag} coordinator reconnected", flush=True)
+                    continue
             op = msg.get("op")
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
@@ -888,15 +923,104 @@ def _tail_drafter(st, ckpt_dir, cache):
     return cache["drafter"]
 
 
+class _RetChannel:
+    """The tail's coordinator-return socket, SWAPPABLE under a lock. The serve loop blocks reading its
+    predecessor, so it cannot itself accept a reconnecting coordinator; a background thread does, and
+    swaps the live socket in here while the loop keeps sending through `send()`. A send to a channel
+    whose coordinator has gone is DROPPED, not fatal — the coordinator that died is not reading it, and
+    the next reset on a freshly accepted channel re-opens the job. One lock, held across the send, so a
+    swap never races a half-written frame onto the wire."""
+
+    def __init__(self, sock):
+        self.sock = sock
+        self.lock = threading.Lock()
+
+    def send(self, msg):
+        with self.lock:
+            try:
+                return send_msg(self.sock, msg)
+            except _LEG_ERRORS:
+                return 0                                       # coordinator gone; the loop keeps serving
+
+    def swap(self, sock):
+        with self.lock:
+            old, self.sock = self.sock, sock
+        return old
+
+    def close(self):
+        with self.lock:
+            sock = self.sock
+        if sock is not None:
+            try:
+                sock.close()
+            except OSError:
+                pass
+
+
+def _tail_return_reaccept(srv, chan, timeout):
+    """Own srv.accept() after bring-up so a coordinator RESTART is survivable. A restarting
+    coordinator re-dials the return channel (hello_return); the tail's serve loop is blocked reading
+    its predecessor and cannot accept it, and without this the coordinator's connect_ring would hang
+    forever waiting on a ret_ok — the ring would be alive but unreachable. This daemon accepts the
+    reconnect, SWAPS it into `chan` FIRST (so by the time the coordinator has its ret_ok, the tail is
+    already answering on the new socket) and only then acks. The predecessor never re-connects here
+    (the upstream stage stays up while the head survives); a stray/scanner frame is dropped."""
+    while True:
+        try:
+            ready, _, _ = select.select([srv], [], [])
+            if srv not in ready:
+                continue
+            conn, _ = srv.accept()
+            conn.setsockopt(*NODELAY)
+            conn.settimeout(timeout)
+        except OSError:
+            return                                             # srv closed on stop/teardown: thread exits
+        try:
+            first = recv_msg(conn)
+        except _STRAY as e:
+            print(f"[tail] dropped stray reconnect: {type(e).__name__}", flush=True)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        if not _is_return_hello(first):
+            print("[tail] dropped non-return reconnect on the tail port", flush=True)
+            try:
+                conn.close()
+            except OSError:
+                pass
+            continue
+        old = chan.swap(conn)                                  # visible BEFORE the coordinator proceeds
+        try:
+            send_msg(conn, "ret_ok")                           # the coordinator's connect_ring blocks on this
+        except _LEG_ERRORS:
+            pass
+        if old is not None:
+            try:
+                old.close()
+            except OSError:
+                pass
+        print("[tail] coordinator-return re-accepted — ring survived a coordinator restart", flush=True)
+
+
 def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
     """Tail serve loop. Accepts BOTH inbound streams (predecessor + coordinator-return) on the one
     engine port, classified by the hello_return greeting, then serves: run the block, collapse the
     hyper-connections, sample, and send the token id back on the return channel.
 
+    The return channel is a swappable `_RetChannel`: a background thread re-accepts a reconnecting
+    coordinator and swaps its socket in, so the ring survives a coordinator restart instead of dying
+    the moment the first coordinator's return socket closes (the tail half of the resilience the head's
+    predecessor re-accept provides).
+
     `ckpt_dir` is set only when the stage was built --dspark: it is where the drafter's `mtp.*` come
     from, and passing it is what makes a drafted ring possible at all."""
     ret, pred, queued = _tail_bringup(srv, timeout)
     print("[tail] predecessor + coord-return connected", flush=True)
+    chan = _RetChannel(ret)
+    threading.Thread(target=_tail_return_reaccept, args=(srv, chan, timeout), daemon=True,
+                     name="v4-tail-reaccept").start()
 
     signer = None
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
@@ -924,7 +1048,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                     # so it would see a stall on this job and on every job after it. The reset ack is
                     # the one channel back, and a non-"ok" ack is already a hard failure there.
                     print(f"[tail] dspark unavailable: {type(e).__name__}: {e}", flush=True)
-                    send_msg(ret, {"ok": False, "error": f"{type(e).__name__}: {e}"})
+                    chan.send({"ok": False, "error": f"{type(e).__name__}: {e}"})
                     continue
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
@@ -932,13 +1056,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 temp = float(msg.get("temp", 0.0))
                 gen = (torch.Generator(device="cpu").manual_seed(int(msg["seed"]))
                        if temp > 0 and msg.get("seed") is not None else None)
-                send_msg(ret, "ok")
+                chan.send("ok")
                 continue
             if op == "receipt":
                 timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
                     msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
-                send_msg(ret, msg.get("receipts", []))
+                chan.send(msg.get("receipts", []))
                 continue
             if op == "step":
                 timer.lap("recv", msg)
@@ -961,17 +1085,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                     out.update(drafter.on_chunk(msg, st, out) or {})
                 timer.sync()
                 timer.lap("draft")
-                timer.lap("send", send_msg(ret, out))
+                timer.lap("send", chan.send(out))
                 timer.frame(h.shape[1])
                 continue
             if op == "stop":
-                try:
-                    send_msg(ret, {"token": None})
-                except OSError:
-                    pass
+                chan.send({"token": None})
                 pred.close()
-                if ret is not None:
-                    ret.close()
+                chan.close()
                 return
             raise RuntimeError(f"tail: unknown op {op!r}")
 
@@ -1789,7 +1909,18 @@ def _encode_prompt(tok, job):
 
 def _coord_cli(a):
     """The node-daemon serving entrypoint (mirrors shard.coordinate): dial the ring, read jobs as
-    JSON lines on stdin, drive decode, and emit the SHARD_JOB_* stdout contract."""
+    JSON lines on stdin, drive decode, and emit the SHARD_JOB_* stdout contract.
+
+    THE PERSISTENT-COORDINATOR PATTERN. This is meant to be a LONG-LIVED process fed a STREAM of job
+    lines and never sent EOF: the node daemon holds it open and writes each job as it arrives, so one
+    warm coordinator serves the ring for its whole lifetime — no reconnect, no re-reset between jobs.
+    A single job's fault keeps it alive (see the except below). And now, crucially, EOF is survivable
+    too: when stdin closes this returns and its sockets drop, but the ring no longer cascades — the
+    head re-accepts a reconnecting coordinator and the tail re-accepts its return channel (see
+    _serve_forward / _serve_tail). So a bench that runs, exits, and re-runs reconnects to the SAME
+    warm ring instead of paying a full ~25min re-warm each time — the biggest iteration-speed win on
+    the V4 path. To stream jobs by hand rather than tear down between them, keep stdin open (e.g. feed
+    a FIFO) rather than piping a here-doc that EOFs after the last line."""
     os.environ.setdefault("V4_DIR", a.dir)
     layer_count = ring_args(a.dir).n_layers                   # same view of the config the stages built
     try:

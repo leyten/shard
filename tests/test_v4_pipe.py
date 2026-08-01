@@ -873,8 +873,9 @@ class _Ring:
             assert e.wait(120), "a stage never came up"
         # the coordinator-return terminates at the tail box INGRESS (the relay), not the global tail
         tail_port = ports[relay_i] if tail_box_g > 1 else ports[-1]
-        self.pipe, self.ret = VP.connect_ring(f"127.0.0.1:{ports[0]}", f"127.0.0.1:{tail_port}",
-                                              timeout=60)
+        self.head_addr = f"127.0.0.1:{ports[0]}"
+        self.tail_addr = f"127.0.0.1:{tail_port}"
+        self.pipe, self.ret = VP.connect_ring(self.head_addr, self.tail_addr, timeout=60)
 
     def coordinate(self, prompt, max_new, nonce=None):
         return VP.coordinate(self.pipe, self.ret, prompt, max_new, nonce=nonce,
@@ -936,6 +937,34 @@ def test_full_ring_receipts_settle_and_c10(tiny):
     verify_coverage(wired, args.n_layers, expected_nonce="settle-nonce-abc", check_chain=True)
     with pytest.raises(ReceiptError, match="nonce"):           # and it binds to THIS job's nonce
         verify_coverage(wired, args.n_layers, expected_nonce="another-nonce", check_chain=True)
+
+
+def test_ring_survives_a_coordinator_disconnect(tiny):
+    """A coordinator that DROPS its sockets — a finished bench, a crash, an EOF, a restart — must not
+    take the warm ring down with it. The head reads only from the coordinator and the tail answers
+    only it, so before this guard the first coordinator's close cascaded the whole ring (a ~25min
+    re-warm per bench, the single biggest iteration tax). Now the head re-accepts a reconnecting
+    coordinator's pipe and the tail's background thread re-accepts its return channel and swaps it in,
+    so a BRAND-NEW coordinator dialed onto the SAME still-running stages decodes the same stream.
+
+    The disconnect is modelled exactly as the real one: the sockets are closed with NO stop op (a
+    stop would tear the ring down on purpose), then connect_ring re-dials the very same head/tail
+    addresses — which is what a re-run bench or a restarted node daemon does."""
+    d, args, ref = tiny
+    ring = _Ring(d, args, [(0, 3), (3, 6), (6, 8)])
+    try:
+        assert ring.coordinate(list(PROMPT), NEW)["tokens"] == ref, "baseline job diverged"
+        # the coordinator vanishes WITHOUT a stop op: just drop both sockets, as a crash/EOF does
+        ring.pipe.close()
+        ring.ret.close()
+        # a fresh coordinator dials the SAME warm ring — head re-accept + tail return re-accept
+        ring.pipe, ring.ret = VP.connect_ring(ring.head_addr, ring.tail_addr, timeout=60)
+        assert ring.coordinate(list(PROMPT), NEW, nonce="after-reconnect")["tokens"] == ref, \
+            "the ring did not survive the coordinator reconnect"
+        # and it is genuinely still warm: a THIRD job on the reconnected coordinator still answers
+        assert ring.coordinate(list(PROMPT), NEW)["tokens"] == ref, "second post-reconnect job diverged"
+    finally:
+        ring.close()
 
 
 def test_fp8_wire_keeps_the_receipt_chain_on_a_real_ring(tiny, monkeypatch):
