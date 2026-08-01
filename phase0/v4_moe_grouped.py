@@ -44,7 +44,8 @@ three things blocking a CUDA-graph capture of the decode layer.
 — does not survive this sm_120 tilelang build: a per-block data-dependent leading index into a
 packed-fp4 bank mis-addresses, uniform eids work but distinct eids collapse every slot onto one
 weight. The torch gather is the working equivalent; it is a handful of extra device launches, still
-no host sync, still CUDA-graph-capturable, still ~8 launches against the reference's ~120.)
+no host sync, still CUDA-graph-capturable, and with w1/w3 fused it is 2 GEMMs + 4 gathers against
+the reference's ~120.)
 
 BIT-EXACT AT s == 1, BY CONSTRUCTION, NOT BY TOLERANCE — the bar is `torch.equal` against the
 reference MoE, and this reaches it the same way `v4_sparse_attn_sm120` reaches it against its
@@ -109,7 +110,8 @@ the reference's `for i in range(...)`. The one thing this leans on that a CPU em
 for free is that the vendored fp4 GEMM is ROW-INVARIANT — the reference runs the duplicated expert as
 a 2-row GEMM and we run it as two 1-row grid blocks — which is true of the tilelang kernel (each
 block computes each output element from its own A row) and NOT true of `torch.matmul`, whose BLAS
-blocking depends on M. See `tests/test_v4_moe_grouped.py::test_hash_duplicate_routing_*`.
+blocking depends on M. See
+`tests/test_v4_moe_grouped.py::test_a_repeated_hash_expert_is_dropped_exactly_as_the_reference_drops_it`.
 
 WEIGHT BANK — THE LOAD-TIME LAYOUT, WHICH IS WHAT LETS THIS RUN ON A FULL STAGE. The per-step gather
 slices the routed experts out of ONE contiguous [n_experts, N, K] fp4 bank (+ its scale bank), not
@@ -432,9 +434,10 @@ def _relayout_moe(moe, preserve=True):
     `preserve=True` keeps the copy, for the caller that has already written the weights (the GPU
     parity harness's standalone layer, `build_real_dims_moe(bank=True)`). Its transient is one whole
     bank, which since the w1/w3 fusion is 32/51 of the layer rather than 16/51 — 2 GiB at the shipped
-    dims. One layer on a card with room can afford that; a full stage is what `preserve=False` exists for. The
-    copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and e8m0 are
-    1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and always present.
+    dims. One layer on a card with room can afford that; a full stage is what `preserve=False` exists
+    for. The copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and
+    e8m0 are 1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and
+    always present.
 
     Declines, leaving the module untouched, when: the experts are not fp4 (the grouped kernel is
     fp4-only, and a bf16 CPU parity model must stay byte-identical), or something already put a bank
@@ -690,7 +693,13 @@ def coverage(module):
     table could only answer by arithmetic, and the one three levers in a row have got wrong. A layer
     that never grouped shows 0 grouped steps and the reason it did not; a stage where every layer
     grouped shows every entry non-zero. Duck-typed like `bank_layout`, so a test can pass a bare MoE
-    or a stand-in and a profiler can pass `stage.layers`."""
+    or a stand-in and a profiler can pass `stage.layers`.
+
+    READ IT AS "DID THIS LAYER EVER GROUP", NOT AS A STEP COUNT, under CUDA graphs. The counters are
+    host-side python, so a captured region runs them once at capture and never on replay — a graphed
+    stage would report 1 step where it served hundreds. WHICH layers grouped stays exact, and that is
+    the question this exists to answer; the per-step number is only honest eager. (v4_stage runs the
+    real routed MoE eager in both graph modes today, so nothing captures this yet.)"""
     out = {}
     for m in module.modules() if hasattr(module, "modules") else [module]:
         if hasattr(m, "experts") and hasattr(m, "experts_start_idx"):
