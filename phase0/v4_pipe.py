@@ -85,6 +85,11 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 import torch  # noqa: E402
 
+# The lever registry (phase0/v4_levers.py). Module scope and UNGUARDED for the same reason v4_stage
+# imports it that way: a process that cannot audit its own levers produces numbers nobody can trust,
+# so a deploy that forgot the file must die in the launch log, not serve.
+import v4_levers  # noqa: E402
+
 try:                                                    # flat box layout (files pushed to /root/) else package
     from transport import send_msg, recv_msg
 except ImportError:
@@ -791,6 +796,11 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
             st.load(ckpt_dir)
     node_key = load_or_make_node_key(key_path) if receipts else None
     print(f"[s{stage}] {st}", flush=True)
+    # THE LEVER AUDIT, here and not later: everything a stage installs is installed by now, and every
+    # number this process is about to produce is about whatever configuration it actually reached.
+    # Requested vs LIVE-observed, per lever, to the log this launch already redirects stderr into.
+    # Raises under V4_LEVERS_STRICT rather than serving a ring whose measurement would be meaningless.
+    v4_levers.report(side=v4_levers.STAGE, stage=st)
 
     srv = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
     srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
@@ -1599,6 +1609,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     gate = V4_DSPARK_CONF_GATE if conf_gate is None else bool(conf_gate)
     thresh = V4_DSPARK_CONF_THRESH if conf_thresh is None else float(conf_thresh)
     min_send = V4_DSPARK_CONF_MIN if conf_min is None else int(conf_min)
+    v4_levers.note("V4_DSPARK_CONF_GATE", gate)          # what the loop RAN with, for the audit
+    v4_levers.note("V4_PIPELINED_SPEC", False)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True,
@@ -1832,6 +1844,12 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     all, and `drafts_issued` what the tail was billed for to achieve it."""
     W = int(depth or V4_SPEC_DEPTH)
     lazy = V4_LAZY_DRAFT if lazy is None else bool(lazy)
+    # A coordinator lever has no rebound method for an audit to inspect -- `lazy` is an ARGUMENT to
+    # this loop -- so the loop states what it ran with and v4_levers reports THAT, not a second read
+    # of the env it already believed. This is the lever that was set on six stages for a night.
+    v4_levers.note("V4_LAZY_DRAFT", lazy)
+    v4_levers.note("V4_SPEC_DEPTH", W)
+    v4_levers.note("V4_PIPELINED_SPEC", True)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True})
@@ -2212,6 +2230,7 @@ ENG_ENV = [
     "V4_KEEPWARM", "V4_KEEPWARM_MS",                                            # transport keep-warm
     "V4_DIAL_CONNECT_TIMEOUT", "V4_DIAL_RETRY_S",                               # inter-stage dial
     "V4_TIMING", "V4_TIMING_EVERY",                                             # instrumentation
+    "V4_LEVERS_STRICT",                                                         # lever audit
 ]
 
 
@@ -2738,7 +2757,13 @@ def _coord_cli(a):
     eos_ids = tuple(eos) if isinstance(eos, (list, tuple)) else ((eos,) if eos is not None else ())
     pipe, ret = connect_ring(a.head, a.tail, timeout=a.timeout, token=SWARM_TOKEN,
                              retry_s=a.connect_retry)
+    # The COORDINATOR-side half of the lever audit, on stderr so the SHARD_JOB_* stdout contract the
+    # node daemon parses stays clean. Its most valuable line is the WRONG PROCESS one: V4_LAZY_DRAFT
+    # and V4_PIPELINED_SPEC are read HERE and nowhere else, and an operator who set them on the
+    # stages instead has, until now, had no signal at all.
+    v4_levers.report(side=v4_levers.COORDINATOR)
     _emit("SHARD_COORD_READY", head=a.head, tail=a.tail, receipts=a.receipts)
+    audited = False
 
     for line in sys.stdin:
         line = line.strip()
@@ -2816,6 +2841,12 @@ def _coord_cli(a):
                   g=r.get("g"), rounds=r.get("rounds"), acceptHist=r.get("accept_hist"),
                   receipts=[wire_receipt(rr) for rr in (r["receipts"] or [])],
                   receiptsOk=r["receipts_ok"], nonce=job.get("nonce"))
+            if not audited:
+                # Once, after the first job: the coordinator levers are ARGUMENTS to a loop, so only
+                # a completed job turns "requested" into an observed fact (v4_levers.note). Before
+                # this the startup audit could only report what the env resolved to.
+                v4_levers.report(side=v4_levers.COORDINATOR)
+                audited = True
         except Exception as e:  # noqa: BLE001
             # Keep the persistent coordinator ALIVE on a single job fault (do not exit): exiting closes
             # the pipe to the head, which disconnects it and cascades the ring down. A fresh reset on
