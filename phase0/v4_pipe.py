@@ -343,14 +343,23 @@ def _recv_hids(msg, signer):
 def _make_step_frame(h, ids, start_pos, signer):
     """Build the forwarded step frame + its receipt out_root digest. fp8-packs h when V4_FP8_WIRE,
     carrying the per-tensor scale as the h8 sidecar; the out digest hashes the packed wire bytes so
-    the next stage's in_root matches losslessly. The ids ride int64 in both modes."""
+    the next stage's in_root matches losslessly. The ids ride int64 in both modes.
+
+    ONE device->host copy, shared. On a GPU stage `h` comes out of the layers on cuda and two
+    separate things want it as host bytes: the receipt digest (`_tbytes` -> .detach().cpu()) and the
+    wire (transport's `_pack_parts` -> .detach().cpu()). Leaving both to find their own way copied
+    the same payload down twice per frame per hop. Landing it once here and handing the SAME CPU
+    tensor to both is byte-identical by construction — they were always hashing and sending the same
+    values, and now they hash and send the same buffer."""
     ids = _ids_tensor(ids)
     if V4_FP8_WIRE:
         qh, sh = _pack_t(h)
+        qh = qh.detach().cpu().contiguous()
         frame = {"op": "step", "h": qh, "h8": sh, "ids": ids, "start_pos": start_pos}
         return frame, (_wire_bytes(qh, ids, sh) if signer is not None else None)
-    frame = {"op": "step", "h": h.contiguous(), "ids": ids, "start_pos": start_pos}
-    return frame, (_payload_bytes(h, ids) if signer is not None else None)
+    hc = h.detach().cpu().contiguous()
+    frame = {"op": "step", "h": hc, "ids": ids, "start_pos": start_pos}
+    return frame, (_payload_bytes(hc, ids) if signer is not None else None)
 
 
 # ── cwnd keep-warm (V4_KEEPWARM): defeat TCP slow-start-after-idle on the forward legs ──────────────
