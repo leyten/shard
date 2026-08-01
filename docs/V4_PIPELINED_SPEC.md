@@ -1,0 +1,247 @@
+# V4 pipelined speculation — the async `coordinate_dspark`
+
+**The highest-ceiling structural lever for the DeepSeek-V4-Flash ring.** Turn the serial, one-chunk
+DSpark round into a *streamed* one: send the drafted block as `B+1` separate `s=1` frames back-to-back
+so the `D=6` pipeline stages fill instead of `5/6` sitting idle, and the per-token replay penalty
+disappears. This is the path from the current ~1.3 tok/s (DSpark ties greedy) to a projected **10–20
+tok/s single-stream**. Designed 2026-08-01. Gated on — and unblocked by — the W-deep speculative
+rollback proven in `phase0/v4_stage.py` (`_spec_ckpts`/`_seek`) and
+`tests/test_v4_stage.py::test_multi_deep_rollback_across_boundaries`.
+
+This document is the design + throughput projection + effort estimate. The correctness proof it depends
+on is already landed and green; see "The gate, and why it is green" below.
+
+---
+
+## 1. The ceiling we are hitting
+
+`coordinate_dspark` today (`phase0/v4_pipe.py:1208`) is a synchronous propose→verify→commit loop:
+
+```
+reset(spec+dspark) → prefill → { send [cur]+drafts as ONE chunk ; WAIT for the reply ;
+                                 accept the matching prefix + 1 correction ; re-open at committed } ...
+```
+
+Two structural costs, both measured by the 7-agent research round, and both a property of *how the
+block moves*, not of the model:
+
+1. **Exactly one speculative chunk is ever in flight, so `5/6` stages are idle.** The round is a single
+   request/reply against the whole `D=6`-stage ring. While stage 3 computes the chunk, stages 1,2 and
+   4,5,6 have nothing to do — the ring's aggregate compute is `~1/D` utilized. The WAN round-trip is
+   serial on top of that.
+
+2. **The block travels as ONE frame and each stage replays it token-by-token** (`v4_stage.py` `forward`,
+   the `start_pos>0 and s>1` branch loops per position — `phase0/v4_stage.py:538-542` region). A
+   `K`-token block costs `K` sequential per-token stage computes *at every stage*. This is the
+   "replay penalty," and it is **why DSpark (1.34 effective tok/s) merely ties greedy (1.43)**: the
+   drafter's `g` is spent paying for the serial replay, so speculation buys nothing.
+
+The lever removes both at once.
+
+## 2. The lever — stream `B+1` `s=1` frames (PipeInfer / FlowSpec)
+
+Instead of one `[cur]+drafts` chunk, stream the block as **separate `s=1` frames, back-to-back,
+without waiting for each reply**:
+
+```
+frame(cur , pos=c)                 → tail computes main_hidden(c), drafts d1..dB locally (MTP), replies {m_c, [d1..dB]}
+frame(d1  , pos=c+1)  ┐
+frame(d2  , pos=c+2)  │  streamed the instant the draft block arrives; ≤W in flight at once
+ ...                  │
+frame(dB  , pos=c+B)  ┘            → tail replies {m_{c+i}} per frame as each clears the ring
+```
+
+Now stage `k` processes token `i` while stage `k-1` processes token `i+1`: the `D` stages fill, and
+every frame is `s=1`, so the per-stage replay loop never runs. This is exactly PipeInfer
+(SC'24, arXiv:2407.11798 — built for high-latency heterogeneous clusters, 2.15× resilient to low
+acceptance) and FlowSpec (2507.02620, distributed) applied to our ring.
+
+**The drafter is unchanged and already speculation-safe.** DeepSeek's MTP (`dspark_block_size=5`,
+`n_mtp_layers=3`, target layers `[40,41,42]`, all tail-owned) predicts a **whole block of 5 tokens from
+one committed `main_hidden`** — locally on the tail, no ring traversal per draft. Crucially,
+`v4_dspark_draft.py` (its `test_cache_never_speculative`) proves the drafter **advances its MTP cache
+only over committed positions and never un-advances it** — "a rejected draft leaves the drafter's state
+untouched by construction." So the async path drafts a block off the committed frontier exactly as the
+sync path does, streams it for verification, and commits the accepted prefix. **No drafter rollback is
+ever needed.** The only thing that had to become multi-deep is the *layer* stage's rollback — because
+now `B+1` frames are in flight when a rejection is detected, not one chunk.
+
+## 3. The gate, and why it is green
+
+The whole lever was blocked on one correctness question, because the speculative rollback rests on an
+invariant with **zero margin** (`phase0/v4_stage.py` `_snapshot` docstring): the compressed KV regions
+(`kv_cache[:, win:]` and `Indexer.kv_cache`) are deliberately **not** snapshotted, on the argument that
+a slot a rejected frame poisoned is *always rewritten before its first read*. Bounded to one chunk
+today, a W-deep rollback crossing a `ratio`-block **compression boundary** could have violated it and
+been silently wrong in plausible numbers.
+
+It does not. The argument is **depth-invariant**, and this is the load-bearing result:
+
+> The read set at position `P` is `[0, (P+1)//ratio)` — a function of `P` alone. Compressed slot `j`
+> enters it **exactly** at `P = q = (j+1)*ratio - 1`, the same position that writes it, for every ratio
+> and at no earlier `P`. A rewind to `r = (last committed + 1)` re-processes every position `≥ r` in
+> order, so a slot poisoned by a rejected frame (necessarily at some `q ≥ r`, since positions `< r`
+> committed) is rewritten at its own `q` **before** that `q` reads it — however many boundaries the `W`
+> rejected frames crossed. The argument is **ratio-agnostic**: proving it at ratio 4 (overlap) and
+> ratio 8 (plain) on the CPU oracle covers the shipped model's ratio-4 / ratio-128 mix.
+
+What the snapshot must carry **fully** for this to hold: the whole window ring **plus both accumulators
+of every compressor, including the Indexer's own** (`kv_state`/`score_state`, all rows). The overlap
+compressor (ratio 4) mutates them at each boundary via the `kv_state[:ratio] = kv_state[ratio:]` shift
+(`model.py:359`); a partial clone would restore a half-shifted ring.
+
+Proven on the CPU oracle (ground truth = sequential decode), all green:
+
+- `test_multi_deep_rollback_across_boundaries` — streams `W` `s=1` frames, rewinds up to `W` deep across
+  several ratio-4 (overlap) and ratio-8 (plain) boundaries, **NaN-poisons** the entire stale compressed region, and
+  matches sequential decode **bit-for-bit** (payload *and* logits at every subsequent step) — including
+  a long-prompt case where the Indexer discriminates (past `index_topk*ratio`) and a rewind **deeper
+  than the window ring**.
+- `test_multi_deep_rollback_mutation_check` — the anti-vacuity proof: dropping **any one** snapshotted
+  region (window / `kv_state` / `score_state` / the Indexer's accumulators) makes the rollback diverge.
+  So the green above is load-bearing, not an accident of harmless numbers.
+- `test_rewind_deeper_than_W_refuses`, `test_commit_drops_settled_checkpoints`, and the split-chain
+  case pin the bounded-`W` refusal, the commit-drop, and per-stage independence.
+
+**Verdict on the gate: GO.** Multi-deep rollback is bit-exact, at any depth `≤ W`, across compression
+boundaries. The lever is safe to build.
+
+## 4. The coordinator state model (async `coordinate_dspark`)
+
+The stage side is done: `forward` already calls `_seek(start_pos)` on entry, and `_seek` is now
+`W`-deep. **A rollback needs no new stage op** — the next frame's `start_pos` *is* the rewind command,
+and the `W`-deep ring lets it reach back across the in-flight frames. What changes is the coordinator:
+it becomes **two cooperating threads over shared, lock-guarded state**, plus an epoch fence.
+
+### State (guarded by one lock)
+
+| field | meaning |
+|---|---|
+| `committed[]`, `c` | committed token ids; `c = len(committed)-1` = committed frontier (absolute pos) |
+| `block[]`, `block_base` | the current draft block from the tail, and the position its first draft sits at |
+| `sent_frontier` | absolute pos of the last frame injected at the head |
+| `inflight` | `sent_frontier - c` — frames sent but not yet judged; **kept `≤ W`** |
+| `epoch` | bumped on every cancel; every frame and reply carries it; stale-epoch replies are dropped |
+
+### Sender thread
+
+```
+after prefill (commits first token, primes MTP window):
+loop:
+    wait until a draft block for the committed frontier is available (from the tail's cur-frame reply)
+    for d,i in block:                      # stream, do not block
+        wait until inflight < W
+        send {op:step, ids:[[d]], start_pos: c+1+i, epoch}
+        sent_frontier = c+1+i ; inflight += 1
+    # block exhausted: idle until the receiver commits/cancels and posts the next block
+```
+
+### Receiver thread — **early inference cancellation**
+
+Replies arrive in position order. For the reply of the frame at position `p` (model greedy token `m_p`,
+the token that should sit at `p+1`):
+
+```
+drop if reply.epoch != epoch                      # fenced: belongs to a cancelled block
+if m_p == token_we_sent_for(p+1):                 # draft accepted
+    commit m_p at p+1 ; c += 1 ; inflight -= 1
+    emit m_p (on_token)
+else:                                             # FIRST mismatch — the truth diverged here
+    commit m_p at p+1 as the correction ; c += 1  # m_p is the model's real token at p+1
+    epoch += 1                                     # fence every still-in-flight frame > p+1
+    inflight = 0
+    post: sender must (a) send the correction frame {ids:[[m_p]], start_pos: c} → each stage
+          _seek(c)s back across the discarded frames automatically, then processes it, and
+          the tail drafts a FRESH block off main_hidden(c); (b) stream that block.
+```
+
+Three things make this correct and bounded:
+
+- **The rollback is implicit and `W`-deep.** When the correction frame arrives at `start_pos = c`, each
+  stage is at `_pos = sent_frontier+1` and `_seek(c)` restores the snapshot taken before position `c`
+  and spends the discarded future. Because every speculative frame pushed a snapshot, and `W ≥` the max
+  in-flight depth (`B+1 ≈ D ≈ 6`; default `V4_SPEC_DEPTH=16`), the snapshot at `c` still exists.
+- **The epoch fence** stops a straggler reply for a discarded frame `> p+1` from being mistaken for an
+  accept. Frames already in the ring when the cancel fires are still *processed* by the stages (their
+  `_seek` undoes them) — that wasted work is the pipeline bubble. The **optimized** variant sends a
+  one-byte `cancel(epoch)` control frame the stages honor by *skipping* queued frames of the fenced
+  epoch before computing them, shrinking the bubble below `D·τ` (this is PipeInfer's "early inference
+  cancellation" proper; the base design is correct without it).
+- **`commit(c)`** is called on the stages as the frontier advances, dropping settled checkpoints so the
+  `W`-ring's clone memory (`≈ (B+1)` × window-ring + both accumulators/compressor) stays bounded.
+
+### Accept rule stays single-sourced
+
+`v4_dspark_draft.plan_verify_round` is still the one accept rule. In the async loop it is applied
+*incrementally* (per streamed reply) rather than per block, but it is the identical comparison —
+"longest draft prefix that matches the model's greedy replies, plus one correction" — so the committed
+stream is byte-identical to greedy, exactly as the sync path is. The tail advances its drafter over the
+committed prefix (`n+1`) the same way; nothing about the drafter's contract changes.
+
+## 5. Throughput projection
+
+Model (PipeInfer's, our variables): committed tokens per rollback cycle `= R+1` where `R = a/(1-a)` is
+the expected accepted run at acceptance rate `a`; cycle time `= (R + D)·τ` — `R+1` frames stream at the
+pipeline's steady `τ`, plus a `~D·τ` bubble to drain the mispredicted tail and refill the pipeline
+(with the fresh block's cur frame). `D = 6`, `τ` = per-token per-stage step time.
+
+```
+tok/s = (R + 1) / ((R + D) · τ)
+```
+
+| `a` | `R` | eager `τ=60ms` | graphed `τ=40ms` | grouped-MoE+graph `τ=26ms` |
+|----:|----:|---------------:|-----------------:|---------------------------:|
+| 0.65 | 1.86 | 6.1 | 9.1  | 14.0 |
+| 0.70 | 2.33 | 6.7 | 10.0 | 15.4 |
+| 0.75 | 3.00 | 7.4 | 11.1 | 17.1 |
+| 0.80 | 4.00 | 8.3 | 12.5 | 19.2 |
+
+For contrast, the **serial** path (one chunk, per-token replay, `K=4`, no stage overlap): at `a=0.7`,
+`~1.9 / 2.8 / 4.3 tok/s` at the same three `τ` — and that *excludes* the WAN round-trip the sync loop
+also pays per round, which is why the measured DSpark sits near 1.3. **The lever is a 3–5× structural
+step even before the WAN round-trip it also removes from the critical path.**
+
+**Landing zone: 10–12.5 tok/s at graphed `τ`, 15–19 tok/s at grouped-MoE+graph `τ`, for `a=0.7–0.8`,
+`D=6` — hitting the 10–20 tok/s single-stream target.**
+
+## 6. Honest caveats (what these numbers assume)
+
+- **Compute must dominate the per-hop wire time.** The model is `1/τ`-bound only if a frame clears one
+  stage (`τ`) faster than it crosses one WAN hop (`L`). On a scattered EU single-5090 ring `L` can rival
+  `τ`; then steady throughput is `1/max(τ, L)` and the fill/drain bubble is `D·(τ+L)`, not `D·τ`.
+  Pipelining *hides* latency for in-flight frames (its whole point, and PipeInfer's resilience result),
+  but the table is a **compute-bound ceiling** and must be confirmed against a real ring's `L`.
+- **`a = 0.65–0.8` is assumed, not measured on our path.** The serial DSpark tying greedy is consistent
+  with the *replay penalty* eating `g`, not necessarily with low `a`; the pipelined path removes that
+  confound, so `a` should reflect the true MTP acceptance — which DeepSeek reports as high but on their
+  own infra. First real-ring measurement of `a` is the single biggest input to these numbers.
+- **`dspark_block_size = 5` caps the per-block run.** `R > 5` (very high `a`) would leave the pipeline
+  under-fed unless we chain-draft the next block off the current block's predicted hidden (continuous /
+  multi-block speculation) — an upside lever that trades compounding acceptance risk for higher
+  utilization, beyond this base projection.
+- **`τ = 26ms` is itself a target**, contingent on the grouped-MoE kernel + CUDA graphs landing on V4;
+  `40ms` graphed is the nearer-term figure and still yields 10–12.5 tok/s.
+
+## 7. Effort estimate
+
+| piece | status / effort |
+|---|---|
+| `W`-deep stage rollback (`_spec_ckpts`, `_seek`, `commit`) | **DONE, proven bit-exact** (this branch) |
+| Drafter rollback | **Not needed** — drafter never persists speculative state (`test_cache_never_speculative`) |
+| Async coordinator (sender + receiver threads, shared state, epoch fence, early-cancel) | **Moderate** — a new `coordinate_dspark_async` beside the sync one; ~a few hundred lines. The hard part (correctness of rollback) is retired; this is transport plumbing + the accept loop moved per-reply. |
+| Stage serve loop | **Minimal** — already processes frames in order and `_seek`s via `forward`; an s=1 frame is its common case. The optional `cancel(epoch)` skip is the only new op, and only for the bubble-shrinking optimization. |
+| Wire protocol | epoch on every frame/reply; the tail's cur-frame reply already carries `draft` (reused). |
+| Real-ring measurement | required before trusting §5 — `a`, `L` vs `τ`, and the achieved `τ`. |
+
+## 8. GO / NO-GO
+
+**GO to build.** The correctness gate — the only thing that could have made this unsafe — is proven
+green: multi-deep rollback is bit-exact across compression boundaries, and the mutation-check shows the
+proof is not vacuous. The drafter needs no rollback. The coordinator rewrite is moderate, well-scoped
+transport work with the risk retired. The projection lands in the 10–20 tok/s target on a compute-bound
+ring.
+
+**The one thing to measure first, on a real warm ring:** whether `τ` dominates the per-hop WAN latency
+`L`. If it does, §5 holds and this is the single highest-ceiling lever on the V4 ring. If `L ≳ τ`,
+throughput is `1/max(τ,L)` and the win is smaller but still removes the replay penalty and the serial
+`5/6`-idle waste — a strict improvement over the current path in every regime.
