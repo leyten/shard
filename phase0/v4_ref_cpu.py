@@ -89,6 +89,12 @@ def load_ref():
         # shape (V4_MOE_DECODE=0 to A/B it).
         import v4_moe_decode
         v4_moe_decode.install(mod)
+        # Same window, same reason: reference-compute "slim" overrides that remove removable per-layer
+        # work (the indexer while context is short; the inplace KV/Q QAT sim). Both behind default-OFF
+        # env flags (V4_REF_SLIM / V4_REF_SLIM_NOQAT), so this is a no-op — reference byte-identical —
+        # unless one is set. See phase0/v4_ref_slim.py.
+        import v4_ref_slim
+        v4_ref_slim.install(mod)
         _REF = mod
     return _REF
 
