@@ -516,6 +516,14 @@ class Stage:
         for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
             h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
             if self._dspark and li in self._tap_ids:
+                # THE TAP MUST STAY OUT HERE, on the Python side of the replay. It is safe today
+                # because a graph spans at most ONE layer, so this runs per step on that layer's fresh
+                # output. Move it inside a captured region -- or let a graph span more than one layer,
+                # so this line falls between two captured layers -- and it becomes m25's stale-EAGLE-aux
+                # bug verbatim (commit e8d2c82): a Python-level side effect inside a graph is recorded
+                # ONCE at capture and skipped by every replay, so the drafter would feed on the
+                # capture step's aux forever, behind valid receipts and entirely plausible numbers.
+                # tests/test_v4_whole_layer.py::test_graph_output_is_fresh_across_positions is the gate.
                 taps.setdefault(li, []).append(h.mean(dim=2).detach().clone())
         # A graphed layer's output ALIASES its hc_post graph's static buffer; the last layer's escapes
         # the stage (onto the wire, or into logits) and must not be overwritten by the next step's

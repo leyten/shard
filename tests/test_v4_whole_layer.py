@@ -94,29 +94,18 @@ def _state_sig(st):
     return sig
 
 
-def _cs_decode(st, R, M, h, ids, start_pos):
-    """One capture-safe decode step through every layer of `st` (the eager `forward`'s cs twin)."""
-    a = st.args
-    pos = torch.tensor([start_pos], dtype=torch.long, device=h.device)
-    x = h
+def _cs_decode(st, R, M, h, ids, start_pos, bgs=None):
+    """One capture-safe decode step through every layer of `st`, WITHOUT a graph.
+
+    Delegates to `WholeBlockGraphs._eager` -- the same object the graph is graded against -- so the
+    bucket decisions, the compress split and the selection are literally the shipped ones rather than
+    a second copy that could drift from them."""
+    if bgs is None:
+        bgs = [WL.WholeBlockGraphs(L, st, moe_mode="eager") for L in st.layers]
     torch.set_grad_enabled(False)
-    for L in st.layers:
-        A = L.attn
-        ratio = A.compress_ratio
-        win_topk = WL.build_win_topk(M, A.window_size, start_pos)
-        if ratio:
-            compress = (start_pos + 1) % ratio == 0
-            if A.indexer is not None:
-                comp_topk = None
-                maxw = A.indexer.kv_cache.size(1)
-                arange = torch.arange(maxw, device=h.device)
-            else:
-                maxw = a.max_seq_len // ratio
-                comp_topk = WL.build_comp_topk(M, ratio, start_pos, A.window_size, maxw)
-                arange = None
-        else:
-            compress, comp_topk, arange = False, None, None
-        x = WL.block_decode_cs(R, L, x, ids, pos, win_topk, comp_topk, arange, compress, WL.real_moe)
+    x = h
+    for bg in bgs:
+        x = bg._eager(x, ids, start_pos)
     return x
 
 
@@ -139,10 +128,11 @@ def _drive_both(steps, **argov):
     for a_, b_ in zip(_state_sig(eager), _state_sig(cs)):
         assert torch.equal(a_, b_), "prefill state diverged before decode even started"
     tok = torch.randint(0, args.vocab_size, (1, 1))
+    bgs = [WL.WholeBlockGraphs(L, cs, moe_mode="eager") for L in cs.layers]
     for i in range(PROMPT, PROMPT + steps):
         h_e = eager.forward(eager.embed(tok), tok, i)
         lg_e = eager.logits_all(h_e, full_logits=False)
-        h_c = _cs_decode(cs, R, M, cs.embed(tok), tok, i)
+        h_c = _cs_decode(cs, R, M, cs.embed(tok), tok, i, bgs)
         cs._pos = i + 1                                  # keep the cs stage's bookkeeping honest
         lg_c = cs.logits_all(h_c, full_logits=False)
         yield i, h_e, h_c, lg_e, lg_c, eager, cs
@@ -227,6 +217,25 @@ def test_fixed_width_selection_matches_reference_selection():
                     f"end_ratio={end_ratio}: tie-free boundary but sets differ {m_valid} vs {r_valid}"
 
 
+def test_bucket_ladder_covers_and_never_truncates():
+    """A bucket must never be SHORTER than what the position needs -- that would silently drop slots.
+
+    The read is narrowed to the bucket, so `bucket >= end_ratio` is the invariant the whole scheme
+    rests on (below it, valid compressed slots would fall outside the einsum and could never be
+    selected). Also checks the ladder is monotone and clamps to the cache, and that a decode only
+    crosses a rung a bounded number of times -- the reason for bucketing over one graph per length."""
+    for maxw in (16, 64, 512, 4096, 16384):
+        seen = set()
+        for need in range(0, maxw + 1):
+            b = WL.bucket_width(need, maxw)
+            assert b >= min(need, maxw), f"bucket {b} < need {need} (maxw {maxw}) — would truncate the read"
+            assert b <= maxw, f"bucket {b} exceeds the cache {maxw}"
+            seen.add(b)
+        assert len(seen) <= len(WL.INDEXER_BUCKETS), \
+            f"maxw={maxw} produced {len(seen)} distinct buckets, more than the ladder has rungs"
+    assert list(WL.INDEXER_BUCKETS) == sorted(WL.INDEXER_BUCKETS), "the ladder must be ascending"
+
+
 def test_selection_is_deterministic_across_widths():
     """The fix's own property: the selection does NOT depend on the array width (what broke topk).
 
@@ -252,12 +261,62 @@ def _ensure_hadamard():
     import importlib.util
     import types
     import v4_kernels_cpu
-    if importlib.util.find_spec("fast_hadamard_transform") is not None:
+    if "fast_hadamard_transform" in sys.modules:
+        return                                  # already present (real, or this shim from an earlier test)
+    try:
+        if importlib.util.find_spec("fast_hadamard_transform") is not None:
+            return
+    except ValueError:                          # a live module with no __spec__
         return
     mod = types.ModuleType("fast_hadamard_transform")
     mod.hadamard_transform = v4_kernels_cpu.hadamard_transform
     mod._v4_cpu_backend = True
     sys.modules["fast_hadamard_transform"] = mod
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs are a GPU-only capture")
+def test_graph_output_is_fresh_across_positions():
+    """FRESHNESS GATE (research/graph_aux_check.py:93): the SAME input at a DIFFERENT position must
+    MOVE the output, and must equal what the eager twin produces at that position.
+
+    This is the cheap insurance against the worst silent failure class here -- a position baked in at
+    capture. A graph that froze `start_pos`, or that replayed a stale static buffer, would return the
+    capture-position answer forever: identical outputs across positions, plausible numbers, valid
+    receipts. m25 shipped exactly that bug once (stale EAGLE aux). Positions are chosen to straddle a
+    bucket rung so a rung crossing is exercised too."""
+    _ensure_hadamard()
+    torch.set_default_device("cuda")
+    try:
+        args = REFCPU.cpu_args()
+        torch.manual_seed(SEED)
+        ids = torch.randint(0, args.vocab_size, (1, PROMPT))
+        st = _stage(REFCPU.build_oracle(args, SEED), args, "cuda", graph=False)
+        st.forward(st.embed(ids), ids, 0)
+        L = next(L for L in st.layers if getattr(L.attn, "indexer", None) is not None)
+        bg = WL.WholeBlockGraphs(L, st, moe_mode="eager")
+        torch.set_grad_enabled(False)
+        x = st.embed(torch.randint(0, args.vocab_size, (1, 1)))
+        tok = torch.randint(0, args.vocab_size, (1, 1))
+        outs, buckets = [], []
+        # 20/40 sit in the first rung (end_ratio <= 16); 71 has end_ratio 18 and lands in the next one,
+        # so the last position is served by a graph captured at a DIFFERENT width.
+        for pos in (PROMPT, PROMPT + 20, 71):
+            snap = [b.clone() for b in WL._layer_state(L)]
+            got = bg.run(x, tok, pos).clone()               # graphed
+            for b, s in zip(WL._layer_state(L), snap):
+                b.copy_(s)
+            want = bg._eager(x, tok, pos).clone()           # the eager twin, same position
+            for b, s in zip(WL._layer_state(L), snap):
+                b.copy_(s)
+            assert torch.equal(got, want), f"TIER-1: graphed != eager twin at pos {pos}"
+            outs.append(got)
+            buckets.append(bg._plan(pos)[0])
+        for j in range(1, len(outs)):
+            assert not torch.equal(outs[0], outs[j]), \
+                f"output did not MOVE from pos {PROMPT} to the {j}th position — position looks baked in"
+        assert len(set(buckets)) > 1, f"all three positions shared bucket {buckets} — rung never crossed"
+    finally:
+        torch.set_default_device("cpu")
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA graphs are a GPU-only capture")
@@ -280,7 +339,11 @@ def test_whole_layer_stage_is_bit_exact_to_eager():
         eager.forward(eager.embed(ids), ids, 0)
         graphed.forward(graphed.embed(ids), ids, 0)
         tok = first
-        for i in range(PROMPT, PROMPT + STEPS):
+        # STEPS_EXACT, not STEPS: the eager Stage runs the VENDORED block, so past the point where the
+        # Indexer really selects this becomes a Tier-2 comparison and the reference's tie-break is in
+        # play. Inside the unambiguous regime it is a true end-to-end bit-exactness bar on the whole
+        # stage; the strict Tier-1 gate (graphed == the capture-safe twin) is the freshness test above.
+        for i in range(PROMPT, PROMPT + STEPS_EXACT):
             h_e = eager.forward(eager.embed(tok), tok, i)
             h_g = graphed.forward(graphed.embed(tok), tok, i)
             lg_e = eager.logits_all(h_e, full_logits=False)

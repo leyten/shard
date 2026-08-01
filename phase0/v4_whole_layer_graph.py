@@ -24,19 +24,25 @@ kernels on the same bytes -- bit-exact, not reassociation-drifted. The three fix
      buffer, and every `kv_cache[:, slot] = v` becomes `index_copy_(1, slot, v)` -- the same store to
      the same byte, chosen at REPLAY time from the copied-in position instead of frozen at capture.
 
-  #2 FIXED MAX-WIDTH + MASK.  The Indexer's einsum reads the WHOLE `kv_cache` (a fixed [., MAXW, .])
-     and masks scores at positions >= end_pos//ratio to -inf; its selection takes a FIXED k =
-     index_topk and maps any pick that landed on a masked (future) slot to -1. sparse_attn already
-     treats a -1 index as "no position" (v4_sparse_attn_sm120.py: it zeroes that KV row and pushes the
-     score to -inf, contributing to neither numerator nor denominator), so the -1 padding is exactly a
-     no-op -- the extra -inf blocks of the online softmax rescale by exp(0)=1 and add 0 -- and the
-     SCORES over the valid columns come out bit-identical to the reference's narrow einsum (measured:
-     max|narrow - wide| = 0.0). The ONE place this is not a free rewrite is the tie-break: the
-     reference's `topk` resolves EXACT ties (relu_ floors negatives to a hard 0.0, so they are common)
-     by an artifact of its partition that varies with array width AND CPU thread count, so it is not
-     reproducible even against itself. This selects by a STABLE sort -- (score DESC, index ASC) -- which
-     is deterministic everywhere and agrees with the reference on every tie-free selection; see the
-     `_indexer_decode_cs` comment and the `ties` risk in the receipt. The window/compress index LISTS
+  #2 BUCKETED WIDTH + MASK + A STABLE TIE-BREAK.  The Indexer's einsum reads a BUCKET of `kv_cache`
+     (m25_stage.py's DECODE_BUCKETS discipline: round the read up to a rung, one graph per rung,
+     capture a new one when a rung is crossed) and masks scores at positions >= end_pos//ratio to
+     -inf; its selection takes a FIXED k = index_topk and maps any pick that landed on a masked
+     (future) slot to -1. sparse_attn already treats a -1 index as "no position"
+     (v4_sparse_attn_sm120.py: it zeroes that KV row and pushes the score to -inf, contributing to
+     neither numerator nor denominator), so the -1 padding is exactly a no-op -- the extra -inf blocks
+     of the online softmax rescale by exp(0)=1 and add 0 -- and the SCORES over the valid columns come
+     out bit-identical to the reference's narrow einsum (measured: max|narrow - wide| = 0.0).
+     THE SELECTION IS A STABLE SORT, NOT A TOPK, AND THAT IS LOAD-BEARING. v4_stage's `_chunk_indexer`
+     already records why for the chunked path: "Masking a common-width score to fake the shorter reads
+     would change which slots a topk near-tie picks". `relu_()` floors every negative score to a hard
+     0.0, so ties are everywhere, and torch.topk breaks them by an artifact of its partition that
+     varies with array WIDTH and with CPU THREAD COUNT -- the reference is not even reproducible
+     against itself. Selecting by (score DESC, index ASC) is width-independent, so a bucket crossing is
+     invisible and the answer does not depend on capture history. It agrees with the reference on
+     every tie-free selection and may pick a different column of IDENTICAL score otherwise: a NAMED,
+     bounded Tier-2 divergence (see the grading note below and the receipt's `ties` risk).
+     The window/compress index LISTS
      (get_window_topk_idxs / get_compress_topk_idxs) are the reference's own, built eagerly per step
      into a static buffer and copied in before replay: they are a handful of tiny launches, not the
      GEMM-and-attention bulk the graph is for, and building them in-graph would mean transcribing
@@ -58,8 +64,25 @@ grouped-fp4-MoE kernel (phase0/v4_moe_grouped.py) is what makes it capture-safe.
 `moe_mode="stub"` runs a FIXED expert set (shared + a constant routed pair, the real decode
 activation count) so the WHOLE-LAYER graph mechanism and its timing are provable end to end, and
 `moe_mode="eager"` graphs attn+islands and leaves the real routed MoE eager between two graphs -- the
-honest intermediate. Neither stub number is passed off as the routed model's; the bit-exact bar is the
-attention core (proven vs the reference) and the graph composition (proven vs the same eager stub).
+honest intermediate. Neither stub number is passed off as the routed model's.
+
+HOW THIS IS GRADED (m25's two-tier bar, research/graph_aux_check.py -- the bar its CUDA graphs, the
+single biggest M2.5 win at +74%, actually shipped under):
+
+  TIER 1, HARD, torch.equal:   graphed == the EAGER TWIN (`WholeBlockGraphs._eager`) -- same math, same
+      bucket decisions, no capture. This is the real capture-correctness proof: a graph replays the
+      same kernels on the same bytes, so it has no licence to differ by one ulp, and every failure
+      mode this module can have (a position baked at capture, a stale static buffer, a state write
+      double-applied) shows up here.
+  TIER 2, NAMED + BOUNDED:     vs the VENDORED reference -- bit-exact wherever the Indexer's selection
+      is unambiguous, and otherwise divergent only by which member of an EXACT score tie is attended
+      (never a lower-scoring column; proven on the selection function). Token-identity against the
+      reference is not a bar the reference can meet: its topk tie-break is not reproducible against
+      itself across array widths or OMP_NUM_THREADS.
+  FRESHNESS GATE:              the same input at a DIFFERENT position must MOVE the output. Cheapest
+      insurance against the worst silent failure here -- position baked in at capture -- which m25 was
+      actually bitten by (stale EAGLE aux, a Python side-effect inside the captured region that
+      replay() skipped, so the drafter fed on prefill aux forever behind valid receipts).
 """
 import os
 import sys
@@ -67,6 +90,27 @@ import sys
 import torch
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# The Indexer's read length `end_pos // ratio` GROWS every `ratio` positions, so a graph cannot bake
+# it and reading the whole `max_seq_len // ratio` at every position pays full-context cost from token
+# one. m25_stage.py's answer (DECODE_BUCKETS, :208) is the one used here: round the read up to a rung,
+# capture a graph per rung, and cross a rung by capturing a NEW graph -- so the count is a priori
+# bounded by the ladder, not by the sequence length. x4 rungs, and the small ones are real: a decode
+# that has only compressed 20 slots should read 64, not 16384.
+INDEXER_BUCKETS = (16, 64, 256, 1024, 4096, 16384, 65536)
+# Every captured graph pins its own workspace; cap the set process-wide exactly like v4_stage's island
+# graphs and m25's M25_GRAPH_MAX. Past the cap a layer stays EAGER -- counted and logged, never a crash.
+V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
+_GRAPH_COUNT = 0        # whole-layer graphs captured so far, across every Stage in this process
+_GRAPH_SKIPPED = 0      # captures a layer skipped because the cap was hit or a capture failed
+
+
+def bucket_width(need, maxw):
+    """Smallest INDEXER_BUCKETS rung >= `need`, clamped to `maxw`. m25_stage._bucket, per-cache."""
+    for b in INDEXER_BUCKETS:
+        if b >= need:
+            return min(b, maxw)
+    return maxw
 
 
 # ── the reference's kernels and globals, resolved once ───────────────────────────────────────────
@@ -154,7 +198,7 @@ def _compressor_decode_cs(R, C, x, pos, compress):
     C.kv_cache.narrow(0, 0, 1).index_copy_(1, comp_slot, kv)
 
 
-def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_maxw, compress):
+def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_w, compress, read_w):
     """Indexer.forward's decode branch with the GROWING read/topk made fixed-width + masked.
 
     Reference (start_pos>0): scores q against `kv_cache[:, :end_pos//ratio]`, `topk(min(index_topk,
@@ -174,20 +218,31 @@ def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_ma
     R.fp4_act_quant(q, R.fp4_block_size, True)
     _compressor_decode_cs(R, I.compressor, x, pos, compress)
     weights = I.weights_proj(x) * (I.softmax_scale * I.n_heads ** -0.5)
-    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1))
+    # BUCKETED read, not the whole cache: `read_w` is a host-side rung >= this position's end_ratio,
+    # fixed for the graph that captured it (see INDEXER_BUCKETS). Columns in [end_ratio, read_w) hold
+    # slots this position may not see yet and are masked out below.
+    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1).narrow(1, 0, read_w))
     index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-    return select_compress_topk(index_score, end_ratio, index_topk, offset, arange_maxw)
+    return select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w)
 
 
-def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_maxw):
-    """Fixed-width masked selection of the compressed slots to attend: the #2 rewrite, in one place.
+def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w):
+    """Bucket-width masked selection of the compressed slots to attend: the #2 rewrite, in one place.
 
     Reference (Indexer.forward, decode): `index_score[..., :end_pos//ratio].topk(min(index_topk,
     end_pos//ratio))[1] + offset` -- a GROWING read width and a GROWING k, neither capturable. Here the
-    scores arrive at a FIXED max width, columns past `end_ratio` are masked to -inf, k is the fixed
-    `index_topk`, and any pick that lands on a masked (future) column becomes -1, which sparse_attn
-    treats as "no position". Tested directly in tests/test_v4_whole_layer.py."""
-    valid = (arange_maxw < end_ratio).view(1, 1, -1)
+    scores arrive at a BUCKET width >= end_ratio, columns past `end_ratio` are masked to -inf, k is the
+    fixed `index_topk`, and any pick that lands on a masked (future) column becomes -1, which
+    sparse_attn treats as "no position".
+
+    THE STABLE SORT IS WHAT MAKES BUCKETING LEGAL, and that is the whole reason it is here rather than
+    a `topk`. v4_stage's own `_chunk_indexer` says it for the chunked path: "Masking a common-width
+    score to fake the shorter reads would change which slots a topk near-tie picks" -- torch.topk's
+    tie-break is an artifact of its partition, so with topk the answer would depend on WHICH BUCKET a
+    position happened to land in, i.e. on capture history. Selecting by (score DESC, index ASC) is
+    width-independent by construction, so a position gets the same slots at bucket 64 as at 16384 and
+    a rung crossing is invisible. Proven in tests/test_v4_whole_layer.py."""
+    valid = (arange_w < end_ratio).view(1, 1, -1)
     index_score = index_score.masked_fill(~valid, float("-inf"))
     # DETERMINISTIC selection: top-k by (score DESC, column index ASC), via a STABLE sort.
     #
@@ -211,7 +266,7 @@ def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_maxw
     return topk_idxs.int()
 
 
-def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_maxw, compress):
+def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_w, compress, read_w):
     """Attention.forward's decode branch (start_pos>0, seqlen==1), capture-safe. Bit-exact vs eager.
 
     `x` is the attn_norm output (the reference passes exactly this to wq_a/wkv/compressor/indexer).
@@ -237,7 +292,7 @@ def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_maxw, compress):
         end_ratio = (pos + 1) // ratio
         if A.indexer is not None:
             compress_topk_idxs = _indexer_decode_cs(R, A.indexer, x, qr, pos, end_ratio, freqs_row,
-                                                    win, arange_maxw, compress)
+                                                    win, arange_w, compress, read_w)
         else:
             compress_topk_idxs = comp_topk
         topk_idxs = torch.cat([topk_idxs, compress_topk_idxs], dim=-1)
@@ -287,7 +342,7 @@ def real_moe(L, x, ids):
 
 # ── a whole decode block, capture-safe, from static buffers ─────────────────────────────────────────
 
-def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_maxw, compress):
+def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress, read_w):
     """Block.forward up to the MoE input: hc_pre/attn_norm, attention, hc_post, hc_pre/ffn_norm.
 
     Returns (ffn_in, residual, post, comb) -- everything the MoE and the trailing hc_post consume. The
@@ -296,7 +351,7 @@ def block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_maxw, compress):
     residual = h
     x, post, comb = L.hc_pre(h, L.hc_attn_fn, L.hc_attn_scale, L.hc_attn_base)
     x = L.attn_norm(x)
-    x = attn_decode_cs(R, L.attn, x, pos, win_topk, comp_topk, arange_maxw, compress)
+    x = attn_decode_cs(R, L.attn, x, pos, win_topk, comp_topk, arange_w, compress, read_w)
     x = L.hc_post(x, residual, post, comb)
     residual = x
     x, post, comb = L.hc_pre(x, L.hc_ffn_fn, L.hc_ffn_scale, L.hc_ffn_base)
@@ -309,14 +364,15 @@ def block_post_cs(L, ffn_out, residual, post, comb):
     return L.hc_post(ffn_out, residual, post, comb)
 
 
-def block_decode_cs(R, L, h, ids, pos, win_topk, comp_topk, arange_maxw, compress, moe):
+def block_decode_cs(R, L, h, ids, pos, win_topk, comp_topk, arange_w, compress, moe, read_w):
     """One Block's decode step, capture-safe -- Block.forward with attn_decode_cs and a chosen MoE.
 
     Same structure as model.py Block.forward: hc_pre/attn_norm, attention, hc_post, hc_pre/ffn_norm,
     ffn, hc_post. `moe(L, x, ids)` is real_moe for the parity oracle (bit-exact vs the reference block)
     or moe_stub for a graph-safe whole-layer capture. Everything is a pure function of (h, pos, the two
     topk buffers) plus the layer's constant parameters and its per-stage KV/compressor state."""
-    ffn_in, residual, post, comb = block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_maxw, compress)
+    ffn_in, residual, post, comb = block_pre_cs(R, L, h, pos, win_topk, comp_topk, arange_w, compress,
+                                                read_w)
     ffn_out = moe(L, ffn_in, ids)
     return block_post_cs(L, ffn_out, residual, post, comb)
 
@@ -390,211 +446,208 @@ class WholeBlockGraphs:
         self.has_indexer = bool(self.ratio) and L.attn.indexer is not None
         self.moe = moe_stub if moe_mode == "stub" else real_moe
         self.eager = False
-        self.built = False
-        # static input buffers (fixed addresses; copied into before every replay)
+        # The compressed cache this layer reads, and therefore what a bucket is clamped to.
+        if self.has_indexer:
+            self.maxw = L.attn.indexer.kv_cache.size(1)
+        elif self.ratio:
+            self.maxw = self.a.max_seq_len // self.ratio
+        else:
+            self.maxw = 0
+        # static input buffers, shape-independent of the bucket (fixed addresses, copied into per replay)
         self.h_buf = torch.zeros(1, 1, self.a.hc_mult, self.a.dim, dtype=self.dt, device=self.dev)
         self.pos_buf = torch.zeros(1, dtype=torch.long, device=self.dev)
         self.ids_buf = torch.zeros(1, 1, dtype=torch.long, device=self.dev)
         self.win_topk_buf = torch.zeros(1, 1, self.win, dtype=torch.int32, device=self.dev)
-        if self.ratio and not self.has_indexer:
-            self.maxw_c = self.a.max_seq_len // self.ratio
-            self.comp_topk_buf = torch.full((1, 1, self.maxw_c), -1, dtype=torch.int32, device=self.dev)
-        else:
-            self.maxw_c = 0
-            self.comp_topk_buf = None
-        self.arange = (torch.arange(L.attn.indexer.kv_cache.size(1), device=self.dev)
-                       if self.has_indexer else None)
-        self._graphs = {}     # compress(bool) -> dict of graph+static-io for this variant
-        self._pool = None     # one shared graph memory pool across variants
+        self._bufs = {}       # bucket -> (comp_topk_buf | None, arange | None), allocated per rung
+        self._graphs = {}     # (bucket, compress) -> graph + static io
+        self._pool = None     # one shared graph memory pool across every variant
+        self.ho = self.ffn_out_buf = self.g_post = None
+
+    # -- per-step shape decisions, all HOST-side before a replay --
+
+    def _plan(self, start_pos):
+        """(bucket, compress) for this position -- the graph key. Both are host-known from start_pos."""
+        if not self.ratio:
+            return 0, False
+        end_ratio = (start_pos + 1) // self.ratio
+        return bucket_width(end_ratio, self.maxw), (start_pos + 1) % self.ratio == 0
+
+    def _bufs_for(self, bucket):
+        """The bucket-shaped static buffers: the compress index list and the mask's arange."""
+        if bucket not in self._bufs:
+            comp = (torch.full((1, 1, bucket), -1, dtype=torch.int32, device=self.dev)
+                    if self.ratio and not self.has_indexer else None)
+            ar = torch.arange(bucket, device=self.dev) if self.has_indexer else None
+            self._bufs[bucket] = (comp, ar)
+        return self._bufs[bucket]
 
     # -- the captured function(s) --
 
-    def _block(self, compress):
-        """block_decode_cs on THIS layer's static buffers, for a compress flag. The capture target."""
+    def _block(self, compress, bucket):
+        """block_decode_cs on THIS layer's static buffers, at this bucket. The capture target."""
+        comp, ar = self._bufs_for(bucket)
         return block_decode_cs(self.R, self.L, self.h_buf, self.ids_buf, self.pos_buf,
-                               self.win_topk_buf, self.comp_topk_buf, self.arange, compress, self.moe)
+                               self.win_topk_buf, comp, ar, compress, self.moe, bucket)
 
-    def _capture_pos(self, compress):
-        """A valid representative decode position to capture this variant at.
+    def _pre(self, compress, bucket):
+        comp, ar = self._bufs_for(bucket)
+        return block_pre_cs(self.R, self.L, self.h_buf, self.pos_buf, self.win_topk_buf,
+                            comp, ar, compress, bucket)
 
-        The graph is position-generic (pos enters through pos_buf, read at replay), so capture only
-        needs an in-bounds position -- but the two variants have different in-bounds sets: the compress
-        branch reads `freqs_cis[pos+1-ratio]`, so its position must be a real compress step
-        (pos+1 divisible by ratio) AND >= ratio-1, which is exactly the set of positions it is ever
-        replayed at. The no-compress branch never touches that row, so any decode pos works; win keeps
-        it in the window's steady state and away from a compress boundary."""
-        if compress:
-            return 2 * self.ratio - 1                      # (2r) % r == 0 and 2r-1 >= r-1
-        p = max(1, self.win)
-        if self.ratio and (p + 1) % self.ratio == 0:
-            p += 1
+    def _capture_pos(self, compress, bucket):
+        """A representative decode position to capture this (bucket, compress) variant at.
+
+        The graph is position-generic (pos enters through pos_buf and is read at replay), so capture
+        only needs a position that is IN BOUNDS for this variant:
+          * the compress branch reads `freqs_cis[pos+1-ratio]`, so pos+1 must be divisible by ratio and
+            pos >= ratio-1 -- exactly the positions it is ever replayed at;
+          * end_ratio must fit the bucket, since the read is narrowed to it.
+        Picks the largest position this bucket owns, so the capture exercises the widest mask it will
+        ever see rather than an all-masked degenerate one."""
+        if not self.ratio:
+            return max(1, self.win)
+        top = min(bucket, self.maxw)                       # the largest end_ratio this bucket serves
+        p = top * self.ratio - 1                           # (p+1)//ratio == top, and (p+1) % ratio == 0
+        if not compress:
+            p = max(p - 1, 1)                              # one step earlier is a non-compress step
+            if (p + 1) % self.ratio == 0:
+                p = max(p - 1, 1)
         return p
 
-    def _feed_capture(self, compress):
-        """Set the static buffers to a valid representative step for capturing `compress`'s variant."""
-        p = self._capture_pos(compress)
+    def _feed_capture(self, compress, bucket):
+        """Point the static buffers at a valid representative step for capturing this variant."""
+        p = self._capture_pos(compress, bucket)
         self.pos_buf.fill_(p)
         self.win_topk_buf.copy_(build_win_topk(self.R.M, self.win, p))
-        if self.comp_topk_buf is not None:
-            self.comp_topk_buf.copy_(build_comp_topk(self.R.M, self.ratio, p, self.win, self.maxw_c))
+        comp, _ = self._bufs_for(bucket)
+        if comp is not None:
+            comp.copy_(build_comp_topk(self.R.M, self.ratio, p, self.win, bucket))
 
-    def _capture_one(self, compress):
-        """Warm up (JIT the tilelang kernels), snapshot state, capture, restore. Never executes state."""
-        self._feed_capture(compress)
-        snap = [b.clone() for b in _layer_state(self.L)]
+    def _warm_and_capture(self, fn, restore=True):
+        """Warm up on a side stream (tilelang JITs and SYNCS on first call), then capture.
+
+        The warm-up EXECUTES, so it advances the layer's KV/compressor state; it is bracketed by a
+        snapshot/restore because real decode must start from the prefill state, never from a throwaway
+        capture-position step. A capture itself runs nothing."""
+        global _GRAPH_COUNT
+        snap = [b.clone() for b in _layer_state(self.L)] if restore else None
         side = torch.cuda.Stream()
         side.wait_stream(torch.cuda.current_stream())
         with torch.cuda.stream(side), torch.no_grad():
             for _ in range(3):
-                self._block(compress)
+                fn()
         torch.cuda.current_stream().wait_stream(side)
         torch.cuda.synchronize()
-        for b, s in zip(_layer_state(self.L), snap):
-            b.copy_(s)
+        if restore:
+            for b, s in zip(_layer_state(self.L), snap):
+                b.copy_(s)
         g = torch.cuda.CUDAGraph()
         with torch.cuda.graph(g, pool=self._pool), torch.no_grad():
-            out = self._block(compress)
+            out = fn()
         if self._pool is None:
             self._pool = g.pool()
-        for b, s in zip(_layer_state(self.L), snap):
-            b.copy_(s)
-        return {"graph": g, "out": out}
+        if restore:
+            for b, s in zip(_layer_state(self.L), snap):
+                b.copy_(s)
+        _GRAPH_COUNT += 1
+        return g, out
 
-    def _build(self):
-        if self.moe_mode == "eager":
-            self._build_moe_eager()
-        else:
-            variants = [False, True] if self.ratio else [False]
-            for c in variants:
-                self._graphs[c] = self._capture_one(c)
-        self.built = True
-
-    # -- moe_eager: two graphs (attn+islands) around the real routed MoE --
-
-    def _pre(self, compress):
-        return block_pre_cs(self.R, self.L, self.h_buf, self.pos_buf, self.win_topk_buf,
-                            self.comp_topk_buf, self.arange, compress)
-
-    def _build_moe_eager(self):
-        """Capture g_pre (compress variants) and g_post, with the real MoE eager between at replay.
-
-        Both g_pre variants write their four outputs (ffn_in, residual, post, comb) into ONE set of
-        hand-off buffers, so the single g_post -- which is compress-independent -- reads a fixed
-        address whichever variant ran. g_post's other input, the eager MoE's output, arrives through
-        ffn_out_buf."""
-        # Everything here that EXECUTES (the shape probe and the priming replay, unlike a capture)
-        # advances the layer's KV/compressor state, so the whole build is bracketed by snapshot/restore:
-        # real decode must start from the prefill state, not from a throwaway capture-position step.
-        outer_snap = [b.clone() for b in _layer_state(self.L)]
-        self._feed_capture(False)
-        with torch.no_grad():
-            ex = self._pre(False)                                        # shape probe (mutates state)
-        self.ho = [torch.zeros_like(t) for t in ex]                      # ffn_in, residual, post, comb
-        self.ffn_out_buf = torch.zeros_like(ex[0])
-        variants = [False, True] if self.ratio else [False]
-        for c in variants:
-            self._graphs[c] = self._capture_pre_one(c)
-        # Prime the hand-off + ffn_out buffers with valid data so g_post captures over non-garbage.
-        with torch.no_grad():
-            self._feed_capture(False)
-            self._graphs[False]["graph"].replay()
-            self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], self.ids_buf))
-        self.g_post = self._capture_post()
-        for b, s in zip(_layer_state(self.L), outer_snap):
-            b.copy_(s)
-
-    def _capture_pre_one(self, compress):
-        """Capture g_pre for one compress variant: run block_pre_cs, store its outputs in `self.ho`."""
-        self._feed_capture(compress)
-        snap = [b.clone() for b in _layer_state(self.L)]
+    def _capture(self, key):
+        """Capture the graph(s) for one (bucket, compress) key. moe_eager captures g_pre (+ g_post once)."""
+        bucket, compress = key
+        # ALWAYS point the static buffers at a valid position for this variant FIRST: the warm-up runs
+        # for real, and a compress variant captured at the zero-filled pos_buf would read
+        # `freqs_cis[1 - ratio]`, i.e. a negative row.
+        self._feed_capture(compress, bucket)
+        if self.moe_mode != "eager":
+            g, out = self._warm_and_capture(lambda: self._block(compress, bucket))
+            return {"graph": g, "out": out}
+        outer = [b.clone() for b in _layer_state(self.L)]
+        if self.ho is None:                                 # shape probe (EXECUTES; restored below)
+            with torch.no_grad():
+                ex = self._pre(False, bucket)
+            self.ho = [torch.zeros_like(t) for t in ex]     # ffn_in, residual, post, comb
+            self.ffn_out_buf = torch.zeros_like(ex[0])
 
         def pre_fn():
-            outs = self._pre(compress)
-            for buf, t in zip(self.ho, outs):
+            for buf, t in zip(self.ho, self._pre(compress, bucket)):
                 buf.copy_(t)
 
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side), torch.no_grad():
-            for _ in range(3):
-                pre_fn()
-        torch.cuda.current_stream().wait_stream(side)
-        torch.cuda.synchronize()
-        for b, s in zip(_layer_state(self.L), snap):
+        g, _ = self._warm_and_capture(pre_fn)
+        entry = {"graph": g}
+        if self.g_post is None:
+            # g_post is bucket- AND compress-independent (it only reads the hand-off buffers), so it is
+            # captured once. Prime those buffers with real data first so it captures over non-garbage.
+            with torch.no_grad():
+                self._feed_capture(compress, bucket)
+                g.replay()
+                self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], self.ids_buf))
+            gp, out = self._warm_and_capture(
+                lambda: block_post_cs(self.L, self.ffn_out_buf, self.ho[1], self.ho[2], self.ho[3]),
+                restore=False)
+            self.g_post = {"graph": gp, "out": out}
+        for b, s in zip(_layer_state(self.L), outer):
             b.copy_(s)
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, pool=self._pool), torch.no_grad():
-            pre_fn()
-        if self._pool is None:
-            self._pool = g.pool()
-        for b, s in zip(_layer_state(self.L), snap):
-            b.copy_(s)
-        return {"graph": g}
-
-    def _capture_post(self):
-        """Capture g_post: block_post_cs(ffn_out_buf, *hand-off). Reads static buffers, mutates nothing."""
-        def post_fn():
-            return block_post_cs(self.L, self.ffn_out_buf, self.ho[1], self.ho[2], self.ho[3])
-
-        side = torch.cuda.Stream()
-        side.wait_stream(torch.cuda.current_stream())
-        with torch.cuda.stream(side), torch.no_grad():
-            for _ in range(3):
-                post_fn()
-        torch.cuda.current_stream().wait_stream(side)
-        torch.cuda.synchronize()
-        g = torch.cuda.CUDAGraph()
-        with torch.cuda.graph(g, pool=self._pool), torch.no_grad():
-            out = post_fn()
-        return {"graph": g, "out": out}
-
-    def _run_moe_eager(self, h, ids, start_pos):
-        compress = bool(self.ratio) and (start_pos + 1) % self.ratio == 0
-        self._feed(h, ids, start_pos)
-        self._graphs[compress]["graph"].replay()        # writes ffn_in + residual/post/comb hand-offs
-        self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], ids))   # real routed MoE, eager
-        self.g_post["graph"].replay()
-        return self.g_post["out"].clone()
+        return entry
 
     # -- the serve-path entry --
 
     def run(self, h, ids, start_pos):
-        """One graphed decode step for this Block, or a capture-safe eager fallback. Never raises."""
+        """One graphed decode step for this Block, or a capture-safe eager fallback. Never raises.
+
+        A position whose bucket has no graph yet captures one HERE, lazily -- so a long decode crosses
+        a rung at most `len(INDEXER_BUCKETS)` times and every other step is a pure replay. Past
+        V4_GRAPH_MAX the layer goes permanently eager, counted and logged (m25's budget discipline)."""
+        global _GRAPH_SKIPPED
         if self.eager:
             return self._eager(h, ids, start_pos)
-        if not self.built:
+        key = self._plan(start_pos)
+        entry = self._graphs.get(key)
+        if entry is None:
+            need = 2 if (self.moe_mode == "eager" and self.g_post is None) else 1
+            if _GRAPH_COUNT + need > V4_GRAPH_MAX:
+                self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + need
+                print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
+                      f"{self.L.layer_id} stays eager", flush=True)
+                return self._eager(h, ids, start_pos)
             try:
-                self._build()
+                entry = self._graphs[key] = self._capture(key)
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 torch.cuda.synchronize()
-                self.eager, self._graphs = True, {}
-                print(f"[v4] whole-layer capture failed for layer {self.L.layer_id}: "
-                      f"{type(e).__name__}: {e} — layer stays eager", flush=True)
+                self.eager, self._graphs, _GRAPH_SKIPPED = True, {}, _GRAPH_SKIPPED + need
+                print(f"[v4] whole-layer capture failed for layer {self.L.layer_id} at bucket "
+                      f"{key[0]}: {type(e).__name__}: {e} — layer stays eager", flush=True)
                 return self._eager(h, ids, start_pos)
-        if self.moe_mode == "eager":
-            return self._run_moe_eager(h, ids, start_pos)
-        compress = bool(self.ratio) and (start_pos + 1) % self.ratio == 0
-        self._feed(h, ids, start_pos)
-        v = self._graphs[compress]
-        v["graph"].replay()
-        return v["out"].clone()
+        self._feed(h, ids, start_pos, key[0])
+        entry["graph"].replay()
+        if self.moe_mode != "eager":
+            return entry["out"].clone()
+        self.ffn_out_buf.copy_(real_moe(self.L, self.ho[0], ids))    # real routed MoE, eager
+        self.g_post["graph"].replay()
+        return self.g_post["out"].clone()
 
-    def _feed(self, h, ids, start_pos):
+    def _feed(self, h, ids, start_pos, bucket):
         """Copy this step's inputs into the static buffers the graph replays over."""
         self.h_buf.copy_(h)
         self.pos_buf.fill_(start_pos)
         if ids is not None:
             self.ids_buf.copy_(ids.view(1, 1))
         self.win_topk_buf.copy_(build_win_topk(self.R.M, self.win, start_pos))
-        if self.comp_topk_buf is not None:
-            self.comp_topk_buf.copy_(build_comp_topk(self.R.M, self.ratio, start_pos, self.win, self.maxw_c))
+        comp, _ = self._bufs_for(bucket)
+        if comp is not None:
+            comp.copy_(build_comp_topk(self.R.M, self.ratio, start_pos, self.win, bucket))
 
     def _eager(self, h, ids, start_pos):
-        """The capture-safe block run WITHOUT a graph -- the fallback and the parity oracle's twin."""
-        compress = bool(self.ratio) and (start_pos + 1) % self.ratio == 0
+        """The capture-safe block run WITHOUT a graph -- the fallback, and the TIER-1 grading twin.
+
+        Same math, same bucket decisions, no capture: `graphed == this` is the hard bit-exactness bar
+        (research/graph_aux_check.py's `eager_manual`, m25's precedent), because a graph that replays
+        the same kernels on the same bytes has no licence to differ from it by even one ulp."""
+        bucket, compress = self._plan(start_pos)
         pos = torch.tensor([start_pos], dtype=torch.long, device=self.dev)
         win_topk = build_win_topk(self.R.M, self.win, start_pos)
-        comp_topk = (build_comp_topk(self.R.M, self.ratio, start_pos, self.win, self.maxw_c)
-                     if self.comp_topk_buf is not None else None)
-        return block_decode_cs(self.R, self.L, h, ids, pos, win_topk, comp_topk, self.arange,
-                               compress, self.moe)
+        comp_topk = (build_comp_topk(self.R.M, self.ratio, start_pos, self.win, bucket)
+                     if self.ratio and not self.has_indexer else None)
+        ar = torch.arange(bucket, device=self.dev) if self.has_indexer else None
+        return block_decode_cs(self.R, self.L, h, ids, pos, win_topk, comp_topk, ar,
+                               compress, self.moe, bucket)
