@@ -481,6 +481,13 @@ def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=N
         # set HERE, in the serve path, rather than at import: a library import that moves every
         # caller's default device is a trap, and the CPU parity suite shares this process.
         torch.set_default_device(dev)
+        # generate.py:77's other half, equally load-bearing at FORWARD time: kernel.py's GEMM
+        # wrappers allocate their output at torch.get_default_dtype() (fp8_gemm:270, fp4_gemm:533),
+        # and the tilelang kernels are compiled for bf16 C — under the fp32 process default the
+        # first quantized linear dies with "input C dtype mismatch, expected bfloat16" (observed:
+        # it killed the head stage's prefill on the first live ring, 2026-08-01). Guarded by the
+        # same cuda condition so the CPU suite keeps its fp32 default.
+        torch.set_default_dtype(torch.bfloat16)
     with _BUILD_LOCK:                                   # process-wide torch/reference globals — see the lock
         st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=(dspark and tail), device=dev)
         if ckpt_dir is not None:
