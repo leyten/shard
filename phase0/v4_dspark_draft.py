@@ -495,7 +495,18 @@ class RingDrafter:
     v4_pipe.coordinate_dspark_pipelined, which streams the block as separate `s=1` frames instead of
     one chunk. The accept rule is the same rule applied one position at a time and the reply carries
     `acc` (this frame's position is committed) where the chunked reply carries `n`; see
-    `_on_chunk_pipelined`."""
+    `_on_chunk_pipelined`.
+
+    LAZY DRAFTING, and the measurement that forced it. A pipelined round streams ONE block per cycle
+    and this class drafted one on EVERY committed frame, so the tail paid for `g` of them and the
+    coordinator threw `g - 1` away. On the 6-stage EU ring that discarded work is the tail's whole
+    margin: 7.33 ms of its 37.37 ms on-box is its own three layers, ~2.1 ms is lm_head + sampling
+    (measured against a greedy job on the same ring), and the remaining ~28 ms is this drafter — on
+    the stage that binds the entire ring, against a next-slowest of 26.0 ms. So the coordinator now
+    hints each frame (`dnxt`/`dprev`, see `wants_block`) and a hinted frame produces only its STATE,
+    via v4_dspark_fast's cache-advance-only write. Nothing about the round changes — same frames,
+    same blocks consumed, same cancels, same tokens — only what the tail computes for the blocks
+    nobody was ever going to read."""
 
     def __init__(self, tail):
         self.tail = tail                                   # a DSparkTail (its 4-method contract)
@@ -507,6 +518,10 @@ class RingDrafter:
         self.pipelined = False
         self._cfront = None
         self._mfront = None
+        # LAZY DRAFTING: (position, block) of the last block this drafter actually produced, which is
+        # what a `dprev` hint dereferences. Only ever written where a block is returned, so a fenced
+        # or skipped frame cannot age it into looking like the previous position's.
+        self._last = None
 
     def on_chunk(self, msg, st, out):
         ids = torch.as_tensor(msg["ids"], dtype=torch.long)
@@ -596,6 +611,7 @@ class RingDrafter:
             # streamed frame (the coordinator feeding that token at position P) accepts.
             self.tail.reset()
             self._done = False
+            self._last = None                              # a new job never dereferences the old one's
             self.tail.prefill([int(out["token"])], main)
             self._cfront, self._mfront = main.shape[1] - 1, int(out["token"])
             return {"acc": True}
@@ -623,9 +639,75 @@ class RingDrafter:
         self._done = self._done or (start_pos + self.tail.block_size + 1) > self.tail.args.max_seq_len
         if self._done:
             return {"acc": True, "draft": []}
+        if not wants_block(msg, m, self._last):
+            # LAZY DRAFTING: this frame's block would be discarded, so only its STATE is produced.
+            # `advance_and_draft` fuses the two — one `forward_spec` per committed position both
+            # writes the mtp KV slot and derives the block — but the WRITE is all a committed position
+            # leaves behind (`DSparkAttention.forward` writes `kv_cache[:, pos % win]` and nothing
+            # else), and v4_dspark_fast._advance_cache_only reproduces exactly those bytes. It is the
+            # same primitive the fast path already uses for the intermediate positions of a serial
+            # round, held to the reference's M=1 shapes and pinned bit-exact against the reference
+            # loop in tests/test_v4_dspark_fast.py — here it is simply applied one position at a time.
+            #
+            # THE CURSOR MOVES ANYWAY, and that is the whole trap: `_advance_cache_only` advances no
+            # cursor of its own, so skipping the block must still leave `_pos` on the position the
+            # ring committed. A drafter left behind the committed stream raises inside the next
+            # `advance_and_draft`, and there is no try/except around the tail's step handler — it
+            # would kill the serve loop and every job after it. The guards below are the reference's
+            # own, run BEFORE the write, so a hint that arrived on the wrong frame fails the job here
+            # rather than corrupting the window silently.
+            import v4_dspark_fast
+            t = self.tail
+            if t.pos is None or start_pos != t.pos + 1:
+                raise RuntimeError(
+                    f"v4 dspark: a lazy advance at {start_pos} but the mtp cache stands at {t.pos} — "
+                    f"the drafter's cursor must walk exactly the committed positions whether or not "
+                    f"it drafts on them")
+            with torch.no_grad():
+                v4_dspark_fast._advance_cache_only(t, t._hidden(main, want_s=1), start_pos)
+            t._pos = start_pos
+            return {"acc": True}
         blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
-        return {"acc": True, "draft": blk[0].tolist(),
+        draft = blk[0].tolist()
+        self._last = (start_pos, draft)
+        return {"acc": True, "draft": draft,
                 "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+
+
+def wants_block(msg, m, last=None):
+    """Will the coordinator consume a block off this frame's reply? -> draft it, or don't.
+
+    UNHINTED MEANS DRAFT. `dnxt` is set only by a lazy-armed coordinator and only on frames it has
+    PROVEN cannot drain the pipeline (v4_pipe's `_hints`), so its absence — an eager coordinator,
+    an older one, or a frame the proof did not cover — falls through to the eager path. The lever
+    can cost throughput by hinting too little; it cannot cost the round a block it needed.
+
+    WHAT THE HINT IS. `dnxt` is the token the coordinator has already streamed at `start_pos + 1`.
+    The round ends on this reply exactly when that token disagrees with `m`, the model's own token
+    at that position — which is `plan_verify_round`'s accept test at one position, the same test
+    this class already applies to itself. Agreement means the frame at `start_pos + 1` is
+    committed too and the speculation runs on, so nothing will ask this reply for a block.
+
+    THE REJECTION STILL DRAFTS EAGERLY, and it has to: the reply that reveals a rejection is the
+    reply the coordinator refills from (coordinate_dspark_pipelined's FRESH BLOCK COMES WITH THE
+    REJECTION). Skipping there would drain the pipeline and idle a full ring traversal waiting for
+    a block — far more than the drafting it saves. So a mismatch drafts, and only agreement
+    skips.
+
+    `dprev` IS THE SAME HINT, DEREFERENCED HERE. The last frame of a burst has a successor the
+    coordinator had not decided when it sent the frame — it is the head of the block the drain reply
+    is about to return — so the coordinator names the source instead of the value, and `last` is what
+    this drafter returned on the frame one position back: `(position, block)`. Every condition that
+    makes the dereference sound is re-checked here rather than assumed, because the coordinator's
+    half of it (that the frame at `H - 1` is the drain) cannot be seen from this side: the block must
+    be ours, from EXACTLY the previous position, and non-empty. Any of those failing falls back to
+    drafting, which is always safe."""
+    nxt = msg.get("dnxt")
+    if nxt is None and msg.get("dprev") and last is not None:
+        at, blk = last
+        if blk and at == int(msg["start_pos"]) - 1:
+            nxt = blk[0]
+    return nxt is None or int(nxt) != m
 
 
 def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
