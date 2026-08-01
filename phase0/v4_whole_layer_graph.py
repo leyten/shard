@@ -105,8 +105,15 @@ _GRAPH_COUNT = 0        # whole-layer graphs captured so far, across every Stage
 _GRAPH_SKIPPED = 0      # captures a layer skipped because the cap was hit or a capture failed
 
 
-def bucket_width(need, maxw):
-    """Smallest INDEXER_BUCKETS rung >= `need`, clamped to `maxw`. m25_stage._bucket, per-cache."""
+def bucket_width(need, maxw, floor=0):
+    """Smallest INDEXER_BUCKETS rung >= `need`, floored at `floor` and clamped to `maxw`.
+
+    m25_stage._bucket, per-cache, with one extra constraint this cache has and m25's did not: the read
+    must be wide enough to SELECT from. `_select_topk_width_invariant` takes a fixed k = index_topk, so
+    a bucket narrower than index_topk could not hold the picks -- pass floor=index_topk. (When
+    index_topk >= maxw the ladder degenerates to the full width, which is correct, just not a saving:
+    at V4's shipped shape index_topk is 512 against max_seq_len//4 = 16384, so the rungs are real.)"""
+    need = max(need, floor)
     for b in INDEXER_BUCKETS:
         if b >= need:
             return min(b, maxw)
@@ -226,6 +233,46 @@ def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_w,
     return select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w)
 
 
+def _select_topk_width_invariant(score, valid, k, arange_w):
+    """Top-k of `score` by (value DESC, index ASC) -- the same set and order at ANY padded width.
+
+    THE ONE THING A FIXED-WIDTH TOPK CANNOT BORROW FROM torch. `Tensor.topk` breaks ties by whatever
+    its selection algorithm happens to do (a non-stable partial_sort on CPU, a radix select on CUDA);
+    that order is not part of the contract and it is NOT invariant to the length of the array. So
+    `score[:end].topk(k)` and `score.masked_fill(idx>=end, -inf).topk(k)` -- mathematically the same
+    query -- can return DIFFERENT SETS whenever the k-th and (k+1)-th values are equal. They tie
+    constantly here: `index_score` is bf16 and passes through `relu_()`, which floors every negative
+    column to a hard 0.0, so whole blocks of candidates share a value exactly. That is what broke the
+    first cut of this file -- a fixed-width read picked a different compressed KV slot than the
+    reference at decode pos 43 and the hidden state diverged by ~2e-3 (tests/test_v4_whole_layer.py).
+
+    (value, -index) is a TOTAL order on the valid columns, so the top-k under it is unique and cannot
+    depend on how many -inf columns are padded on the end. Concretely: take the k-th largest VALUE
+    (a multiset property, already width-invariant), admit every column strictly above it, then admit
+    the tied columns in ascending index until k are held. All fixed-shape, all device-side -- no host
+    sync, nothing baked at capture -- so this is what makes a fixed-width OR bucketed read legitimate
+    rather than merely usually-right.
+
+    It does NOT reproduce torch's tie order, and cannot: see the module docstring's TIER 2 note.
+
+    IMPLEMENTED AS A STABLE DESCENDING SORT, and the lane ORDER that falls out is worth as much as the
+    set. `sort(descending=True, stable=True)` IS the (value DESC, index ASC) order: equal values keep
+    ascending index, and the -inf padding sorts to the tail whatever the width, so the first k are the
+    same picks IN THE SAME LANES at any padded width.
+
+    The alternative -- take the k-th value, admit `> kth`, then admit ties by cumsum -- selects the
+    same SET more cheaply, but emits it in ascending INDEX order. That is a second, independent source
+    of last-bit divergence from the reference: `topk` hands sparse_attn its picks in DESCENDING SCORE
+    order, and sparse_attn's per-block reduction is order-sensitive, so re-laning the same support set
+    regroups the sum. Measured on this branch at V4's real dims, moe_eager vs the vendored reference
+    over 40 decode steps: ascending-index lanes gave 2/40 steps bit-exact (max 9.4e-2), descending-score
+    lanes gave 40/40 bit-exact (0.0). The sort costs a little more than the cumsum trick and is worth
+    it -- it removes a whole class of Tier-2 noise, leaving genuine ties as the only difference."""
+    s = score.masked_fill(~valid, float("-inf"))
+    pick = s.sort(dim=-1, descending=True, stable=True).indices.narrow(-1, 0, k)
+    return pick, valid.gather(-1, pick)
+
+
 def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w):
     """Bucket-width masked selection of the compressed slots to attend: the #2 rewrite, in one place.
 
@@ -235,35 +282,19 @@ def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_w):
     fixed `index_topk`, and any pick that lands on a masked (future) column becomes -1, which
     sparse_attn treats as "no position".
 
-    THE STABLE SORT IS WHAT MAKES BUCKETING LEGAL, and that is the whole reason it is here rather than
-    a `topk`. v4_stage's own `_chunk_indexer` says it for the chunked path: "Masking a common-width
-    score to fake the shorter reads would change which slots a topk near-tie picks" -- torch.topk's
-    tie-break is an artifact of its partition, so with topk the answer would depend on WHICH BUCKET a
-    position happened to land in, i.e. on capture history. Selecting by (score DESC, index ASC) is
-    width-independent by construction, so a position gets the same slots at bucket 64 as at 16384 and
-    a rung crossing is invisible. Proven in tests/test_v4_whole_layer.py."""
-    valid = (arange_w < end_ratio).view(1, 1, -1)
-    index_score = index_score.masked_fill(~valid, float("-inf"))
-    # DETERMINISTIC selection: top-k by (score DESC, column index ASC), via a STABLE sort.
-    #
-    # `topk` cannot be used here and this is the one place the fixed-width read is NOT a free
-    # rewrite of the reference. index_score is riddled with EXACT ties -- `relu_()` floors every
-    # negative score to a hard 0.0, and bf16 collides -- and torch.topk's tie-break is an artifact of
-    # its partition, so it depends on the array WIDTH (the reference's end_pos//ratio vs this fixed
-    # max width) and on the CPU thread count. Two runs of the SAME reference at different
-    # OMP_NUM_THREADS can pick different members of a tie, and a fixed-width read picks a different
-    # one again. A stable descending sort pins it: among equal scores the lowest column index wins,
-    # on every width, thread count, and device.
-    #
-    # So this is deterministic where the reference is not, and it agrees with the reference on every
-    # tie-FREE selection (a -inf column never outranks a finite one, so the top-k finite columns are
-    # the same set). Where the reference's own tie-break is ambiguous it may select a different
-    # column of IDENTICAL score -- see tests/test_v4_whole_layer.py, which proves the selected score
-    # multiset always matches, and docs/receipts/v4-whole-layer-graph-20260801.json's `ties` risk.
-    order = index_score.sort(dim=-1, descending=True, stable=True)[1]
-    topk_idxs = order[..., :index_topk]
-    topk_idxs = torch.where(topk_idxs < end_ratio, topk_idxs + offset, topk_idxs.new_full((), -1))
-    return topk_idxs.int()
+    THE TIE-BREAK IS WHAT MAKES BUCKETING LEGAL, and it is the whole reason `topk` is not used here.
+    v4_stage's own `_chunk_indexer` says it for the chunked path: "Masking a common-width score to fake
+    the shorter reads would change which slots a topk near-tie picks". `Tensor.topk` does not define
+    its tie order -- a non-stable partial_sort on CPU, a radix select on CUDA -- and that order is NOT
+    invariant to array length, while `index_score` is bf16 behind a `relu_()` that floors every
+    negative column to a hard 0.0, so ties at the k-th rank are routine (measured: 23 of 120 decode
+    steps). With `topk` the answer would depend on WHICH BUCKET a position happened to land in, i.e. on
+    capture history. `_select_topk_width_invariant` imposes a total order instead, so a position gets
+    the same slots at bucket 64 as at 16384 and a rung crossing is invisible."""
+    arange = arange_w.view(1, 1, -1)
+    valid = arange < end_ratio
+    pick, kept = _select_topk_width_invariant(index_score, valid, index_topk, arange)
+    return torch.where(kept, pick + offset, pick.new_full((), -1)).int()
 
 
 def attn_decode_cs(R, A, x, pos, win_topk, comp_topk, arange_w, compress, read_w):
@@ -470,7 +501,8 @@ class WholeBlockGraphs:
         if not self.ratio:
             return 0, False
         end_ratio = (start_pos + 1) // self.ratio
-        return bucket_width(end_ratio, self.maxw), (start_pos + 1) % self.ratio == 0
+        floor = self.L.attn.indexer.index_topk if self.has_indexer else 0
+        return bucket_width(end_ratio, self.maxw, floor), (start_pos + 1) % self.ratio == 0
 
     def _bufs_for(self, bucket):
         """The bucket-shaped static buffers: the compress index list and the mask's arange."""

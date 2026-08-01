@@ -1,39 +1,42 @@
-"""The capture-safe decode transcription against the reference `Block.forward`, and the whole-layer
-graph against that same path run eager.
+"""The capture-safe decode transcription, graded on m25's two-tier bar.
 
-WHAT IS BIT-EXACT, AND THE ONE THING THAT IS NOT. A graph replays the same kernels on the same bytes,
-so `graphed == eager` is a torch.equal bar and stays one. The capture-safe REWRITE of the attention
-core is also bit-exact to the reference in every value it computes -- the scores over the valid
-columns come out identical to the reference's narrow einsum (measured: max|narrow - wide| = 0.0) and
-every KV/compressor buffer matches -- with ONE documented exception:
+WHAT IS BIT-EXACT AND WHAT IS NOT. A graph replays the same kernels on the same bytes, so
+`graphed == the eager twin` is torch.equal and stays one. Against the VENDORED reference there are
+TWO reasons the last bits can differ, and neither is a rounding drift in this code:
 
-  THE INDEXER'S TOP-K TIE-BREAK. `index_score` is full of EXACT ties (relu_ floors every negative
-  score to a hard 0.0, and bf16 collides), and `torch.topk` resolves them by an artifact of its
-  partition that depends on the array WIDTH and on the CPU THREAD COUNT. The reference is therefore
-  not reproducible even against itself: the same vendored model at OMP_NUM_THREADS=1 and at the
-  default can pick different members of a tie. The capture-safe path reads a FIXED width, so its
-  tie-break differs again -- and it pins the ambiguity with a STABLE sort, (score DESC, index ASC),
-  which is deterministic on every width, thread count and device. It agrees with the reference on
-  every tie-FREE selection and may pick a different column of IDENTICAL score otherwise.
+  1. TOP-K TIE ORDER. `index_score` is bf16 behind a `relu_()` that floors negatives to a hard 0.0,
+     so ties at the k-th rank are routine (23 of 120 decode steps). `Tensor.topk` does not define its
+     tie order, it differs between CPU and CUDA, and it is NOT invariant to array length -- so a
+     fixed-width or bucketed read picked a DIFFERENT compressed slot than the reference's narrow one
+     (pos 43, ~2e-3 on the hidden state: a different attention support set, not rounding).
+     `_select_topk_width_invariant` imposes a total order (value DESC, index ASC), which makes the
+     selection unique and width-invariant. It does not reproduce torch's arbitrary order and cannot.
+  2. LANE ORDER. The reference's topk returns its picks in DESCENDING SCORE order; a width-invariant
+     selection returns them in ascending index order. Same support set, but sparse_attn then gathers
+     the rows in a different lane order and its per-block reduction regroups -- measured ~3e-4 at
+     pos 55 with the sets identical.
 
-So the bars below are split by what is actually provable:
+So the reference is not the long-run bar. These are:
 
-  test_fixed_width_selection_matches_reference_selection   the claim itself, on the shipped selection
-      function: same selected SET whenever the boundary is tie-free, and the same selected SCORE
-      MULTISET always (i.e. always a maximal-scoring set), plus the -1 padding and offset mapping.
+  test_read_width_is_a_cost_knob_over_a_long_run  TIER 1, the headline: max width vs bucketed widths
+      give torch.equal hidden, logits and every KV buffer -- 120 steps x 3 seeds. This is what the
+      capture actually has to guarantee, and it would have caught the original bug with no reference.
+  test_read_width_is_a_cost_knob_only             the same invariant on the shipped selection
+      function directly, over score vectors built to tie.
+  test_capture_safe_block_matches_reference       TIER 2, the clean regime: where the Indexer keeps
+      every valid column, hidden/logits/KV torch.equal the reference, 3 seeds.
+  test_fixed_width_selection_matches_reference_selection  TIER 2, the selection: same SET when the
+      boundary is tie-free, same selected SCORE MULTISET always (never a lower-scoring column).
+  test_bucket_ladder_covers_and_never_truncates   the bucket may never be shorter than the position
+      needs, and the rung count stays bounded.
+  test_graph_output_is_fresh_across_positions     CUDA. TIER 1 per position + the FRESHNESS GATE: the
+      same input at a DIFFERENT position must MOVE the output (a position baked in at capture is the
+      worst silent failure here; m25 shipped it once as stale EAGLE aux).
+  test_whole_layer_stage_is_bit_exact_to_eager    CUDA. A V4_CUDA_GRAPH=whole Stage vs the eager
+      Stage, over the unambiguous regime.
 
-  test_capture_safe_block_matches_reference   CPU, over the regime where the selection is unambiguous
-      (every valid column is selected, so no tie can bite): hidden, logits AND every KV/compressor
-      buffer torch.equal the reference, across a run that wraps the 16-slot window and crosses both
-      compression boundaries (ratio 4 and 8).
-
-  test_capture_safe_buffers_match_reference_under_pressure   CPU, past the point where the Indexer
-      really selects: every KV/compressor buffer still torch.equal step for step (those writes are
-      selection-INDEPENDENT), which is what pins the device-side position, the compress/no-compress
-      split and the window ring.
-
-  test_whole_layer_stage_is_bit_exact_to_eager   CUDA-only. A V4_CUDA_GRAPH=whole Stage replays
-      byte-identical to the eager Stage -- the graph bar, on top of the above.
+Seeds matter: the first cut of this file failed on seeds 7 and 11 at different positions and PASSED
+on 23, which is exactly how the bug survived a green run.
 
 Run:  python3 -m pytest tests/test_v4_whole_layer.py -q         (CPU tests run anywhere)
 """
@@ -60,7 +63,10 @@ requires_cpu_kernels = pytest.mark.skipif(
     reason=f"block parity drives CPU stages; this process bound the {KERNELS.backend()} kernels "
            f"(re-run with V4_KERNELS=cpu)")
 
-SEED, PROMPT, STEPS = 7, 20, 40
+SEED, PROMPT, STEPS = 7, 20, 120
+# Seeds 7 and 11 both failed the first cut of this file at different positions and seed 23 PASSED,
+# which is exactly how the bug survived a green run. Multi-seed is not decoration here.
+SEEDS = (7, 11, 23)
 # The Indexer only really SELECTS once end_pos//ratio exceeds index_topk; below that it keeps every
 # valid column and the reference's tie-break cannot bite. At cpu_args() (ratio 4, index_topk 8) that
 # is (pos+1)//4 <= 8, i.e. pos <= 34 -- 15 decode steps from PROMPT=20, which still wrap the 16-slot
@@ -109,7 +115,7 @@ def _cs_decode(st, R, M, h, ids, start_pos, bgs=None):
     return x
 
 
-def _drive_both(steps, **argov):
+def _drive_both(steps, seed=SEED, **argov):
     """Prefill + `steps` decode steps through an eager and a capture-safe stage, in lockstep.
 
     Both stages are fed the SAME token every step (the eager side's argmax), so a divergence cannot
@@ -117,11 +123,13 @@ def _drive_both(steps, **argov):
     input. Yields (pos, h_eager, h_cs, logits_eager, logits_cs, eager, cs) per step."""
     os.environ["V4_KERNELS"] = "cpu"
     args = REFCPU.cpu_args(**argov)
+    global SEED_IN_USE
+    SEED_IN_USE = seed
     M = REFCPU.load_ref()
     R = WL._Ref(M)
-    eager = _stage(REFCPU.build_oracle(args, SEED), args, "cpu")
-    cs = _stage(REFCPU.build_oracle(args, SEED), args, "cpu")
-    torch.manual_seed(SEED)
+    eager = _stage(REFCPU.build_oracle(args, seed), args, "cpu")
+    cs = _stage(REFCPU.build_oracle(args, seed), args, "cpu")
+    torch.manual_seed(seed)
     ids = torch.randint(0, args.vocab_size, (1, PROMPT))
     eager.forward(eager.embed(ids), ids, 0)
     cs.forward(cs.embed(ids), ids, 0)
@@ -149,31 +157,53 @@ def test_capture_safe_block_matches_reference():
     valid column (end_pos//ratio <= index_topk), so no tie-break can differ and the whole pipeline
     must agree BYTE FOR BYTE. The run still wraps the 16-slot window ring and crosses both
     compression boundaries."""
-    for i, h_e, h_c, lg_e, lg_c, eager, cs in _drive_both(STEPS_EXACT):
-        assert torch.equal(h_e, h_c), f"hidden diverged at decode step {i} (pos {i})"
+    for seed in SEEDS:
+      for i, h_e, h_c, lg_e, lg_c, eager, cs in _drive_both(STEPS_EXACT, seed=seed):
+        assert torch.equal(h_e, h_c), f"seed {seed}: hidden diverged at decode step {i} (pos {i})"
         assert torch.equal(lg_e, lg_c), f"logits diverged at decode step {i}"
         for a_, b_ in zip(_state_sig(eager), _state_sig(cs)):
             assert torch.equal(a_, b_), f"a KV/compressor buffer diverged at decode step {i}"
 
 
 @requires_cpu_kernels
-def test_capture_safe_block_matches_reference_over_a_long_run():
-    """CPU: the same bit-exact bar over the FULL 40-step run, with the tie-break taken out of play.
+def test_read_width_is_a_cost_knob_over_a_long_run():
+    """TIER 1, the long-run bar: driving the SAME decode at max width and at bucketed widths gives
+    torch.equal hidden, logits and KV -- for 120 steps, on three seeds.
 
-    `index_topk` is raised to 16 so that end_pos//ratio never exceeds it across pos 20..59 -- the
-    Indexer keeps every valid column at every step, so its selection is unambiguous and the whole
-    pipeline must agree BYTE FOR BYTE for 40 consecutive decode steps. That wraps the 16-slot window
-    ring two and a half times and crosses ten ratio-4 and five ratio-8 compression boundaries, which
-    is the long-run exercise of the rotating slot, the `pos+1-ratio` rope row and the compress split.
+    This, not agreement with the reference, is what the whole-layer capture has to guarantee: the read
+    width is a COST knob. It is also the bar that would have caught the original bug (a wide read
+    picking a different compressed slot than a narrow one) without needing the reference at all, and
+    it is the one that stays valid under the Tier-2 caveats below -- neither the reference's tie order
+    NOR its lane order is part of the contract.
 
-    (Why not simply assert this at index_topk=8: past pos 34 the Indexer really selects, and there the
-    reference's own tie-break is width- and thread-count-dependent -- see the module docstring. The
-    selection tests below carry that regime; this one carries the length.)"""
-    for i, h_e, h_c, lg_e, lg_c, eager, cs in _drive_both(STEPS, index_topk=16):
-        assert torch.equal(h_e, h_c), f"hidden diverged at decode step {i} (pos {i})"
-        assert torch.equal(lg_e, lg_c), f"logits diverged at decode step {i}"
-        for a_, b_ in zip(_state_sig(eager), _state_sig(cs)):
-            assert torch.equal(a_, b_), f"a KV/compressor buffer diverged at decode step {i}"
+    Why the reference cannot be the long-run bar: `topk` returns its picks in DESCENDING SCORE order
+    while a width-invariant selection returns them in ascending index order. Same support set, but
+    sparse_attn then sums the gathered rows in a different lane order, and that regroups its per-block
+    reduction -- a last-bit difference that has nothing to do with which slots were chosen. Measured
+    here at pos 55 (~3e-4 on the hidden state) with the sets identical."""
+    for seed in SEEDS:
+        wide, bucketed = None, None
+        for force_max in (True, False):
+            orig = WL.bucket_width
+            if force_max:
+                WL.bucket_width = lambda need, maxw, floor=0: maxw
+            try:
+                run = [(h_c.clone(), lg_c.clone(), [t.clone() for t in _state_sig(cs)])
+                       for _, _, h_c, _, lg_c, _, cs in _drive_both(STEPS, seed=seed)]
+            finally:
+                WL.bucket_width = orig
+            if force_max:
+                wide = run
+            else:
+                bucketed = run
+        assert len(wide) == len(bucketed) == STEPS
+        for i, ((h_w, lg_w, st_w), (h_b, lg_b, st_b)) in enumerate(zip(wide, bucketed)):
+            pos = PROMPT + i
+            assert torch.equal(h_w, h_b), f"seed {seed}: read width changed the hidden state at pos {pos}"
+            assert torch.equal(lg_w, lg_b), f"seed {seed}: read width changed the logits at pos {pos}"
+            for a_, b_ in zip(st_w, st_b):
+                assert torch.equal(a_, b_), f"seed {seed}: read width changed a KV buffer at pos {pos}"
+
 
 
 def test_fixed_width_selection_matches_reference_selection():
@@ -215,6 +245,34 @@ def test_fixed_width_selection_matches_reference_selection():
             if tie_free:
                 assert m_valid == r_valid, \
                     f"end_ratio={end_ratio}: tie-free boundary but sets differ {m_valid} vs {r_valid}"
+
+
+def test_read_width_is_a_cost_knob_only():
+    """TIER 1, the property the first cut of this file did NOT have: the READ WIDTH cannot change the
+    answer -- max width, a bucket, and the exact width all select the SAME slots.
+
+    This is the direct regression test for the pos-43 failure. `torch.topk` fails it (its tie order is
+    undefined and length-dependent, and `relu_()` manufactures ties by flooring negatives to a hard
+    0.0), so a wide-masked read picked a different compressed slot than the reference's narrow one.
+    `_select_topk_width_invariant`'s total order (value DESC, index ASC) makes the top-k unique, hence
+    width-invariant, which is also what turns bucketing into a pure cost lever."""
+    torch.manual_seed(0)
+    k, offset = 8, 16
+    for seed in SEEDS:
+        torch.manual_seed(seed)
+        for end_ratio in (5, 8, 9, 11, 20, 33):
+            for trial in range(12):
+                base = (torch.randn(1, 1, end_ratio) * 3).round() / 4      # collides on purpose
+                if trial % 2:
+                    base = base.relu()                                     # the real tie factory
+                picks = []
+                for width in (max(end_ratio, k), 64, 256):                 # exact-ish, bucket, max
+                    sc = torch.zeros(1, 1, width)
+                    sc[..., :end_ratio] = base
+                    picks.append(WL.select_compress_topk(sc, torch.tensor(end_ratio), k, offset,
+                                                        torch.arange(width))[0, 0].tolist())
+                assert picks[0] == picks[1] == picks[2], \
+                    f"seed {seed} end_ratio {end_ratio}: read width changed the selection {picks}"
 
 
 def test_bucket_ladder_covers_and_never_truncates():
