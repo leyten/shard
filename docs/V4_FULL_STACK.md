@@ -91,15 +91,44 @@ Each stage prints its `__repr__` — this reports **observed** state, not the en
 
 ```
 <V4Stage [0:7) IWCIWCI head=True tail=False torch.bfloat16 on cuda:0 pos=0 kernels=tilelang
- dspark=off taps=[] spec=off/16 graph=whole fast_verify=off moe=grouped/7 ref_slim=indexer>
+ dspark=off taps=[] spec=off/16 graph=whole fast_verify=off moe=multi>grouped>decode/7
+ ref_slim=indexer levers=ok>
 ```
 
 - `graph=whole` — armed. `graph=off` with a `GRAPH REFUSED ...` line above it means it declined and
   said why. `graph=off` with **no** line means the flag never arrived.
-- `moe=grouped/7` — the grouped forward is bound AND 7 layers took the bank. **`moe=grouped/0` is the
-  ring failure that made this branch necessary**: the flag read as on for every job while the bank
-  declined on every layer, so the lever never fired and the run measured nothing.
+- `moe=multi>grouped>decode/7` — the WHOLE live `MoE.forward` chain, top first, plus the count of
+  layers that took the bank. Every lever that rebound the forward appears. **A single name where you
+  set two flags is the sixth instance of this bug**: before the chain was reported, `V4_MOE_MULTI=1`
+  put `multi` on top and the status printed `moe=ref` while grouped was installed and serving.
+  **`moe=...grouped/0` is the ring failure that made this branch necessary**: the flag read as on for
+  every job while the bank declined on every layer.
 - `ref_slim=indexer` — item 1 only. `indexer+noqat` means someone set NOQAT; stop the run.
+- `levers=ok` — every requested lever was verified against LIVE state. Anything else is a finding:
+  `!V4_MOE_GROUPED:mismatch` (asked for, not engaged), `!V4_LAZY_DRAFT:wrong` (a coordinator lever
+  set on a stage), `!V4_TOPK_STABLE:unknown` (a `V4_*` var nothing reads). The full table is printed
+  under the repr by `v4_levers.report()`; `V4_LEVERS_STRICT=1` makes any finding a refusal to serve,
+  which is what a run that is about to produce a NUMBER should set.
+
+### Which process must carry which var
+
+`v4_levers.LEVERS` is the source of truth and `tests/test_v4_levers.py` keeps it total against the
+source. Setting a coordinator lever on the stages does nothing at all — that cost a night.
+
+| var | side | read by |
+|---|---|---|
+| `V4_MOE_GROUPED` / `V4_MOE_DECODE` / `V4_MOE_MULTI` (+`_MAX`) | **stage** | `v4_moe_*` at import, installed by `v4_ref_cpu.load_ref()` |
+| `V4_CUDA_GRAPH` / `V4_GRAPH_MAX` | **stage** | `v4_stage` at import (graph mode is emitted by `stage_launch_cmd`, never via ENG_ENV) |
+| `V4_FAST_VERIFY` (+`_MAX`) | **stage** | `v4_stage` at import |
+| `V4_REF_SLIM` / `V4_REF_SLIM_NOQAT` | **stage** | `v4_ref_slim` at import |
+| `V4_DSPARK_FAST` (+`V4_DSPARK_GRAPH`) | **stage (tail only)** | `v4_dspark_fast`, installed onto `DSparkTail` |
+| `V4_FP8_WIRE` | **stage** | `v4_pipe._make_step_frame`, i.e. every non-tail stage packs its own output |
+| `V4_KERNELS` | **stage** | `v4_kernels_cpu` at import |
+| `V4_SPEC_DEPTH` | **both** | the coordinator's in-flight window AND the stage's rollback ring |
+| `V4_PIPELINED_SPEC` | **coordinator** | `_coord_cli` picks the coordinator loop |
+| `V4_LAZY_DRAFT` | **coordinator** | `coordinate_dspark_pipelined`; the tail reacts to frame hints, not to its own env |
+| `V4_DSPARK_CONF_GATE` (+`_MIN`/`_THRESH`) | **coordinator** | `coordinate_dspark` (serial path only) |
+| `V4_TOPK_STABLE` | **NOT IMPLEMENTED** | nothing. Written up as an acceptance fix; no phase0 module reads it. Setting it is reported UNKNOWN |
 
 ---
 
