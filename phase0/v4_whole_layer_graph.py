@@ -24,17 +24,33 @@ kernels on the same bytes -- bit-exact, not reassociation-drifted. The three fix
      buffer, and every `kv_cache[:, slot] = v` becomes `index_copy_(1, slot, v)` -- the same store to
      the same byte, chosen at REPLAY time from the copied-in position instead of frozen at capture.
 
-  #2 FIXED MAX-WIDTH + MASK.  The Indexer's einsum reads the WHOLE `kv_cache` (a fixed [., MAXW, .])
-     and masks scores at positions >= end_pos//ratio to -inf; its topk takes a FIXED k = index_topk
-     and maps any selection that landed on a masked (future) slot to -1. sparse_attn already treats a
-     -1 index as "no position" (v4_sparse_attn_sm120.py: it zeroes that KV row and pushes the score to
-     -inf, contributing to neither numerator nor denominator), so a fixed-width topk padded with -1 is
-     BYTE-IDENTICAL to the reference's variable-width topk over the same valid set -- the extra -inf
-     blocks of the online softmax rescale by exp(0)=1 and add 0. The window/compress index LISTS
-     (get_window_topk_idxs / get_compress_topk_idxs) are the reference's own, built eagerly per step
-     into a static buffer and copied in before replay: they are a handful of tiny launches, not the
-     GEMM-and-attention bulk the graph is for, and building them in-graph would mean transcribing
-     their per-position branch structure for no dispatch saving.
+  #2 FIXED MAX-WIDTH + MASK + A WIDTH-INVARIANT TIE-BREAK.  The Indexer's einsum reads the WHOLE
+     `kv_cache` (a fixed [., MAXW, .]) and masks scores at positions >= end_pos//ratio to -inf; the
+     selection takes a FIXED k = index_topk and pads unfilled slots with -1. sparse_attn treats a -1
+     index as "no position" (it zeroes that KV row and pushes the score to -inf), and because the
+     kernel walks topk in FIXED 64-wide blocks, an all-masked block rescales by exp(0)=1 and adds 0 --
+     so the -1 padding is bitwise free. THE MASK IS NOT ENOUGH ON ITS OWN, THOUGH: `Tensor.topk`'s
+     tie order is an unspecified artifact of its selection algorithm and is NOT invariant to array
+     length, and `index_score` is bf16 behind a `relu_()` that floors negatives to a hard 0.0, so
+     exact ties at the k-th rank are common and a masked wide topk can select a DIFFERENT SET than
+     the reference's narrow one. The selection therefore uses an explicit (value DESC, index ASC)
+     total order (_select_topk_width_invariant) whose result is identical at ANY read width >=
+     end_pos//ratio -- which is also what makes BUCKETING the read a free cost lever rather than a
+     correctness change. The window/compress index LISTS (get_window_topk_idxs /
+     get_compress_topk_idxs) are the reference's own, built eagerly per step into a static buffer and
+     copied in before replay: they are a handful of tiny launches, not the GEMM-and-attention bulk
+     the graph is for, and building them in-graph would mean transcribing their per-position branch
+     structure for no dispatch saving.
+
+     TIER 1 vs TIER 2 -- WHAT "BIT-EXACT" MEANS HERE, EXACTLY.  Tier 1 (hard, torch.equal): this
+     path is a deterministic function of (h, pos, state) that does not depend on the padded read
+     width, and a graph of it replays byte-identically to running it eager. Tier 2 (named, bounded):
+     against the VENDORED reference it is bit-identical at every position where the reference's own
+     top-k is well defined, and may pick a different compressed slot only where the scores TIE at the
+     k-th rank -- a case in which the reference's answer is torch's arbitrary order, not the model's
+     intent, and already differs between the CPU and CUDA topk backends. That is a real, if small,
+     accuracy caveat and not a rounding difference; tests/test_v4_whole_layer.py counts the ties and
+     reports the first step one bites.
 
   #3 TWO GRAPHS, PICKED BY POSITION.  `should_compress` is known on the HOST from `start_pos`, so the
      block is captured TWICE -- a no-compress variant (the Compressor only advances kv_state/
@@ -148,17 +164,52 @@ def _compressor_decode_cs(R, C, x, pos, compress):
     C.kv_cache.narrow(0, 0, 1).index_copy_(1, comp_slot, kv)
 
 
+def _select_topk_width_invariant(score, valid, k, arange_w):
+    """Top-k of `score` by (value DESC, index ASC) -- the same set and order at ANY padded width.
+
+    THE ONE THING A FIXED-WIDTH TOPK CANNOT BORROW FROM torch. `Tensor.topk` breaks ties by whatever
+    its selection algorithm happens to do (a non-stable partial_sort on CPU, a radix select on CUDA);
+    that order is not part of the contract and it is NOT invariant to the length of the array. So
+    `score[:end].topk(k)` and `score.masked_fill(idx>=end, -inf).topk(k)` -- mathematically the same
+    query -- can return DIFFERENT SETS whenever the k-th and (k+1)-th values are equal. They tie
+    constantly here: `index_score` is bf16 and passes through `relu_()`, which floors every negative
+    column to a hard 0.0, so whole blocks of candidates share a value exactly. That is what broke the
+    first cut of this file -- a fixed-width read picked a different compressed KV slot than the
+    reference at decode pos 43 and the hidden state diverged by ~2e-3 (tests/test_v4_whole_layer.py).
+
+    (value, -index) is a TOTAL order on the valid columns, so the top-k under it is unique and cannot
+    depend on how many -inf columns are padded on the end. Concretely: take the k-th largest VALUE
+    (a multiset property, already width-invariant), admit every column strictly above it, then admit
+    the tied columns in ascending index until k are held. All fixed-shape, all device-side -- no host
+    sync, nothing baked at capture -- so this is what makes a fixed-width OR bucketed read legitimate
+    rather than merely usually-right.
+
+    It does NOT reproduce torch's tie order, and cannot: see the module docstring's TIER 2 note."""
+    s = score.masked_fill(~valid, float("-inf"))
+    kth = s.topk(k, dim=-1).values.narrow(-1, k - 1, 1)          # k-th largest value, width-invariant
+    gt = s > kth                                                 # strictly inside the cut
+    eq = (s == kth) & valid                                      # tied exactly at the cut
+    need = k - gt.sum(-1, keepdim=True)                          # how many tied columns to admit
+    take = gt | (eq & (eq.cumsum(-1) <= need))                   # cumsum = rank among ties, index ASC
+    w = arange_w.size(-1)
+    key = torch.where(take, w - arange_w, arange_w.new_full((), -1))   # distinct, DESC in index
+    pick = key.topk(k, dim=-1).indices                           # -> ascending index, no ties left
+    return pick, take.gather(-1, pick)
+
+
 def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_maxw, compress):
     """Indexer.forward's decode branch with the GROWING read/topk made fixed-width + masked.
 
     Reference (start_pos>0): scores q against `kv_cache[:, :end_pos//ratio]`, `topk(min(index_topk,
     end_pos//ratio))`, `+= offset`. Here: score against the whole `kv_cache` (fixed MAXW), mask
-    columns >= end_ratio to -inf, take a FIXED topk of index_topk, and send any selection at a masked
-    (future) column to -1. The valid selections match the reference in value AND order (a -inf column
-    never outranks a finite one, so the top min(index_topk, end_ratio) finite columns are identical),
-    and the -1 padding is a sparse_attn no-op -- so the concatenated topk feeds byte-identical
-    attention. `offset` (= window_size on decode) shifts a compressed slot index into the attn
-    kv_cache's compressed region, exactly as the reference's `topk_idxs += offset`."""
+    columns >= end_ratio to -inf, and select a FIXED index_topk of them with a tie-break that does
+    not depend on the read width (_select_topk_width_invariant), padding the unfilled slots with -1.
+    A -1 is a sparse_attn no-op -- the kernel walks topk in fixed 64-wide blocks, so an all-masked
+    block rescales by exp(0)==1 and adds 0 (v4_kernels_cpu.sparse_attn emulates that blocking for
+    the same reason) -- so the padded list feeds byte-identical attention.
+
+    `offset` (= window_size on decode) shifts a compressed slot index into the attn kv_cache's
+    compressed region, exactly as the reference's `topk_idxs += offset`."""
     n_local_heads, head_dim, rd = I.n_local_heads, I.head_dim, I.rope_head_dim
     index_topk = I.index_topk
     q = I.wq_b(qr)
@@ -168,12 +219,16 @@ def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_ma
     R.fp4_act_quant(q, R.fp4_block_size, True)
     _compressor_decode_cs(R, I.compressor, x, pos, compress)
     weights = I.weights_proj(x) * (I.softmax_scale * I.n_heads ** -0.5)
-    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1))
+    # `arange_maxw`'s length IS the read width: pass a full-width arange for the shipped fixed-max
+    # read, or a bucket-sized one to read only as far as the position needs. The selection is
+    # width-invariant, so that choice is pure cost -- but the bucket must hold index_topk slots.
+    read_w = arange_maxw.size(-1)
+    index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1).narrow(1, 0, read_w))
     index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
-    valid = (arange_maxw < end_ratio).view(1, 1, -1)
-    index_score = index_score.masked_fill(~valid, float("-inf"))
-    topk_idxs = index_score.topk(index_topk, dim=-1)[1]
-    topk_idxs = torch.where(topk_idxs < end_ratio, topk_idxs + offset, topk_idxs.new_full((), -1))
+    arange = arange_maxw.view(1, 1, -1)
+    valid = arange < end_ratio
+    pick, kept = _select_topk_width_invariant(index_score, valid, index_topk, arange)
+    topk_idxs = torch.where(kept, pick + offset, pick.new_full((), -1))
     return topk_idxs.int()
 
 

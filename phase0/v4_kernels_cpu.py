@@ -175,30 +175,59 @@ def fp4_gemm(a, a_s, b, b_s, scale_dtype=torch.float32):
 
 # ── attention, hyper-connections, rotation ───────────────────────────────────────────────────────
 
+SPARSE_ATTN_BLOCK = 64          # kernel.py sparse_attn_kernel's `block` -- the reduction quantum
+
+
 def sparse_attn(q, kv, attn_sink, topk_idxs, softmax_scale):
     """Gather-then-softmax attention over topk_idxs, with a learned per-head sink in the denominator.
 
     q [b,s,h,d] bf16, kv [b,n,d] bf16, attn_sink [h] fp32, topk_idxs [b,s,topk] int32 where -1 means
     "no position" (the kernel zeroes that KV row and pushes the score to -inf, so it contributes to
-    neither the numerator nor the denominator). The GPU kernel walks topk in 64-wide blocks with an
-    online softmax; one pass in fp32 is the same function.
+    neither the numerator nor the denominator).
+
+    BLOCKED IN 64s, LIKE THE KERNEL, AND THAT IS LOAD-BEARING. kernel.py walks topk in
+    `ceildiv(topk, 64)` fixed 64-wide blocks with a running max/sum, so out-of-range lanes are
+    ALWAYS present (`idxs[i] = -1` past `topk`) and an extra all-masked block rescales by
+    exp(0) == 1 and adds exactly 0 -- padding a topk list with -1 is BITWISE free on the GPU. A
+    single flat `p.sum(-1)` / `p @ gathered` over the true width is the same function in exact
+    arithmetic but NOT the same rounding: widening the reduction regroups its pairwise tree, so a
+    31-wide list and the same list padded to 48 disagreed in the last bits on ~1% of calls and
+    occasionally crossed a bf16 boundary. Anything that feeds this a fixed-width padded index list
+    (v4_whole_layer_graph's capture-safe decode) would then fail a parity test the GPU passes. The
+    block loop makes the emulation padding-invariant for the same reason the kernel is.
 
     NOT emulated: the head padding to 16 in kernel.py's wrapper (a GPU tiling detail -- it slices
-    the padding straight back off), and the all-masked row, which the kernel leaves as NaN
-    (scores_max stays -inf, exp(sink - -inf) is NaN) and which is treated here as an all-zero output.
-    The reference never produces such a row: every query keeps at least its own window position."""
+    the padding straight back off), the bf16 cast of P before the second gemm (`acc_s_cast`), and
+    the all-masked row, which the kernel leaves as NaN (scores_max stays -inf, exp(sink - -inf) is
+    NaN) and which is treated here as an all-zero output. The reference never produces such a row:
+    every query keeps at least its own window position."""
     b, s, h, d = q.shape
-    idx = topk_idxs.long()
-    valid = idx >= 0
-    gathered = kv[torch.arange(b, device=kv.device)[:, None, None], idx.clamp_min(0)].float()
-    scores = torch.einsum("bshd,bstd->bsht", q.float(), gathered) * softmax_scale
-    scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
-    m = scores.amax(-1)
-    m = torch.where(torch.isfinite(m), m, torch.zeros_like(m))
-    p = torch.exp(scores - m.unsqueeze(-1))
-    denom = p.sum(-1) + torch.exp(attn_sink.float().view(1, 1, h) - m)
-    o = torch.einsum("bsht,bstd->bshd", p, gathered) / denom.unsqueeze(-1)
-    return o.to(q.dtype)
+    topk = topk_idxs.size(-1)
+    block = SPARSE_ATTN_BLOCK
+    ar_b = torch.arange(b, device=kv.device)[:, None, None]
+    acc_o = torch.zeros(b, s, h, d, dtype=torch.float32, device=q.device)
+    sum_exp = torch.zeros(b, s, h, dtype=torch.float32, device=q.device)
+    m = torch.full((b, s, h), float("-inf"), dtype=torch.float32, device=q.device)
+    for t in range(0, max(topk, 1), block):
+        n = min(block, topk - t)
+        idx = topk_idxs.new_full((b, s, block), -1)
+        if n > 0:
+            idx[..., :n] = topk_idxs[..., t:t + n]
+        idx = idx.long()
+        valid = idx >= 0
+        gathered = kv[ar_b, idx.clamp_min(0)].float()
+        gathered = torch.where(valid.unsqueeze(-1), gathered, torch.zeros_like(gathered))
+        scores = torch.einsum("bshd,bstd->bsht", q.float(), gathered) * softmax_scale
+        scores = scores.masked_fill(~valid.unsqueeze(2), float("-inf"))
+        m_prev = m
+        m = torch.maximum(m, scores.amax(-1))
+        rescale = torch.exp(m_prev - m)
+        rescale = torch.where(torch.isnan(rescale), torch.ones_like(rescale), rescale)
+        p = torch.exp(scores - m.unsqueeze(-1))
+        sum_exp = sum_exp * rescale + p.sum(-1)
+        acc_o = acc_o * rescale.unsqueeze(-1) + torch.einsum("bsht,bstd->bshd", p, gathered)
+    sum_exp = sum_exp + torch.exp(attn_sink.float().view(1, 1, h) - m)
+    return (acc_o / sum_exp.unsqueeze(-1)).to(q.dtype)
 
 
 def hc_split_sinkhorn(mixes, hc_scale, hc_base, hc_mult=4, sinkhorn_iters=20, eps=1e-6):
