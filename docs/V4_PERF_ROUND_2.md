@@ -1,5 +1,10 @@
 # V4 perf round 2 — the composed launch recipe
 
+> **SUPERSEDED for the ring launch by [`V4_FULL_STACK.md`](V4_FULL_STACK.md).** That branch composes
+> these levers onto PIPELINED speculation, adds whole-layer CUDA graphs, and fixes the grouped-MoE
+> bank layout — which changes two conclusions below (marked CORRECTED). This file is kept because the
+> per-lever measurements and the mutual-exclusion argument in it are still the source of record.
+
 Four independently-built, independently-measured levers for the DeepSeek-V4-Flash engine, integrated
 onto one branch and proven together on CPU. Each was verified ALONE in its own worktree; this file is
 what the composition actually costs and how to drive it on the ring.
@@ -12,10 +17,10 @@ Every lever is opt-in and default OFF. With no `V4_*` set, this branch is byte-i
 
 | env | what | where it runs | measured alone | numerics |
 |---|---|---|---|---|
-| `V4_MOE_GROUPED=1` | routed-expert GEMMs of a decode step in ONE grouped fp4 launch | every stage, CUDA only, **s == 1 only** | MoE.forward 4.15 ms → 1.30 ms (3.19×) on a ONE-LAYER bench | bit-exact (`torch.equal`, 3-way vs reference and vs `v4_moe_decode`) |
+| `V4_MOE_GROUPED=1` | routed-expert GEMMs of a decode step in ONE grouped fp4 launch | every stage, CUDA only, **s == 1 only** | MoE.forward 4.15 ms → 1.30 ms (3.19×) on a ONE-LAYER bench — on a REAL multi-layer stage 4.75 → 2.02 ms (2.35×), see the correction below | bit-exact (`torch.equal`, 3-way vs reference and vs `v4_moe_decode`) |
 | `V4_DSPARK_FAST=1` | collapse the drafter's wasted intermediate forwards to a cache-advance | TAIL only (the drafter lives there) | 4.51× at n=6 (123.7 → 27.4 ms) | bit-exact, CPU + GPU |
 | `V4_FAST_VERIFY=1` | chunked verify — one pass per layer instead of a per-token loop | every stage, **s > 1 only** | — (GPU round measures it) | not bit-identical to the loop (batched-GEMM reassociation) |
-| `V4_CUDA_GRAPH=1` | partial CUDA graphs over the position/data-independent decode islands | every stage, CUDA only, **s == 1 only** | ~68 of ~240 launches/layer, ~+12% steady-state single-stream | bit-exact (replays the reference's own kernels) |
+| `V4_CUDA_GRAPH=1` | partial CUDA graphs over the position/data-independent decode islands | every stage, CUDA only, **s == 1 only** | ~68 of ~240 launches/layer, ~+12% steady-state single-stream — and on `V4_FULL_STACK` the flag takes a MODE, with `whole` graphing the attention core too | bit-exact (replays the reference's own kernels) |
 | `V4_REF_SLIM=1` | skip the Indexer's SCORING while the top-k selects every compressed slot | every stage, **via `Indexer.forward` only** | ~15-22 of ~240 launches/layer on 21 of 43 layers | selection exact; ≤1-2 bf16 ULP from gather ORDER |
 
 `V4_MOE_DECODE` is already ON by default on master and stays on — it is the fallback the grouped
@@ -46,19 +51,34 @@ numbers make the loop plausibly the winner at `s = 6` (the chunk pass is ~4× a 
 at *reference* cost, the loop is ~5.8× but each position gets MoE 4.15 → 1.30 ms plus ~12% from
 graphs plus the indexer skip), but that is arithmetic, not a measurement — settle it on the ring.
 
-**2. `V4_MOE_GROUPED` will DECLINE on a full stage, by design, until the loader changes.** The kernel
-gathers experts out of a contiguous bank that is an exact DUPLICATE of the layer's routed-expert
-weights — ~3.2 GiB per layer at shipped dims, beside the ~3.7 GiB already resident. A 7-layer stage on
-a 32 GiB card cannot hold both. The real fix is a load-time layout choice (store the experts as a
-bank, drop the per-expert tensors) and it is NOT on this branch. The bank build therefore checks free
-VRAM and declines — once per layer, with a printed line — falling back to the decode path, rather
-than OOMing on the first decode token and killing the stage. **Expect the 3.19× not to materialise on
-a full ring.** It is safe to leave the flag set; watch the stage log for the decline line.
+**2. `V4_MOE_GROUPED` will DECLINE on a full stage, by design, until the loader changes.**
+**~~CORRECTED — the loader DID change.~~** What follows was true of this branch and is no longer true
+of `V4_FULL_STACK`; it is left in place because it is why the lever read as ON and did nothing on the
+first ring, which is the failure worth remembering.
 
-Related: the grouped kernel's ~11× / 0.377 ms number was measured with the whole MoE forward inside a
-CUDA graph. The serve path cannot deliver that — `_BlockGraphs` leaves `ffn` eager BY CONSTRUCTION
-(the reference's expert dispatch drains the device and branches in Python, which a graph cannot
-capture). 3.19× eager is the ceiling this branch can reach, and only where the bank fits.
+The kernel gathers experts out of a contiguous bank that is an exact DUPLICATE of the layer's
+routed-expert weights — ~3.2 GiB per layer at shipped dims, beside the ~3.7 GiB already resident. A
+7-layer stage on a 32 GiB card cannot hold both. The bank build therefore checks free VRAM and
+declines — once per layer, with a printed line — falling back to the decode path, rather than OOMing
+on the first decode token and killing the stage. On the live ring it declined on EVERY layer of every
+stage, so the lever never fired at all.
+
+The fix (`v4_moe_grouped.bank_layout`, called from `Stage.__init__` between constructing the Blocks
+and `load()`) makes the routed experts BE the bank: each expert parameter is repointed at a slice of a
+contiguous per-layer bank and `load_state_dict` writes through the view, so the checkpoint lands in
+the bank and nowhere else. VRAM is byte-identical to the non-grouped path (10.168 GiB on a 3-layer
+stage either way) and the kernel fires 7/7 and 8/8 instead of 1/7.
+
+**The honest multi-layer numbers, which are lower than the one-layer bench:** MoE.forward 4.75 → 2.02
+ms (2.35×), whole stage eager 26.9 → 18.6 ms/step (1.45×), with CUDA graphs 23.6 → 15.4 (1.54×). The
+**~~3.19× eager ceiling~~** above came from a ONE-LAYER bench with nothing else competing for the
+launch queue; 2.35× is what a real stage sees. Bit-exact either way (41 decode steps `torch.equal`
+with the lever off, both graph settings; the s>1 paths `torch.equal` too).
+
+Still true: the grouped kernel's ~11× / 0.377 ms number was measured with the whole MoE forward inside
+a CUDA graph, and the serve path does not deliver that — `_BlockGraphs` leaves `ffn` eager BY
+CONSTRUCTION, and whole-layer mode leaves the *real routed* MoE eager between two graphs for the same
+reason (the reference's expert dispatch drains the device and branches in Python).
 
 ## Recipe — what to launch the GPU ring with
 

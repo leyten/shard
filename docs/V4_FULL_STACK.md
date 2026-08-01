@@ -1,0 +1,254 @@
+# V4 full stack — the composed ring launch
+
+Every DeepSeek-V4-Flash perf lever built so far, on one branch, over the one that actually moved a
+live ring: **pipelined speculation**. This is the branch the headline 6-box measurement runs from.
+
+**The base is measured, not projected.** On a live 6-box ring, identical code, same prompt:
+
+| arm | tok/s |
+|---|---|
+| greedy | 1.80 |
+| DSpark, serial | 1.43 |
+| **DSpark, PIPELINED** | **3.81 / 3.83** |
+
+2.67× over serial, output bit-identical (`pipelined_equals_greedy: true`), 6/6 receipts verified
+out-of-process, reproducible to 0.4%. The accept histogram shows rounds committing 7, 8 and 10 tokens
+— impossible serially, where a round is capped at `block_size + 1 = 6` — so the pipeline genuinely
+fills. **That build carried no compute levers at all.** This branch adds them.
+
+Every lever is opt-in and default OFF. With no `V4_*` set this branch emits, token for token, what
+`v4/pipelined-coord` emits — asserted, not assumed
+(`tests/test_v4_full_stack.py::test_the_ring_recipe_serves_exactly_what_the_default_serves`).
+
+---
+
+## THE ENV RECIPE
+
+### Stage-side, per box
+
+Through the launcher (preferred — the mode is an argument, so it cannot be lost in a string):
+
+```python
+stage_launch_cmd(..., cuda_graph="whole",
+                 extra_env="V4_MOE_GROUPED=1 V4_MOE_DECODE=1 V4_DSPARK_FAST=1 V4_REF_SLIM=1 ")
+```
+
+which produces, per stage:
+
+```
+V4_CUDA_GRAPH=whole V4_MOE_GROUPED=1 V4_MOE_DECODE=1 V4_DSPARK_FAST=1 V4_REF_SLIM=1
+```
+
+`stage_launch_cmd` **raises** on a `cuda_graph` value the stage would resolve to `off`, so a typo
+fails at launch instead of producing a ring that runs eager while the launch line says `whole`.
+
+### Coordinator-side
+
+```
+V4_PIPELINED_SPEC=1
+```
+
+`V4_PIPELINED_SPEC` is read by the **coordinator** — it chooses which coordinate function drives the
+job. Setting it on the stages too is harmless.
+
+**`V4_SPEC_DEPTH` is read by BOTH sides and they must agree.** It is the coordinator's in-flight
+window `W` (`coordinate_dspark_pipelined`) *and* the stage's rollback checkpoint ring depth
+(`Stage._spec_ckpts.maxlen`). Both default to 16, so the safe move is to **leave it unset everywhere**.
+Raise it on the coordinator alone and a rejection W frames downstream tries to rewind past the oldest
+checkpoint a stage still holds — which refuses loudly rather than serving stale state, but it kills
+the job. If you tune it, tune it on every box in the ring.
+
+### MUST STAY OFF, and why
+
+| flag | why it stays off |
+|---|---|
+| `V4_FAST_VERIFY` | **Structurally dead under pipelining, not merely unhelpful.** `Stage.forward` tests `start_pos == 0 or s == 1` BEFORE `_chunk_ok(s)`, and every pipelined frame is `s == 1`, so the chunk path is unreachable. Worse than a no-op: the flag also swaps in `_ChunkBlock` and reserves `_chunk_cap` extra KV rows per attention on every stage, so it costs VRAM to buy nothing. |
+| `V4_REF_SLIM_NOQAT` | **The one lever in the stack that is not lossless.** It removes the reference's deliberate fp8/fp4 QAT *simulation*, so the run is strictly MORE precise than the reference and therefore a different answer — the toy config's tokens diverge from step 3. It is invisible to the selftest (ring and reference move together) and disqualifying for an arm whose claim is "bit-identical to greedy". Correct to enable only for a deployment that really does store a bf16 KV cache and has re-derived the bar. |
+| `V4_DSPARK_CONF_GATE` | Two reasons. (1) `conf` is a raw logit, not a probability — the threshold has to be calibrated against the real model first (`conf_probe`). (2) It gates the tail's OFFERED BLOCK LENGTH, and the pipelined coordinator never sends a block. Setting both now **raises** rather than being ignored. |
+| `V4_MOE_DECODE=0` | Never set this. It is the fallback the grouped kernel hands every shape it declines (s>1, world_size>1, hash-routed layers). |
+
+### The A/B to run
+
+Three arms, one variable each, all on the same warm ring:
+
+```
+1. serial baseline    (nothing set)                    -> expect ~1.43
+2. pipelining only    V4_PIPELINED_SPEC=1              -> expect ~3.81   (the known-good anchor)
+3. full stack         the recipe above                 -> the headline
+```
+
+Arm 2 is not optional. It is the only thing that separates "the compute levers multiplied" from "the
+ring was faster today", and it is the arm whose number we already know.
+
+### What to check in the stage log before trusting any number
+
+Each stage prints its `__repr__` — this reports **observed** state, not the env it was handed:
+
+```
+<V4Stage [0:7) IWCIWCI head=True tail=False torch.bfloat16 on cuda:0 pos=0 kernels=tilelang
+ dspark=off taps=[] spec=off/16 graph=whole fast_verify=off moe=grouped/7 ref_slim=indexer>
+```
+
+- `graph=whole` — armed. `graph=off` with a `GRAPH REFUSED ...` line above it means it declined and
+  said why. `graph=off` with **no** line means the flag never arrived.
+- `moe=grouped/7` — the grouped forward is bound AND 7 layers took the bank. **`moe=grouped/0` is the
+  ring failure that made this branch necessary**: the flag read as on for every job while the bank
+  declined on every layer, so the lever never fired and the run measured nothing.
+- `ref_slim=indexer` — item 1 only. `indexer+noqat` means someone set NOQAT; stop the run.
+
+---
+
+## Levers: what composes, what is exclusive
+
+| lever | env | composes with pipelining? | why |
+|---|---|---|---|
+| pipelined speculation | `V4_PIPELINED_SPEC=1` | **the base** | streams `s=1` frames instead of one `[cur]+drafts` block per round, so the D stages fill |
+| whole-layer CUDA graphs | `V4_CUDA_GRAPH=whole` | **YES** | `_run`'s graph path needs `start_pos > 0`, `s == 1`, not replaying — exactly what a pipelined frame is |
+| island CUDA graphs | `V4_CUDA_GRAPH=1` | **YES** (weaker) | same gate; graphs only the hc_pre/hc_post/norm islands |
+| grouped fp4 MoE | `V4_MOE_GROUPED=1` | **YES** | claims the single-token score-routed step; declines s>1 to `v4_moe_decode` |
+| MoE decode fast path | `V4_MOE_DECODE=1` | **YES** (default) | the fallback under grouped |
+| DSpark draft collapse | `V4_DSPARK_FAST=1` | **YES** | tail-local; rebinds `DSparkTail.advance_and_draft`, orthogonal to the wire shape |
+| ref-slim, item 1 | `V4_REF_SLIM=1` | **YES** | rebinds `Indexer.forward`, which the `s=1` path calls |
+| W-deep rollback ring | `V4_SPEC_DEPTH=N` | **YES** (required) | pipelining streams W frames before the first is judged; a rewind past the oldest checkpoint refuses loudly. Default 16 |
+| chunked verify | `V4_FAST_VERIFY=1` | **NO — mutually exclusive** | see below |
+| ref-slim, item 2 | `V4_REF_SLIM_NOQAT=1` | composes, but **not lossless** | removes a precision reduction; changes the stream |
+| confidence gate | `V4_DSPARK_CONF_GATE=1` | **NO — refused** | gates a block length the pipelined path never sends |
+
+### The exclusivity, exactly
+
+`Stage.forward` dispatches in this order:
+
+```python
+if start_pos == 0 or s == 1:      # prefill, or ANY single-position frame
+    out = self._run(...)          # <- graphs, grouped MoE, ref-slim item 1 all live HERE
+elif self._chunk_ok(s):
+    out = self._run_chunk(...)    # <- the fast-verify chunk
+else:
+    out = cat([self._run(one position at a time) ...])   # s=1 each, so the levers apply again
+```
+
+`s == 1` is tested first, so a pipelined frame can never reach the chunk path. Asserted on the AST of
+the dispatch itself, not on prose: `test_fast_verify_is_bypassed_by_every_s_equals_1_frame`.
+
+And the chunk path, when the *serial* coordinator does reach it, bypasses three things:
+
+- **CUDA graphs** — the graph gate requires `h.shape[1] == 1`.
+- **ref-slim item 1** — `_chunk_attention` calls `_chunk_indexer(...)`, its own s-position
+  reimplementation, never `self.indexer.forward(...)`. So rebinding the class method cannot reach it.
+  Pinned by `test_indexer_skip_does_not_reach_the_chunked_verify_path`.
+- **grouped MoE** — `grouped_forward` declines `s > 1` to the decode path.
+
+**ref-slim item 2 is the exception that proves the rule**: it rebinds the module-level `act_quant` /
+`fp4_act_quant` names, and `_chunk_attention` reads `M.act_quant(...)`, so that one *does* compose
+with the chunk path. Class-method overrides are bypassed; module-global overrides are not.
+
+This bypass is not theoretical — it surfaced as an 18-test cross-file failure. See below.
+
+---
+
+## Merge decisions
+
+Four merges onto `v4/pipelined-coord`. What was kept, and why:
+
+**`Stage.__init__`** — pipelining added `spec_depth`, round 2 added `fast_verify`. Both kept; they are
+independent.
+
+**The coordinator choice** — pipelining added "which coordinator", round 2 added the `conf_*` knobs to
+`coordinate_dspark`. Composed explicitly: the knobs go to the serial call, and asking for both
+**raises**. A gate that silently did nothing would be measured on the ring as "confidence gating did
+not help", which is the same class of lie as a graph that never captured.
+
+**`V4_CUDA_GRAPH`** — the islands branch and the whole-layer branch each added the flag block, git
+kept both copies, and the bool version sat above the mode version as dead code that read as live.
+Removed. This is precisely the artifact the reachability suite exists to catch, and the merge produced
+one on the first try.
+
+**`Stage.__repr__`** — every status field, reporting **observed** state rather than declared. It is
+the line an operator reads on a live ring to answer "did the lever fire?", so it reads the function
+actually bound to the reference class and the count of layers that actually took the bank.
+
+**The tie-break, reconciled from two independent triages.** `v4/whole-layer-graph-fix` and the
+whole-layer branch found the same bug separately: `torch.topk`'s tie order is not width-invariant, and
+`index_score` is bf16 behind a `relu_()` that floors negatives to a hard 0.0, so ties at the k-th rank
+are routine (23 of 120 decode steps). A bucketed or fixed-width read could therefore select a
+*different compressed slot* than the reference's narrow one.
+
+- **Block-faithful `sparse_attn`** — taken from `e1db515`. The CPU oracle reduced in one flat pass
+  over the true topk width, so padding with `-1` regrouped its pairwise tree and moved last bits on
+  ~1% of calls; the real kernel walks fixed 64-wide blocks where an all-masked block rescales by
+  `exp(0) == 1` and adds 0. An oracle not blocked the same way fails a parity the GPU passes. 0
+  mismatches over 200 trials × 3 pad widths.
+- **Width-invariant selection** — taken from the whole-layer branch, and this was a real choice. Both
+  implementations select the same SET. `e1db515`'s (k-th value + cumsum admission) emits it in
+  ascending INDEX order; the whole-layer branch's (stable descending sort) emits it in descending
+  SCORE order — the lane order the reference's own `topk` hands `sparse_attn`. Since `sparse_attn`'s
+  per-block reduction is order-sensitive, the lanes matter: at V4's real dims over 40 decode steps,
+  ascending-index gave **2/40** bit-exact vs the reference, descending-score gave **40/40**.
+- **Bucketing** — kept. It is the cost lever, and it is legal *only* because the selection is
+  width-invariant: with `torch.topk` the answer would depend on which bucket a position landed in,
+  i.e. on capture history.
+
+---
+
+## The two bugs the composition found
+
+**1. `v4_ref_slim` leaked across the whole test process.** `tests/test_v4_ref_slim.py` armed the slim
+overrides in a module-scoped fixture and never removed them, and `v4_ref_cpu.load_ref()` caches the
+reference module process-wide. So every later test file inherited a rebound `Indexer.forward`. That is
+what produced the 18 `test_fast_verify_attends_exactly_what_the_loop_attends[2-*]` failures that
+appeared **only** in a full-suite run: the LOOP took the slim fixed index while the CHUNK took the
+real indexer — same key set, different gather order.
+
+It was previously logged as an unreproducible flake needing "cumulative process state". It is not; it
+reproduces deterministically from two files, `tests/test_v4_ref_slim.py` + `tests/test_v4_stage.py`.
+It is **not** the topk tie-break. Fixed by giving `v4_ref_slim` an `uninstall()` and using it in the
+fixture. The bypass it exposed is now pinned as a permanent test, because it is a real property of the
+composition.
+
+**2. `V4_REF_SLIM_NOQAT` changes the served tokens**, found by comparing streams *across* configs.
+"ALL PASS" cannot catch this: the selftest compares each config's ring against *that config's*
+reference, so a lever that moves both together passes in-config while changing what the ring serves.
+
+---
+
+## Test matrix
+
+CPU-only, `OMP_NUM_THREADS=1`.
+
+| suite | result |
+|---|---|
+| full v4 suite (`pytest tests/ -k v4`) | **392 passed, 5 skipped** (5 = CUDA capture / tilelang parity) |
+| lever reachability + losslessness (`tests/test_v4_full_stack.py`) | **23 passed** |
+| whole-layer Tier-1 / Tier-2 / freshness | passing (CUDA arms skip on this box) |
+
+Both pipe selftests, every config, ALL PASS (14/14 assertions each):
+
+| config | env | tokens |
+|---|---|---|
+| default | — | identical to base branch |
+| pipelined | `V4_PIPELINED_SPEC=1` | identical |
+| pipe + island graphs | `+ V4_CUDA_GRAPH=1` | identical |
+| pipe + whole graphs | `+ V4_CUDA_GRAPH=whole` | identical |
+| pipe + ref-slim | `+ V4_REF_SLIM=1` | identical |
+| pipe + dspark-fast | `+ V4_DSPARK_FAST=1` | identical |
+| pipe + grouped MoE | `+ V4_MOE_GROUPED=1` | identical |
+| pipe + fast-verify | `+ V4_FAST_VERIFY=1` | identical (and unreachable) |
+| pipe + spec-depth 4 | `+ V4_SPEC_DEPTH=4` | identical |
+| serial + fast-verify | `V4_FAST_VERIFY=1` | identical |
+| **the ring recipe** | all six | **identical** |
+| pipe + ref-slim + NOQAT | `+ V4_REF_SLIM_NOQAT=1` | **DIVERGES from step 3 — excluded** |
+
+24/24 runs `ALL PASS`; 22/24 also token-identical to the pre-merge base on all five paths (`ring`,
+`ref`, `spec`, `dspark`, `pipe`). The 2 exceptions are the NOQAT config, by design and asserted.
+
+## Reproduce
+
+```
+OMP_NUM_THREADS=1 python3 -m pytest tests/ -q -k v4
+OMP_NUM_THREADS=1 python3 -m pytest tests/test_v4_full_stack.py -q
+OMP_NUM_THREADS=1 python3 phase0/v4_pipe.py selftest
+OMP_NUM_THREADS=1 python3 phase0/v4_pipe.py selftest-relay
+```
+
+`OMP_NUM_THREADS=1` is not decoration: the toy-config tests run ~22× faster with it, and `torch.topk`'s
+tie order varies with thread count, which is one of the things the width-invariant selection removes.

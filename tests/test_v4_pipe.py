@@ -1135,6 +1135,37 @@ def test_launch_defaults_cuda_graph_on_with_an_opt_out():
     assert override.index("V4_CUDA_GRAPH=1 ") < override.index("V4_CUDA_GRAPH=0 ")
 
 
+def test_launch_carries_the_graph_MODE_and_refuses_one_the_stage_would_drop():
+    """V4_CUDA_GRAPH is a mode after the whole-layer merge, and the LAUNCHER has to be able to say
+    `whole` — a launcher that can only reach island is one forgotten extra_env away from measuring
+    island and reporting whole, which is the m25 failure this engine's flags exist to prevent.
+
+    An unrecognised value must RAISE here rather than travel to a stage that would resolve it to
+    "off": a ring that silently runs eager while the launch line says otherwise produces a number
+    nobody can interpret, and it costs a full provisioning cycle to discover."""
+    whole = VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph="whole")
+    assert "V4_CUDA_GRAPH=whole " in whole and whole.index("V4_CUDA_GRAPH=") < whole.index("V4_DIR=")
+    assert "V4_CUDA_GRAPH=island " in VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph="island")
+    for bad in ("yes", "true", "WHOLE", "3", ""):
+        with pytest.raises(ValueError, match="V4_CUDA_GRAPH"):
+            VP.stage_launch_cmd(0, 3, 0, 15, cuda_graph=bad)
+
+
+def test_launcher_graph_modes_are_exactly_the_ones_the_stage_accepts():
+    """GRAPH_MODE_VALUES is duplicated out of v4_stage._graph_mode (stage_launch_cmd is a pure builder
+    and must not import the model — see LAZY MODEL IMPORT). Duplication is only safe if drift fails
+    loudly, so this is the thing that makes it safe: every value the launcher will emit must resolve
+    to a real mode on the stage, and every value the stage accepts must be reachable from a launcher."""
+    V4 = pytest.importorskip("v4_stage")
+    for v in VP.GRAPH_MODE_VALUES:
+        mode = V4._graph_mode(v)
+        assert (mode == "off") == (v == "0"), f"launcher would emit {v!r}, stage resolves it to {mode}"
+    # nothing the stage understands is missing from the launcher's set
+    for v in ("0", "1", "island", "on", "whole", "2", "eager"):
+        if V4._graph_mode(v) != "off" or v == "0":
+            assert v in VP.GRAPH_MODE_VALUES, f"the stage accepts {v!r} but the launcher rejects it"
+
+
 def test_plan_layer_ranges_names_the_missing_v4_profile():
     """shard/plan.py keys engine profiles by catalog model id and REFUSES an unknown one rather than
     planning V4 at another model's calibration (the admit-then-OOM failure the measured numbers exist
