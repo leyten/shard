@@ -1445,6 +1445,19 @@ def _peerid_of(maddr):
     return maddr.rsplit("/p2p/", 1)[-1].split("/p2p-circuit")[0]
 
 
+# Every engine lever the operator exports locally has to reach the STAGE PROCESSES too — V4 reads
+# them once at import, per process, so a lever set only on the launcher box configures nothing.
+# m25_scatter_pipe's ENG_ENV carries the same list for the same reason, and its comment records the
+# measurement that taught it. The fp8 wire is the worst possible case for this bug: a ring where
+# only some processes have it still WORKS (_recv_hids dispatches on the frame, not on the local
+# flag), so a missed propagation is invisible except in the byte counters.
+ENG_ENV = ["V4_FP8_WIRE"]
+
+
+def _eng_env():
+    return "".join(f"{k}={os.environ[k]} " for k in ENG_ENV if k in os.environ)
+
+
 def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=False,
                      device="cuda", token=None, extra_env="", gpu=None, port=None, nxt_addr=None,
                      ret_relay=None, dspark=False):
@@ -1483,8 +1496,8 @@ def stage_launch_cmd(stage, nstages, lo, hi, *, model_dir="/root/v4", receipts=F
     log = f"/root/v4_stage_{port}.log"
     inner = (f"python3 /root/v4_pipe.py stage --stage {stage} --nstages {nstages} --lo {lo} --hi {hi} "
              f"--port {port} {nxt} {rr}{ds}--dir {model_dir} > {log} 2>&1")
-    return (f"{rc}{tk}{cvd}{extra_env}V4_DIR={model_dir} V4_DEV={device} M25_ENGINE_BIND=127.0.0.1 "
-            f"setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
+    return (f"{rc}{tk}{cvd}{_eng_env()}{extra_env}V4_DIR={model_dir} V4_DEV={device} "
+            f"M25_ENGINE_BIND=127.0.0.1 setsid bash -c '{inner}' </dev/null >/dev/null 2>&1 &")
 
 
 # ── multi-GPU per box: split node blocks to GPUs, wire loopback intra-box + WAN inter-box ───────────

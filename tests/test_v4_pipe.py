@@ -1300,3 +1300,16 @@ def test_dspark_stream_still_equals_the_greedy_stream_under_the_fp8_wire(tiny, m
         f"the fp8 wire desynced speculation from greedy: {drafted['tokens']} != {greedy}")
     assert drafted["g"] >= 1.0
 
+
+def test_the_fp8_wire_lever_reaches_a_launched_stage(monkeypatch):
+    """V4 reads its levers once per process at import, so a lever exported only on the launcher box
+    configures NOTHING on the stages. The fp8 wire is the worst case for that bug: a ring where only
+    some processes have it still WORKS (_recv_hids dispatches on the frame, not on the local flag),
+    so the miss is invisible except in the byte counters. m25_scatter_pipe's ENG_ENV exists because
+    M2.5 was burned by exactly this."""
+    monkeypatch.delenv("V4_FP8_WIRE", raising=False)
+    assert "V4_FP8_WIRE" not in VP.stage_launch_cmd(0, 3, 0, 15), "unset must stay unset"
+    monkeypatch.setenv("V4_FP8_WIRE", "1")
+    cmd = VP.stage_launch_cmd(0, 3, 0, 15)
+    assert "V4_FP8_WIRE=1 " in cmd, f"the lever never reaches the stage process: {cmd}"
+    assert cmd.index("V4_FP8_WIRE=1") < cmd.index("setsid"), "env must precede the launched command"
