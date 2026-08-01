@@ -434,6 +434,35 @@ def test_stage_lays_out_the_bank_between_construction_and_load():
         "the bank layout must sit in __init__, i.e. after construction and before load()"
 
 
+def test_a_real_stage_lays_its_layers_out_release_first(monkeypatch):
+    """The same seam, RUN rather than read — a real `Stage`, built with fp4 routed experts.
+
+    The source check above cannot survive a refactor to positional arguments, and the CPU oracle's
+    experts are bf16, so until this test the shipped `preserve=False` path was never once executed
+    against a `Stage`. `cpu_args(expert_dtype="fp4")` gives one that the layout does claim: every
+    layer gets a bank, every expert parameter is a view into it, and `_relayout_moe` is asked for the
+    release-first ordering on every one of them."""
+    VS = pytest.importorskip("v4_stage")
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    asked = []
+    real = GROUPED._relayout_moe
+    monkeypatch.setattr(GROUPED, "_relayout_moe",
+                        lambda moe, preserve=True: (asked.append(preserve), real(moe, preserve))[1])
+    args = REFCPU.cpu_args(expert_dtype="fp4")
+    st = VS.Stage(0, 2, args, device="cpu")
+    assert asked and all(p is False for p in asked), \
+        f"Stage must relayout release-first; it asked for preserve={asked}"
+    for L in st.layers:
+        bank = getattr(L.ffn, "_grouped_bank", None)
+        assert bank, "a stage's fp4 layer must come out of __init__ banked"
+        for i, e in enumerate(L.ffn.experts):
+            for k in _KINDS:
+                lin = getattr(e, k)
+                assert lin.weight.data_ptr() == bank[k][i].data_ptr()
+                assert lin.scale.data_ptr() == bank[k + "_s"][i].data_ptr()
+                assert lin.weight.scale is lin.scale, "the reference reads the scale off the weight"
+
+
 # ── the layout's memory timeline: what it may hold, and when ─────────────────────────────────────
 #
 # The bank layout's ONLY justification is that it costs nothing on the card, and the first version of

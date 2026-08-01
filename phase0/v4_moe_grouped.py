@@ -115,19 +115,26 @@ MEASURED ON A REAL STAGE (RTX 5090, 31.36 GiB usable, the converted 43-layer che
       V4_MOE_GROUPED=0                  23.641 GiB      24.270 GiB       0/7
       bank layout                       23.641 GiB      24.381 GiB       7/7
       stacking the bank instead         26.829 GiB      27.457 GiB       1/7, SIX DECLINED
-Those are END-STATE numbers, and end state was never the binding constraint. Sizes for one 8-layer
-head stage at the shipped dims, from config.json (dim 4096, moe_inter_dim 2048, 256 fp4 experts):
-per layer the routed experts are 3.1875 GiB in 1536 blocks (3 weight banks of 1024.00 MiB, 3 e8m0
-scale banks of 64.00 MiB), the layer is ~3.365 GiB, eight of them plus the head embedding is 27.98
-GiB resident (26.998 of layers + 0.986 of embedding). Building each layer's banks BEFORE releasing
-what they replace peaks at steady + 3.19 GiB reserved; releasing first peaks at steady. Against a
-30.76 GiB budget (31.36 usable less the ~0.6 GiB CUDA context) that is the whole difference:
+Those are END-STATE numbers on the PRE-FIX code, and end state was never the binding constraint.
+
+ARITHMETIC, NOT MEASUREMENT -- everything from here to the speed table is computed from
+config.json (dim 4096, moe_inter_dim 2048, 256 fp4 experts) by building the real Blocks on the meta
+device, and NOTHING below has been run on a card yet. Per layer the routed experts are 3.1875 GiB in
+1536 blocks (3 weight banks of 1024.00 MiB, 3 e8m0 scale banks of 64.00 MiB); the layers run
+3.352-3.402 GiB; eight of them plus the head embedding is 27.98 GiB resident (26.998 + 0.986).
+Building a layer's banks BEFORE releasing what they replace peaks at steady + 3200 MiB (the stranded
+run at the w2 request, the worst of the six); releasing first peaks at steady. Against a 30.76 GiB
+budget (31.36 usable less the ~0.6 GiB CUDA context) that is the whole difference:
     head stage    steady     OLD peak      NEW peak
-      [0:7)       24.62      27.81  fits    24.62     <- why seven layers measured clean
-      [0:8)       27.98      31.17  OOM     27.98     <- and why eight did not
-Eight is the ceiling either way: nine layers is 30.40 GiB of weights alone, 0.36 GiB short of a
-stage that could serve anything. `tests/test_v4_moe_grouped.py` gates the ordering at the real expert
-count with a storage-liveness meter (`test_bank_layout_never_outruns_what_it_released`).
+      [0:7)       24.62      27.74  fits    24.62     <- why seven layers measured clean
+      [0:8)       27.98      31.11  OOM     27.98     <- and why eight did not
+Eight is the ceiling for a head or middle stage: nine layers is 30.40 GiB of weights alone. It is NOT
+the ceiling for a dspark tail -- `RingDrafter`'s three DSparkBlocks are three more 256-expert MoEs
+(10.28 GiB), built lazily on the first dspark job, i.e. after load; that stage tops out around four
+layers and is a separate problem this fix does not touch. Nor does 8 leave room to prefill at
+V4_MAX_SEQ=8192 (a ratio-4 layer's Indexer scores are ~5.5 GiB at s=8192 against 2.78 GiB free).
+`tests/test_v4_moe_grouped.py` gates the ordering at the real expert count with a storage-liveness
+meter (`test_bank_layout_never_outruns_what_it_released`).
 And the speed it was all for -- stage[40:43), real weights, median of 40 decode steps:
       eager        26.902 -> 18.599 ms/step   (8.967 -> 6.200 ms/layer, 1.45x)
       V4_CUDA_GRAPH=1  23.627 -> 15.387 ms/step   (7.876 -> 5.129 ms/layer, 1.54x)
@@ -319,22 +326,39 @@ def _relayout_moe(moe, preserve=True):
     +1024 MiB of live bytes per weight kind, and, worse, the released blocks are the WRONG SHAPE to
     satisfy it: 256 scattered 4 MiB per-expert blocks, sharing 20 MiB large-pool segments with the
     kinds not yet relaid, cannot be coalesced into the one 1 GiB request that replaces them, and
-    `empty_cache` cannot return a segment that is not wholly free. So `memory_reserved` — what the
-    driver and the next `cudaMalloc` actually see — climbs by the banks built so far while the bytes
-    they replaced stay stranded, and only falls back at the END of the layer, once the last kind
-    frees the run. Peak reserved is therefore steady + a WHOLE LAYER's experts (3.19 GiB at the
-    shipped dims), not the +1.07 GiB the allocated high-water mark suggests, and an 8-layer stage
-    dies at load on a 32 GiB card. The reported OOM reads back exactly as that: 27.97 GiB allocated
-    (the arithmetic below says 27.98 for an 8-layer head stage — flat, because the release IS real),
-    2.13 GiB reserved but unallocated (1024 + 64 + 1024 + 64 MiB = the w1/w1_s/w3/w3_s banks already
-    built in `_BANK_KINDS` order, their originals stranded behind them), 669 MiB free, and a
-    1024.00 MiB request — the w2 weight bank, the fifth of six — that cannot be met.
+    no release — automatic or explicit — can hand back a segment that is not wholly free. So
+    `memory_reserved` — what the driver and the next `cudaMalloc` actually see — climbs by the banks
+    built so far while the bytes they replaced stay stranded, and only falls at the END of the layer,
+    once the last weight kind frees the run. Peak reserved is therefore steady + 3200 MiB at the
+    shipped dims (the stranded run at the w2 request, the worst of the six), not the +1.07 GiB the
+    allocated high-water mark suggests, and an 8-layer stage dies at load on a 32 GiB card. The
+    reported OOM reads back as that, to within a few MiB on each term: 27.97 GiB allocated (the
+    arithmetic says 27.98 for an 8-layer head stage — and it is FLAT, because the release IS real),
+    2.13 GiB reserved but unallocated (the freed originals of the four kinds already relaid, which by
+    symmetry is the same 1024 + 64 + 1024 + 64 = 2176 MiB their banks cost), 669 MiB free, and a
+    1024.00 MiB request — the w2 weight bank, the fifth of six in `_BANK_KINDS` order — unmeetable.
 
     `preserve=False` inverts the order and the excursion disappears: release EVERY routed-expert
-    block of the layer first (rebind each parameter to a void tensor), `empty_cache` so the now
-    wholly-free segments go back to the driver, and only THEN allocate the six banks — into the
-    3.19 GiB the layer just vacated. Peak allocated and peak reserved both equal the steady state;
-    nothing is ever resident twice, in the model or in the allocator.
+    block of the layer first (rebind each parameter to a void tensor), `empty_cache`, and only THEN
+    allocate the six banks — into the 3.19 GiB the layer just vacated. Peak allocated and peak
+    reserved both equal the steady state; nothing is ever resident twice, in the model or in the
+    allocator.
+
+    Two things that ordering does NOT rest on, stated so nobody re-derives them wrongly:
+      * `empty_cache` is not what rescues the allocation. The caching allocator already runs
+        `release_available_cached_blocks` and then `release_cached_blocks` and retries `cudaMalloc`
+        before it reports OOM — which is why the old code died with 2.13 GiB still stranded AFTER
+        that automatic release, and why the first version of this docstring calling the per-kind
+        `empty_cache` "not optional" was wrong. The ORDERING is the fix. The call stays because it
+        makes the return eager and deterministic, so `memory_reserved` reflects the model between
+        layers rather than only when something is about to fail.
+      * The pools do not net out exactly. A layer releases 3072 MiB of 4 MiB weight blocks into the
+        LARGE pool and 192 MiB of 256 KiB scale blocks into the SMALL pool (the 1 MiB threshold), but
+        all six banks — including the three 64 MiB scale banks — are large-pool requests. So 192 MiB
+        per layer has to make the round trip through the driver, which is exactly what the
+        `empty_cache` above is for: the layer's scale blocks are freed together and are contiguous
+        within the small pool (the weights went elsewhere), so their segments are wholly free and do
+        return. If that ever stopped holding it would cost 192 MiB per layer, not a whole bank.
 
     What it costs is the tensors' CONTENTS, which is why it is not the default and why the caller
     has to ask for it. It is exactly right at `Stage.__init__`, the only place it is used: the Blocks
@@ -352,7 +376,12 @@ def _relayout_moe(moe, preserve=True):
 
     Declines, leaving the module untouched, when: the experts are not fp4 (the grouped kernel is
     fp4-only, and a bf16 CPU parity model must stay byte-identical), or something already put a bank
-    on this module (never lay out twice, and never over the lazy stack)."""
+    on this module (never lay out twice, and never over the lazy stack). Both checks run before
+    anything is released, so a decline is total. A `preserve=False` run that RAISES partway is not,
+    though: the parameters it already voided stay voided and there is nothing to restore them from.
+    That is a stage that must not serve, and does not — `Stage.__init__` propagates, the strict
+    `load_state_dict` would reject the 0-element shapes anyway, and the only thing that can raise
+    here is the OOM this ordering exists to prevent."""
     if getattr(moe, "_grouped_bank", None):
         return False
     lo, hi = moe.experts_start_idx, moe.experts_end_idx
