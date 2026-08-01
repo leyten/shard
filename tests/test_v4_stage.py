@@ -21,6 +21,7 @@ single-process Transformer as the oracle -- no GPU, no network, no 158 GiB check
 
 Run: python3 -m pytest tests/test_v4_stage.py -q
 """
+import contextlib
 import os
 import sys
 
@@ -582,29 +583,34 @@ def test_ids_reach_the_hash_gate(oracle, args):
 
 # ── 9. the chunked verify path (V4_FAST_VERIFY) ──────────────────────────────────────────────────
 #
-# WHAT IS PROVED HERE, AND WHY IT IS NOT "torch.equal ON h"
+# WHAT IS PROVED HERE, AND WHY IT RUNS UNDER A BATCH-INVARIANT HARNESS
 #
-# The fast path runs an s-token chunk in ONE pass per layer instead of s. Its mechanics -- which kv
+# The fast path runs an s-token chunk in ONE pass per layer instead of s. Its MECHANICS -- which kv
 # each position attends, in which order, which compressed slots exist by then, what the window ring
-# and the compressor accumulators end up holding -- must be EXACTLY the per-token loop's, and that is
-# what test_fast_verify_attends_exactly_what_the_loop_attends and
-# test_fast_verify_leaves_the_same_state assert, bit for bit, with nothing hand-waved.
+# and the compressor accumulators end up holding -- must be EXACTLY the per-token loop's. Its
+# ARITHMETIC cannot be, and no implementation could make it so: a batched pass hands torch bigger
+# tensors, and torch reassociates its reductions by SIZE. A GEMM at M = s tiles its K-reduction
+# differently from M = 1 (cuBLAS, MKL, and -- the one that first bit this path in CI -- the einsum
+# inside `sparse_attn`, whose d-contraction over a [b, s, ...] query reorders relative to [b, 1, ...]).
+# So "chunk == loop, bit for bit" is a statement about the ALGORITHM that is only well-posed once that
+# one freedom is removed, and removing it is exactly what `batch_invariant()` below does: it swaps
+# every linear and every einsum for a broadcast-multiply-then-fp32-sum, whose reduction order is fixed
+# per output element and independent of s. Under it BOTH paths compute the identical (lower-precision,
+# deterministic) numbers, so a surviving difference is a real mechanical error and nothing else.
 #
-# Its ARITHMETIC cannot be, and no implementation of it could be. A batched pass hands torch bigger
-# tensors, and torch picks its kernels by size: MKL uses a different sgemm for M=1 than for M=6 (the
-# reassociation `_tail_logit_rows` already keeps away from the logits, v4_pipe.py:698), and even
-# `rsqrt` on bf16 rounds one ulp differently once a tensor is big enough to take its vectorized path
-# -- measured here, not assumed. So "the same numbers" is available only up to that, and the tests
-# that follow say exactly which claim they are making:
+# This is not a workaround for a flaky test -- it is the only honest form of the claim. An earlier
+# cut asserted torch.equal on raw arithmetic and passed only because THIS box happened to reassociate
+# a small toy identically at s <= 6; CI's build did not, and the "failure" was reassociation wearing a
+# mechanical error's error message. A batch-invariant sweep over every window-straddling position
+# (15,16,31,32,63,127 x s in 2,4,6, every layer kind) is bit-exact, which is the real proof the wrap
+# is correct; what follows pins it permanently.
 #
-#   attends_exactly / leaves_the_same_state   EXACT. Per layer, fed an identical input, so no
-#       cross-layer drift can hide a mechanical error and no mechanical error can hide behind drift.
-#       These are the tests that fail if the ring is pre-written, if a compressed row is one slot
+#   attends_exactly / leaves_the_same_state / rows_are_the_greedy_rows   EXACT, under batch_invariant.
+#       The mechanics tests. They fail if the ring is pre-written (a chunk position reads a FUTURE
+#       token, a different POSITION, which no reassociation can mask), if a compressed row is one slot
 #       long or short, or if the indexer picks its top-k off the wrong end_pos.
-#   verify_rows_are_the_greedy_rows           the losslessness bar the ENGINE actually needs: every
-#       position's greedy token out of the whole 8-layer stage, chunked, is the token the loop got.
-#   drift_stays_under_a_bf16_ulp              the size of what is left, pinned so a regression that
-#       turns ulps into something else is visible.
+#   drift_is_reassociation_sized              REAL arithmetic, on purpose: the size of what batching
+#       costs when the reassociation is left in, bounded so a structural regression still stands out.
 
 # (prompt, s) geometries. Every one is here for a reason cpu_args() makes reachable: window_size 16,
 # compress ratios 4 and 8, index_topk 8.
@@ -620,10 +626,50 @@ FAST_CASES = [
     (37, 6),     # deep in the ring: every chunk position overwrites a slot an earlier one still reads
     (12, 8),     # wider than a g=5 round sends — the mechanics must hold there too
 ]
-# The widths a verify chunk actually has (g+1 for the g≈4 the drafter delivers). The stream tests
-# stop here deliberately, and the reason is measured, not assumed: see
-# test_fast_verify_rows_are_the_greedy_rows.
-FAST_STREAM_CASES = [c for c in FAST_CASES if c[1] <= 6]
+# Straddle EVERY window multiple, at every real chunk width. win=16, so 15/31 are the last un-wrapped
+# ring rows (get_window_topk_idxs's `elif` branch) and 16/32 the first wrapped ones (its `if` branch)
+# -- the seam a chunk crosses when start_pos ≡ -1 mod window. CI caught the original cut here: a chunk
+# at 15 spans 15,16 and 16 % 16 wraps the ring slot to 0. Permanent coverage, per the fix.
+WRAP_CASES = [(p, s) for p in (15, 16, 31, 32) for s in (2, 4, 6)]
+# The mechanics tests run over both — the compression-boundary geometries above and every wrap seam.
+MECH_CASES = FAST_CASES + [c for c in WRAP_CASES if c not in FAST_CASES]
+
+
+@contextlib.contextmanager
+def batch_invariant():
+    """Force every contraction to a broadcast-multiply-then-fp32-sum, so no BLAS/einsum kernel runs
+    and reduction order is fixed per output element -- identical whether a pass carries 1 position or
+    s. This is what makes "the chunk equals the loop, bit for bit" a well-posed claim: it removes the
+    ONE thing that legitimately differs between them (size-dependent reassociation) and nothing else,
+    so anything still divergent is a mechanical error. See this section's header.
+
+    fp32 accumulation mirrors torch's own mixed-precision matmul; the result is cast back to the first
+    operand's dtype. Covers the four einsum signatures the V4 forward uses (sparse_attn's two, the
+    grouped o-projection, the indexer score) and every Linear."""
+    real_linear, real_einsum = torch.nn.functional.linear, torch.einsum
+
+    def linear(x, weight, bias=None):
+        y = (x.unsqueeze(-2).float() * weight.float()).sum(-1).to(x.dtype)
+        return y if bias is None else y + bias
+
+    patterns = {
+        "bshd,bstd->bsht": lambda q, g: (q.unsqueeze(-2).float() * g.unsqueeze(-3).float()).sum(-1),
+        "bsht,bstd->bshd": lambda p, g: (p.unsqueeze(-1).float() * g.unsqueeze(-3).float()).sum(-2),
+        "bshd,btd->bsht": lambda q, kv: (q.unsqueeze(-2).float() * kv[:, None, None].float()).sum(-1),
+        "bsgd,grd->bsgr": lambda o, w: (o.unsqueeze(-2).float() * w.float()).sum(-1).to(o.dtype),
+    }
+
+    def einsum(eq, *ops):
+        fn = patterns.get(eq.replace(" ", ""))
+        return fn(*ops) if fn is not None else real_einsum(eq, *ops)
+
+    torch.nn.functional.linear = linear
+    torch.einsum = einsum
+    try:
+        yield
+    finally:
+        torch.nn.functional.linear = real_linear
+        torch.einsum = real_einsum
 
 
 def _capture_sparse_attn(monkeypatch):
@@ -696,7 +742,7 @@ def _state(st):
     return out
 
 
-@pytest.mark.parametrize("prompt,s", FAST_CASES)
+@pytest.mark.parametrize("prompt,s", MECH_CASES)
 @pytest.mark.parametrize("li", (0, 2, 3))          # sliding-window / ratio-4 + indexer / ratio-8
 def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
     """THE headline. Every chunk position attends the same places, in the same order, as the loop.
@@ -708,11 +754,11 @@ def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
     holding the oldest token of position p's own window -- so a pass that writes the ring before it
     attends (the obvious implementation, and the one the reference's own decode branch does per
     token) answers p's oldest window slots with tokens from p's FUTURE. It runs, and it is wrong, and
-    nothing but this comparison notices. (37, 6) is the case where every one of the s positions does
-    it; (12, 8) does it with a chunk wider than the ring's spare room.
+    nothing but this comparison notices. The WRAP_CASES (15,16,31,32) are where it bites: a chunk at
+    15 spans 15,16 and 16 % 16 wraps back to slot 0. (37, 6) is where every position does it.
 
-    Both stages are ONE layer and are handed the same payload, so this is a statement about the
-    chunk mechanics alone: no cross-layer arithmetic drift can enter, and none can be blamed.
+    RUNS UNDER batch_invariant so the byte check below is a statement about POSITION, not float order.
+    Both stages are ONE layer and handed the same payload, so this is the chunk mechanics alone.
 
     The one licensed difference is the right-hand -1 padding: a chunk's positions have different
     compressed read lengths and different indexer top-k widths, and one [b, s, k] tensor has to hold
@@ -726,14 +772,15 @@ def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
         slow = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False)
         ids, hp, hc = _payloads(args, prompt, s, seed=prompt * 31 + s)
 
-        fast.forward(hp, ids[:, :prompt], 0)                  # prefill attends too — not under test
-        calls.clear()
-        fast.forward(hc, ids[:, prompt:], prompt)
-        assert len(calls) == 1, "the fast path must answer the whole chunk in ONE attention call"
-        f_rows, f_kv = calls[0]
-        slow.forward(hp, ids[:, :prompt], 0)
-        calls.clear()
-        slow.forward(hc, ids[:, prompt:], prompt)
+        with batch_invariant():
+            fast.forward(hp, ids[:, :prompt], 0)              # prefill attends too — not under test
+            calls.clear()
+            fast.forward(hc, ids[:, prompt:], prompt)
+            assert len(calls) == 1, "the fast path must answer the whole chunk in ONE attention call"
+            f_rows, f_kv = calls[0]
+            slow.forward(hp, ids[:, :prompt], 0)
+            calls.clear()
+            slow.forward(hc, ids[:, prompt:], prompt)
         assert len(calls) == s, "the reference path is one call per position — the control"
         win = args.window_size
         base = (f_kv.size(1) - V4.V4_FAST_VERIFY_MAX, prompt)
@@ -749,7 +796,8 @@ def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
             # ...and the places must still HOLD what the loop found in them. Comparing meanings alone
             # would pass an implementation that writes the ring before it attends: the row still says
             # "slot 3, which is position 35", and slot 3 now holds position 39. Same claim, different
-            # bytes. So the operands themselves are compared, gathered exactly as the kernel gathers.
+            # POSITION -- so the gathered operands differ under batch_invariant, where the only thing
+            # that could make two equal-position kv differ (reassociation) has been removed.
             s_kv, s_row = calls[j][1], calls[j][0][0, 0].tolist()
             for k, (v_f, v_s) in enumerate(zip(f_rows[0, j].tolist(), s_row)):
                 if int(v_s) < 0:
@@ -761,7 +809,7 @@ def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
         monkey.undo()
 
 
-@pytest.mark.parametrize("prompt,s", FAST_CASES)
+@pytest.mark.parametrize("prompt,s", MECH_CASES)
 @pytest.mark.parametrize("li", (0, 2, 3))
 def test_fast_verify_leaves_the_same_state(args, li, prompt, s):
     """Bit-identical window ring, compressed region and compressor accumulators after the chunk.
@@ -769,41 +817,45 @@ def test_fast_verify_leaves_the_same_state(args, li, prompt, s):
     The other half of the mechanics: the chunk must not only READ what sequential decode reads, it
     must LEAVE what sequential decode leaves -- the next round's window, the compressed slots this
     chunk's boundaries emitted, and both fp32 accumulators (the layer's and, on a ratio-4 layer, the
-    indexer's). torch.equal, per layer, on the same input: the compressor is driven one position at a
-    time through the reference's OWN decode branch precisely so this can be exact rather than close.
+    indexer's). torch.equal under batch_invariant, per layer, on the same input: the compressor is
+    driven one position at a time through the reference's OWN decode branch so that even the emitted
+    compressed slot is the loop's, and the harness removes the only other source of difference.
 
     A rejected chunk's rollback rests on this (`Stage._snapshot` restores the window and the
     accumulators and argues the compressed region is always rewritten before it is read), so a fast
-    chunk that left a subtly different accumulator would make every rewind after it wrong."""
+    chunk that left a subtly different accumulator would make every rewind after it wrong. The
+    WRAP_CASES pin the ring commit specifically: a wrong slot at start_pos ≡ -1 mod window shows up
+    here as a window row that no longer matches the loop's."""
     oracle = REFCPU.build_oracle(args, SEED)
     fast = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False, fast=True)
     slow = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False)
     ids, hp, hc = _payloads(args, prompt, s, seed=prompt * 31 + s)
 
-    _drive(fast, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
-    _drive(slow, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
+    with batch_invariant():
+        _drive(fast, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
+        _drive(slow, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
     for (name, got), (_, want) in zip(_state(fast), _state(slow)):
         assert torch.equal(got, want), f"layer {li}: {name} diverged over a {s}-token chunk at {prompt}"
     assert fast._pos == slow._pos == prompt + s
 
 
-@pytest.mark.parametrize("prompt,s", FAST_STREAM_CASES)
+@pytest.mark.parametrize("prompt,s", MECH_CASES)
 def test_fast_verify_rows_are_the_greedy_rows(oracle, args, prompt, s):
     """Whole 8-layer stage: the verify chunk's per-position greedy tokens are the loop's. Losslessness.
 
     This is the bar the RING is settled against -- `_serve_tail` answers a spec chunk with
     `[int(r.argmax()) for r in rows]`, one row per position at the same GEMM shape greedy decode uses
     (v4_pipe.py:698), and a draft is accepted exactly when that token matches. So this compares the
-    thing acceptance is decided on, over a chunk that has been through all eight layers and therefore
-    carries whatever the batched GEMMs reassociated on the way.
+    thing acceptance is decided on, over a chunk that has been through all eight layers -- including
+    every WRAP seam and every s up to the scratch width.
 
-    AND IT IS A MEASUREMENT, NOT A THEOREM, WHICH IS WHY THE WIDTHS STOP AT 6. Swept over 18 random
-    chunks per width on this toy model: s = 2..6 preserved the stream 18/18 each (90/90 in total,
-    drift <= 24 bf16 ulps), s = 8 preserved it 9/18 at up to 53 ulps. The cliff is torch changing
-    kernels with size -- at 4 heads a chunk of 8 is the first one whose per-head tensors take the
-    vectorized `rsqrt` path -- so its exact location is an artifact of THIS shape and says nothing
-    about 64 heads on a GPU. What it does say is that the fast path's losslessness is empirical where
-    the loop's is structural, and that is the whole reason the flag defaults to off.
+    UNDER batch_invariant, this is exact and it is the ALGORITHM's losslessness: chunked verify picks
+    the same tokens sequential decode would. On REAL arithmetic the eight layers' reassociation can
+    flip a near-tie (the toy's tiny dims make ties common; measured 90/90 at s <= 6 on one build, 9/18
+    at s = 8, and CI's build flipped one at s = 2) -- which is the documented, off-by-default cost of
+    batching, and is what test_fast_verify_drift_is_reassociation_sized bounds on real arithmetic. At
+    V4's real shape near-ties are astronomically rarer and the GPU's sparse_attn is itself
+    batch-invariant, so real-ring losslessness is far better than this toy's real-arithmetic run.
 
     The three decode steps after the chunk are compared too: a chunk that committed a different
     window or a different compressed slot would not necessarily move THIS round's tokens, but it
@@ -812,22 +864,23 @@ def test_fast_verify_rows_are_the_greedy_rows(oracle, args, prompt, s):
     slow = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
     ids = _ids(prompt + s, args, seed=prompt * 7 + s)
 
-    rows = []
-    for st in (fast, slow):
-        st.forward(st.embed(ids[:, :prompt]), ids[:, :prompt], 0)
-        h = st.forward(st.embed(ids[:, prompt:]), ids[:, prompt:], prompt)
-        rows.append([st.logits_all(h[:, j:j + 1], full_logits=False) for j in range(s)])
-    assert [int(r.argmax()) for r in rows[0]] == [int(r.argmax()) for r in rows[1]], \
-        f"a {s}-token chunk at {prompt} verified different tokens than sequential decode"
-
-    tok = rows[1][-1].argmax(dim=-1).unsqueeze(1)
-    for i in range(3):
-        nxt = []
+    with batch_invariant():
+        rows = []
         for st in (fast, slow):
-            h = st.forward(st.embed(tok), tok, prompt + s + i)
-            nxt.append(st.logits_all(h, full_logits=False))
-        assert int(nxt[0].argmax()) == int(nxt[1].argmax()), f"streams parted {i} steps after the chunk"
-        tok = nxt[1].argmax(dim=-1).unsqueeze(1)
+            st.forward(st.embed(ids[:, :prompt]), ids[:, :prompt], 0)
+            h = st.forward(st.embed(ids[:, prompt:]), ids[:, prompt:], prompt)
+            rows.append([st.logits_all(h[:, j:j + 1], full_logits=False) for j in range(s)])
+        assert [int(r.argmax()) for r in rows[0]] == [int(r.argmax()) for r in rows[1]], \
+            f"a {s}-token chunk at {prompt} verified different tokens than sequential decode"
+
+        tok = rows[1][-1].argmax(dim=-1).unsqueeze(1)
+        for i in range(3):
+            nxt = []
+            for st in (fast, slow):
+                h = st.forward(st.embed(tok), tok, prompt + s + i)
+                nxt.append(st.logits_all(h, full_logits=False))
+            assert int(nxt[0].argmax()) == int(nxt[1].argmax()), f"streams parted {i} steps after chunk"
+            tok = nxt[1].argmax(dim=-1).unsqueeze(1)
 
 
 @pytest.mark.parametrize("prompt,s", FAST_CASES)
