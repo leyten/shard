@@ -716,7 +716,7 @@ def _bdp(r):
     return r.rtt_ms / max(r.taus())
 
 
-def validate(n_tokens=120):
+def validate(n_tokens=300):
     _hr("VALIDATION — 2 free ring parameters against 6 measured throughputs, then 4 predicted counters")
     d = fit_drafter()
     print(f"  STEP 1 — the drafter, from the ACCEPTANCE column only (no timing number is used):")
@@ -941,3 +941,81 @@ def interventions(cal, n_tokens=200):
         d, x, _ = best_depth(rr, aq, n_tokens=n_tokens, **kw)
         print(f"  {name:<44}{x.toks_per_s:>7.2f} tok/s   depth {d:<3} "
               f"(ceiling 1/tau_max {1000 / max(rr.taus()):.1f})")
+
+
+def reach(cal, n_tokens=200, target=20.0):
+    """What ring shape reaches the target — and what becomes the binding constraint on the way.
+
+    Every ring-shape lever is bounded: width is +16%, balancing +24%, out-of-band cancel +19%, a
+    better drafter +23%. They multiply to well under 2x. Only tau itself is unbounded, so the sweep
+    that matters is over COMPUTE, and the thing to watch on the way is which constraint takes over."""
+    r, aseq = cal["ring"], cal["aseq"]
+    aq9 = accept_seq(0.90, cal["rho"], 24)
+    _hr(f"WHAT REACHES {target:.0f} tok/s — sweeping compute, with every ring lever already applied")
+    print( "  configuration: balanced, uplink fixed, out-of-band cancel, drafter a1=0.90, own depth*")
+    print(f"    {'compute':>8}{'D':>4}{'B':>4}{'hop':>6}{'tau_max':>9}{'RTT':>7}{'BDP':>6}"
+          f"{'depth*':>8}{'ceiling':>9}{'tok/s':>8}")
+    fx = statistics.fmean([st.ovh_ms for i, st in enumerate(r.stages) if i != 3])
+    sd = statistics.median([st.snd_ms for i, st in enumerate(r.stages) if i != 3])
+    rf = r._with(stages=[Stage(x.p_ms, x.ckpt_ms, sd if i == 3 else x.snd_ms,
+                               fx if i == 3 else x.ovh_ms, x.layers) for i, x in enumerate(r.stages)])
+    for sp, D, B, hop in [(1, 10, 6, None), (2, 10, 6, None), (4, 10, 6, None), (8, 10, 6, None),
+                          (8, 10, 12, None), (8, 10, 12, 5.0), (16, 10, 12, 5.0),
+                          (8, 6, 12, 5.0), (8, 16, 12, 5.0), (16, 16, 16, 5.0)]:
+        rr = retile(rf.balanced(), D, speedup=sp, hop_ms=hop).balanced()
+        d, x, _ = best_depth(rr, aq9, block=B, n_tokens=n_tokens, dmax=B + 3, oob_cancel=True)
+        print(f"    {sp:>7}x{D:>4}{B:>4}{rr.hop_ms:>6.0f}{max(rr.taus()):>9.1f}{rr.rtt_ms:>7.0f}"
+              f"{_bdp(rr):>6.1f}{d:>8}{1000 / max(rr.taus()):>9.1f}{x.toks_per_s:>8.2f}")
+    print("\n  The block size is what stops the wide/fast rings: the coordinator can never hold more")
+    print("  than B+2 frames in flight, so once RTT/tau_max climbs past that the pipe cannot fill and")
+    print("  throughput stops tracking 1/tau_max. B is not binding today (depth* 6 < 7); it becomes")
+    print("  the binding constraint the moment compute improves.")
+
+
+def anatomy(cal, n_tokens=200):
+    """Where the wall clock goes at the SHIPPED configuration — fill loss against waste loss."""
+    r, aseq = cal["ring"], cal["aseq"]
+    x = sim_pipelined(r, aseq, BLOCK_EFF, W=16, n_tokens=n_tokens)
+    tp = r.taus()
+    _hr("WHERE THE THROUGHPUT GOES — it is NOT bubbles")
+    print(f"  pipeline-rate ceiling  1/tau_max        {1000 / max(tp):6.2f} tok/s   "
+          f"(tau_max {max(tp):.0f} ms, stage s{tp.index(max(tp))})")
+    print(f"  achieved at V4_SPEC_DEPTH=16            {x.toks_per_s:6.2f} tok/s   "
+          f"= {100 * x.toks_per_s * max(tp) / 1000:.0f}% of it")
+    print(f"  bottleneck stage busy                   {max(x.util) * 100:5.1f}% of the wall clock")
+    print(f"  frames computed per token committed     {x.frames / x.tokens:6.2f}")
+    print(f"  of the frames computed, discarded       {100 * x.wasted_frames / x.frames:5.0f}%")
+    print(f"\n  fill loss  (bottleneck idle)            {100 - max(x.util) * 100:5.1f}%")
+    print(f"  waste loss (computed, then discarded)   {100 * x.wasted_frames / x.frames:5.1f}%")
+    print(f"  RTT {r.rtt_ms:.0f} ms = {sum(tp):.0f} ms compute + {r.legs * r.hop_ms:.0f} ms wire "
+          f"({100 * r.legs * r.hop_ms / r.rtt_ms:.0f}% wire)")
+    return x
+
+
+def main():
+    ap = argparse.ArgumentParser(description="V4 pipelined-speculation ring simulator")
+    ap.add_argument("--validate", action="store_true", help="calibration + validation only")
+    ap.add_argument("--tokens", type=int, default=300,
+                    help="tokens per simulated run. Below ~200 the stale-reply count is dominated "
+                         "by sampling noise and the validation will report a false FAIL.")
+    ap.add_argument("--json", action="store_true")
+    args = ap.parse_args()
+    cal, worst = validate(n_tokens=args.tokens)
+    if args.validate:
+        return 0 if worst <= 0.20 else 1
+    anatomy(cal, args.tokens)
+    depth_rule(cal, args.tokens)
+    width(cal, args.tokens)
+    gradient(cal, args.tokens)
+    interventions(cal, args.tokens)
+    reach(cal, args.tokens)
+    if args.json:
+        r = cal["ring"]
+        print("\n" + json.dumps({"kappa": cal["kappa"], "hop_ms": cal["hop_ms"], "a1": cal["a1"],
+                                 "rho": cal["rho"], "tau_ms": r.taus(), "rtt_ms": r.rtt_ms,
+                                 "bdp": _bdp(r), "worst_predicted_residual": worst}, indent=2))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
