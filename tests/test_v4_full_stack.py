@@ -394,3 +394,25 @@ def test_a_pipelined_rollback_rebuilds_state_eager_under_graphs():
         print("BOUND OK")
     """)
     assert "BOUND OK" in out
+
+
+def test_the_drafter_moe_lever_serves_exactly_what_the_default_serves():
+    """V4_MOE_MULTI on top of the whole recipe must emit the SAME tokens as the all-off default.
+
+    The lever claims the one MoE shape no other lever claims — the DSpark drafter's block — so it
+    only ever changes bytes on the DRAFTED and PIPELINED paths, which is precisely where a wrong
+    draft is least visible: acceptance falls, nothing raises, and the receipts still settle. A
+    cross-config comparison is the only thing that catches that (test_the_ring_recipe_serves_exactly
+    _what_the_default_serves's own reasoning), so it gets one.
+
+    It is NOT in RING_RECIPE. Bit-exact is necessary but not sufficient for a launch recipe: this
+    lever has never been measured on a card, and an unmeasured lever in the documented recipe is how
+    a bench reports a win it did not get. It goes in when the tail measures it."""
+    base = selftest_streams()
+    lever = selftest_streams(**RING_RECIPE, V4_MOE_MULTI=1)
+    common = sorted(set(base) & set(lever))
+    assert set(common) >= {"ring", "ref", "spec", "dspark", "pipe"}, common
+    for path in common:
+        assert base[path] == lever[path], (
+            f"the drafter MoE lever changed the {path} stream\n  default: {base[path]}\n"
+            f"  lever:   {lever[path]}")
