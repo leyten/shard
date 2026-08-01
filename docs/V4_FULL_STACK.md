@@ -250,6 +250,31 @@ reference, so a lever that moves both together passes in-config while changing w
 
 ---
 
+## Known caveat, carried in but NOT introduced by this branch
+
+`docs/receipts/v4-whole-layer-graph-20260801.json` records it as `REFERENCE_TOPK_IS_NOT_DETERMINISTIC`:
+the **vendored** Indexer resolves exact score ties by an artifact of `torch.topk`'s selection
+algorithm — undefined order, backend-specific, not length-invariant. So the same reference on the same
+input can pick different compressed slots at different array widths, CPU thread counts, or devices.
+
+**Scope it correctly, in both directions.**
+
+*It does not affect this measurement.* In a pipeline-parallel ring each layer lives on exactly one
+box; every position is computed at its own natural width `(p+1)//ratio`, so a replay of position `p`
+uses the same width `p` used the first time; and one process means one thread count. Deterministic
+within a run — which is why every arm here is reproducible and bit-identical.
+
+*It does affect two things worth naming before anyone claims them.* (a) **Cross-box reproducibility**:
+two boxes asked to recompute the same layer can legitimately disagree on a tie, so a receipt must not
+be read as "anyone re-running this gets these bytes". (b) **A spot-check auditor** re-running a layer
+elsewhere could reject an honest stage for no modelling reason.
+
+`v4_whole_layer_graph._select_topk_width_invariant` pins the tie order for the **capture-safe** path.
+The **eager** reference path is not pinned, and should be, before the network depends on cross-box
+determinism. That is a separate change and is not on this branch.
+
+---
+
 ## Test matrix
 
 CPU-only, `OMP_NUM_THREADS=1`.
