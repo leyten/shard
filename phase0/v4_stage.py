@@ -702,11 +702,18 @@ class Stage:
                 self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
 
     def _graph_refusal(self):
-        """Why this stage cannot graph its decode islands, or None. Loud and specific, never silent.
+        """Why this stage cannot graph its decode step, or None. Loud and specific, never silent.
 
-        The captured regions are the position- and data-INDEPENDENT Block methods (hc_pre/hc_post/the
-        norms), so unlike K3 there is no growing KV or per-position branch INSIDE a graph to refuse
-        over -- the only hard requirement is a CUDA device to capture on."""
+        Serves BOTH modes, and neither has anything device-independent to refuse over. In island mode
+        the captured regions are the position- and data-INDEPENDENT Block methods (hc_pre/hc_post/the
+        norms), so unlike K3 there is no growing KV or per-position branch INSIDE a graph. In whole
+        mode the attention core is captured too, but v4_whole_layer_graph is what makes it
+        position-independent (the ring slot is chosen at replay from a copied-in position, the indexer
+        read is bucketed, the selection is width-invariant) -- so again nothing here to refuse.
+        The only hard requirement either way is a CUDA device to capture on.
+
+        A refusal PRINTS. `graph=off` in the repr with a refusal line above it means the lever
+        declined and said why; `graph=off` with no line means the flag never arrived."""
         if not str(self.device).startswith("cuda"):
             return f"device is {self.device} (CUDA graphs are a GPU-only capture)"
         return None
