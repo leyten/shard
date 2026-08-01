@@ -661,9 +661,14 @@ class Stage:
         # checkpoint lands in the bank and nowhere else -- one copy on the card, the same bytes the
         # non-grouped path holds. Doing it after load would mean stacking a duplicate, which at the
         # shipped dims is ~3.2 GiB per layer and is exactly why the lever declined on a full stage.
+        # preserve=False because the Blocks are two statements old and every routed-expert byte is
+        # still the constructor's uninitialised `torch.empty`: the layout may RELEASE each layer's
+        # per-expert run before it allocates that layer's banks, instead of asking the driver for a
+        # bank while the memory it replaces is still resident. That ordering is the difference
+        # between a peak of 27.98 GiB and 31.17 GiB on an 8-layer stage -- see v4_moe_grouped.
         # No-op under V4_MOE_GROUPED=0 (the default): nothing allocated, nothing repointed.
         import v4_moe_grouped
-        self._moe_banked = banked = v4_moe_grouped.bank_layout(self.layers)
+        self._moe_banked = banked = v4_moe_grouped.bank_layout(self.layers, preserve=False)
         if banked:
             print(f"[v4] stage[{lo}:{hi}): grouped-MoE bank layout on {banked} layer(s) — the routed "
                   f"experts ARE the bank, no duplicate", flush=True)

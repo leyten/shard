@@ -85,12 +85,14 @@ on a 32 GiB card cannot afford it. That is why the lever measured 3.19x on a one
 never fired in production: `_expert_bank` would check free VRAM and decline.
 
 `bank_layout()` removes the copy instead of budgeting for it. At LOAD time, before a single weight is
-read off disk, it allocates the per-layer bank and REPOINTS each expert `Linear`'s parameter at its
-slice of it (`p.data = bank[j]`, a zero-copy view — the slice of a contiguous [E, N, K] bank is
-itself contiguous), then frees the tensor the constructor had allocated. `Stage.load`'s
-`load_state_dict` writes THROUGH those views into the bank, so the checkpoint lands in the bank and
-nowhere else: ONE copy of the weights on the card, the same bytes the non-grouped path would hold,
-and the bank costs nothing on top. See `_relayout_moe`.
+read off disk, it RELEASES the layer's per-expert tensors, hands the segments back, and allocates the
+per-layer bank into the memory they just vacated, repointing each expert `Linear`'s parameter at its
+slice (`p.data = bank[j]`, a zero-copy view — the slice of a contiguous [E, N, K] bank is itself
+contiguous). `Stage.load`'s `load_state_dict` writes THROUGH those views into the bank, so the
+checkpoint lands in the bank and nowhere else: ONE copy of the weights on the card, the same bytes
+the non-grouped path would hold, and the bank costs nothing on top — not in `memory_allocated` and
+not in `memory_reserved`, which is the harder half and the one the first version of this got wrong.
+See `_relayout_moe` for why the release has to come FIRST.
 
 Keeping the per-expert `Linear`s as views (rather than deleting them) is also what keeps the s > 1
 fallback alive. The reference `MoE.forward` — which prefill, a verify chunk, a hash-routed layer and
@@ -113,7 +115,26 @@ MEASURED ON A REAL STAGE (RTX 5090, 31.36 GiB usable, the converted 43-layer che
       V4_MOE_GROUPED=0                  23.641 GiB      24.270 GiB       0/7
       bank layout                       23.641 GiB      24.381 GiB       7/7
       stacking the bank instead         26.829 GiB      27.457 GiB       1/7, SIX DECLINED
-    stage[0:8) banked: 27.007 GiB allocated either way, 28.007 GiB peak (the one-kind transient).
+Those are END-STATE numbers on the PRE-FIX code, and end state was never the binding constraint.
+
+ARITHMETIC, NOT MEASUREMENT -- everything from here to the speed table is computed from
+config.json (dim 4096, moe_inter_dim 2048, 256 fp4 experts) by building the real Blocks on the meta
+device, and NOTHING below has been run on a card yet. Per layer the routed experts are 3.1875 GiB in
+1536 blocks (3 weight banks of 1024.00 MiB, 3 e8m0 scale banks of 64.00 MiB); the layers run
+3.352-3.402 GiB; eight of them plus the head embedding is 27.98 GiB resident (26.998 + 0.986).
+Building a layer's banks BEFORE releasing what they replace peaks at steady + 3200 MiB (the stranded
+run at the w2 request, the worst of the six); releasing first peaks at steady. Against a 30.76 GiB
+budget (31.36 usable less the ~0.6 GiB CUDA context) that is the whole difference:
+    head stage    steady     OLD peak      NEW peak
+      [0:7)       24.62      27.74  fits    24.62     <- why seven layers measured clean
+      [0:8)       27.98      31.11  OOM     27.98     <- and why eight did not
+Eight is the ceiling for a head or middle stage: nine layers is 30.40 GiB of weights alone. It is NOT
+the ceiling for a dspark tail -- `RingDrafter`'s three DSparkBlocks are three more 256-expert MoEs
+(10.28 GiB), built lazily on the first dspark job, i.e. after load; that stage tops out around four
+layers and is a separate problem this fix does not touch. Nor does 8 leave room to prefill at
+V4_MAX_SEQ=8192 (a ratio-4 layer's Indexer scores are ~5.5 GiB at s=8192 against 2.78 GiB free).
+`tests/test_v4_moe_grouped.py` gates the ordering at the real expert count with a storage-liveness
+meter (`test_bank_layout_never_outruns_what_it_released`).
 And the speed it was all for -- stage[40:43), real weights, median of 40 decode steps:
       eager        26.902 -> 18.599 ms/step   (8.967 -> 6.200 ms/layer, 1.45x)
       V4_CUDA_GRAPH=1  23.627 -> 15.387 ms/step   (7.876 -> 5.129 ms/layer, 1.54x)
@@ -283,77 +304,135 @@ def _gather_fp(t, ids):
 _BANK_KINDS = (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s"))
 
 
-def _relayout_moe(moe):
+def _relayout_moe(moe, preserve=True):
     """Make one MoE's routed experts VIEWS of a contiguous per-layer bank, in place. Returns True if
     it took.
 
     This is the load-time layout choice that makes the grouped kernel affordable: instead of stacking
     a SECOND copy of the experts on the first decode token (`_expert_bank`), the bank IS where the
-    experts live. Per weight kind it allocates the [E, N, K] bank, copies each expert's tensor in, and
-    repoints that expert's parameter at its slice:
+    experts live. Per weight kind it allocates the [E, N, K] bank and repoints that expert's
+    parameter at its slice:
 
         p.data = bank[j]        # zero-copy: slice j of a contiguous [E, N, K] bank is contiguous
 
-    which drops the last reference to the tensor the constructor allocated, so the per-expert storage
-    is freed as the loop walks. Net VRAM is one copy of the weights — exactly what the non-grouped
-    path holds — and the bank adds nothing.
+    which drops the last reference to the tensor the constructor allocated. Net VRAM is one copy of
+    the weights — exactly what the non-grouped path holds — and the bank adds nothing.
 
-    ORDER MATTERS, AND THE PEAK IS WHY: the banks are built ONE KIND AT A TIME, so the transient high
-    water mark is one kind of one layer (~1.07 GiB at the shipped dims), not a whole layer.
+    NEVER ASK THE DRIVER FOR A BYTE YOU HAVE NOT ALREADY HANDED BACK. That is the whole content of
+    `preserve=False`, and it is what the first version of this function got wrong. Freeing the
+    per-expert tensors AS the copy walks (bank allocated first, originals released one at a time
+    behind it) keeps `memory_allocated` exactly flat — there really is only ever one copy — but it
+    means every bank is a request for memory the layer is still holding. At the shipped dims that is
+    +1024 MiB of live bytes per weight kind, and, worse, the released blocks are the WRONG SHAPE to
+    satisfy it: 256 scattered 4 MiB per-expert blocks, sharing 20 MiB large-pool segments with the
+    kinds not yet relaid, cannot be coalesced into the one 1 GiB request that replaces them, and
+    no release — automatic or explicit — can hand back a segment that is not wholly free. So
+    `memory_reserved` — what the driver and the next `cudaMalloc` actually see — climbs by the banks
+    built so far while the bytes they replaced stay stranded, and only falls at the END of the layer,
+    once the last weight kind frees the run. Peak reserved is therefore steady + 3200 MiB at the
+    shipped dims (the stranded run at the w2 request, the worst of the six), not the +1.07 GiB the
+    allocated high-water mark suggests, and an 8-layer stage dies at load on a 32 GiB card. The
+    reported OOM reads back as that, to within a few MiB on each term: 27.97 GiB allocated (the
+    arithmetic says 27.98 for an 8-layer head stage — and it is FLAT, because the release IS real),
+    2.13 GiB reserved but unallocated (the freed originals of the four kinds already relaid, which by
+    symmetry is the same 1024 + 64 + 1024 + 64 = 2176 MiB their banks cost), 669 MiB free, and a
+    1024.00 MiB request — the w2 weight bank, the fifth of six in `_BANK_KINDS` order — unmeetable.
 
-    AND `empty_cache` PER KIND IS NOT OPTIONAL, which is the part that only shows up on a real card.
-    The freed per-expert blocks are ~4 MiB each; the bank is one ~1 GiB request. The caching allocator
-    cannot serve the second out of the first, so it takes a NEW segment from the driver every time and
-    keeps the old ones cached — `memory_allocated` stays flat (there really is one copy) while
-    `memory_reserved`, which is what the driver and the next `cudaMalloc` see, climbs toward double.
-    Measured on a real 3-layer stage: 10.17 GiB allocated with the layout or without it, but 19.75 GiB
-    RESERVED without this call against 10.23 GiB with it — the same 9.6 GiB duplicate, just held by
-    the allocator instead of by the model. Returning each kind's freed segments before the next kind
-    asks for its bank is what keeps the card's occupancy equal to the weights, which is the claim.
+    `preserve=False` inverts the order and the excursion disappears: release EVERY routed-expert
+    block of the layer first (rebind each parameter to a void tensor), `empty_cache`, and only THEN
+    allocate the six banks — into the 3.19 GiB the layer just vacated. Peak allocated and peak
+    reserved both equal the steady state; nothing is ever resident twice, in the model or in the
+    allocator.
 
-    Run this BEFORE the weights are loaded and it costs nothing but the transient; run it AFTER and it
-    still works — the copy preserves whatever is in the tensors either way, which is what makes it
-    safe to call from both `Stage.__init__` (empty, pre-load) and the GPU parity harness (already
-    filled). `Stage.load`'s `load_state_dict` copies INTO the parameter, i.e. through the view and
-    into the bank, so a pre-load relayout needs no cooperation from the loader at all.
+    Two things that ordering does NOT rest on, stated so nobody re-derives them wrongly:
+      * `empty_cache` is not what rescues the allocation. The caching allocator already runs
+        `release_available_cached_blocks` and then `release_cached_blocks` and retries `cudaMalloc`
+        before it reports OOM — which is why the old code died with 2.13 GiB still stranded AFTER
+        that automatic release, and why the first version of this docstring calling the per-kind
+        `empty_cache` "not optional" was wrong. The ORDERING is the fix. The call stays because it
+        makes the return eager and deterministic, so `memory_reserved` reflects the model between
+        layers rather than only when something is about to fail.
+      * The pools do not net out exactly. A layer releases 3072 MiB of 4 MiB weight blocks into the
+        LARGE pool and 192 MiB of 256 KiB scale blocks into the SMALL pool (the 1 MiB threshold), but
+        all six banks — including the three 64 MiB scale banks — are large-pool requests. So 192 MiB
+        per layer has to make the round trip through the driver, which is exactly what the
+        `empty_cache` above is for: the layer's scale blocks are freed together and are contiguous
+        within the small pool (the weights went elsewhere), so their segments are wholly free and do
+        return. If that ever stopped holding it would cost 192 MiB per layer, not a whole bank.
 
-    The copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and e8m0 are
+    What it costs is the tensors' CONTENTS, which is why it is not the default and why the caller
+    has to ask for it. It is exactly right at `Stage.__init__`, the only place it is used: the Blocks
+    were built two statements earlier out of `torch.empty`, so every routed-expert byte is
+    uninitialised garbage, and `Stage.load` then `load_state_dict(strict=True)`s every one of them
+    THROUGH the views into the bank. Nothing readable is discarded because nothing readable exists
+    yet. (A stage that is constructed and never loaded serves garbage either way — the same garbage
+    the constructor would have left.)
+
+    `preserve=True` keeps the copy, for the caller that has already written the weights (the GPU
+    parity harness's standalone layer, `build_real_dims_moe(bank=True)`). One layer on a card with
+    room can afford the +1 kind transient; a full stage is what `preserve=False` exists for. The
+    copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and e8m0 are
     1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and always present.
 
     Declines, leaving the module untouched, when: the experts are not fp4 (the grouped kernel is
     fp4-only, and a bf16 CPU parity model must stay byte-identical), or something already put a bank
-    on this module (never lay out twice, and never over the lazy stack)."""
+    on this module (never lay out twice, and never over the lazy stack). Both checks run before
+    anything is released, so a decline is total. A `preserve=False` run that RAISES partway is not,
+    though: the parameters it already voided stay voided and there is nothing to restore them from.
+    That is a stage that must not serve, and does not — `Stage.__init__` propagates, the strict
+    `load_state_dict` would reject the 0-element shapes anyway, and the only thing that can raise
+    here is the OOM this ordering exists to prevent."""
     if getattr(moe, "_grouped_bank", None):
         return False
     lo, hi = moe.experts_start_idx, moe.experts_end_idx
     experts = [moe.experts[i] for i in range(lo, hi)]
     if not experts or experts[0].w1.weight.dtype != torch.float4_e2m1fn_x2:
         return False
-    bank = {}
+    # One entry per bank the layer will own: the parameters that become its slices, and the shape /
+    # dtype / device to allocate it with. Built up front so `preserve=False` can release every one of
+    # them before the first bank is asked for.
+    plan = []
     for kind, skey in _BANK_KINDS:
         for attr, key in (("weight", kind), ("scale", skey)):
             params = [getattr(getattr(e, kind), attr) for e in experts]
             t0 = params[0]
-            b = torch.empty((len(params),) + tuple(t0.shape), dtype=t0.dtype, device=t0.device)
+            plan.append((key, params, (len(params),) + tuple(t0.shape), t0.dtype, t0.device))
+    cuda = experts[0].w1.weight.is_cuda
+    if not preserve:
+        # Hand the whole layer's per-expert run back FIRST. One void tensor per (dtype, device) is
+        # shared by every parameter of that kind -- these are placeholders for the width of one
+        # `empty_cache`, and each is replaced by its bank slice below.
+        void = {}
+        for _key, params, _shape, dtype, device in plan:
+            v = void.setdefault((dtype, device), torch.empty(0, dtype=dtype, device=device))
+            for p in params:
+                p.data = v
+        if cuda:
+            torch.cuda.empty_cache()   # the run is wholly free now, so the segments actually return
+    bank = {}
+    with torch.no_grad():
+        for key, params, shape, dtype, device in plan:
+            b = torch.empty(shape, dtype=dtype, device=device)
             bu = b.view(torch.uint8)
-            with torch.no_grad():
-                for j, p in enumerate(params):
+            for j, p in enumerate(params):
+                if preserve:
                     bu[j].copy_(p.detach().view(torch.uint8))
-                    p.data = b[j]          # the parameter now ADDRESSES the bank; its old block frees
+                p.data = b[j]          # the parameter now ADDRESSES the bank; its old block frees
             bank[key] = b
-            if t0.is_cuda:                 # hand the freed per-expert segments back BEFORE the next
-                torch.cuda.empty_cache()   # kind asks the driver for its bank (see the docstring)
+            if preserve and cuda:      # hand the freed per-expert blocks back before the next kind
+                torch.cuda.empty_cache()
     moe._grouped_bank = bank
     return True
 
 
-def bank_layout(module):
+def bank_layout(module, preserve=True):
     """Give every fp4 routed-expert MoE under `module` the bank layout. Returns how many took it.
 
     The loader's entry point — `v4_stage.Stage.__init__` calls it on the stage's Blocks right after
-    they are constructed and before `Stage.load` fills them. A no-op under `V4_MOE_GROUPED=0`, which
-    is what keeps the default path byte-identical: nothing is allocated, nothing is repointed, and
-    every expert keeps the tensor its constructor gave it.
+    they are constructed and before `Stage.load` fills them, with `preserve=False`, which is what
+    keeps the layout's peak equal to its steady state on a full stage (see `_relayout_moe`). A no-op
+    under `V4_MOE_GROUPED=0`, which is what keeps the default path byte-identical: nothing is
+    allocated, nothing is repointed, and every expert keeps the tensor its constructor gave it.
 
     Every fp4 MoE gets it, including the hash-routed layers the grouped kernel will never claim. The
     layout is free (one copy either way), it is the same memory shape on every layer, and a stage that
@@ -365,7 +444,8 @@ def bank_layout(module):
     if not V4_MOE_GROUPED:
         return 0
     return sum(1 for m in module.modules()
-               if hasattr(m, "experts") and hasattr(m, "experts_start_idx") and _relayout_moe(m))
+               if hasattr(m, "experts") and hasattr(m, "experts_start_idx")
+               and _relayout_moe(m, preserve))
 
 
 # VRAM the LAZY bank build must leave FREE on the card after it copies. That build (`_expert_bank`,
