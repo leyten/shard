@@ -133,6 +133,44 @@ V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
 _GRAPH_COUNT = 0        # island graphs captured so far, across every Stage in this process
 _GRAPH_SKIPPED = 0      # island graphs a layer skipped because the cap was hit or a capture failed
 
+# CUDA graphs over a decode step, opt-in, default OFF (the default path stays byte-identical and the
+# CPU parity suite never touches this). UNLIKE K3, a V4 layer CANNOT be captured whole: three of its
+# pieces bake position or data into a graph and are wrong on replay --
+#   * the attention core writes `kv_cache[:, start_pos % win]` (a ROTATING ring slot), reads a
+#     COMPRESSED region whose valid width GROWS with position, and the Indexer's score einsum runs
+#     over `kv_cache[:, :end_pos // ratio]` (a growing slice); a graph freezes all three at capture.
+#   * the Compressor's `should_compress = (start_pos+1) % ratio == 0` is a per-position PYTHON branch,
+#     and its compressed write slot `kv_cache[:, start_pos // ratio]` grows.
+#   * the MoE picks its experts per token (`indices[0].tolist()` — a host sync even on the decode fast
+#     path), so a captured graph runs ONE token's expert set.
+# So the capture is PARTIAL: it graphs the POSITION- and DATA-INDEPENDENT islands the reference
+# exposes as pure Block methods -- the two `hc_pre` (mix + Sinkhorn), the two `hc_post`, and the two
+# attn/ffn RMSNorms -- and leaves `attn` and `ffn` eager between them (measured: ~68 of ~240
+# launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
+# Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
+# through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
+# "0"/off (default), "1"/"island" (hc_pre/hc_post/norm islands only, attn+MoE eager), "whole"/"eager"
+# (the WHOLE decode layer -- the capture-safe attention core folded in too, real routed MoE eager
+# between two graphs, bit-exact to the reference; v4_whole_layer_graph.py). See _graph_mode.
+V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0")
+
+
+def _graph_mode(v=None):
+    """Resolve V4_CUDA_GRAPH (env string or a monkeypatched bool) to off/island/whole."""
+    v = V4_CUDA_GRAPH if v is None else v
+    if v in (True, "1", "island", "on"):
+        return "island"
+    if v in ("whole", "2", "eager"):
+        return "whole"
+    return "off"
+
+
+# Every captured graph pins its own workspace pool; cap the set process-wide (3 graphs per layer).
+# Past the cap a layer stays EAGER (counted, never a crash), exactly like K3's K3_GRAPH_MAX.
+V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
+_GRAPH_COUNT = 0        # island graphs captured so far, across every Stage in this process
+_GRAPH_SKIPPED = 0      # island graphs a layer skipped because the cap was hit or a capture failed
+
 _REF = None
 _ARGS = {}
 _WM = {}
@@ -610,6 +648,7 @@ class Stage:
         self._fast = V4_FAST_VERIFY if fast_verify is None else bool(fast_verify)
         self._chunk_cap = V4_FAST_VERIFY_MAX if self._fast else 0
         M = ref()
+        self._M = M                       # the exec'd reference module (v4_whole_layer_graph borrows its kernels)
         self.globals = _set_globals(M, self.args)
         a = self.args
         if not 0 <= lo < hi <= a.n_layers:
@@ -642,7 +681,7 @@ class Stage:
         # shipped dims is ~3.2 GiB per layer and is exactly why the lever declined on a full stage.
         # No-op under V4_MOE_GROUPED=0 (the default): nothing allocated, nothing repointed.
         import v4_moe_grouped
-        banked = v4_moe_grouped.bank_layout(self.layers)
+        self._moe_banked = banked = v4_moe_grouped.bank_layout(self.layers)
         if banked:
             print(f"[v4] stage[{lo}:{hi}): grouped-MoE bank layout on {banked} layer(s) — the routed "
                   f"experts ARE the bank, no duplicate", flush=True)
@@ -664,13 +703,19 @@ class Stage:
         self._pos = 0
         self._replaying = False
         self.reset()
-        # One _BlockGraphs per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH).
-        # A stage that cannot graph stays fully eager and says why -- never a silent half-capture.
+        # One graph object per layer, capturing lazily on the first decode step (see V4_CUDA_GRAPH):
+        # island mode graphs only the hc_pre/hc_post/norm islands, whole mode graphs the WHOLE decode
+        # layer (attention core included, real routed MoE eager). A stage that cannot graph stays fully
+        # eager and says why -- never a silent half-capture.
         self._block_graphs = None
-        if V4_CUDA_GRAPH:
+        self._graph_mode = _graph_mode()
+        if self._graph_mode != "off":
             why = self._graph_refusal()
             if why:
                 print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
+            elif self._graph_mode == "whole":
+                import v4_whole_layer_graph as _wl
+                self._block_graphs = [_wl.WholeBlockGraphs(L, self, moe_mode="eager") for L in self.layers]
             else:
                 self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
 
@@ -939,9 +984,10 @@ class Stage:
     def _run(self, h, ids, start_pos, taps):
         """One pass of this stage's layers over `h` at `start_pos`, collecting any owned taps.
 
-        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its
-        _BlockGraphs when the stage is armed: the graph replays the hc_pre/hc_post/norm islands and
-        runs `attn`/`ffn` eager between them. Prefill, a multi-token chunk, and a rollback replay
+        A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its captured
+        graph when the stage is armed -- island mode replays the hc_pre/hc_post/norm islands (attn/ffn
+        eager between), whole mode replays the whole layer incl. the capture-safe attention core (real
+        routed MoE eager between two graphs). Prefill, a multi-token chunk, and a rollback replay
         (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
         the reference's own decode branch is the thing it is proven against."""
         bg = self._block_graphs
@@ -949,6 +995,14 @@ class Stage:
         for i, (li, L) in enumerate(zip(range(self.lo, self.hi), self.layers)):
             h = bg[i].run(h, ids, start_pos) if graphed else L(h, start_pos, ids)
             if self._dspark and li in self._tap_ids:
+                # THE TAP MUST STAY OUT HERE, on the Python side of the replay. It is safe today
+                # because a graph spans at most ONE layer, so this runs per step on that layer's fresh
+                # output. Move it inside a captured region -- or let a graph span more than one layer,
+                # so this line falls between two captured layers -- and it becomes m25's stale-EAGLE-aux
+                # bug verbatim (commit e8d2c82): a Python-level side effect inside a graph is recorded
+                # ONCE at capture and skipped by every replay, so the drafter would feed on the
+                # capture step's aux forever, behind valid receipts and entirely plausible numbers.
+                # tests/test_v4_whole_layer.py::test_graph_output_is_fresh_across_positions is the gate.
                 taps.setdefault(li, []).append(h.mean(dim=2).detach().clone())
         # A graphed layer's output ALIASES its hc_post graph's static buffer; the last layer's escapes
         # the stage (onto the wire, or into logits) and must not be overwritten by the next step's
@@ -1127,9 +1181,31 @@ class Stage:
                 f"{self.dtype} on {self.device} pos={self._pos} "
                 f"kernels={v4_kernels_cpu.backend()} "
                 f"dspark={'on' if self._dspark else 'off'} taps={list(self._tap_ids)} "
-                f"spec={'on' if self._spec else 'off'} "
-                f"graph={'on' if self._block_graphs is not None else 'off'} "
-                f"fast_verify={f'<={self._chunk_cap}' if self._fast else 'off'}>")
+                f"spec={'on' if self._spec else 'off'}/{self._spec_depth} "
+                f"graph={self._graph_mode if self._block_graphs is not None else 'off'} "
+                f"fast_verify={f'<={self._chunk_cap}' if self._fast else 'off'} "
+                f"moe={self._moe_status()} "
+                f"ref_slim={self._ref_slim_status()}>")
+
+    def _moe_status(self):
+        """Which MoE forward this stage will actually take, and whether the bank layout took.
+
+        OBSERVED, not declared: it reads the function bound on the reference class, not the env flag,
+        because the whole point of this line is to answer "did the lever fire?" on a live ring. The
+        grouped install declines silently off-CUDA and the bank layout declines per layer, so
+        `V4_MOE_GROUPED=1` alone proves nothing -- `grouped/8` does."""
+        M = ref()
+        fwd = M.MoE.forward
+        kind = ("grouped" if getattr(fwd, "_v4_grouped", False) else
+                "decode" if getattr(fwd, "_v4_decode_fast", False) else "ref")
+        return f"{kind}/{self._moe_banked}" if kind == "grouped" else kind
+
+    def _ref_slim_status(self):
+        """Which v4_ref_slim overrides are live on the reference — same observed-not-declared rule."""
+        M = ref()
+        on = [n for n, f in (("indexer", M.Indexer.forward), ("noqat", M.act_quant))
+              if getattr(f, "_v4_ref_slim", False)]
+        return "+".join(on) if on else "off"
 
 
 # ── partial CUDA graphs over a decode step ─────────────────────────────────────────────────────────
