@@ -113,7 +113,7 @@ Each stage prints its `__repr__` — this reports **observed** state, not the en
 | grouped fp4 MoE | `V4_MOE_GROUPED=1` | **YES** | MoE.forward 2.35×; whole stage 1.45× eager / 1.54× graphed | claims the single-token score-routed step; declines s>1 to `v4_moe_decode` |
 | MoE decode fast path | `V4_MOE_DECODE=1` | **YES** (default) | — | the fallback under grouped |
 | DSpark draft collapse | `V4_DSPARK_FAST=1` | **YES** | 4.51× at n=6, tail-local | rebinds `DSparkTail.advance_and_draft`, orthogonal to the wire shape |
-| ref-slim, item 1 | `V4_REF_SLIM=1` | **YES** | ~15-22 of ~240 launches/layer on 21 of 43 layers | rebinds `Indexer.forward`, which the `s=1` path calls |
+| ref-slim, item 1 | `V4_REF_SLIM=1` | **PARTLY — read the note** | ~15-22 of ~240 launches/layer on 21 of 43 layers | rebinds `Indexer.forward`. Under `V4_CUDA_GRAPH=whole` it reaches **prefill only**, not the graphed decode steps |
 | W-deep rollback ring | `V4_SPEC_DEPTH=N` | **YES** (required) | — | pipelining streams W frames before the first is judged; a rewind past the oldest checkpoint refuses loudly. Default 16 |
 | chunked verify | `V4_FAST_VERIFY=1` | **NO — mutually exclusive** | — | see below |
 | ref-slim, item 2 | `V4_REF_SLIM_NOQAT=1` | composes, but **not lossless** | — | removes a precision reduction; changes the stream |
@@ -161,6 +161,32 @@ And the chunk path, when the *serial* coordinator does reach it, bypasses three 
 with the chunk path. Class-method overrides are bypassed; module-global overrides are not.
 
 This bypass is not theoretical — it surfaced as an 18-test cross-file failure. See below.
+
+### The same bypass hits `V4_REF_SLIM` under `whole` graphs — read this before reading the A/B
+
+`v4_whole_layer_graph` never calls `Indexer.forward` either. It passes the Indexer **module** as data
+to `_indexer_decode_cs`, its own capture-safe reimplementation, because the reference's version bakes
+a growing read width no graph can hold. **So under `V4_CUDA_GRAPH=whole`, rebinding `Indexer.forward`
+cannot reach a graphed decode step.**
+
+`V4_REF_SLIM=1` is still in the recipe, but for a different reason than the flag advertises:
+
+- **Prefill takes it.** Prefill is `start_pos == 0` and the graph gate needs `start_pos > 0`, so
+  prefill runs the reference `Attention.forward` → `self.indexer(...)` → the slim path. On a ring
+  whose first-token latency is a real cost, that is worth having.
+- **Any un-graphed layer takes it** (past `V4_GRAPH_MAX`, or a capture that failed).
+- **What it does NOT buy under `whole` is the decode-step launch saving** — the graph already
+  collapses those launches.
+
+So do not read a flat ref-slim A/B under `whole` as "ref-slim did nothing". Measure it under
+`V4_CUDA_GRAPH=1` (island) or off, where the indexer runs eager, if you want its decode number.
+Pinned by `test_indexer_skip_does_not_reach_a_WHOLE_LAYER_GRAPHED_decode_step`.
+
+Item 2 (noqat) is different again: `_Ref` snapshots the module-level `act_quant`/`fp4_act_quant` at
+`WholeBlockGraphs` construction — after `load_ref()` installed them — so that one *does* reach a
+graphed step. (Corollary worth knowing: install/uninstall of ref-slim **after** a Stage is built would
+leave the graph on the old binding while eager took the new one. `load_ref()` fixes the order, so
+nothing on the serve path can hit it.)
 
 ### Where pipelining and the graphs actually touch — read this before trusting a graphed ring
 

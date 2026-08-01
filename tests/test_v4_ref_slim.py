@@ -338,3 +338,35 @@ def test_indexer_skip_does_not_reach_the_chunked_verify_path():
     assert "_chunk_indexer(" in src, "the chunk path no longer owns its indexer — recheck exclusivity"
     assert "self.indexer.forward" not in src and "self.indexer(" not in src
     assert "M.act_quant(" in src, "item 2 (noqat) rebinds a module global the chunk path DOES read"
+
+
+def test_indexer_skip_does_not_reach_a_WHOLE_LAYER_GRAPHED_decode_step():
+    """The same bypass, on the lever the ring recipe actually turns on — and this one is easy to miss.
+
+    v4_whole_layer_graph never calls `Indexer.forward`. It passes the Indexer MODULE as data to
+    `_indexer_decode_cs`, its own capture-safe reimplementation that reads the module's weights and
+    buffers directly, because the reference's version bakes a growing read width a graph cannot hold.
+    So under `V4_CUDA_GRAPH=whole`, rebinding `Indexer.forward` cannot reach a graphed decode step.
+
+    V4_REF_SLIM is still worth setting with `whole`, for a reason that is NOT the one on the tin:
+      * PREFILL is `start_pos == 0`, the graph gate requires `start_pos > 0`, so prefill runs the
+        reference `Attention.forward` -> `self.indexer(...)` and DOES take the slim path.
+      * a layer that could not capture (V4_GRAPH_MAX, or a failed capture) falls back to eager.
+    What it does NOT buy under `whole` is the decode-step launch saving the flag is advertised for —
+    the graph collapses those launches anyway. Documented in docs/V4_FULL_STACK.md so the ring's A/B
+    is not read as "ref-slim did nothing".
+
+    Item 2 (noqat) is different again: `_Ref` snapshots the module-level `act_quant`/`fp4_act_quant`
+    at WholeBlockGraphs construction, which is after load_ref() installed them, so that one DOES reach
+    a graphed step."""
+    import inspect
+    WL = pytest.importorskip("v4_whole_layer_graph")
+    attn = inspect.getsource(WL.attn_decode_cs)
+    assert "_indexer_decode_cs(" in attn, "the capture-safe path no longer owns its indexer"
+    assert "indexer.forward" not in attn and "A.indexer(" not in attn
+    assert "R.act_quant(" in attn, "item 2 rebinds a name the capture-safe path DOES read"
+    idx = inspect.getsource(WL._indexer_decode_cs)
+    assert "R.fp4_act_quant(" in idx and "I.forward" not in idx
+    # and _Ref binds the module's OWN functions, so an install before Stage construction is picked up
+    ref_src = inspect.getsource(WL._Ref.__init__)
+    assert "M.act_quant" in ref_src and "M.fp4_act_quant" in ref_src
