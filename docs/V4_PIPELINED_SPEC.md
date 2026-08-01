@@ -258,3 +258,125 @@ ring.
 `L`. If it does, §5 holds and this is the single highest-ceiling lever on the V4 ring. If `L ≳ τ`,
 throughput is `1/max(τ,L)` and the win is smaller but still removes the replay penalty and the serial
 `5/6`-idle waste — a strict improvement over the current path in every regime.
+
+---
+
+## 9. WHAT WAS BUILT (2026-08-01) — `coordinate_dspark_pipelined`
+
+Landed on `v4/pipelined-coord`, CPU-proven, opt-in. The serial `coordinate_dspark` is untouched and
+still the default; `V4_PIPELINED_SPEC=1` (env) or a job's `"pipelined": true` selects the new path.
+
+### 9.1 The wire, in full
+
+Three fields are added to the step frame and they ride every hop (`v4_pipe._PASSTHRU`):
+
+| field | on | meaning |
+|---|---|---|
+| `epoch` | every step frame of a pipelined job | the speculation generation; bumped on every cancel |
+| `cpos` | every streamed frame | the settled watermark: each stage calls `Stage.commit(cpos)` |
+| `fenced` | a frame a stage refused to compute | propagates, so every stage makes the same decision |
+
+The tail's reply echoes `epoch` and `pos` (which frame it answers) and carries `acc` — the tail's own
+judgment that this frame's position is committed — where the chunked reply carries `n`. A fenced frame
+is answered `{"fenced": true, "epoch", "pos"}` with nothing computed. Nothing else changed: the reset
+gains a `pipelined` flag beside `spec`/`dspark`, and **the serial path is byte-identical with the flag
+off** (no `epoch` ⇒ no fence, no `cpos` ⇒ no commit, no extra reply keys).
+
+`cpos = c - 1`, never `c`. The deepest rewind the coordinator can still ask for is `c` itself (a cancel
+commits at some `p+1 > c` and re-opens *there*), so a checkpoint ending at or before `c-1` is provably
+unreachable and everything that could cover `c` survives. This is what bounds the `W`-ring's clone
+memory without a separate control frame — one integer on a frame that was going down the ring anyway.
+
+### 9.2 The round, as implemented (and one correction to §4)
+
+The tail advances its drafter **one position per COMMITTED frame**, using that frame's own tap and its
+own greedy reply, and the block it returns proposes `q+2 .. q+B+1`. That is exactly the serial round's
+`[cur] + drafts` decomposed: the coordinator commits `m_q` at `q+1` off the same reply and streams
+`[m_q] + block` from `q+1`. Advancing one position at a time is bit-identical to the serial `n+1`-
+position call (`advance_and_draft` loops per position internally) — pinned by
+`test_pipelined_stepwise_advance_equals_one_multiposition_advance`, because if the two cadences drifted,
+an acceptance rate measured on one path would say nothing about the other.
+
+**The tail runs the accept rule too, and it needs exactly two scalars to do it.** Frames arrive in the
+order they were injected, so the frame at `q` is on the committed path iff `q == cfront + 1` and its
+token equals `mfront` (the greedy the tail produced at `cfront`). A rejected frame does not move the
+frontier, so every frame behind it fails the same test — the poisoning of a speculative tail falls out
+of the rule rather than needing a flag, including the sharp case where a later draft happens to equal
+the greedy token the *rejected* frame produced.
+
+**§4 said the cancel costs a `D·τ` drain. It does not have to.** The reply that reveals a rejection is
+the reply of a *committed* frame, so the tail has already advanced its drafter over the correction token
+and drafted a block off the correct history. The coordinator streams `[correction] + block` immediately:
+the pipeline refills in the same breath it drains, and the only cost of a cancel is the wasted work of
+the frames already in the ring. §5's `(R + D)·τ` is therefore conservative on the fill side.
+
+### 9.3 The epoch fence — what it is, and what it honestly is not
+
+The fence is **load-bearing in the coordinator's receiver** and nowhere else. Replies for discarded
+frames are still on their way back when the correction is streamed; without the epoch they would be
+read as judgments of the *new* frames at the same positions and commit the wrong tokens. Three places
+act on it:
+
+- **receiver** — pops the FIFO of frames actually sent, asserts the reply names that `(pos, epoch)`,
+  and drops anything whose epoch is not current. This is the one that prevents corruption.
+- **sender** — drops queued frames of a dead epoch before they reach the wire (a cancel can fire with a
+  whole block still queued). Correctness never rests on winning that race: a frame that slips out is
+  fenced by the receiver anyway. The check and the "owed a reply" bookkeeping happen under one lock, so
+  a dropped frame can never leave the receiver waiting for an answer that will not come.
+- **stages** — pass a fenced/stale frame on *without computing it*: no forward, no checkpoint, no state
+  touched. **This is a guard, not PipeInfer's early-cancellation optimisation.** On a single in-band
+  FIFO ring a cancel cannot overtake the frames it cancels — it is injected at the head *behind* them —
+  so in normal operation no stage ever sees a stale frame, and shrinking the bubble below `D·τ` would
+  need an out-of-band control path to every stage that this topology (one forward pipe, one return)
+  does not have. What the guard buys is that a replaying relay, a re-dialled leg or a coordinator bug
+  cannot `_seek` a stage backwards onto a discarded future; it drops, loudly and observably, instead.
+
+`test_stale_epoch_frame_is_dropped_by_the_ring_and_changes_nothing` proves both halves on real stages:
+the injected frame is answered `fenced` and the stream is unchanged, **and** with `_fenced` stubbed out
+the same frame corrupts the stream — so the green is the fence working, not the frame being harmless.
+
+### 9.4 Receipts: fenced frames are excluded from the chain, on every stage
+
+A fenced frame does no work, so no stage calls `signer.observe` on it. That is safe *because the
+decision propagates*: the first stage to fence a frame marks it, and every stage downstream honours the
+marker, so all stages observe the same sequence of frames and `out_root == in_root` still holds hop for
+hop. (On a FIFO ring the epochs alone would already agree — a stage that has seen epoch `e+1` got it
+from its predecessor — but the marker makes it true by construction rather than by argument.) In a
+normal pipelined run the ring never sees a fenced frame at all, because the sender drops them first, so
+the receipt chain covers exactly the frames the serial path would have produced. `receipts_ok is True`
+with `check_chain=True` is asserted on every real-ring pipelined test.
+
+### 9.5 What was proven, on CPU
+
+`tests/test_v4_pipe.py` §7c (protocol, no model) and §10 (real stages over the tiny checkpoint), plus
+`tests/test_v4_dspark.py` §7b (the tail's frontier rule). All green, `OMP_NUM_THREADS=1`.
+
+- **Lossless, bit-identical to the reference Transformer's own greedy stream**, in every regime:
+  zero-accept (the real MTP drafter at random weights — every block rejected, so every reply cancels
+  and rewinds `W` deep), full-accept (the block substituted with the reference's continuation — no
+  cancel ever fires), partial accept, EOS landing mid-block with frames still in the ring, `max_new`
+  landing mid-block, and **a cancel that lands exactly on a compression boundary** (positions 7 and 11
+  at cpu_args' ratio-4/ratio-8 mix — the zero-margin case the whole rollback rests on).
+- **Identical to the serial `coordinate_dspark` path** token for token, on the same warm ring, and the
+  two interleave on one ring without either leaking state into the other.
+- **Receipts settle** (`verify_coverage`, `check_chain=True`, coverage tiling all layers) on every one.
+- **The pipeline fills**: `max_inflight == dspark_block_size + 1` on the full-accept path (4 at the toy
+  block size of 3), i.e. the block plus the frame at the frontier are all in the ring at once, which is
+  the structural claim. The in-process ring is GIL-serialised, so the wall clock there is meaningless —
+  the depth is the observable, and it is reported per job (`max_inflight`, `mean_inflight`).
+
+### 9.6 Remaining risk for a real-ring run
+
+1. **`a` and `L` are still unmeasured** (§6, unchanged). This build removes the confound; it does not
+   answer the question.
+2. **Backpressure is untested at WAN scale.** The coordinator's frames are token ids (tens of bytes) so
+   its sends cannot realistically block, but the *ring* now carries `B+1` frames of `4 × dim` activation
+   where it carried one chunk. Bytes/token are unchanged; bytes in flight are not.
+3. **`W` vs the block.** In-flight depth is capped at `V4_SPEC_DEPTH` (16) and the stage's rollback ring
+   uses the same number, so a rewind can always reach. A future continuous/multi-block speculation that
+   streams deeper must raise both or it will hit `_seek`'s loud refusal.
+4. **The bubble is now wasted ring work, not idle time.** After a cancel the stale frames still traverse
+   and compute at every stage before the correction reaches them. That is the `D·τ` cost, and on this
+   topology it can only be removed with an out-of-band cancel path (§9.3).
+5. **Single sequence.** The tail's reply protocol is row 0's, as in the serial path; batching still needs
+   the ragged accept path first.

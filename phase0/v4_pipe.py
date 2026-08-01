@@ -47,7 +47,7 @@ WHAT CROSSES THE RETURN TUNNEL: a TOKEN, not logits (V4's vocab is 129280 — a 
 vector would dwarf the boundary payload for no gain). The tail runs hc_head + final norm + lm_head,
 argmaxes, and returns the int id.
 
-THREE WAYS TO DECODE, ONE ACCEPT RULE. coordinate() is greedy (g=1). coordinate_spec() drafts on the
+FOUR WAYS TO DECODE, ONE ACCEPT RULE. coordinate() is greedy (g=1). coordinate_spec() drafts on the
 COORDINATOR (n-gram/repeat — any proposer) and coordinate_dspark() lets the TAIL draft with V4's own
 trained MTP speculator, which is where that drafter has to run because `main_hidden` never leaves the
 box. Both drafted paths verify a whole chunk in one traversal, commit the accepted prefix plus one
@@ -55,6 +55,10 @@ correction, and are LOSSLESS: the committed stream is bit-identical to greedy, b
 row the tail ever computes is taken at the same GEMM shape (_tail_logit_rows) and because a rejected
 tail is rolled back by Stage._seek before the next chunk. The accept rule itself is ONE function,
 v4_dspark_draft.plan_verify_round, run by both ends of every round and asserted to agree.
+coordinate_dspark_pipelined() is the fourth: the SAME drafted round with the block streamed as
+separate s=1 frames instead of sent as one chunk, so the D stages fill instead of 5/6 idling and no
+stage replays a block position by position. Opt-in (V4_PIPELINED_SPEC / a job's `pipelined` flag),
+epoch-fenced, and held to the same bit-identical bar. See docs/V4_PIPELINED_SPEC.md.
 
   self-test (CPU, no GPU, no spend):  python3 phase0/v4_pipe.py selftest
   self-test, multi-GPU tail box:      python3 phase0/v4_pipe.py selftest-relay
@@ -62,8 +66,10 @@ v4_dspark_draft.plan_verify_round, run by both ends of every round and asserted 
   coordinator: python3 phase0/v4_pipe.py coord --head 127.0.0.1:29610 --tail 127.0.0.1:29612 --dir /root/v4
 """
 import argparse
+import collections
 import json
 import os
+import queue
 import select
 import socket
 import struct
@@ -366,6 +372,41 @@ def _make_step_frame(h, ids, start_pos, signer):
     hc = h.detach().cpu().contiguous()
     frame = {"op": "step", "h": hc, "ids": ids, "start_pos": start_pos}
     return frame, (_payload_bytes(hc, ids) if signer is not None else None)
+
+
+# ── the epoch fence: recognising frames from a CANCELLED speculation ────────────────────────────────
+# Pipelined speculation (coordinate_dspark_pipelined) streams s=1 frames without waiting for their
+# replies, so when a reply rejects a draft there are up to W frames already in the ring that belong to
+# a future the coordinator has just discarded. Every step frame therefore carries an `epoch` — a
+# generation counter the coordinator bumps on every cancel — and every reply echoes it.
+#
+# WHO THE FENCE IS FOR, precisely, because it is easy to over-claim:
+#   * THE COORDINATOR'S RECEIVER is where it is load-bearing. Replies for the discarded frames are
+#     still on their way back, and without the epoch it would read them as judgments of the frames it
+#     has just streamed into the NEW epoch — committing the wrong tokens at the right positions, which
+#     is exactly the silent corruption this whole path has to be free of.
+#   * THE SENDER drops its own queued frames of a fenced epoch before they reach the wire, so a cancel
+#     stops the ring computing a future nobody wants. (Correctness never rests on winning that race:
+#     a frame that slips out is fenced by the receiver anyway.)
+#   * THE STAGES honour `fenced`/a stale epoch by passing the frame on WITHOUT computing it — no
+#     forward, no checkpoint, no state touched, and no receipt observation, so the hash-chain stays
+#     aligned across stages (the marker propagates, so every stage makes the same decision). This is a
+#     GUARD, not the bubble-shrinking optimisation PipeInfer describes: on a single in-band FIFO ring a
+#     cancel can never overtake the frames it cancels, so in normal operation no stage ever sees one.
+#     Skipping queued work needs an out-of-band control path to every stage, which this topology (one
+#     forward pipe from the head, one return from the tail) does not have. What the guard buys is that
+#     a replaying relay, a re-dialled leg or a coordinator bug cannot rewind a stage with a frame from
+#     a discarded future — it drops loudly instead of _seek()ing on stale state.
+# The rollback itself needs none of this: the correction frame's `start_pos` IS the rewind command and
+# Stage._seek is W-deep (see v4_stage._snapshot). The fence is about who is allowed to BELIEVE a reply.
+_PASSTHRU = ("epoch", "cpos")                          # header fields every hop must carry unchanged
+
+
+def _fenced(msg, epoch):
+    """Is this step frame from a speculation that has been cancelled? An upstream stage's `fenced`
+    marker is authoritative (so one decision propagates down the ring); otherwise an epoch older than
+    the newest this stage has seen means the coordinator has moved on without it."""
+    return bool(msg.get("fenced")) or int(msg.get("epoch", 0)) < epoch
 
 
 # ── cwnd keep-warm (V4_KEEPWARM): defeat TCP slow-start-after-idle on the forward legs ──────────────
@@ -757,6 +798,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
     signer = None
     kw = _KeepWarm(nxt_sock)                                   # cwnd keep-warm on the forward leg (opt-in)
     tag = f"[s{stage}]"
+    epoch = 0                                                  # newest speculation generation seen (fence)
     timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None))
     with torch.no_grad():
         while True:
@@ -770,6 +812,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 st.reset()
                 st._spec = bool(msg.get("spec"))              # arm the stage snapshot/rollback (step 5)
                 st._dspark = bool(msg.get("dspark"))          # arm the tail's DSpark drafter (step 4)
+                epoch = 0
                 signer = (ReceiptSigner(node_key, msg.get("swarm_id", "swarm"),
                                         msg.get("job_id", "job"), lo, hi, nonce=msg.get("nonce"))
                           if receipts else None)
@@ -783,6 +826,13 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 continue
             if op == "step":
                 timer.lap("recv", msg)
+                if _fenced(msg, epoch):                       # stale speculation: pass it on, untouched
+                    msg["fenced"] = True
+                    kw.send(msg)
+                    continue
+                epoch = max(epoch, int(msg.get("epoch", 0)))
+                if "cpos" in msg:                             # settled frontier: free the spent snapshots
+                    st.commit(int(msg["cpos"]))
                 if head:
                     ids = _ids_tensor(msg["ids"])             # the coordinator sends a plain list
                     h = st.embed(ids)                         # token ids -> h [b, s, hc_mult, dim]
@@ -795,6 +845,9 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 timer.sync()
                 timer.lap("fwd")
                 frame, out_b = _make_step_frame(h, ids, start_pos, signer)  # fp8-packs when V4_FP8_WIRE
+                for k in _PASSTHRU:                           # protocol header rides every hop
+                    if k in msg:
+                        frame[k] = msg[k]
                 if signer is not None:
                     signer.observe(in_b, out_b)
                 timer.lap("out")
@@ -901,6 +954,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
     signer = None
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
     drafter, built = None, {}                                # per-job arm, process-lifetime drafter
+    epoch = 0                                                # newest speculation generation seen (fence)
     timer = _timer("[tail]", ("recv", "pre", "fwd", "out", "logits", "draft", "send"),
                    getattr(st, "device", None))
     with torch.no_grad():
@@ -915,8 +969,11 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 st.reset()
                 st._spec = bool(msg.get("spec"))              # arm the stage's snapshot/rollback
                 st._dspark = bool(msg.get("dspark"))          # arm the taps the drafter consumes
+                epoch = 0
                 try:
                     drafter = _tail_drafter(st, ckpt_dir, built) if st._dspark else None
+                    if drafter is not None:                   # streamed s=1 frames vs one chunk
+                        drafter.pipelined = bool(msg.get("pipelined"))
                 except Exception as e:  # noqa: BLE001 — any drafter fault is this JOB's, not the ring's
                     # A dspark job on a tail that cannot draft — launched without --dspark, or a
                     # checkpoint carrying no mtp.* — must fail the JOB and leave the ring standing.
@@ -942,6 +999,13 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 continue
             if op == "step":
                 timer.lap("recv", msg)
+                if _fenced(msg, epoch):                       # stale speculation: answer, compute nothing
+                    send_msg(ret, {"fenced": True, "epoch": int(msg.get("epoch", 0)),
+                                   "pos": int(msg["start_pos"])})
+                    continue
+                epoch = max(epoch, int(msg.get("epoch", 0)))
+                if "cpos" in msg:                             # settled frontier: free the spent snapshots
+                    st.commit(int(msg["cpos"]))
                 h, ids, in_b = _recv_hids(msg, signer)        # upcasts fp8; in_b hashes the wire bytes
                 start_pos = int(msg["start_pos"])
                 timer.lap("pre")
@@ -955,6 +1019,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 out = {"token": sample_token(rows[-1][0], temp, gen)}
                 if getattr(st, "_spec", False):               # spec: model's greedy token at EVERY chunk pos
                     out["tokens"] = [int(r[0].argmax()) for r in rows]
+                if "epoch" in msg:                            # pipelined: the reply names the frame it judges
+                    out["epoch"], out["pos"] = int(msg["epoch"]), start_pos
                 timer.sync()
                 timer.lap("logits")
                 if drafter is not None:                       # dspark: draft the next block locally
@@ -1299,6 +1365,310 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist}
+
+
+# ── PIPELINED speculation: stream the block as s=1 frames instead of verifying it as one chunk ──────
+# The design, the throughput model and the correctness gate are docs/V4_PIPELINED_SPEC.md. In one
+# paragraph: coordinate_dspark sends `[cur] + drafts` as ONE frame and waits, so exactly one chunk is
+# ever in flight (5 of 6 stages idle) and every stage replays the chunk position by position
+# (v4_stage.forward's start_pos>0 loop) — which is why the drafted path merely ties greedy. Streaming
+# the same block as separate s=1 frames back-to-back deletes both costs at once: stage k works on
+# token i while stage k-1 works on token i+1, and no frame is ever longer than one position.
+#
+# OPT-IN, and the serial path is untouched: V4_PIPELINED_SPEC (env) or a job's `pipelined` flag.
+V4_PIPELINED_SPEC = bool(int(os.environ.get("V4_PIPELINED_SPEC", "0") or 0))
+# The in-flight cap, and it is the SAME number as the stage's rollback ring (v4_stage's
+# V4_SPEC_DEPTH): a rejection W frames downstream has to rewind across all W, and a stage refuses to
+# rewind past its oldest live checkpoint. Streaming more than the stage can undo is the one way this
+# path can fail loudly, so the two defaults are read from one env var.
+V4_SPEC_DEPTH = int(os.environ.get("V4_SPEC_DEPTH", "16") or 16)
+
+
+class _PipeSpecState:
+    """The only state the sender thread and the receiver loop share, and the lock over it.
+
+    `epoch` is written by the receiver (on a cancel) and read by the sender (to drop frames of a
+    cancelled speculation); `outstanding` is appended by the sender at the moment a frame really goes
+    on the wire and popped by the receiver as replies arrive, so it is the exact FIFO of frames the
+    ring owes an answer for. `pending` counts frames handed to the sender and not yet accounted for by
+    EITHER path (replied, or dropped unsent), which is what tells the receiver when the ring has
+    nothing left to say — a count the receiver alone could not keep, because it does not know which
+    queued frames the fence swallowed."""
+
+    def __init__(self):
+        self.lock = threading.Lock()
+        self.epoch = 0
+        self.outstanding = collections.deque()
+        self.pending = 0
+        self.unsent = 0                                       # frames the fence dropped before the wire
+
+
+class _FrameSender(threading.Thread):
+    """Push step frames at the head without ever blocking the receiver.
+
+    The sender is a thread and not just a send() call in the loop for one reason: the accept loop must
+    never be parked in a socket write while a reply is waiting to be read. It is also where the
+    SENDER-SIDE half of the epoch fence lives — a cancel fires while a whole block may still be queued
+    here, and those frames must not reach the wire. The check and the `outstanding` append happen under
+    the same lock, so a frame is recorded as owed a reply exactly when it is about to be sent: dropping
+    one can never leave the receiver waiting for an answer that will never come."""
+
+    def __init__(self, pipe, state):
+        super().__init__(daemon=True, name="v4-pipe-sender")
+        self.pipe = pipe
+        self.st = state
+        self.q = queue.Queue()
+        self.err = None
+        self._stopped = False
+
+    def put(self, frame, epoch):
+        with self.st.lock:
+            self.st.pending += 1
+        self.q.put((frame, epoch))
+
+    def stop(self):
+        """Drain and join. The RECEIVER calls this the moment it stops generating, not just at the
+        end, and that ordering is load-bearing: `pending` is incremented by the caller but decremented
+        by whichever of the two paths (a reply, or the fence swallowing the frame unsent) gets there,
+        so a receiver that checked "is anything still owed" while the sender had a fenced frame in hand
+        would read a stale non-zero and park in a recv nothing will ever answer. Joining first settles
+        the count. Idempotent — the end-of-job call is a no-op after the stop-generating one."""
+        if self._stopped:
+            return
+        self._stopped = True
+        self.q.put(None)
+        self.join(timeout=10)
+
+    def run(self):
+        while True:
+            item = self.q.get()
+            if item is None:
+                return
+            frame, ep = item
+            with self.st.lock:
+                if ep != self.st.epoch:                       # fenced: a cancelled block never ships
+                    self.st.pending -= 1
+                    self.st.unsent += 1
+                    continue
+                self.st.outstanding.append((int(frame["start_pos"]), ep))
+            try:
+                send_msg(self.pipe, frame)
+            except Exception as e:                            # noqa: BLE001 — the receiver reports it
+                self.err = e
+                return
+
+
+def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
+                                swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
+                                timeout=600.0, on_token=None, depth=None):
+    """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
+
+    Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
+    stream) and a different shape on the wire. Instead of one `[cur] + drafts` frame per round:
+
+        frame(cur, pos=c)            -> reply {m_c, block}   m_c is the model's token at c+1
+        frame(m_c, pos=c+1)  ┐
+        frame(d1,  pos=c+2)  │  streamed back-to-back, never waiting; <= W in flight
+        ...                  ┘       -> one reply per frame, in position order
+
+    so the D stages fill (stage k runs token i while stage k-1 runs token i+1) and every frame is
+    genuinely s=1 — no stage ever runs `forward`'s per-position replay loop.
+
+    LOSSLESSNESS, and why it is not an argument about speculation at all: every token this emits is
+    `m_p`, the tail's own greedy token from a frame at position `p` whose entire history is committed,
+    computed at M=b through ParallelHead exactly as `coordinate()` computes it (_tail_logit_rows).
+    Accepting a draft does not commit the DRAFT, it commits `m_p` — which happens to equal it. So on
+    the accepted path the ring sees precisely the frame sequence greedy decode would send it, plus
+    rejected frames that Stage._seek undoes before the next accepted frame is processed. Same frames,
+    same shapes, same order => same tokens, bit for bit.
+
+    THE CANCEL. When the reply for `p` disagrees with the token already streamed at `p+1`, everything
+    behind it is a discarded future: commit `m_p` at `p+1`, bump the epoch (see the epoch fence above),
+    and stream the correction frame AT `p+1` — whose `start_pos` IS the rewind command, because
+    Stage.forward seeks before it does anything else and the checkpoint ring is W deep. No cancel op
+    crosses the wire and no stage needs one.
+
+    AND THE FRESH BLOCK COMES WITH THE REJECTION. The reply that reveals the rejection is the reply of
+    a COMMITTED frame, so the tail advanced its drafter over `m_p` — the correction token — and drafted
+    a block off that correct history before answering. The coordinator can therefore stream
+    `[correction] + block` immediately: the pipeline refills in the same breath it drains, rather than
+    idling a full traversal waiting for a new block to be proposed.
+
+    BOTH ENDS STILL RUN THE ACCEPT RULE AND MUST AGREE, as in the serial path: the tail's `acc` (its
+    own judgment that this frame's position is committed, from its incremental frontier) is asserted
+    against this loop's. A divergence means the drafter is conditioning on a history the ring never
+    took, and it fails the job loudly instead of quietly rotting acceptance.
+
+    Returns coordinate()'s dict plus {frames, drafted, generated, accepted, cancels, cycles, g,
+    accept_hist, max_inflight, mean_inflight, stale_replies, unsent_frames} — `max_inflight` being the
+    pipeline depth actually achieved, i.e. whether the thing pipelined at all."""
+    W = int(depth or V4_SPEC_DEPTH)
+    ret.settimeout(timeout)
+    send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
+                    "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True})
+    ack = recv_msg(ret)
+    if not (ack == "ok" or (isinstance(ack, dict) and ack.get("ok"))):
+        raise RuntimeError(f"v4 dspark ring reset not acked: {ack!r}")
+
+    eos = set(eos_ids)
+    ids = list(prompt_ids)                                    # full committed sequence (prompt + gen)
+    toks = []                                                 # generated tokens only
+
+    # PREFILL is still one multi-token frame — it is the only place the whole chunk goes in at once
+    # (the reference's own collapse-then-slice), and it is where the tail builds its mtp window.
+    send_msg(pipe, {"op": "step", "ids": [ids], "start_pos": 0, "epoch": 0})
+    rep = recv_msg(ret)
+    if not isinstance(rep, dict) or "acc" not in rep:
+        raise RuntimeError(
+            "v4 pipelined dspark: the tail's prefill reply carries no `acc`, so nothing is drafting "
+            "on it in pipelined mode — launch the tail stage with --dspark (and check it is a build "
+            "new enough to honour the reset's `pipelined` flag)")
+    cur = int(rep["token"])
+    c = len(ids)                                              # absolute position of the first new token
+    ids.append(cur)
+    toks.append(cur)
+    if on_token is not None:
+        on_token(cur)
+    stop = cur in eos or len(toks) >= max_new
+
+    st8 = _PipeSpecState()
+    sender = _FrameSender(pipe, st8)
+    sender.start()
+    sent = {}                                                 # pos -> token fed there in THIS epoch
+    horizon = c - 1                                           # highest position a frame has been sent for
+    frames = drafted = accepted = cancels = run = stale = 0
+    hist, depths = {}, []
+
+    def _feed(pos, tok):
+        """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
+        `c - 1`, never `c`: the deepest rewind this coordinator can still ask for is `c` itself (a
+        cancel commits at some p+1 > c and re-opens THERE), so anything ending at or before `c - 1` is
+        provably unreachable, and anything that could cover `c` survives."""
+        nonlocal horizon, frames
+        sent[pos] = int(tok)
+        horizon = max(horizon, pos)
+        frames += 1
+        sender.put({"op": "step", "ids": [[int(tok)]], "start_pos": pos,
+                    "epoch": st8.epoch, "cpos": c - 1}, st8.epoch)
+
+    if not stop:
+        _feed(c, cur)                                         # the cur frame: its reply carries block 1
+    while True:
+        with st8.lock:
+            waiting = st8.pending
+        if waiting == 0:
+            if stop:
+                break
+            raise RuntimeError(                               # would otherwise be a silent hang
+                f"v4 pipelined dspark: nothing in flight at position {c} with {len(toks)} of "
+                f"{max_new} tokens generated — the pipeline emptied without stopping")
+        try:
+            rep = recv_msg(ret)
+        except Exception:
+            if sender.err is not None:
+                raise RuntimeError(f"v4 pipelined dspark: the frame sender died: "
+                                   f"{type(sender.err).__name__}: {sender.err}") from sender.err
+            raise
+        with st8.lock:
+            pos, ep = st8.outstanding.popleft()
+            st8.pending -= 1
+        if int(rep.get("pos", pos)) != pos or int(rep.get("epoch", ep)) != ep:
+            raise RuntimeError(
+                f"v4 pipelined dspark: reply {rep.get('pos')}@e{rep.get('epoch')} for the frame "
+                f"{pos}@e{ep} — the return channel reordered or dropped a frame, and every accept "
+                f"after it would be attributed to the wrong position")
+        if rep.get("fenced") or ep != st8.epoch:              # THE FENCE: a cancelled future's reply
+            stale += 1
+            continue
+        if stop:                                              # draining after EOS/max_new: judge nothing
+            continue
+        if pos != c:
+            raise RuntimeError(f"v4 pipelined dspark: reply for position {pos} with the committed "
+                               f"frontier at {c} — replies must land in committed order")
+        # A reply is only allowed to be BELIEVED when the frame that produced it was on the committed
+        # path — otherwise its greedy token answers a history the ring is not taking. Two independent
+        # ways to know, and both must say yes: this loop's own record of what it fed at `pos` against
+        # what it committed there, and the tail's `acc` from its own incremental frontier. The first is
+        # an invariant of the fence (a rejected frame is fenced and its reply dropped before it can get
+        # here); the second is the same cross-check the serial round asserts on `n`.
+        if sent.get(pos) != ids[pos]:
+            raise RuntimeError(
+                f"v4 pipelined dspark: about to judge the reply of the frame at {pos}, which fed "
+                f"{sent.get(pos)!r} while the committed token there is {ids[pos]!r} — a fenced frame "
+                f"reached the accept path, and every token after it would answer a discarded history")
+        if not rep.get("acc"):
+            raise RuntimeError(
+                f"v4 pipelined dspark: the tail judged the frame at {pos} speculative and this "
+                f"coordinator judged it committed, off the same frame and the same replies. The two "
+                f"ends of a lossless round have diverged, so the drafter is advancing over a history "
+                f"the ring is not taking — one accept rule, and it is plan_verify_round.")
+        m = int(rep["tokens"][0])                             # the model's token at pos+1, at M=b
+        fed = sent.get(pos + 1)                               # what we streamed there, if anything yet
+        ids.append(m)
+        c = pos + 1
+        toks.append(m)
+        if on_token is not None:
+            on_token(m)
+        if fed == m:
+            accepted += 1
+            run += 1
+        stop = m in eos or len(toks) >= max_new
+        if stop:
+            with st8.lock:                                    # fence what is still queued: the run is
+                st8.epoch += 1                                # over, so nothing more reaches the ring
+            sender.stop()                                     # settle `pending` before draining on it
+            continue
+        if fed is None:                                       # nothing speculated here: feed the truth
+            _feed(c, m)
+        elif fed != m:                                        # REJECT -> cancel, rewind, correct
+            cancels += 1
+            hist[run] = hist.get(run, 0) + 1
+            run = 0
+            with st8.lock:
+                st8.epoch += 1
+            for p in [p for p in sent if p > pos]:            # the discarded future
+                del sent[p]
+            horizon = pos
+            _feed(c, m)                                       # start_pos == c IS the rewind command
+        blk = [int(t) for t in (rep.get("draft") or [])]
+        # Stream the fresh block only when this reply opened the speculation — after a cancel, after
+        # the first frame, or when the previous block has been fully consumed (a full-accept run, whose
+        # last reply commits the bonus token and lands the horizon back on the frontier). Mid-run
+        # replies also carry a block, drafted one position further along; taking it would re-speculate
+        # positions already in flight, which the serial round does not do either.
+        if blk and horizon == c:
+            drafted += 1
+            for i, d in enumerate(blk):
+                if (pos + 2 + i) - c >= W:                    # never stream deeper than a stage can undo
+                    break
+                _feed(pos + 2 + i, d)
+        # THE PIPELINE FILL, measured: positions c..horizon all have a frame in the ring and none of
+        # them has been judged yet (replies land in order and this one was for c-1), so that span IS
+        # the number of frames in flight. 1 means the pipeline never filled and this is greedy decode
+        # with extra steps; B+1 is the block fully streamed.
+        depths.append(horizon - c + 1)
+        sent.pop(pos - 1, None)                               # settled two positions back: never read again
+
+    hist[run] = hist.get(run, 0) + 1
+    with st8.lock:                                            # drop anything the fence left queued
+        st8.epoch += 1
+    sender.stop()
+    if sender.err is not None:
+        raise RuntimeError(f"v4 pipelined dspark: the frame sender died: "
+                           f"{type(sender.err).__name__}: {sender.err}") from sender.err
+    recs, receipts_ok = [], None
+    if receipts:
+        recs, receipts_ok = _sweep_receipts(pipe, ret, layer_count, nonce)
+    gen = len(toks)
+    cycles = cancels + 1
+    return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
+            "receipts": recs, "receipts_ok": receipts_ok,
+            "frames": frames, "drafted": drafted, "generated": gen, "accepted": accepted,
+            "cancels": cancels, "cycles": cycles, "rounds": cycles,
+            "g": (gen / cycles) if cycles else float(gen), "accept_hist": hist,
+            "max_inflight": max(depths) if depths else 0,
+            "mean_inflight": round(sum(depths) / len(depths), 2) if depths else 0.0,
+            "stale_replies": stale, "unsent_frames": st8.unsent}
 
 
 # ── layer tiling: consume a V4 profile via plan_ring ───────────────────────────────────────────────
@@ -1694,6 +2064,8 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
     d_pipe, d_ret = _spawn_ring(d, d_ranges, tail_box_g, dspark=True, tag="d")
     k = coordinate_dspark(d_pipe, d_ret, list(prompt), max_new, nonce="dspark-nonce-0",
                           receipts=True, layer_count=n_layers, timeout=120)
+    q = coordinate_dspark_pipelined(d_pipe, d_ret, list(prompt), max_new, nonce="dspark-nonce-1",
+                                    receipts=True, layer_count=n_layers, timeout=120)
     send_msg(d_pipe, {"op": "stop"})
 
     def cover(res, rs):
@@ -1723,6 +2095,14 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
         # first one carries one — and that the stream came out exact anyway. Acceptance is a
         # measurement for real weights on a real ring. Losslessness is provable here, and here it is.
         "dspark_drafted_real_blocks": (k["rounds"] > 1 and k["drafted"] == k["rounds"] - 1),
+        # PIPELINED: the same drafted ring, streamed as s=1 frames instead of verified as one chunk.
+        # Same bar and one more — the emitted stream must equal the reference AND the serial dspark
+        # path token for token, because "we restructured the wire and the answer changed" is the only
+        # way this lever can be wrong.
+        "pipelined_lossless_vs_greedy": (q["tokens"] == ref_tokens),
+        "pipelined_matches_the_serial_dspark_path": (q["tokens"] == k["tokens"]),
+        "pipelined_receipts_settle": (q["receipts_ok"] is True and cover(q, d_ranges)),
+        "pipelined_actually_pipelined": (q["max_inflight"] > 1),
     }
     tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
     print("\n=== V4 pipe offline selftest (CPU tiny config) ===")
@@ -1737,6 +2117,10 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
           f"hist={p['accept_hist']}  (perfect drafter: full accepts, no rewind)")
     print(f"  dspark rounds={k['rounds']} drafted={k['drafted']} accepted={k['accepted']} "
           f"g={k['g']:.2f} hist={k['accept_hist']}")
+    print(f"  tokens (pipe)   {q['tokens']}")
+    print(f"  pipe   frames={q['frames']} cycles={q['cycles']} accepted={q['accepted']} "
+          f"cancels={q['cancels']} g={q['g']:.2f} inflight max={q['max_inflight']} "
+          f"mean={q['mean_inflight']} stale={q['stale_replies']} unsent={q['unsent_frames']}")
     for name, v in checks.items():
         print(f"  [{'PASS' if v else 'FAIL'}] {name}")
     ok = all(checks.values())
@@ -1807,10 +2191,14 @@ def _coord_cli(a):
             prompt_ids = _encode_prompt(tok, job)
             state["t0"] = time.time()
             if job.get("dspark"):                             # V4's own trained speculator, on the tail
-                r = coordinate_dspark(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
-                                      nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
-                                      job_id=job_id, layer_count=layer_count, receipts=a.receipts,
-                                      timeout=a.timeout, on_token=_on_token)
+                # PIPELINED is opt-in per job or per process, and the serial path stays the default:
+                # the two emit the same stream, but only one of them has been measured on a real ring.
+                drive = (coordinate_dspark_pipelined
+                         if (V4_PIPELINED_SPEC or job.get("pipelined")) else coordinate_dspark)
+                r = drive(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
+                          nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
+                          job_id=job_id, layer_count=layer_count, receipts=a.receipts,
+                          timeout=a.timeout, on_token=_on_token)
             elif job.get("spec"):                             # coordinator-side drafter (n-gram)
                 r = coordinate_spec(pipe, ret, prompt_ids, max_new, eos_ids=eos_ids,
                                     nonce=job.get("nonce"), swarm_id=job.get("swarmId") or "swarm",
