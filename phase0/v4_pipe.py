@@ -1867,6 +1867,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     horizon = c - 1                                           # highest position a frame has been sent for
     frames = drafted = accepted = cancels = run = stale = issued = 0
     hist, depths = {}, []
+    prevhint = set()                                          # positions sent a `dprev` PREDICTION
 
     def _feed(pos, tok, nxt=None, prev=False):
         """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
@@ -1892,6 +1893,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             f["dnxt"] = int(nxt)
         if lazy and prev:
             f["dprev"] = True
+            prevhint.add(pos)
         sender.put(f, st8.epoch)
 
     def _hints(span):
@@ -1901,9 +1903,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         hint for position `p` is the token at `p + 1`, or None where this loop cannot prove the
         frame's reply will not be asked for a block.
 
-        THE PROOF THE HINT STANDS ON. This loop consumes a block from the reply of position `p`
-        exactly when the pipeline has drained to the frontier (`horizon == p + 1` once `p`'s token is
-        committed) or when `sent[p + 1]` disagrees with the model's token and the round cancels.
+        THE PROOF THE HINT STANDS ON. This loop consumes a block from the reply of position `p` in
+        exactly three cases, which are the `need` predicate below: nothing is speculated at `p + 1`
+        (`fed is None`), what is speculated there disagrees with the model's token and the round
+        cancels, or the pipeline has drained to the frontier (`horizon == p + 1`).
         After this burst the in-flight span is `c .. H` with `H = c + len(span) - 1`, CONTIGUOUS, and
         horizon only ever grows. So for a frame at `p <= H - 2`: `sent[p + 1]` exists (contiguity),
         and `p + 1 <= H - 1 < horizon`, so its reply cannot be the drain. The only way it can be the
@@ -1991,13 +1994,24 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         # to it (`horizon == c`). It is exactly the condition the block is streamed under, hoisted so
         # the lazy-draft hint can be audited against it.
         need = fed is None or fed != m or horizon == c
-        if need and "draft" not in rep:
-            # LAZY DRAFTING SKIPPED A BLOCK THE ROUND NEEDED. The hint on the frame at `pos` must have
-            # been absent or contradicted, and the tail must have drafted. A reply with no `draft` key
-            # AT ALL is a tail that skipped one it was not entitled to skip (a `_done` tail sends
-            # `"draft": []`, which is a different thing and legal). It would not corrupt a token — the
-            # round would fall back to greedy — but it would silently delete the speculation, so it
-            # fails loudly instead of quietly costing the throughput this lever is here to buy.
+        if lazy and need and "draft" not in rep and pos not in prevhint:
+            # LAZY DRAFTING SKIPPED A BLOCK THE ROUND NEEDED. A reply with no `draft` key AT ALL is a
+            # tail that skipped one (a `_done` tail sends `"draft": []`, which is a different thing
+            # and legal). It would not corrupt a token — the round falls back to feeding the truth one
+            # position at a time — but it would silently delete the speculation, so a `dnxt` hint,
+            # which is a FACT about a frame already streamed, fails loudly when it turns out wrong.
+            #
+            # `dprev` is a PREDICTION and is exempt, deliberately. It says "your successor is the head
+            # of the block you return one frame from now", which holds unless the NEXT burst is
+            # degenerate — a burst of one puts the drain back on the frontier, i.e. on this very
+            # frame. That cannot happen while the drafter's block length is fixed (it is: the
+            # pipelined path refuses the one lever that trims it, see the confGate raise in
+            # `_coord_cli`), but the cost of being wrong should be a round of greedy, not a dead job
+            # in the middle of a generation. So the prediction degrades and the fact raises.
+            #
+            # Gated on `lazy` because with the flag off no hint was sent, and a tail that answers a
+            # committed frame with no block is then simply a tail that is not drafting — the eager
+            # path's own business, and it ran to completion before this lever existed.
             raise RuntimeError(
                 f"v4 pipelined dspark: the reply for the frame at {pos} carries no block and this "
                 f"round needs one (frontier {c}, horizon {horizon}) — the tail skipped a draft the "
@@ -2054,6 +2068,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         # with extra steps; B+1 is the block fully streamed.
         depths.append(horizon - c + 1)
         sent.pop(pos - 1, None)                               # settled two positions back: never read again
+        prevhint.discard(pos)
 
     hist[run] = hist.get(run, 0) + 1
     with st8.lock:                                            # drop anything the fence left queued
@@ -2577,10 +2592,22 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
                           receipts=True, layer_count=n_layers, timeout=120)
     q = coordinate_dspark_pipelined(d_pipe, d_ret, list(prompt), max_new, nonce="dspark-nonce-1",
                                     receipts=True, layer_count=n_layers, timeout=120)
-    # LAZY DRAFTING, at three pipeline depths on the same warm ring. The depth is what decides WHICH
-    # frame drains the pipeline, so it is what the hint is derived from — one depth proving lossless
-    # would prove the arithmetic at one depth. depth=2 is the degenerate one where the drain sits on
-    # the frontier and the lever is expected to stay off rather than be clever.
+    # LAZY DRAFTING, at three pipeline depths on the same warm ring, each against ITS OWN eager
+    # baseline at the SAME depth. The depth decides WHICH frame drains the pipeline and is therefore
+    # what the hint is derived from, so one depth proving lossless would prove the arithmetic at one
+    # depth — and comparing a lazy run at W against an eager run at some other W would compare two
+    # different rounds. depth=2 is the degenerate one where the drain sits on the frontier and the
+    # lever is expected to stay off rather than be clever.
+    #
+    # WHAT THIS CANNOT SHOW, and where the proof that matters lives: at random weights the toy's own
+    # drafter is wrong every round, so every reply IS the round's last and there is nothing a hint
+    # can license skipping. This is the zero-accept regime — it proves the lever is lossless through a
+    # rewind on every round and costs nothing, not that it skips anything. The forced-accept regime,
+    # where the skipping actually happens, needs a scripted block and lives in
+    # tests/test_v4_pipe.py::test_lazy_drafting_on_a_real_ring_is_bit_identical_at_every_depth.
+    y = {w: coordinate_dspark_pipelined(d_pipe, d_ret, list(prompt), max_new, nonce=f"eager-{w}",
+                                        receipts=True, layer_count=n_layers, timeout=120, depth=w)
+         for w in (2, 3, 16)}
     z = {w: coordinate_dspark_pipelined(d_pipe, d_ret, list(prompt), max_new, nonce=f"lazy-{w}",
                                         receipts=True, layer_count=n_layers, timeout=120,
                                         depth=w, lazy=True)
@@ -2622,15 +2649,16 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
         "pipelined_matches_the_serial_dspark_path": (q["tokens"] == k["tokens"]),
         "pipelined_receipts_settle": (q["receipts_ok"] is True and cover(q, d_ranges)),
         "pipelined_actually_pipelined": (q["max_inflight"] > 1),
-        # LAZY DRAFTING: same stream, same blocks consumed, at every depth — and never MORE drafting
-        # than the eager round paid for. At random weights every round is rejected, so this proves the
-        # rejection path (where the block must still come back with the correction) and leaves the
-        # accepted path to tests/test_v4_pipe.py, which can force it.
+        # LAZY DRAFTING, against the eager round at the same depth: the reference's stream, the same
+        # blocks consumed off the same cancels at the same depth, and never MORE drafting. See the
+        # comment above `y` for what the zero-accept regime can and cannot show.
         "lazy_lossless_vs_greedy_at_every_depth": all(v["tokens"] == ref_tokens for v in z.values()),
-        "lazy_consumes_the_same_blocks": all(v["drafted"] == q["drafted"] and v["cancels"] == q["cancels"]
-                                             for v in z.values()),
-        "lazy_never_drafts_more_than_eager": all(v["drafts_issued"] <= q["drafts_issued"]
-                                                 for v in z.values()),
+        "lazy_runs_the_same_round_as_eager": all(
+            z[w]["drafted"] == y[w]["drafted"] and z[w]["cancels"] == y[w]["cancels"]
+            and z[w]["frames"] == y[w]["frames"] and z[w]["max_inflight"] == y[w]["max_inflight"]
+            for w in z),
+        "lazy_never_drafts_more_than_eager": all(z[w]["drafts_issued"] <= y[w]["drafts_issued"]
+                                                 for w in z),
         "lazy_receipts_settle": all(v["receipts_ok"] is True and cover(v, d_ranges) for v in z.values()),
     }
     tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
@@ -2650,8 +2678,10 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
     print(f"  pipe   frames={q['frames']} cycles={q['cycles']} accepted={q['accepted']} "
           f"cancels={q['cancels']} g={q['g']:.2f} inflight max={q['max_inflight']} "
           f"mean={q['mean_inflight']} stale={q['stale_replies']} unsent={q['unsent_frames']}")
-    print(f"  drafts issued/consumed  eager {q['drafts_issued']}/{q['drafted']}   "
-          + "   ".join(f"lazy W={w} {v['drafts_issued']}/{v['drafted']}" for w, v in z.items()))
+    print("  drafts issued/consumed  "
+          + "   ".join(f"W={w} eager {y[w]['drafts_issued']}/{y[w]['drafted']} "
+                       f"lazy {z[w]['drafts_issued']}/{z[w]['drafted']}" for w in z)
+          + "   (zero accept: every block is consumed, so there is nothing to skip)")
     for name, v in checks.items():
         print(f"  [{'PASS' if v else 'FAIL'}] {name}")
     ok = all(checks.values())

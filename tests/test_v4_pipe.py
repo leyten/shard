@@ -1109,15 +1109,19 @@ def test_lazy_drafting_is_off_by_default_and_puts_no_hint_on_the_wire():
     assert not any(ring.dprev.values()), "the eager path put a `dprev` hint on the wire"
 
 
+class _NeverDrafts(_ScriptedPipeRing):
+    """A tail that answers every committed frame with no `draft` key at all."""
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, **kw)
+        self.blocks = lambda q: None
+
+
 def test_a_tail_that_skips_a_block_the_round_needed_fails_loudly():
     """The anti-silence check. A lazy tail whose skip is wrong does not corrupt a token — the round
-    just falls back to feeding the truth one position at a time — so the failure mode is a silent
-    collapse to greedy on a ring that still answers correctly. It must be loud instead."""
-    class _NeverDrafts(_ScriptedPipeRing):
-        def __init__(self, *a, **kw):
-            super().__init__(*a, **kw)
-            self.blocks = lambda q: None                  # answers every frame with no `draft` key
-
+    falls back to feeding the truth one position at a time — so the failure mode is a silent collapse
+    to greedy on a ring that still answers correctly. A `dnxt` hint is a FACT about a frame already
+    streamed, so being wrong about it is a bug and must be loud."""
     ring = _NeverDrafts(TRUTH, _perfect_block)
     try:
         with pytest.raises(RuntimeError, match="carries no block and this round needs one"):
@@ -1125,6 +1129,40 @@ def test_a_tail_that_skips_a_block_the_round_needed_fails_loudly():
                                            timeout=10, lazy=True)
     finally:
         ring.close()
+
+
+def test_the_eager_path_never_raises_over_a_hint_it_did_not_send():
+    """The same tail, with the lever OFF, must run exactly as it did before the lever existed.
+
+    A tail that answers a committed frame with no block is then simply a tail that is not drafting —
+    the round degrades to greedy and still emits the model's own tokens. Failing it over a
+    "lazy-draft hint" on a round that sent no hints would make the flag-off path strictly narrower
+    than the one it is supposed to reproduce frame for frame."""
+    ring = _NeverDrafts(TRUTH, _perfect_block)
+    try:
+        r = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 6, timeout=10)
+    finally:
+        ring.close()
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 9)], "the undrafted round stopped being greedy"
+    assert r["drafted"] == 0 and r["max_inflight"] == 1, "nothing should have been speculated"
+
+
+@pytest.mark.parametrize("shrink_at", [6, 9])
+def test_a_block_that_shrinks_mid_job_degrades_instead_of_killing_the_round(shrink_at):
+    """`dprev` is a PREDICTION — "your successor is the head of the block you return one frame from
+    now" — and it holds unless the NEXT burst is degenerate. A burst of one puts the drain back on
+    the frontier, i.e. on the very frame the prediction was sent to, so a drafter whose block length
+    collapsed mid-job could have that frame skip a block the round then needs.
+
+    It cannot happen today (the block is `block_size` every round, and the one lever that trims it is
+    refused against the pipelined path), which is exactly why the cost of being wrong must be a round
+    of greedy rather than a dead job halfway through a generation. Forced here by shrinking the block
+    at a fixed position: the stream must still be the model's own."""
+    def blocks(q):
+        return _perfect_block(q, n=(1 if q >= shrink_at else 3))
+
+    r, _ = _pipelined(blocks, max_new=12, lazy=True)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 15)], "the shrinking block moved the stream"
 
 
 def test_sender_side_epoch_fence_drops_queued_frames_without_stranding_the_receiver():
@@ -1871,9 +1909,13 @@ def test_pipelined_cancel_on_a_compression_boundary_is_lossless(tiny, long_ref, 
 
 
 def _drafter_state(double):
-    """The drafter's ENTIRE persistent state, as bytes: the mtp KV window of every DSpark stage, plus
-    the cursor that says which position it stands on. Nothing else in a DSparkBlock survives a call
-    (v4_dspark_draft's WHY THE MTP CACHE NEVER NEEDS A ROLLBACK)."""
+    """The drafter state a later frame can READ: the mtp KV window of every DSpark stage, plus the
+    cursor that says which position it stands on. Nothing else in a DSparkBlock survives a call
+    (v4_dspark_draft's WHY THE MTP CACHE NEVER NEEDS A ROLLBACK).
+
+    `last_spec` is deliberately not here. It is the raw triple from the last DRAFT — which is what it
+    still holds after a skipped frame, by its own definition — and nothing on the serve path reads
+    it; it exists for a caller that wants the drafter's own logits."""
     t = double._inner.tail
     return t.pos, [b.attn.kv_cache.clone() for b in t.mtp]
 

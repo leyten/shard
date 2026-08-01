@@ -656,7 +656,6 @@ class RingDrafter:
             # would kill the serve loop and every job after it. The guards below are the reference's
             # own, run BEFORE the write, so a hint that arrived on the wrong frame fails the job here
             # rather than corrupting the window silently.
-            import v4_dspark_fast
             t = self.tail
             if t.pos is None or start_pos != t.pos + 1:
                 raise RuntimeError(
@@ -664,7 +663,7 @@ class RingDrafter:
                     f"the drafter's cursor must walk exactly the committed positions whether or not "
                     f"it drafts on them")
             with torch.no_grad():
-                v4_dspark_fast._advance_cache_only(t, t._hidden(main, want_s=1), start_pos)
+                _fast()._advance_cache_only(t, t._hidden(main, want_s=1), start_pos)
             t._pos = start_pos
             return {"acc": True}
         blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
@@ -672,6 +671,20 @@ class RingDrafter:
         self._last = (start_pos, draft)
         return {"acc": True, "draft": draft,
                 "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+
+
+def _fast():
+    """v4_dspark_fast, memoised. Imported lazily like `_v4()` — that module rebinds THIS one's
+    `advance_and_draft` in `install()`, so a module-level import would be a cycle — and cached
+    because the lazy path dereferences it once per skipped frame."""
+    global _FAST
+    if _FAST is None:
+        import v4_dspark_fast
+        _FAST = v4_dspark_fast
+    return _FAST
+
+
+_FAST = None
 
 
 def wants_block(msg, m, last=None):
