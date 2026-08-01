@@ -1099,3 +1099,20 @@ def test_reset_gives_a_warm_ring_a_cold_rings_answer(tiny):
     finally:
         ring.close()
     assert warm == ref, f"warm-after-reset {warm} != cold {ref}"
+
+
+def test_swarm_token_value_is_actually_compared(monkeypatch):
+    """The hole a live-ring audit found: greetings were checked for SHAPE only, so any scanner
+    speaking the codec could greet its way past a token-'gated' ring. The token VALUE must gate."""
+    monkeypatch.setattr(VP, "SWARM_TOKEN", "s3cret")
+    assert VP._is_pred_hello({"op": "hello_pred", "token": "s3cret"}), "the right token must pass"
+    assert VP._is_return_hello({"op": "hello_return", "token": "s3cret"})
+    assert not VP._is_pred_hello({"op": "hello_pred", "token": "wrong"}), "a wrong token is a stranger"
+    assert not VP._is_pred_hello({"op": "hello_pred"}), "a missing token is a stranger"
+    assert not VP._is_return_hello({"op": "hello_return", "token": "wrong"})
+    # right shape, wrong op — never a match
+    assert not VP._is_pred_hello({"op": "hello_return", "token": "s3cret"})
+    # token-less ring: shape alone gates (a token=None deployment is unchanged)
+    monkeypatch.setattr(VP, "SWARM_TOKEN", None)
+    assert VP._is_pred_hello({"op": "hello_pred"}), "token-less ring accepts on shape"
+    assert VP._is_pred_hello({"op": "hello_pred", "token": "ignored"})

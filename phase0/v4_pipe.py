@@ -540,6 +540,10 @@ def _fwd_open(kw, nxt, timeout, msg, tag="[s]"):
     kw.attach(None)
     sock = _dial(*nxt.rsplit(":", 1), timeout=timeout)    # a re-dial that fails raises into the serve
     kw.attach(sock)                                       # loop's supervision, exactly as before
+    if SWARM_TOKEN is not None:
+        # the fresh link must greet like the launch-time dial did, or a token-mode successor
+        # (rightly) drops it as a stranger and the self-heal this function exists for never lands
+        send_msg(sock, {"op": "hello_pred", "token": SWARM_TOKEN})
     kw.send(msg)
     return sock
 
@@ -572,11 +576,20 @@ def ring_args(ckpt_dir):
 
 
 def _is_return_hello(msg):
-    return isinstance(msg, dict) and msg.get("op") == "hello_return"
+    """A coordinator-return greeting THIS swarm accepts. When SHARD_SWARM_TOKEN is set the token
+    VALUE is compared — a greeting of the right shape with the wrong (or no) token is a stranger.
+    The shape-only check shipped first and was a hole: any scanner speaking the frame codec could
+    have adopted the return channel of a token-'gated' ring."""
+    if not (isinstance(msg, dict) and msg.get("op") == "hello_return"):
+        return False
+    return SWARM_TOKEN is None or msg.get("token") == SWARM_TOKEN
 
 
 def _is_pred_hello(msg):
-    return isinstance(msg, dict) and msg.get("op") == "hello_pred"
+    """Predecessor greeting, token value compared under the same rule as _is_return_hello."""
+    if not (isinstance(msg, dict) and msg.get("op") == "hello_pred"):
+        return False
+    return SWARM_TOKEN is None or msg.get("token") == SWARM_TOKEN
 
 
 def serve_stage(stage, nstages, lo, hi, port, nxt=None, *, ckpt_dir=None, args=None, device=None,
