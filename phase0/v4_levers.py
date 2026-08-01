@@ -417,10 +417,19 @@ def audit(side=STAGE, stage=None):
     for lv in LEVERS:
         set_here = os.environ.get(lv.env, "") not in ("", "0")
         if set_here and not lv.wanted_here(side):
-            other = COORDINATOR if lv.side == COORDINATOR else STAGE
-            out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "WRONG PROCESS",
-                               f"{lv.side}-side lever set on a {side} process — this process never "
-                               f"reads it; set it where the {other} runs"))
+            # ONE-DIRECTIONAL ON PURPOSE. A coordinator-side lever on a STAGE is a dead flag: nothing
+            # in that process reads it, which is instance 5 and cost a night. The reverse is NORMAL --
+            # the coordinator usually runs on the launcher box, and `_eng_env()` reads os.environ to
+            # build the stages' environment, so a stage lever exported there is doing its job. Calling
+            # that a problem would put a false alarm on every healthy ring, and an alarm that always
+            # fires is the same as no alarm.
+            if lv.side == COORDINATOR:
+                out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "WRONG PROCESS",
+                                   f"coordinator-side lever set on a {side} process — this process "
+                                   f"never reads it; set it where the coordinator runs"))
+            else:
+                out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "PROPAGATED",
+                                   "stage-side lever; this process forwards it via ENG_ENV"))
             continue
         if not lv.wanted_here(side):
             continue

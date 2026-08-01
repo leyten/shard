@@ -231,14 +231,19 @@ def test_a_coordinator_lever_set_on_a_stage_is_reported_as_the_wrong_process():
     assert "coordinator-side lever set on a stage" in out, out
 
 
-def test_a_stage_lever_set_on_a_coordinator_is_reported_too():
-    """Symmetric, and not hypothetical: a coordinator that exports a stage lever it never launched
-    stages with has configured nothing either."""
+def test_a_stage_lever_on_a_coordinator_is_not_an_alarm():
+    """The check is one-directional ON PURPOSE, and this pins that it stays that way.
+
+    The coordinator normally runs on the launcher box and `_eng_env()` reads os.environ to build the
+    stages' environment, so every stage lever is legitimately exported there. Flagging that would put
+    a false alarm on every healthy ring, and an alarm that always fires is the same as no alarm — so
+    it is reported PROPAGATED and is not a problem. The real check lives in the stage's own audit."""
     out = run_probe("""
         import v4_pipe, v4_levers
         print(v4_levers.report(side=v4_levers.COORDINATOR))
     """, V4_FAST_VERIFY=1)
-    assert "V4_FAST_VERIFY" in out and "WRONG PROCESS" in out, out
+    assert "V4_FAST_VERIFY" in out and "PROPAGATED" in out, out
+    assert "PROBLEM(S)" not in out, "a launcher-exported stage lever must not raise an alarm"
 
 
 def test_a_v4_var_nothing_reads_is_reported_unknown():
