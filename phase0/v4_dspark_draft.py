@@ -489,11 +489,24 @@ class RingDrafter:
     SINGLE SEQUENCE. The reply protocol is row 0's alone (`_serve_tail` samples `logits[0]`), so a
     b>1 chunk cannot even express the other rows' accept lengths; it is refused rather than silently
     drafting for row 0 and advancing the whole batch's lockstep cache. Batching needs the ragged
-    accept path first."""
+    accept path first.
+
+    PIPELINED MODE (`self.pipelined`, armed per job by the reset's `pipelined` flag) serves
+    v4_pipe.coordinate_dspark_pipelined, which streams the block as separate `s=1` frames instead of
+    one chunk. The accept rule is the same rule applied one position at a time and the reply carries
+    `acc` (this frame's position is committed) where the chunked reply carries `n`; see
+    `_on_chunk_pipelined`."""
 
     def __init__(self, tail):
         self.tail = tail                                   # a DSparkTail (its 4-method contract)
         self._done = False
+        # PIPELINED mode (v4_pipe.coordinate_dspark_pipelined), armed per JOB by the reset's
+        # `pipelined` flag. `_cfront` is the position of the last frame this tail judged COMMITTED and
+        # `_mfront` is the model's greedy token that frame produced -- i.e. the token that belongs at
+        # `_cfront + 1`. Those two scalars ARE the incremental accept rule; see _on_chunk_pipelined.
+        self.pipelined = False
+        self._cfront = None
+        self._mfront = None
 
     def on_chunk(self, msg, st, out):
         ids = torch.as_tensor(msg["ids"], dtype=torch.long)
@@ -502,6 +515,8 @@ class RingDrafter:
         if ids.dim() != 2 or ids.shape[0] != 1:
             raise RuntimeError(f"v4 dspark: a drafted round is single-sequence today, got ids "
                                f"{tuple(ids.shape)} — see RingDrafter's docstring")
+        if self.pipelined:
+            return self._on_chunk_pipelined(ids, msg, st, out)
         start_pos = int(msg["start_pos"])
         main = st.tail_main_hidden()
         if start_pos == 0:
@@ -537,6 +552,79 @@ class RingDrafter:
         # check the drafter can make and drafts off a history the ring rejected.
         blk, conf = self.tail.advance_and_draft([committed], main[:, :n + 1], start_pos=start_pos)
         return {"draft": blk[0].tolist(), "n": n,
+                "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+
+    def _on_chunk_pipelined(self, ids, msg, st, out):
+        """One STREAMED `s=1` frame of a pipelined round. -> {acc, draft, conf}, merged into the reply.
+
+        Pipelined speculation does not send a chunk: it streams `B+1` separate one-token frames
+        back-to-back without waiting, so the drafter can no longer be advanced "over the round's
+        committed prefix" -- there is no round, and when a frame is forwarded nobody yet knows whether
+        its token will survive. `plan_verify_round` still decides every acceptance; it is just applied
+        ONE POSITION AT A TIME, and the tail applies it to itself.
+
+        THE INCREMENTAL ACCEPT RULE, and why two scalars are the whole of it. Frames reach the tail in
+        the order the coordinator injected them (the ring is FIFO per leg), so the tail sees the frame
+        at `q` after the frame at `q-1`. It computed that frame's greedy token `_mfront`, which IS the
+        model's token at `q` whenever position `q-1` is itself committed. So the frame at `q` is on the
+        committed path exactly when `q == _cfront + 1` and the token it carries equals `_mfront` --
+        which is `plan_verify_round`'s "does the draft match the model's reply at this position",
+        position by position. A rejected frame does not move `_cfront`, so every frame behind it fails
+        the `q == _cfront + 1` test as well: the poisoning of a speculative tail falls out of the rule
+        rather than needing a flag. The correction frame the coordinator sends after a cancel lands at
+        `_cfront + 1` carrying `_mfront`, and re-opens the frontier.
+
+        THE DRAFTER ADVANCES ONLY ON A COMMITTED FRAME, ONE POSITION, and drafts off the tap of THAT
+        frame -- `advance_and_draft(ids=[m], main=tap(q), start_pos=q)` leaves `_pos = q`, so the block
+        it returns proposes positions `q+2 .. q+B+1`. The coordinator commits `m` at `q+1` off this
+        same reply and streams `[m] + block` from `q+1`, which is exactly the serial path's
+        `[cur] + drafts` chunk decomposed into `s=1` frames. Advancing one position per call is
+        bit-identical to the serial path's `n+1`-position call: `advance_and_draft` loops per position
+        internally and keeps the last block, so the mtp cache walks the same committed positions in the
+        same order and the block for a given history is the same block.
+
+        NOTHING HERE ROLLS BACK, because nothing here is ever speculative -- the mtp cache only ever
+        records committed positions (the module docstring's WHY THE MTP CACHE NEVER NEEDS A ROLLBACK,
+        and test_cache_never_speculative). That is what makes the drafter side of pipelined speculation
+        free: only the main stage's window ring had to learn to rewind W frames deep."""
+        start_pos = int(msg["start_pos"])
+        main = st.tail_main_hidden()
+        if start_pos == 0:
+            # THE RING'S PREFILL, identical to the serial path: one forward_spec over 0..P-1, which
+            # drafts nothing. It also seeds the frontier -- the last prompt position is committed by
+            # construction and `out["token"]` is the model's token at the one after it, so the first
+            # streamed frame (the coordinator feeding that token at position P) accepts.
+            self.tail.reset()
+            self._done = False
+            self.tail.prefill([int(out["token"])], main)
+            self._cfront, self._mfront = main.shape[1] - 1, int(out["token"])
+            return {"acc": True}
+        if self._cfront is None:
+            raise RuntimeError("v4 dspark: a pipelined frame before the prefill — the mtp window is "
+                               "empty and there is no committed frontier to judge this frame against")
+        if ids.shape[1] != 1:
+            raise RuntimeError(f"v4 dspark: a pipelined round streams s=1 frames, got s={ids.shape[1]} "
+                               f"— the whole point is that no stage replays a block position by "
+                               f"position, so a multi-token frame is a coordinator bug")
+        replies = out.get("tokens")
+        if replies is None:
+            raise RuntimeError(
+                "v4 dspark: a pipelined job's reset must arm `spec` as well — the accept rule needs "
+                "the model's greedy token at this frame's position, and the tail only computes those "
+                "when _spec is armed")
+        if start_pos != self._cfront + 1 or int(ids[0, 0]) != self._mfront:
+            return {"acc": False}                          # speculative, and wrong: judge nothing
+        m = int(replies[0])
+        self._cfront, self._mfront = start_pos, m
+        # THE CONTEXT CLIFF, as in the serial path: stop drafting (and stop advancing) before
+        # `advance_and_draft` would rope a block past max_seq_len, rather than raising inside the
+        # tail's serve loop and killing every later job. The frontier keeps moving, so the round
+        # degrades to a one-frame-in-flight pipeline, which is plain greedy decode.
+        self._done = self._done or (start_pos + self.tail.block_size + 1) > self.tail.args.max_seq_len
+        if self._done:
+            return {"acc": True, "draft": []}
+        blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
+        return {"acc": True, "draft": blk[0].tolist(),
                 "conf": [round(c, 4) for c in conf[0].float().tolist()]}
 
 
