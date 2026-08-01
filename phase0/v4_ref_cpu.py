@@ -89,6 +89,16 @@ def load_ref():
         # shape (V4_MOE_DECODE=0 to A/B it).
         import v4_moe_decode
         v4_moe_decode.install(mod)
+        # THEN the grouped fp4 kernel, and the ORDER OF THESE TWO IS THE PRECEDENCE. Each install
+        # captures whatever `MoE.forward` is bound at that moment as its own fallback, so installing
+        # grouped SECOND makes the chain grouped -> decode -> reference: the grouped kernel claims the
+        # single-token score-routed decode step (V4_MOE_GROUPED=1, CUDA only), hands everything it
+        # declines (s>1, world_size>1, hash-routed layers) to the decode fast path, and that hands
+        # what IT declines to the untouched reference. Both off => reference, byte-identical.
+        # Installing them the other way round would bury the grouped kernel under the decode path and
+        # it would never run — this line's position is the whole wiring.
+        import v4_moe_grouped
+        v4_moe_grouped.install(mod)
         # Same window, same reason: reference-compute "slim" overrides that remove removable per-layer
         # work (the indexer while context is short; the inplace KV/Q QAT sim). Both behind default-OFF
         # env flags (V4_REF_SLIM / V4_REF_SLIM_NOQAT), so this is a no-op — reference byte-identical —

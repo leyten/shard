@@ -125,6 +125,66 @@ def test_hash_layer_falls_back(args, oracle, monkeypatch):
     assert calls, "a hash-routed layer must take the reference path"
 
 
+def _stub_mod():
+    """The two things install() touches: a class with a `forward`, and `world_size`. Hermetic on
+    purpose — rebinding the real `dsv4_model.MoE.forward` would follow every later test in the run."""
+    ref = lambda self, x, ids: "reference"                 # noqa: E731 — identity is what we compare
+    return type("stub", (), {"MoE": type("MoE", (), {"forward": ref}), "world_size": 1})
+
+
+def test_install_order_is_the_precedence_grouped_over_decode(monkeypatch):
+    """The wiring `v4_ref_cpu.load_ref()` implements, pinned as a contract.
+
+    Each install captures whatever `MoE.forward` is bound AT THAT MOMENT as its own fallback, so the
+    order of the two calls IS the precedence. Grouped second => grouped -> decode -> reference: the
+    grouped kernel claims the single-token score-routed decode step and hands back everything it
+    declines. Grouped FIRST would bury it under the decode path, which claims that same step and would
+    therefore never fall through — the lever would be installed and dead."""
+    DECODE = pytest.importorskip("v4_moe_decode")
+    monkeypatch.setattr(DECODE, "V4_MOE_DECODE", True)
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)   # never used: nothing is CALLED here
+    for m, names in ((DECODE, ("_REF_FORWARD", "_WORLD_SIZE")),
+                     (GROUPED, ("_REF_FORWARD", "_MOD", "_WORLD_SIZE"))):
+        for n in names:                                    # monkeypatch restores the module globals
+            monkeypatch.setattr(m, n, getattr(m, n))
+
+    mod = _stub_mod()                                      # shipped order: decode, then grouped
+    reference = mod.MoE.forward
+    assert DECODE.install(mod) is True
+    assert mod.MoE.forward is DECODE.decode_forward
+    assert GROUPED.install(mod) is True
+    assert mod.MoE.forward is GROUPED.grouped_forward, "grouped must own the decode step"
+    assert GROUPED._REF_FORWARD is DECODE.decode_forward, "grouped's fallback is the decode path"
+    assert DECODE._REF_FORWARD is reference, "decode's fallback is still the untouched reference"
+
+    rev = _stub_mod()                                      # the order that would silently kill it
+    assert GROUPED.install(rev) is True and DECODE.install(rev) is True
+    assert rev.MoE.forward is DECODE.decode_forward, "reversed: decode is on top and grouped is dead"
+
+
+def test_both_flags_off_leaves_the_reference_forward(monkeypatch):
+    """The default composition: neither lever installs, so `load_ref()` hands back a byte-identical
+    reference no matter how many install() calls are wired into it."""
+    DECODE = pytest.importorskip("v4_moe_decode")
+    monkeypatch.setattr(DECODE, "V4_MOE_DECODE", False)
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", False)
+    mod = _stub_mod()
+    reference = mod.MoE.forward
+    assert DECODE.install(mod) is False and GROUPED.install(mod) is False
+    assert mod.MoE.forward is reference
+
+
+def test_load_ref_installs_grouped_after_decode():
+    """The seam itself: `v4_ref_cpu.load_ref()` must actually CALL grouped's install, in that order.
+    A lever nothing reaches is not a lever, and the CPU box cannot prove this by running the kernel."""
+    import inspect
+    src = inspect.getsource(REFCPU.load_ref)
+    assert "v4_moe_grouped.install(mod)" in src, "load_ref never installs the grouped kernel"
+    assert src.index("v4_moe_decode.install(mod)") < src.index("v4_moe_grouped.install(mod)"), \
+        "grouped must install AFTER decode or it is buried under it (see the precedence test)"
+
+
 @pytest.mark.hardware
 def test_bit_exact_on_gpu(monkeypatch):
     """The real bar. GPU-only: builds V4's shipped-dims MoE with random fp4 weights and checks
