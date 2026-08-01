@@ -76,17 +76,51 @@ the same reasons:
                                           step the six ids are distinct and no host-side dedup — and
                                           so no sync — is needed.
 
-WEIGHT BANK — AND THE VRAM BOUND THAT KEEPS THIS OFF A FULL RING FOR NOW. The per-step gather slices
-the routed experts out of ONE contiguous [n_experts, N, K] fp4 bank (+ its scale bank), not the
-reference's per-expert `nn.Parameter`s (which cannot be gathered in a single op). This file stacks
-them on first use and caches them on the module. THAT STACK IS A COPY: at the shipped dims it is
-~3.2 GiB per layer beside ~3.7 GiB of routed weights that are still alive, so a stage holding more
-than a layer or two cannot afford it. Making it affordable is a LOAD-TIME layout choice (store the
-experts as a bank and drop the per-expert tensors) that belongs in the loader and is NOT implemented
-here. Until it is, `_expert_bank` measures free VRAM and DECLINES — the layer falls back to the
-decode path and says so — rather than OOMing mid-first-token and taking the stage, and the ring, with
-it. For a single layer on a 32 GiB card, which is what the parity/bench harness builds, the cached
-copy fits and the fast path runs.
+WEIGHT BANK — THE LOAD-TIME LAYOUT, WHICH IS WHAT LETS THIS RUN ON A FULL STAGE. The per-step gather
+slices the routed experts out of ONE contiguous [n_experts, N, K] fp4 bank (+ its scale bank), not
+the reference's per-expert `nn.Parameter`s (which cannot be gathered in a single op). Building that
+bank by STACKING the per-expert tensors is a second copy of the layer's weights — ~3.2 GiB per layer
+at the shipped dims beside the ~3.4 GiB already resident — and a stage holding seven or eight layers
+on a 32 GiB card cannot afford it. That is why the lever measured 3.19x on a one-layer bench and then
+never fired in production: `_expert_bank` would check free VRAM and decline.
+
+`bank_layout()` removes the copy instead of budgeting for it. At LOAD time, before a single weight is
+read off disk, it allocates the per-layer bank and REPOINTS each expert `Linear`'s parameter at its
+slice of it (`p.data = bank[j]`, a zero-copy view — the slice of a contiguous [E, N, K] bank is
+itself contiguous), then frees the tensor the constructor had allocated. `Stage.load`'s
+`load_state_dict` writes THROUGH those views into the bank, so the checkpoint lands in the bank and
+nowhere else: ONE copy of the weights on the card, the same bytes the non-grouped path would hold,
+and the bank costs nothing on top. See `_relayout_moe`.
+
+Keeping the per-expert `Linear`s as views (rather than deleting them) is also what keeps the s > 1
+fallback alive. The reference `MoE.forward` — which prefill, a verify chunk, a hash-routed layer and
+any world_size > 1 rank all still take — reaches the weights through `self.experts[i].w1.weight`.
+Those are the same objects, the same dtypes, the same contiguous bytes, addressing bank memory; the
+reference path runs UNCHANGED and stays bit-exact by construction rather than by a re-derived s > 1
+grouped kernel (which would not be bit-exact anyway: grouped-and-padded MoE is not token-count
+invariant). One layout, both paths, one copy.
+
+The lazy stack survives as the fallback for an MoE the loader never banked (the GPU parity harness's
+standalone layer, a drafter block), and there it still measures free VRAM and DECLINES rather than
+OOMing mid-first-token and taking the stage, and the ring, with it.
+
+MEASURED ON A REAL STAGE (RTX 5090, 31.36 GiB usable, the converted 43-layer checkpoint):
+    stage[40:43), real weights          allocated       on the card      layers with a bank
+      V4_MOE_GROUPED=0                  10.168 GiB      10.793 GiB       0/3
+      bank layout                       10.168 GiB      10.830 GiB       3/3
+      stacking the bank instead         19.730 GiB      20.355 GiB       3/3
+    stage[0:7), shipped dims -- what a 43-layer ring actually asks a 5090 to hold
+      V4_MOE_GROUPED=0                  23.641 GiB      24.270 GiB       0/7
+      bank layout                       23.641 GiB      24.381 GiB       7/7
+      stacking the bank instead         26.829 GiB      27.457 GiB       1/7, SIX DECLINED
+    stage[0:8) banked: 27.007 GiB allocated either way, 28.007 GiB peak (the one-kind transient).
+And the speed it was all for -- stage[40:43), real weights, median of 40 decode steps:
+      eager        26.902 -> 18.599 ms/step   (8.967 -> 6.200 ms/layer, 1.45x)
+      V4_CUDA_GRAPH=1  23.627 -> 15.387 ms/step   (7.876 -> 5.129 ms/layer, 1.54x)
+      MoE.forward alone at the decode shape      4.75 -> 2.02 ms (2.35x)
+      41 decoded steps, `torch.equal` against the same run with the lever off, both graph settings.
+The 2.35x is the honest multi-layer number; the one-layer bench's 3.19x was measured with nothing
+else competing for the card's launch queue.
 
 Opt-in, default OFF: `V4_MOE_GROUPED=1` rebinds `MoE.forward` after `v4_moe_decode` has (it captures
 whatever forward it finds and falls back to it, so the two compose); with the env unset this module
@@ -243,11 +277,102 @@ def _gather_fp(t, ids):
     return t.view(torch.uint8)[ids.long()].view(t.dtype)
 
 
-# VRAM the bank build must leave FREE on the card after it copies. The bank is an exact DUPLICATE of
-# the layer's routed-expert weights (see _expert_bank), and it is built lazily, on the first decode
-# token, AFTER the graph pools are pinned and the KV cache is allocated — the worst possible moment to
-# discover the card is full. 2 GiB covers the per-step gathers, activations, and the compressed-KV
-# region still growing under a long job.
+# ── the load-time bank layout: the experts ARE the bank ──────────────────────────────────────────
+
+# (weight key, scale key) per expert Linear, in the order the bank stores them.
+_BANK_KINDS = (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s"))
+
+
+def _relayout_moe(moe):
+    """Make one MoE's routed experts VIEWS of a contiguous per-layer bank, in place. Returns True if
+    it took.
+
+    This is the load-time layout choice that makes the grouped kernel affordable: instead of stacking
+    a SECOND copy of the experts on the first decode token (`_expert_bank`), the bank IS where the
+    experts live. Per weight kind it allocates the [E, N, K] bank, copies each expert's tensor in, and
+    repoints that expert's parameter at its slice:
+
+        p.data = bank[j]        # zero-copy: slice j of a contiguous [E, N, K] bank is contiguous
+
+    which drops the last reference to the tensor the constructor allocated, so the per-expert storage
+    is freed as the loop walks. Net VRAM is one copy of the weights — exactly what the non-grouped
+    path holds — and the bank adds nothing.
+
+    ORDER MATTERS, AND THE PEAK IS WHY: the banks are built ONE KIND AT A TIME, so the transient high
+    water mark is one kind of one layer (~1.07 GiB at the shipped dims), not a whole layer.
+
+    AND `empty_cache` PER KIND IS NOT OPTIONAL, which is the part that only shows up on a real card.
+    The freed per-expert blocks are ~4 MiB each; the bank is one ~1 GiB request. The caching allocator
+    cannot serve the second out of the first, so it takes a NEW segment from the driver every time and
+    keeps the old ones cached — `memory_allocated` stays flat (there really is one copy) while
+    `memory_reserved`, which is what the driver and the next `cudaMalloc` see, climbs toward double.
+    Measured on a real 3-layer stage: 10.17 GiB allocated with the layout or without it, but 19.75 GiB
+    RESERVED without this call against 10.23 GiB with it — the same 9.6 GiB duplicate, just held by
+    the allocator instead of by the model. Returning each kind's freed segments before the next kind
+    asks for its bank is what keeps the card's occupancy equal to the weights, which is the claim.
+
+    Run this BEFORE the weights are loaded and it costs nothing but the transient; run it AFTER and it
+    still works — the copy preserves whatever is in the tensors either way, which is what makes it
+    safe to call from both `Stage.__init__` (empty, pre-load) and the GPU parity harness (already
+    filled). `Stage.load`'s `load_state_dict` copies INTO the parameter, i.e. through the view and
+    into the bank, so a pre-load relayout needs no cooperation from the loader at all.
+
+    The copy goes through `.view(torch.uint8)` for the same reason `_gather_fp` does: fp4 and e8m0 are
+    1-byte dtypes with thin kernel coverage, and a byte copy is exactly as correct and always present.
+
+    Declines, leaving the module untouched, when: the experts are not fp4 (the grouped kernel is
+    fp4-only, and a bf16 CPU parity model must stay byte-identical), or something already put a bank
+    on this module (never lay out twice, and never over the lazy stack)."""
+    if getattr(moe, "_grouped_bank", None):
+        return False
+    lo, hi = moe.experts_start_idx, moe.experts_end_idx
+    experts = [moe.experts[i] for i in range(lo, hi)]
+    if not experts or experts[0].w1.weight.dtype != torch.float4_e2m1fn_x2:
+        return False
+    bank = {}
+    for kind, skey in _BANK_KINDS:
+        for attr, key in (("weight", kind), ("scale", skey)):
+            params = [getattr(getattr(e, kind), attr) for e in experts]
+            t0 = params[0]
+            b = torch.empty((len(params),) + tuple(t0.shape), dtype=t0.dtype, device=t0.device)
+            bu = b.view(torch.uint8)
+            with torch.no_grad():
+                for j, p in enumerate(params):
+                    bu[j].copy_(p.detach().view(torch.uint8))
+                    p.data = b[j]          # the parameter now ADDRESSES the bank; its old block frees
+            bank[key] = b
+            if t0.is_cuda:                 # hand the freed per-expert segments back BEFORE the next
+                torch.cuda.empty_cache()   # kind asks the driver for its bank (see the docstring)
+    moe._grouped_bank = bank
+    return True
+
+
+def bank_layout(module):
+    """Give every fp4 routed-expert MoE under `module` the bank layout. Returns how many took it.
+
+    The loader's entry point — `v4_stage.Stage.__init__` calls it on the stage's Blocks right after
+    they are constructed and before `Stage.load` fills them. A no-op under `V4_MOE_GROUPED=0`, which
+    is what keeps the default path byte-identical: nothing is allocated, nothing is repointed, and
+    every expert keeps the tensor its constructor gave it.
+
+    Every fp4 MoE gets it, including the hash-routed layers the grouped kernel will never claim. The
+    layout is free (one copy either way), it is the same memory shape on every layer, and a stage that
+    owns layers 0-7 owns three hash layers — sparing them would buy nothing and would make the stage's
+    memory profile depend on which layers it happens to hold.
+
+    Duck-typed on `experts` + `experts_start_idx` rather than an `isinstance(m, mod.MoE)` so this
+    module does not have to have been `install()`ed (and so a test can pass a stand-in)."""
+    if not V4_MOE_GROUPED:
+        return 0
+    return sum(1 for m in module.modules()
+               if hasattr(m, "experts") and hasattr(m, "experts_start_idx") and _relayout_moe(m))
+
+
+# VRAM the LAZY bank build must leave FREE on the card after it copies. That build (`_expert_bank`,
+# the fallback for an MoE `bank_layout` never reached) is an exact DUPLICATE of the layer's
+# routed-expert weights, and it happens on the first decode token, AFTER the graph pools are pinned
+# and the KV cache is allocated — the worst possible moment to discover the card is full. 2 GiB covers
+# the per-step gathers, activations, and the compressed-KV region still growing under a long job.
 _BANK_HEADROOM_BYTES = 2 << 30
 
 
@@ -263,22 +388,21 @@ def _bank_fits(experts):
 
 
 def _expert_bank(moe):
-    """Stack this MoE's routed experts into contiguous [E, N, K] fp4 banks (+ e8m0 scale banks).
+    """This MoE's [E, N, K] fp4 banks (+ e8m0 scale banks), stacking them if nobody laid them out.
 
-    Cached on the module the first time a decode step runs it. `_gather_fp` slices the six routed
-    experts out of this bank per step; the reference's per-expert `nn.Parameter`s cannot be gathered
-    in one op, a bank can.
+    The normal case on a stage is that `bank_layout` already ran at load and `_grouped_bank` is
+    sitting on the module — the experts ARE the bank, there is nothing to build, and this returns on
+    its first line. Every decode step goes through here, so that is the path that matters.
 
-    THE STACK COPIES, AND ON THE REAL MODEL THAT IS A SECOND COPY OF THE LAYER'S EXPERTS. At the
-    shipped dims (dim 4096, moe_inter_dim 2048, 256 fp4 routed experts) that is ~3.2 GiB per layer
-    against ~3.7 GiB of routed weights — so a stage holding more than a layer or two CANNOT afford it
-    while the reference's per-expert `nn.Parameter`s are still alive. The fix is a LOAD-TIME layout
-    choice (store the experts as a bank and drop the per-expert tensors) that lives in the loader, not
-    here, and is NOT on this branch.
+    THE STACK BELOW IS THE FALLBACK, for an MoE the loader never reached: the GPU parity harness's
+    standalone layer, or a module built outside `Stage`. It COPIES, and on the real model that is a
+    second copy of the layer's experts — at the shipped dims (dim 4096, moe_inter_dim 2048, 256 fp4
+    routed experts) ~3.2 GiB per layer against ~3.4 GiB already resident. One layer on a 32 GiB card
+    can afford that; a seven-layer stage cannot, which is exactly what `bank_layout` exists to fix.
 
-    Until it is, this DECLINES rather than OOMs: returning None sends the caller to the reference
-    forward for good on this layer. That is the difference between a lever that quietly does not
-    engage and a stage process that dies mid-first-token and cascades the whole ring — nothing
+    So when it cannot afford it, it DECLINES rather than OOMs: returning None sends the caller to the
+    reference forward for good on this layer. That is the difference between a lever that quietly does
+    not engage and a stage process that dies mid-first-token and cascades the whole ring — nothing
     upstream catches an OOM out of `ffn` (v4_stage's _BlockGraphs guards only the graph capture)."""
     bank = getattr(moe, "_grouped_bank", None)
     if bank is not None:
@@ -287,9 +411,10 @@ def _expert_bank(moe):
     experts = [moe.experts[i] for i in range(lo, hi)]
     if not _bank_fits(experts):
         moe._grouped_bank = False                          # decided ONCE: never retry, never thrash
-        print(f"[v4] grouped MoE declined on layer {getattr(moe, 'layer_id', '?')} — the expert bank "
-              f"does not fit alongside the per-expert weights; this layer stays on the decode path. "
-              f"V4_MOE_GROUPED needs the load-time bank layout to run on a full stage.", flush=True)
+        print(f"[v4] grouped MoE declined on layer {getattr(moe, 'layer_id', '?')} — stacking the "
+              f"expert bank would not fit beside the per-expert weights; this layer stays on the "
+              f"decode path. A stage gets the bank from bank_layout() at load and never reaches "
+              f"this; an MoE built outside Stage does.", flush=True)
         return None
     bank = {
         "w1": torch.stack([e.w1.weight for e in experts]).contiguous(),
@@ -405,8 +530,13 @@ def _fp8_block_quant(w, block=128):
     return q.reshape(out, inn).contiguous(), scale.to(torch.float8_e8m0fnu).contiguous()
 
 
-def build_real_dims_moe(mod, args, seed=0, layer_id=7):
+def build_real_dims_moe(mod, args, seed=0, layer_id=7, bank=False):
     """A single MoE at V4's shipped dims with random-but-self-consistent quantized weights.
+
+    `bank=True` applies the shipped LOAD-TIME layout (`_relayout_moe`) after the weights are written,
+    so the harness proves the kernel against the exact tensor layout a stage serves from rather than
+    against the lazy stack. It is applied after, not before, only because this harness fills the
+    weights by hand where a stage fills them from a checkpoint; the layout copies either way.
 
     No 158 GiB checkpoint: routed experts get valid fp4 (packed weight + e8m0 scale) by quantizing a
     random bf16 draw through the reference's own `fp4_act_quant`; the shared expert is fp8, so it gets
@@ -442,6 +572,8 @@ def build_real_dims_moe(mod, args, seed=0, layer_id=7):
             lin.scale.data.copy_(s)
         moe.gate.weight.data.copy_(rand(args.n_routed_experts, args.dim).to(moe.gate.weight.dtype))
         moe.gate.bias.data.normal_(0, 0.02)
+    if bank:
+        assert _relayout_moe(moe), "the bank layout must take on a shipped-dims fp4 MoE"
     return moe.eval()
 
 
@@ -470,23 +602,40 @@ def _load_model_module():
 
 
 def _smoke():
-    """JIT + run at V4's real MoE shape, decode, against the reference — checks `torch.equal`."""
+    """JIT + run at V4's real MoE shape against the reference — `torch.equal`, both layouts.
+
+    Two MoEs from the SAME seed: one left in the reference's per-expert layout, one given the shipped
+    bank layout. The bank one is the oracle's mirror, so this pins three things at once — the grouped
+    decode step is bit-exact to the reference (the original bar), the bank layout does not perturb it,
+    and the s > 1 reference path reading the banked experts as views is bit-exact to the same path
+    reading standalone tensors (the fallback prefill/verify-chunk still take)."""
     assert torch.cuda.is_available(), "v4 moe grouped smoke needs a CUDA device"
     mod = _load_model_module()
     args = real_dims_args(mod)
-    moe = build_real_dims_moe(mod, args)
+    ref_moe = build_real_dims_moe(mod, args)
+    bank_moe = build_real_dims_moe(mod, args, bank=True)
+    assert bank_moe._grouped_bank, "the bank layout did not take"
     ref_forward = mod.MoE.forward
     install(mod)
     for t in range(8):
         x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
         ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
         with torch.no_grad():
-            ref = ref_forward(moe, x, ids)
-            got = grouped_forward(moe, x, ids)
+            ref = ref_forward(ref_moe, x, ids)
+            got = grouped_forward(bank_moe, x, ids)
         eq = torch.equal(ref, got)
-        print(f"draw {t}  equal={eq}  max|d|={(ref.float() - got.float()).abs().max().item():.3e}")
-        assert eq, "grouped MoE is not bit-exact to the reference"
-    print("bit-exact over 8 draws")
+        print(f"decode draw {t}  equal={eq}  max|d|={(ref.float() - got.float()).abs().max().item():.3e}")
+        assert eq, "grouped MoE on the bank layout is not bit-exact to the reference"
+    for t, s in enumerate((2, 5, 17)):
+        x = torch.randn(1, s, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, s), device="cuda")
+        with torch.no_grad():
+            ref = ref_forward(ref_moe, x, ids)
+            got = grouped_forward(bank_moe, x, ids)      # s > 1: falls through, reads the bank views
+        eq = torch.equal(ref, got)
+        print(f"prefill s={s}  equal={eq}  max|d|={(ref.float() - got.float()).abs().max().item():.3e}")
+        assert eq, "the s > 1 fallback over banked experts is not bit-exact to the reference"
+    print("bit-exact over 8 decode draws + 3 prefill shapes, on the bank layout")
 
 
 if __name__ == "__main__":

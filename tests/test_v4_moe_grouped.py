@@ -10,6 +10,13 @@ envelope around that kernel:
   * it installs NOTHING unless `V4_MOE_GROUPED=1` AND a CUDA device is present, and
   * every shape it does not claim falls through to the forward it captured, untouched.
 
+It also pins the LOAD-TIME BANK LAYOUT, which is not a numeric claim at all and so belongs here in
+full: the grouped kernel needs a contiguous expert bank, and the layout's whole job is to make that
+bank the ONLY copy of the weights rather than a duplicate the card cannot afford. That is a statement
+about storage identity, about the bytes surviving the relay, and about `load_state_dict` writing
+through the views into the bank — all of which a CPU box can check exactly, at tiny dims, with the
+reference's own `MoE`.
+
 The numeric parity test is GPU-gated and skips here. Run: python3 -m pytest tests/test_v4_moe_grouped.py -q
 """
 import os
@@ -248,6 +255,178 @@ def test_load_ref_installs_grouped_after_decode():
         "grouped must install AFTER decode or it is buried under it (see the precedence test)"
 
 
+# ── the load-time bank layout ────────────────────────────────────────────────────────────────────
+
+_KINDS = ("w1", "w2", "w3")
+
+
+def _fp4_moe(oracle, n_experts=4, expert_dtype="fp4"):
+    """A tiny MoE built from the REFERENCE's own classes with fp4 routed experts.
+
+    Not a stub: the layout repoints real `nn.Parameter`s and the loader test drives a real
+    `load_state_dict`, so anything less than the reference's `MoE`/`Expert`/`Linear` would prove
+    nothing about the stage. fp4 needs `dim` a multiple of `fp4_block_size` (32); everything else is
+    as small as the constructor's asserts allow. Takes `oracle` only to force `dsv4_model` loaded."""
+    mod = sys.modules["dsv4_model"]
+    a = mod.ModelArgs(dim=64, moe_inter_dim=32, n_routed_experts=n_experts, n_activated_experts=2,
+                      n_shared_experts=1, n_hash_layers=1, expert_dtype=expert_dtype,
+                      dtype="bf16", scale_fmt=None, scale_dtype="fp32", vocab_size=32)
+    with mod.set_dtype(torch.bfloat16):
+        return mod.MoE(7, a)
+
+
+def _paint(moe):
+    """Give every routed expert tensor a distinct byte pattern, so a relay that scrambles or aliases
+    the wrong slot cannot pass by luck."""
+    with torch.no_grad():
+        for i, e in enumerate(moe.experts):
+            for j, k in enumerate(_KINDS):
+                getattr(e, k).weight.data.view(torch.uint8).fill_(1 + i * 8 + j)
+                getattr(e, k).scale.data.view(torch.uint8).fill_(129 + i * 8 + j)
+
+
+def _painted(moe):
+    return all(bool((getattr(e, k).weight.view(torch.uint8) == 1 + i * 8 + j).all())
+               and bool((getattr(e, k).scale.view(torch.uint8) == 129 + i * 8 + j).all())
+               for i, e in enumerate(moe.experts) for j, k in enumerate(_KINDS))
+
+
+def test_bank_layout_is_a_noop_with_the_flag_off(oracle, monkeypatch):
+    """Default OFF has to mean the loader allocates nothing and moves nothing — every expert keeps
+    the exact tensor its constructor gave it, so a stage on the shipped default is byte-identical."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", False)
+    moe = _fp4_moe(oracle)
+    ptrs = [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS]
+    assert GROUPED.bank_layout(moe) == 0
+    assert [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS] == ptrs
+    assert not hasattr(moe, "_grouped_bank"), "the flag-off path must not even mark the module"
+
+
+def test_bank_layout_leaves_one_copy_of_the_weights_not_two(oracle, monkeypatch):
+    """THE POINT OF THE WHOLE CHANGE, as a storage-identity claim.
+
+    After the layout there is exactly ONE allocation per weight kind — the bank — and every routed
+    expert's parameter is a VIEW into it, at its own offset, in expert order. Nothing was duplicated,
+    so the bank the grouped kernel gathers from costs zero extra bytes and a seven-layer stage on a
+    32 GiB card can hold it. The old lazy stack would have doubled these tensors instead."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    assert GROUPED.bank_layout(moe) == 1
+    bank = moe._grouped_bank
+    for k, skey in (("w1", "w1_s"), ("w3", "w3_s"), ("w2", "w2_s")):
+        for attr, key in (("weight", k), ("scale", skey)):
+            b = bank[key]
+            assert b.shape[0] == len(moe.experts) and b.is_contiguous()
+            store = b.untyped_storage()
+            for i, e in enumerate(moe.experts):
+                p = getattr(getattr(e, k), attr)
+                assert p.data_ptr() == b[i].data_ptr(), f"{k}.{attr}[{i}] is not the bank's slot {i}"
+                assert p.untyped_storage().data_ptr() == store.data_ptr(), "a second allocation"
+                assert p.is_contiguous(), "the s > 1 reference path needs contiguous expert weights"
+            assert store.nbytes() == sum(getattr(getattr(e, k), attr).numel()
+                                         for e in moe.experts), "the bank is not exactly one copy"
+
+
+def test_bank_layout_carries_the_bytes_across(oracle, monkeypatch):
+    """The relay copies, it does not reinterpret: every expert reads back exactly what it held, at
+    its own slot. (Pre-load the tensors are uninitialised and this is vacuous on a stage — it matters
+    because the same function is called by the GPU harness AFTER the weights are written.)"""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    _paint(moe)
+    assert GROUPED.bank_layout(moe) == 1
+    assert _painted(moe), "the layout moved an expert's bytes to the wrong slot"
+    bank = moe._grouped_bank
+    for i, e in enumerate(moe.experts):
+        assert bool((bank["w1"][i].view(torch.uint8) == e.w1.weight.view(torch.uint8)).all())
+
+
+def test_the_loader_writes_through_the_views_into_the_bank(oracle, monkeypatch):
+    """The `Stage.load` seam, and with it the s > 1 fallback.
+
+    The layout runs BEFORE the checkpoint is read, so `load_state_dict` must land in the bank rather
+    than replacing the view with a fresh tensor — otherwise the stage would serve from per-expert
+    copies while the grouped kernel gathered stale bank memory. It copies into the parameter, so it
+    writes through; this pins that, and pins that only the loaded expert's slot moves."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    _paint(moe)
+    GROUPED.bank_layout(moe)
+    bank = moe._grouped_bank
+    tgt = 2
+    sd = {k: torch.zeros_like(v) for k, v in moe.experts[tgt].state_dict().items()}
+    sd["w1.weight"] = torch.full(tuple(moe.experts[tgt].w1.weight.shape), 9,
+                                 dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+    moe.experts[tgt].load_state_dict(sd, strict=True)
+    assert bool((bank["w1"][tgt].view(torch.uint8) == 9).all()), "the load did not reach the bank"
+    assert moe.experts[tgt].w1.weight.data_ptr() == bank["w1"][tgt].data_ptr(), "the view was replaced"
+    for i in range(len(moe.experts)):
+        if i != tgt:
+            assert bool((bank["w1"][i].view(torch.uint8) == 1 + i * 8).all()), "a neighbour moved"
+
+
+def test_banked_experts_keep_the_scale_the_reference_path_reads(oracle, monkeypatch):
+    """`linear()` reaches an fp4 expert's scale as `weight.scale`, an attribute the reference hangs on
+    the weight Parameter itself. The layout repoints `.data` rather than rebinding the Parameter
+    precisely so that attribute survives — rebind it and prefill dies on a missing `.scale`."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    GROUPED.bank_layout(moe)
+    for i, e in enumerate(moe.experts):
+        for k in _KINDS:
+            lin = getattr(e, k)
+            assert lin.weight.scale is lin.scale, "weight.scale must still BE the scale parameter"
+            assert lin.scale.data_ptr() == moe._grouped_bank[k + "_s"][i].data_ptr()
+
+
+def test_bank_layout_leaves_non_fp4_experts_alone(oracle, monkeypatch):
+    """The grouped kernel is fp4-only, so a bf16 MoE (the CPU parity model, an unquantized config) is
+    not relaid — no bank, no repointing, byte-identical."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle, expert_dtype=None)
+    ptrs = [e.w1.weight.data_ptr() for e in moe.experts]
+    assert GROUPED.bank_layout(moe) == 0
+    assert [e.w1.weight.data_ptr() for e in moe.experts] == ptrs
+    assert not hasattr(moe, "_grouped_bank")
+
+
+def test_bank_layout_is_idempotent(oracle, monkeypatch):
+    """A second call must not build a second bank on top of the first — that would be the duplicate
+    this whole change exists to delete, allocated by the fix itself."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    assert GROUPED.bank_layout(moe) == 1
+    first = moe._grouped_bank
+    assert GROUPED.bank_layout(moe) == 0
+    assert moe._grouped_bank is first
+
+
+def test_expert_bank_uses_the_load_time_bank_and_never_stacks(oracle, monkeypatch):
+    """A banked layer must reach the fast path without going anywhere near the lazy stack: no fit
+    check, no copy, no decline. The decline exists for an MoE the loader never reached; a stage's
+    layers are all reached, which is why the lever now fires instead of declining."""
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    moe = _fp4_moe(oracle)
+    GROUPED.bank_layout(moe)
+    calls = []
+    monkeypatch.setattr(GROUPED, "_bank_fits", lambda experts: (calls.append(1), True)[1])
+    assert GROUPED._expert_bank(moe) is moe._grouped_bank
+    assert calls == [], "a banked layer must not re-decide whether a stack would fit"
+
+
+def test_stage_lays_out_the_bank_between_construction_and_load():
+    """The seam, pinned as source: the layout has to run AFTER the Blocks exist (there is nothing to
+    repoint before) and BEFORE `load()` (so the checkpoint writes through the views into the bank).
+    Relayout after the load would mean copying — the duplicate this change removes. v4_stage is
+    GPU-shaped and cannot be instantiated at V4's dims here, so the ordering is checked in the text."""
+    import inspect
+    src = inspect.getsource(pytest.importorskip("v4_stage").Stage)
+    assert "v4_moe_grouped.bank_layout(self.layers)" in src, "Stage never lays out the bank"
+    init = src.index("def __init__")
+    assert init < src.index("v4_moe_grouped.bank_layout(self.layers)") < src.index("def load("), \
+        "the bank layout must sit in __init__, i.e. after construction and before load()"
+
+
 @pytest.mark.hardware
 def test_bit_exact_on_gpu(monkeypatch):
     """The real bar. GPU-only: builds V4's shipped-dims MoE with random fp4 weights and checks
@@ -267,3 +446,39 @@ def test_bit_exact_on_gpu(monkeypatch):
             ref = ref_forward(moe, x, ids)
             got = GROUPED.grouped_forward(moe, x, ids)
         assert torch.equal(ref, got), f"draw {t}: max|d| = {(ref.float() - got.float()).abs().max()}"
+
+
+@pytest.mark.hardware
+def test_bit_exact_on_gpu_over_the_bank_layout(monkeypatch):
+    """The bar again, but against the layout a STAGE actually serves from.
+
+    Two shipped-dims MoEs from the same seed: the oracle in the reference's per-expert layout, the
+    subject relaid so its experts are views of one bank. Both halves of the envelope are checked on
+    the subject — the grouped decode step (which reads the bank) and an s > 1 prefill (which falls
+    through to the reference forward and reads the same bytes as per-expert views). If the layout
+    perturbed either, this is where it shows."""
+    if not torch.cuda.is_available():
+        pytest.skip("grouped MoE parity needs a CUDA device (tilelang)")
+    mod = GROUPED._load_model_module()
+    args = GROUPED.real_dims_args(mod)
+    ref_moe = GROUPED.build_real_dims_moe(mod, args)
+    bank_moe = GROUPED.build_real_dims_moe(mod, args, bank=True)
+    assert bank_moe._grouped_bank, "the bank layout did not take on a shipped-dims fp4 MoE"
+    ref_forward = mod.MoE.forward
+    monkeypatch.setattr(GROUPED, "_REF_FORWARD", ref_forward)
+    monkeypatch.setattr(GROUPED, "_MOD", mod)
+    monkeypatch.setattr(GROUPED, "_WORLD_SIZE", 1)
+    for t in range(4):
+        x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
+        with torch.no_grad():
+            ref = ref_forward(ref_moe, x, ids)
+            got = GROUPED.grouped_forward(bank_moe, x, ids)
+        assert torch.equal(ref, got), f"decode {t}: max|d| = {(ref.float() - got.float()).abs().max()}"
+    for s in (2, 5):
+        x = torch.randn(1, s, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, s), device="cuda")
+        with torch.no_grad():
+            ref = ref_forward(ref_moe, x, ids)
+            got = GROUPED.grouped_forward(bank_moe, x, ids)
+        assert torch.equal(ref, got), f"prefill s={s}: max|d| = {(ref.float() - got.float()).abs().max()}"

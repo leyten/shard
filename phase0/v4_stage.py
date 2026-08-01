@@ -627,6 +627,19 @@ class Stage:
                     self.hc_head_fn = torch.nn.Parameter(torch.empty(a.hc_mult, a.hc_mult * a.dim))
                     self.hc_head_base = torch.nn.Parameter(torch.empty(a.hc_mult))
                     self.hc_head_scale = torch.nn.Parameter(torch.empty(1))
+        # Re-lay the routed experts as ONE contiguous bank per layer, so the grouped fp4 MoE kernel
+        # can gather them without holding a second copy of the weights. HERE, between construction and
+        # `load()`, is the only place it is free: it repoints each expert Linear's parameter at a
+        # slice of the bank, and `load()`'s `load_state_dict` then writes THROUGH that view, so the
+        # checkpoint lands in the bank and nowhere else -- one copy on the card, the same bytes the
+        # non-grouped path holds. Doing it after load would mean stacking a duplicate, which at the
+        # shipped dims is ~3.2 GiB per layer and is exactly why the lever declined on a full stage.
+        # No-op under V4_MOE_GROUPED=0 (the default): nothing allocated, nothing repointed.
+        import v4_moe_grouped
+        banked = v4_moe_grouped.bank_layout(self.layers)
+        if banked:
+            print(f"[v4] stage[{lo}:{hi}): grouped-MoE bank layout on {banked} layer(s) — the routed "
+                  f"experts ARE the bank, no duplicate", flush=True)
         if self._fast:
             self._reserve_chunk_scratch()
         for m in self._owned_modules():
