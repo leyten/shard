@@ -126,6 +126,123 @@ V4_MAX_BATCH = int(os.environ.get("V4_MAX_BATCH", "1") or 1)
 # A dead forward leg is an EDGE fault, not a process death — see _fwd_open.
 _LEG_ERRORS = (OSError, EOFError)
 
+# ── stage-side step timing (V4_TIMING) ─────────────────────────────────────────────────────────────
+# A ring hop costs recv-wait + on-box work, and only the on-box half is ours to shrink. Live, the two
+# are indistinguishable from the coordinator: it sees one round-trip. This accumulates wall time per
+# PHASE of the serve loop and prints the per-frame means at the receipt sweep — one line per job.
+#
+# OFF (the default) every call site is a method on a shared no-op singleton: no clock read, no
+# allocation, and byte-identical behaviour. ON it costs two perf_counter reads per phase plus, on
+# CUDA, ONE torch.cuda.synchronize() after the layers. That sync is the point: kernels are queued
+# async, so without it `fwd` measures dispatch only and the GPU time lands in whichever later phase
+# first touches the result (the D2H copy in _make_step_frame) — precisely the attribution question
+# this exists to answer. It adds no wall time, because the frame already blocks on that same copy
+# before it can send.
+V4_TIMING = bool(int(os.environ.get("V4_TIMING", "0") or 0))
+V4_TIMING_EVERY = int(os.environ.get("V4_TIMING_EVERY", "0") or 0)      # >0: also print every N frames
+
+
+class _NoTimer:
+    """The V4_TIMING=0 stand-in — every hook is a no-op, so the serve loop is unchanged."""
+    __slots__ = ()
+
+    def lap(self, phase, obj=None):
+        pass
+
+    def sync(self):
+        pass
+
+    def frame(self, s=1):
+        pass
+
+    def report(self):
+        pass
+
+    def start(self):
+        pass
+
+
+_NO_TIMER = _NoTimer()
+
+
+def _frame_bytes(obj):
+    """The tensor bytes a message carries — what actually crosses the wire, give or take the ~150 B
+    JSON header. An int passes straight through, because send_msg already returns the exact count."""
+    if isinstance(obj, int):
+        return obj
+    if torch.is_tensor(obj):
+        return obj.numel() * obj.element_size()
+    if isinstance(obj, dict):
+        return sum(_frame_bytes(v) for v in obj.values())
+    if isinstance(obj, (list, tuple)):
+        return sum(_frame_bytes(v) for v in obj)
+    return 0
+
+
+class _StepTimer:
+    """Per-phase wall-clock accumulator for one stage's serve loop.
+
+    `lap(phase, obj)` closes the phase that began at the previous lap (or at `start()`), so the
+    phases tile the frame exactly: `recv` covers the block on the predecessor AND the frame decode,
+    the rest is this box's own work. `obj` is optional and only carries BYTES — a message to size or
+    a count from send_msg — so `recv`/`send` report an effective wire rate next to their wall time.
+    That is the whole point on a consumer uplink: a drafted round's frame is `block_size+1` times
+    fatter than a greedy one, and only bytes-over-seconds separates "the layers got slower" from
+    "the uplink did". `start()` re-bases at a job reset; `report()` prints the per-frame means."""
+    __slots__ = ("tag", "phases", "cuda", "every", "acc", "by", "n", "npos", "t")
+
+    def __init__(self, tag, phases, device=None, every=0):
+        self.tag, self.phases = tag, phases
+        self.cuda = str(device or "").startswith("cuda")
+        self.every = every
+        self.start()
+
+    def start(self):
+        self.acc = dict.fromkeys(self.phases, 0.0)
+        self.by = dict.fromkeys(self.phases, 0)
+        self.n = self.npos = 0
+        self.t = time.perf_counter()
+
+    def lap(self, phase, obj=None):
+        now = time.perf_counter()
+        self.acc[phase] += now - self.t
+        self.t = now
+        if obj is not None:
+            self.by[phase] += _frame_bytes(obj)
+
+    def sync(self):
+        if self.cuda:
+            torch.cuda.synchronize()
+
+    def frame(self, s=1):
+        self.n += 1
+        self.npos += int(s)
+        if self.every and self.n % self.every == 0:
+            self.report()
+
+    def _phase(self, p):
+        ms = 1000.0 * self.acc[p] / self.n
+        if not self.by[p]:
+            return f"{p}={ms:.2f}"
+        kb = self.by[p] / 1024.0 / self.n
+        mbps = (self.by[p] / 1e6) / self.acc[p] if self.acc[p] > 0 else float("inf")
+        return f"{p}={ms:.2f}[{kb:.0f}KB {mbps:.1f}MB/s]"
+
+    def report(self):
+        if not self.n:
+            return
+        on_box = sum(1000.0 * self.acc[p] / self.n for p in self.phases if p != "recv")
+        print(f"{self.tag} timing n={self.n} s={self.npos / self.n:.1f} "
+              + " ".join(self._phase(p) for p in self.phases)
+              + f" on_box={on_box:.2f} ms/frame", flush=True)
+
+
+def _timer(tag, phases, device=None):
+    """The serve loop's timer: a real one under V4_TIMING, else the shared no-op."""
+    if not V4_TIMING:
+        return _NO_TIMER
+    return _StepTimer(tag, phases, device, V4_TIMING_EVERY)
+
 
 def _v4():
     """phase0/v4_stage, imported on first use (see the module docstring's LAZY MODEL IMPORT note).
@@ -273,8 +390,9 @@ class _KeepWarm:
         if not self.on:
             return send_msg(self.sock, msg)
         with self.lock:
-            send_msg(self.sock, msg)
+            n = send_msg(self.sock, msg)
             self.last = time.monotonic()
+        return n                                             # bytes on the wire, as send_msg reports
 
     def _run(self):
         while not self._stop:
@@ -611,6 +729,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
     signer = None
     kw = _KeepWarm(nxt_sock)                                   # cwnd keep-warm on the forward leg (opt-in)
     tag = f"[s{stage}]"
+    timer = _timer(tag, ("recv", "pre", "fwd", "out", "send"), getattr(st, "device", None))
     with torch.no_grad():
         while True:
             msg = queued if queued is not None else recv_msg(conn)
@@ -619,6 +738,7 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             if op == "reset":
+                timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
                 st._spec = bool(msg.get("spec"))              # arm the stage snapshot/rollback (step 5)
                 st._dspark = bool(msg.get("dspark"))          # arm the tail's DSpark drafter (step 4)
@@ -628,11 +748,13 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 _fwd_open(kw, nxt, timeout, msg, tag)          # propagate reset UNCHANGED down the ring
                 continue
             if op == "receipt":                               # job done: append my receipt, pass on
+                timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
                     msg.setdefault("receipts", []).append({"stage": stage, **signer.finalize()})
                 _fwd_open(kw, nxt, timeout, msg, tag)          # the sweep opens a leg that idled all job
                 continue
             if op == "step":
+                timer.lap("recv", msg)
                 if head:
                     ids = _ids_tensor(msg["ids"])             # the coordinator sends a plain list
                     h = st.embed(ids)                         # token ids -> h [b, s, hc_mult, dim]
@@ -640,11 +762,16 @@ def _forward_loop(st, stage, nxt_sock, nxt, head, lo, hi, node_key, receipts, co
                 else:
                     h, ids, in_b = _recv_hids(msg, signer)    # upcasts fp8; in_b hashes the wire bytes
                 start_pos = int(msg["start_pos"])
+                timer.lap("pre")
                 h = st.forward(h, ids, start_pos)
+                timer.sync()
+                timer.lap("fwd")
                 frame, out_b = _make_step_frame(h, ids, start_pos, signer)  # fp8-packs when V4_FP8_WIRE
                 if signer is not None:
                     signer.observe(in_b, out_b)
-                kw.send(frame)
+                timer.lap("out")
+                timer.lap("send", kw.send(frame))
+                timer.frame(h.shape[1])
                 continue
             if op == "stop":
                 kw.stop()
@@ -746,6 +873,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
     signer = None
     temp, gen = 0.0, None                                    # sampling arm, (re)set per job by the reset
     drafter, built = None, {}                                # per-job arm, process-lifetime drafter
+    timer = _timer("[tail]", ("recv", "pre", "fwd", "out", "logits", "draft", "send"),
+                   getattr(st, "device", None))
     with torch.no_grad():
         while True:
             msg = queued if queued is not None else recv_msg(pred)
@@ -754,6 +883,7 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "noop":                                  # keep-warm tick from the predecessor: skip
                 continue
             if op == "reset":
+                timer.start()                                 # a reset opens a job: time it on its own
                 st.reset()
                 st._spec = bool(msg.get("spec"))              # arm the stage's snapshot/rollback
                 st._dspark = bool(msg.get("dspark"))          # arm the taps the drafter consumes
@@ -777,23 +907,34 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
                 send_msg(ret, "ok")
                 continue
             if op == "receipt":
+                timer.report()                                # the job barrier: one timing line per job
                 if signer is not None:
                     msg.setdefault("receipts", []).append({"stage": "tail", **signer.finalize()})
                 send_msg(ret, msg.get("receipts", []))
                 continue
             if op == "step":
+                timer.lap("recv", msg)
                 h, ids, in_b = _recv_hids(msg, signer)        # upcasts fp8; in_b hashes the wire bytes
                 start_pos = int(msg["start_pos"])
+                timer.lap("pre")
                 h = st.forward(h, ids, start_pos)
+                timer.sync()
+                timer.lap("fwd")
                 if signer is not None:
                     signer.observe(in_b, _payload_bytes(h, ids))
+                timer.lap("out")
                 rows = _tail_logit_rows(st, h, start_pos)     # hc_head + norm + lm_head, one row per pos
                 out = {"token": sample_token(rows[-1][0], temp, gen)}
                 if getattr(st, "_spec", False):               # spec: model's greedy token at EVERY chunk pos
                     out["tokens"] = [int(r[0].argmax()) for r in rows]
+                timer.sync()
+                timer.lap("logits")
                 if drafter is not None:                       # dspark: draft the next block locally
                     out.update(drafter.on_chunk(msg, st, out) or {})
-                send_msg(ret, out)
+                timer.sync()
+                timer.lap("draft")
+                timer.lap("send", send_msg(ret, out))
+                timer.frame(h.shape[1])
                 continue
             if op == "stop":
                 try:
