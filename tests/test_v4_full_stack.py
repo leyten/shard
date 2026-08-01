@@ -356,3 +356,41 @@ def test_noqat_is_the_one_lever_that_changes_the_stream_and_is_therefore_not_in_
         "before letting it into the recipe")
     # and it moves every path together, which is why the in-config selftest cannot see it
     assert noqat["ref"] == noqat["ring"] == noqat["pipe"], noqat
+
+
+# ── where the two biggest levers actually touch ───────────────────────────────────────────────────
+
+def test_a_pipelined_rollback_rebuilds_state_eager_under_graphs():
+    """THE COMPOSITION THAT BINDS PIPELINING TO THE GRAPHS' TIER-1 BAR. Pin it, because nothing else
+    states it and it is invisible on a CPU box.
+
+    A pipelined cancel calls `Stage._replay`, which re-feeds the accepted prefix to rebuild the window
+    ring and both compressor accumulators. `_replay` sets `_replaying = True`, and `_run`'s graph gate
+    excludes it — so the rollback rebuilds that state through the EAGER path, while the forward frames
+    that originally wrote it went through the GRAPH.
+
+    Therefore: if graphed and eager differ by even one bit, every cancel leaves the stage holding
+    state the un-cancelled run would not have had, and the divergence is silent, behind valid
+    receipts. Pipelining cancels often — the CPU selftest shows 3 cancels in 4 cycles — so this is the
+    common path, not a corner.
+
+    That makes the whole-layer graph's Tier-1 bar (`graphed == its eager twin`, torch.equal, incl.
+    across bucket crossings) not a quality nicety but the CORRECTNESS PRECONDITION for running
+    V4_CUDA_GRAPH with V4_PIPELINED_SPEC. Tier 2 (vs the vendored reference, tie-bounded) is NOT
+    sufficient here: an approximate-but-defensible graph would still poison every rollback.
+
+    Follow-up worth taking, deliberately NOT taken on this branch: `_replay` is s=1 per position and
+    throws its outputs away, so it could use the graph instead — which would be faster AND would
+    dissolve this dependency entirely. That is a behaviour change to a separately verified module and
+    belongs in its own change, measured on its own."""
+    out = run_probe("""
+        import inspect, textwrap, v4_stage
+        rep = textwrap.dedent(inspect.getsource(v4_stage.Stage._replay))
+        run = textwrap.dedent(inspect.getsource(v4_stage.Stage._run))
+        assert "self._replaying = True" in rep, "the replay no longer flags itself"
+        assert "not self._replaying" in run, "the graph gate no longer excludes a replay"
+        # and the replay drives _run per POSITION, so each call is the s=1 shape a graph would take
+        assert "self._run(h[:, i:i + 1]" in rep, rep
+        print("BOUND OK")
+    """)
+    assert "BOUND OK" in out

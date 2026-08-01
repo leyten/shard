@@ -144,6 +144,27 @@ with the chunk path. Class-method overrides are bypassed; module-global override
 
 This bypass is not theoretical — it surfaced as an 18-test cross-file failure. See below.
 
+### Where pipelining and the graphs actually touch — read this before trusting a graphed ring
+
+A pipelined cancel calls `Stage._replay` to rebuild the window ring and both compressor accumulators
+over the accepted prefix. `_replay` sets `_replaying = True`, and `_run`'s graph gate excludes it. So
+**a rollback rebuilds state through the EAGER path, while the frames that originally wrote that state
+went through the GRAPH.**
+
+If graphed and eager differ by one bit, every cancel leaves the stage holding state the un-cancelled
+run would not have had — silently, behind valid receipts. And pipelining cancels *often*: the CPU
+selftest shows 3 cancels in 4 cycles.
+
+That makes the whole-layer graph's **Tier-1 bar (`graphed == its eager twin`, `torch.equal`, including
+across bucket crossings) the correctness precondition** for running `V4_CUDA_GRAPH` together with
+`V4_PIPELINED_SPEC` — not a quality nicety. Tier 2 (vs the vendored reference, tie-bounded) is *not*
+sufficient on its own: an approximate-but-defensible graph would still poison every rollback. Pinned
+by `test_a_pipelined_rollback_rebuilds_state_eager_under_graphs`.
+
+**Follow-up, deliberately not taken here:** `_replay` is `s=1` per position and discards its outputs,
+so it could use the graph — faster, and it would dissolve this dependency outright. That is a
+behaviour change to a separately verified module and belongs in its own change, measured on its own.
+
 ---
 
 ## Merge decisions
