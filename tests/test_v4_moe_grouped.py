@@ -930,6 +930,26 @@ def test_a_discarded_hash_slot_cannot_poison_the_token_whatever_it_holds(oracle,
     assert torch.isfinite(got.float()).all(), "a discarded slot's inf/NaN reached the token"
     assert torch.equal(want, got), "the discarded slots were read, not dropped"
 
+def test_the_kernel_wrapper_refuses_shapes_its_store_loop_cannot_hold(oracle, monkeypatch):
+    """The grouped kernel's store is UNPREDICATED — a precondition, not a preference.
+
+    The vendored fp4 GEMM writes its tile with a bounds-checked `T.copy`; the grouped one writes row
+    g with a raw `for j in T.Parallel(block_N)` loop, so an N that is not a whole number of 128-wide
+    tiles makes the last block write past the row, and more expert slots than the block_M=32 A tile
+    holds cannot be stored at all. Neither raises on a card: both are silent memory stomps. The
+    wrapper asserts instead, and this pins that it does — the docstring said `G <= block_M` for
+    months while nothing checked it."""
+    def fp4(*shape):                       # torch.zeros has no fp4 CPU kernel; a uint8 view does
+        return torch.zeros(*shape, dtype=torch.uint8).view(torch.float4_e2m1fn_x2)
+
+    act = torch.zeros(4, 128, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="whole number of 128-wide tiles"):
+        GROUPED.grouped_fp4_gemm(act, torch.zeros(4, 1), fp4(4, 192, 64), torch.zeros(4, 192, 4))
+    big = torch.zeros(33, 128, dtype=torch.uint8).view(torch.float8_e4m3fn)
+    with pytest.raises(AssertionError, match="exceeds the block_M"):
+        GROUPED.grouped_fp4_gemm(big, torch.zeros(33, 1), fp4(33, 128, 64), torch.zeros(33, 128, 4))
+
+
 # ── the coverage gate: a matrix kind that silently un-groups must FAIL, not just get slower ──────
 
 
@@ -1093,3 +1113,41 @@ def test_bit_exact_on_gpu_over_the_bank_layout(monkeypatch):
             ref = ref_forward(ref_moe, x, ids)
             got = GROUPED.grouped_forward(bank_moe, x, ids)
         assert torch.equal(ref, got), f"prefill s={s}: max|d| = {(ref.float() - got.float()).abs().max()}"
+
+
+@pytest.mark.hardware
+def test_bit_exact_on_gpu_with_a_duplicated_hash_expert(monkeypatch):
+    """The one claim that CANNOT be checked off a card, forced instead of hoped for.
+
+    The hash path's correctness rests on the tilelang fp4 GEMM being ROW-INVARIANT: the reference
+    runs a duplicated expert as an n-row GEMM and the grouped path runs n one-row grid blocks. That
+    is a property of the kernel, so only a GPU can measure it — and until this test the GPU never
+    saw a hash layer at all (both parity tests build `layer_id=7`, and `_smoke`'s random `tid2eid`
+    draws contain no duplicate at all about 62% of the time at 256 experts and topk 6).
+
+    So the routing is PINNED, not drawn: expert 3 named three times and 17 twice, which is the
+    reference discarding three of six slots. If `torch.matmul`-style M-dependent blocking were ever
+    true of the tilelang kernel, this is where it would show, and nothing else would."""
+    if not torch.cuda.is_available():
+        pytest.skip("grouped MoE parity needs a CUDA device (tilelang)")
+    mod = GROUPED._load_model_module()
+    args = GROUPED.real_dims_args(mod)
+    ref_moe = GROUPED.build_real_dims_moe(mod, args, seed=3, layer_id=0)
+    bank_moe = GROUPED.build_real_dims_moe(mod, args, seed=3, layer_id=0, bank=True)
+    assert ref_moe.gate.hash and bank_moe._grouped_bank
+    pattern = torch.tensor([3, 3, 17, 3, 200, 17], dtype=torch.int32, device="cuda")
+    assert pattern.numel() == args.n_activated_experts
+    with torch.no_grad():
+        for m in (ref_moe, bank_moe):
+            m.gate.tid2eid.data.copy_(pattern.expand_as(m.gate.tid2eid))
+    ref_forward = mod.MoE.forward
+    monkeypatch.setattr(GROUPED, "_REF_FORWARD", ref_forward)
+    monkeypatch.setattr(GROUPED, "_MOD", mod)
+    monkeypatch.setattr(GROUPED, "_WORLD_SIZE", 1)
+    for t in range(4):
+        x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
+        ids = torch.randint(0, args.vocab_size, (1, 1), device="cuda")
+        with torch.no_grad():
+            ref = ref_forward(ref_moe, x, ids)
+            got = GROUPED.grouped_forward(bank_moe, x, ids)
+        assert torch.equal(ref, got), f"dup {t}: max|d| = {(ref.float() - got.float()).abs().max()}"

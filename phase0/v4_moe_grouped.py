@@ -62,8 +62,10 @@ vendored kernel: the arithmetic is transcribed, not re-derived.
     the A row and on W row j alone, never on N or on which N-tile j fell in. Concatenating the two
     weight blocks only changes how many N-tiles the grid walks, so `both[:, :inter]` is the fp32
     word `grouped_fp4_gemm(xq, w1)` would have produced and `both[:, inter:]` is w3's. (Nothing here
-    needs inter_dim to be a multiple of block_N; a tile straddling the w1/w3 seam still computes
-    each of its output elements from its own W row.)
+    needs inter_dim to be a multiple of block_N — a tile straddling the w1/w3 seam still computes
+    each of its output elements from its own W row. The KERNEL does need the fused N to be a whole
+    number of block_N tiles, because its store loop is unpredicated; the fusion RELAXES that from
+    inter_dim % 128 to inter_dim % 64, and `grouped_fp4_gemm` asserts it either way.)
   * The SwiGLU, the routing-weight multiply, the `.to(dtype)` and the two `act_quant`s stay in the
     reference's own torch / tilelang code, run on the SAME operands, batched over the expert axis.
     Elementwise and per-row reductions are batch-invariant, so row g of the batch is bit-identical to
@@ -203,6 +205,15 @@ _WORLD_SIZE = 1
 
 _KERNELS = {}          # (N, K, tl_scale_dtype) -> compiled grouped kernel, memoized like the vendored
 
+# The kernel's tile dims, hoisted because the WRAPPER has to enforce them. The vendored fp4 GEMM
+# stores its tile with a bounds-checked `T.copy`; the grouped one stores row g with a raw
+# `for j in T.Parallel(block_N)` loop, which is UNPREDICATED — so N must be a whole number of
+# block_N tiles or the last block writes past the row. And the A tile is block_M rows, so a launch
+# can carry at most that many expert slots. Both hold at the shipped dims and at every call this
+# module makes; they are asserted rather than commented because the failure is a silent memory
+# stomp, not an exception.
+_BLOCK_M, _BLOCK_N = 32, 128
+
 
 # ── the kernel ───────────────────────────────────────────────────────────────────────────────────
 
@@ -245,8 +256,8 @@ def grouped_fp4_gemm_kernel(N, K, scale_dtype="float32"):
     out_dtype, accum_dtype = BF16, FP32
     act_group_size = 128
     weight_group_size = 32
-    block_M = 32
-    block_N = 128
+    block_M = _BLOCK_M
+    block_N = _BLOCK_N
     block_K = 32                       # == weight_group_size: one scale per K-block, no reassociation
     n_sub = act_group_size // block_K  # 4 K-blocks per act-scale group
 
@@ -324,6 +335,12 @@ def grouped_fp4_gemm(a, a_s, w, w_s, scale_dtype=torch.float32):
     import is local so the CPU stand-ins (`v4_kernels_cpu.install`) can be swapped in per test."""
     assert a.is_contiguous() and w.is_contiguous(), "grouped fp4: a and w must be contiguous"
     assert a_s.is_contiguous() and w_s.is_contiguous(), "grouped fp4: scales must be contiguous"
+    assert w.size(1) % _BLOCK_N == 0, (
+        f"grouped fp4: N={w.size(1)} is not a whole number of {_BLOCK_N}-wide tiles — the kernel's "
+        f"store loop is unpredicated and the last block would write past the row")
+    assert a.size(0) <= _BLOCK_M, (
+        f"grouped fp4: {a.size(0)} expert slots exceeds the block_M={_BLOCK_M} A tile the kernel "
+        f"copies; only rows below it can be stored")
     if not a.is_cuda:
         import kernel
         return torch.cat([kernel.fp4_gemm(a[g:g + 1], a_s[g:g + 1], w[g], w_s[g], scale_dtype)
@@ -845,6 +862,14 @@ def _smoke():
     install(mod)
     hash_ref = build_real_dims_moe(mod, args, seed=1, layer_id=0)
     hash_bank = build_real_dims_moe(mod, args, seed=1, layer_id=0, bank=True)
+    # PIN a duplicated routing rather than hoping a random `tid2eid` draws one: at 256 experts and
+    # topk 6 a draw repeats only ~5.7% of the time, so eight random draws miss the duplicate branch
+    # — the branch that needs the kernel to be row-invariant — about 62% of runs. Expert 3 named
+    # three times and 17 twice is the reference discarding three of the six slots.
+    pattern = torch.tensor([3, 3, 17, 3, 200, 17], dtype=torch.int32, device="cuda")
+    with torch.no_grad():
+        for m in (hash_ref, hash_bank):
+            m.gate.tid2eid.data.copy_(pattern.expand_as(m.gate.tid2eid))
     for tag, (a, b) in (("decode", (ref_moe, bank_moe)), ("hash", (hash_ref, hash_bank))):
         for t in range(8):
             x = torch.randn(1, 1, args.dim, dtype=torch.bfloat16, device="cuda")
