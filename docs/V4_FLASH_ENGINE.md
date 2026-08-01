@@ -50,10 +50,28 @@ applied *after* signing, and leaving it in puts it in the preimage and fails a v
 
 ## What is actually blocking 20 tok/s
 
-**1. Pipeline efficiency, not compute.** Summed per-frame on-box work is 2205 ms across 6 stages
-while stages report idle `recv` of 1794-2258 ms. The slowest stage is 579 ms, so the pipelined
-ceiling is ~26 tok/s and we measure 3.68 — roughly **11-15% efficiency**. Around 85% of the
-available throughput is lost to bubbles, which is a bigger prize than any single kernel lever.
+**0. First, two ceilings that were wrong — do not repeat them.**
+A "26 tok/s ceiling / 11-15% efficiency" figure circulated all day. It was an **artefact**: it
+divided a per-frame `on_box` of 579 ms by a timed window of `s = 15`. The true `s=1` bottleneck is
+**147 ms**, so this ring's ceiling is **7.3 tok/s and we measure 39% of it**. Separately, any
+"ceiling = 1/max-stage-time" number silently assumes a full pipe; see §3. Quote
+`min(1/max_stage, (block+1)/round_latency)` or the number is fiction.
+
+**1. Compute, not bubbles and not transport.** A validated discrete-event model (calibrated on
+disjoint evidence, RMS 7.1%, predicting g / stale replies / in-flight depth across a whole depth
+sweep, worst residual 15.2%) decomposes the loss as **9% fill, 54% misspeculation waste**. The
+bottleneck stage is **91% busy** and `unsent_frames` is 0 — the pipe is full of *discarded* work,
+not empty. RTT is 632 ms of which only **~28 ms is wire**, so the ring is **96% compute-bound** and
+fp8 wire buys almost nothing on decode (it is a prefill/TTFT lever).
+
+**Lever prices, measured, not assumed:** `d(tok/s)/dg ~ 0.27` at g=3.7 (about **9% per unit of g**,
+and g caps near 5.9 with the measured decay) against **83% for a 2x cut in per-stage tau**, which
+does not cap. **Compute is worth about nine times acceptance.** Reaching 20 tok/s needs draft block
+>= 12 *plus* roughly **8-16x on tau**; every ring-shape lever combined ceilings out near 4.4 tok/s.
+
+For scale: an 8-layer stage reads ~1.2 GB of fp4 weights per token, ~0.7 ms at the card's
+bandwidth, against 147 ms measured — **~200x off roofline**. At batch 1 / s=1 that is small-kernel
+launch latency, not bandwidth, which is exactly the regime CUDA graphs address.
 
 **2. The ring is VRAM-bound (6 boxes).** Six 32 GB cards hold ~45 layers against the model's 43.
 An exact max-stage-minimising planner (verified against brute force on 4000 pools, zero
@@ -62,28 +80,59 @@ reach 1.61x better, a gap no tiling can close. Straggler **ejection is infeasibl
 unhelpful: every 5-box subset holds 37 layers < 43. The fix is a **wider ring**, which lowers
 max-stage-time and adds VRAM headroom in one move.
 
-**3. Acceptance regressed.** With `V4_DSPARK_FAST=1 V4_REF_SLIM=1`, g fell **4.0 -> 3.05** serial
-(3.37 pipelined), with 4 of 21 rounds accepting zero tokens. It is fully deterministic and
-reproducible. Since g multiplies throughput, this cancelled most of the compute levers' gain —
-the composed stack measured roughly net-neutral. Suspect: an accuracy shortcut applied
-inconsistently between the draft and verify paths, so the verifier rejects its own drafter.
+**3. Ring WIDTH is capped by the draft block — width and block size are ONE knob.** In-flight
+frames saturate at **block_size + 1 = 6**, proven by depth 6 / 8 / 12 returning byte-identical
+results on a 10-stage ring (`max_inflight` 6, `stale_replies` 41, g 4.92 every time). A 10-box ring
+therefore leaves **four stages permanently idle** and measured *slower* than 6 boxes (pipelined
+decode 4.39 vs 5.35; greedy 1.64 vs 2.28 — pure added hop latency). 6 stages is simultaneously the
+fill cap and the VRAM floor, which is why 8/8/8/8/8/3 is the right topology. To use more width you
+must raise the draft block first.
 
-**4. Known correctness risk — `topk` non-determinism.** The vendored reference's `torch.topk` tie
-order is undefined *and width-dependent*, and `relu_()` floors negatives to hard 0.0, manufacturing
-ties. Two boxes can therefore select different compressed KV slots for the same input. A
-width-invariant tie-break (value DESC, index ASC) fixed this elsewhere; the eager path still needs
-auditing.
+**4. Acceptance: root-caused, and it is a BUG.** g fell **4.0 -> 3.05** serial (3.37 pipelined).
+Neither named lever was at fault — both are bit-exact in isolation. The mechanism is **gather
+order**: `slim_indexer_forward` returns compressed slots *ascending* while the chunked verify path's
+`_chunk_indexer` returns them *score-descending*. Same position, same selected SET, different ORDER
+depending on whether it arrived in a verify chunk or an s=1 frame — which changes **30-35% of
+attention output elements** by ~2 bf16 ULP at the shipped shape, so the verifier rejects its own
+drafter. This predicts the serial-vs-pipelined split exactly. Fix: `V4_TOPK_STABLE` canonicalises
+the index (a pure permutation); 32/32 positions compare equal where 0/32 did before.
+
+Two traps in that investigation worth keeping: the effect is **0.0% at topk 24/128/192 and only
+appears at 256+** (shipped is 640), so a tolerance test at toy width is structurally blind; and the
+tie source is **not** `relu_()` (3 exact zeros in 719,400 candidates) but **bf16 pigeonhole** —
+16.8% of candidates collide. Also note ring `accept_hist` shows keys a block-5 rule cannot produce,
+so ring-g chains rounds and is not the same quantity as harness-g; compare g only within one
+accounting scheme, depth, and generation length.
+
+**5. Measure at realistic length.** At 48-64 tokens, prefill is 32-48% of wall clock, so end-to-end
+tok/s understates the generation rate by ~1.7x — report `decode_tok_s` too. Acceptance is also far
+better on long runs (g 10.3 at 320 tokens vs 4.0 at 48), because rounds chain across blocks.
 
 ## Levers (all opt-in, default OFF)
 
 | lever | env | status |
 |---|---|---|
 | Pipelined speculation | `V4_PIPELINED_SPEC=1` | **shipped, 1.94x, lossless** |
-| Grouped fp4 MoE | `V4_MOE_GROUPED=1` | 3.19x eager / 11x graphed, bit-exact |
-| MoE bank layout | (with grouped) | **OOMs an 8-layer stage at load — under repair** |
-| Whole-layer CUDA graphs | `V4_CUDA_GRAPH=1` | needs VRAM headroom; keep OFF on the tail |
-| DSpark fast draft | `V4_DSPARK_FAST=1` | 4.51x draft; implicated in the g regression |
-| Ref-slim decode | `V4_REF_SLIM=1` | indexer skip; prime suspect for the g regression |
+| Grouped fp4 MoE | `V4_MOE_GROUPED=1` | 3.19x eager / 11x graphed **on CPU**; on hardware see below |
+| MoE bank layout | (with grouped) | **FIXED** — was an allocation-ORDER bug, peak 31.11 -> 27.98 GiB |
+| Whole-layer CUDA graphs | `V4_CUDA_GRAPH=1` | **~1.0x ALONE** — needs grouped MoE to be capturable |
+| DSpark fast draft | `V4_DSPARK_FAST=1` | 4.51x draft, bit-exact; **exonerated** on the g regression |
+| Ref-slim decode | `V4_REF_SLIM=1` | bit-exact in isolation; **exonerated** (see gather order) |
+| Stable top-k | `V4_TOPK_STABLE=1` | canonicalises index order — the real acceptance fix |
+| fp8 wire | `V4_FP8_WIRE=1` | 1.977x on the s=1 frame, but the ring is 96% compute-bound |
+
+**The bank layout was an ORDER bug, not a leak.** Each bank was allocated *before* the experts it
+replaces were released, so peak held both; the freed blocks are 256 scattered 4 MiB allocations,
+the wrong shape to satisfy a 1024 MiB request. Steady-state cost of the bank is **+0 bytes** —
+the bank *is* the experts. Fix is release-first (`preserve=False`). Proven with storage finalizers,
+not inferred.
+
+**Two silent holes found the same way, both worth re-checking after any refactor:** `V4_FP8_WIRE`
+never reached a stage process at all (`stage_launch_cmd` hand-built the env and omitted it — now an
+`ENG_ENV` allowlist, as M2.5 already had), and the grouped kernel **never fires on the drafter**,
+because only `Stage.layers` gets the bank layout while `RingDrafter`'s three DSparkBlocks (10.28 GiB,
+allocated lazily on the first dspark job) fall back. A lever that silently does nothing looks
+exactly like a lever that does not work.
 
 ## Ring ops that cost us real time
 
@@ -100,6 +149,12 @@ auditing.
   matches the pattern and kills what it just started. Use separate sessions.
 - **The tail needs `V4_CUDA_GRAPH=0`.** Graph pools cost ~18 GB on the box that also holds the MTP
   blocks, the fp32 head and the embedding.
+- **The cold-start JIT cascade is SERIALIZED across stages.** A stage compiles its tilelang kernels
+  when the first frame reaches it, so on a cold ring the compiles happen one after another down the
+  chain — measured on a 10-box ring at roughly 1-2 min per stage, ~12-15 min to first token, once.
+  It looks exactly like a hung ring; check the stage logs for advancing per-stage timestamps before
+  concluding anything is stuck. Worth pre-warming each stage with a dummy forward IN PARALLEL at
+  boot, which would turn a serial 15 min into a parallel 2 min and get a wide ring measuring sooner.
 
 ## Layout
 
