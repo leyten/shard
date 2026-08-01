@@ -64,7 +64,7 @@ def _ids(n, args, seed=0):
 
 # ── oracle -> stage weight transfer ──────────────────────────────────────────────────────────────
 
-def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=False):
+def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=False, fast=False):
     """A Stage over [lo, hi) holding the oracle's OWN weights, transferred in process.
 
     No checkpoint round-trip and no name mapping: `Stage.layers[i]` is the same `Block` class the
@@ -78,7 +78,7 @@ def stage_from_oracle(oracle, args, lo, hi, *, head=None, tail=None, dspark=Fals
     in any state_dict here -- each Stage allocates its own, in its constructor state."""
     head = (lo == 0) if head is None else head
     tail = (hi == args.n_layers) if tail is None else tail
-    st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device="cpu")
+    st = V4.Stage(lo, hi, args, head=head, tail=tail, dspark=dspark, device="cpu", fast_verify=fast)
     for li in range(lo, hi):
         st.layers[li - lo].load_state_dict(oracle.layers[li].state_dict(), strict=True)
     if st.embed_tokens is not None:
@@ -578,3 +578,348 @@ def test_ids_reach_the_hash_gate(oracle, args):
     st_c = stage_from_oracle(oracle, args, 0, args.n_layers)
     run([st_c], prompt, 0)
     assert torch.equal(st_c.forward(h.clone(), tok_a, PROMPT), h_a), "control: same ids, same output"
+
+
+# ── 9. the chunked verify path (V4_FAST_VERIFY) ──────────────────────────────────────────────────
+#
+# WHAT IS PROVED HERE, AND WHY IT IS NOT "torch.equal ON h"
+#
+# The fast path runs an s-token chunk in ONE pass per layer instead of s. Its mechanics -- which kv
+# each position attends, in which order, which compressed slots exist by then, what the window ring
+# and the compressor accumulators end up holding -- must be EXACTLY the per-token loop's, and that is
+# what test_fast_verify_attends_exactly_what_the_loop_attends and
+# test_fast_verify_leaves_the_same_state assert, bit for bit, with nothing hand-waved.
+#
+# Its ARITHMETIC cannot be, and no implementation of it could be. A batched pass hands torch bigger
+# tensors, and torch picks its kernels by size: MKL uses a different sgemm for M=1 than for M=6 (the
+# reassociation `_tail_logit_rows` already keeps away from the logits, v4_pipe.py:698), and even
+# `rsqrt` on bf16 rounds one ulp differently once a tensor is big enough to take its vectorized path
+# -- measured here, not assumed. So "the same numbers" is available only up to that, and the tests
+# that follow say exactly which claim they are making:
+#
+#   attends_exactly / leaves_the_same_state   EXACT. Per layer, fed an identical input, so no
+#       cross-layer drift can hide a mechanical error and no mechanical error can hide behind drift.
+#       These are the tests that fail if the ring is pre-written, if a compressed row is one slot
+#       long or short, or if the indexer picks its top-k off the wrong end_pos.
+#   verify_rows_are_the_greedy_rows           the losslessness bar the ENGINE actually needs: every
+#       position's greedy token out of the whole 8-layer stage, chunked, is the token the loop got.
+#   drift_stays_under_a_bf16_ulp              the size of what is left, pinned so a regression that
+#       turns ulps into something else is visible.
+
+# (prompt, s) geometries. Every one is here for a reason cpu_args() makes reachable: window_size 16,
+# compress ratios 4 and 8, index_topk 8.
+FAST_CASES = [
+    (2, 2),      # before ANY compression: ratio-8 rows are empty, ratio-4 crosses its first boundary
+    (5, 4),      # still inside the first window: the un-wrapped `[0..p]` index row, padded
+    (16, 2),     # crosses no compression boundary at all — the control
+    (15, 2),     # the window-wrap seam: p=15 is the last un-wrapped row, p=16 the first wrapped one
+    (18, 2),     # a ratio-4 boundary lands INSIDE the chunk
+    (13, 4),     # ratio-4 and ratio-8 boundaries both inside, plus the wrap
+    (20, 4),     # ratio-8 boundary inside, ring already full
+    (14, 6),     # TWO ratio-4 boundaries in one chunk -> three indexer read lengths
+    (37, 6),     # deep in the ring: every chunk position overwrites a slot an earlier one still reads
+    (12, 8),     # wider than a g=5 round sends — the mechanics must hold there too
+]
+# The widths a verify chunk actually has (g+1 for the g≈4 the drafter delivers). The stream tests
+# stop here deliberately, and the reason is measured, not assumed: see
+# test_fast_verify_rows_are_the_greedy_rows.
+FAST_STREAM_CASES = [c for c in FAST_CASES if c[1] <= 6]
+
+
+def _capture_sparse_attn(monkeypatch):
+    """Record every (topk_idxs, kv) the reference's attention kernel is called with. -> the list."""
+    M = V4.ref()
+    calls, real = [], M.sparse_attn
+
+    def spy(q, kv, attn_sink, topk_idxs, softmax_scale):
+        calls.append((topk_idxs.clone(), kv.clone()))
+        return real(q, kv, attn_sink, topk_idxs, softmax_scale)
+
+    monkeypatch.setattr(M, "sparse_attn", spy)
+    return calls
+
+
+def _meaning(row, win, pos, base=None):
+    """One sparse-attention index row -> what it MEANS, independent of where the bytes live.
+
+    An index is only ever a place: a window slot holding some absolute position, a compressed slot,
+    the fast path's scratch row for a chunk position, or -1 for nothing. Resolving all of them to
+    ('p', absolute position) / ('c', compressed slot) / ('-',) is what lets the fast path's rows be
+    compared against the loop's AT ALL -- they are deliberately different integers (that is the whole
+    mechanism) and have to be the same MEANING.
+
+    `pos` is the position the row belongs to, and the ring is read as it stood when the row was used:
+    slot v last held `pos - ((pos - v) % win)`. `base` is the fast path's scratch offset, whose row i
+    holds chunk position `start` + i."""
+    out = []
+    for v in (int(x) for x in row):
+        if v < 0:
+            out.append(("-",))
+        elif base is not None and v >= base[0]:
+            out.append(("p", base[1] + (v - base[0])))
+        elif v < win:
+            out.append(("p", pos - ((pos - v) % win)))
+        else:
+            out.append(("c", v - win))
+    return out
+
+
+def _drive(st, prompt_ids, chunk_ids, hp, hc, start_pos):
+    """Prefill a layer-range stage with `hp`, then feed it `hc` at `start_pos`. -> the chunk's output.
+
+    Payloads rather than token ids because these tests isolate ONE layer at a time, and a middle
+    layer has no embedding: what matters is that both stages see the SAME [b, s, hc_mult, dim] in."""
+    st.forward(hp, prompt_ids, 0)
+    return st.forward(hc, chunk_ids, start_pos)
+
+
+def _payloads(args, prompt, s, seed, b=1):
+    g = torch.Generator().manual_seed(seed)
+    ids = torch.randint(0, args.vocab_size, (b, prompt + s), generator=g)
+    hp = torch.randn(b, prompt, args.hc_mult, args.dim, generator=g).bfloat16() * 0.3
+    hc = torch.randn(b, s, args.hc_mult, args.dim, generator=g).bfloat16() * 0.3
+    return ids, hp, hc
+
+
+def _state(st):
+    """Every per-stage buffer of a one-layer stage, as (name, tensor). The fast stage's kv_cache is
+    truncated to the reference's length -- the scratch region past it is the fast path's own."""
+    a, out = st.layers[0].attn, []
+    real = st.args.window_size + (st.args.max_seq_len // a.compress_ratio if a.compress_ratio else 0)
+    out.append(("kv_cache", a.kv_cache[:, :real]))
+    if a.compress_ratio:
+        out += [("kv_state", a.compressor.kv_state), ("score_state", a.compressor.score_state)]
+        if a.indexer is not None:
+            out += [("idx.kv_cache", a.indexer.kv_cache),
+                    ("idx.kv_state", a.indexer.compressor.kv_state),
+                    ("idx.score_state", a.indexer.compressor.score_state)]
+    return out
+
+
+@pytest.mark.parametrize("prompt,s", FAST_CASES)
+@pytest.mark.parametrize("li", (0, 2, 3))          # sliding-window / ratio-4 + indexer / ratio-8
+def test_fast_verify_attends_exactly_what_the_loop_attends(args, li, prompt, s):
+    """THE headline. Every chunk position attends the same places, in the same order, as the loop.
+
+    Compared as MEANINGS, not as integers, because the integers are deliberately different: the fast
+    path's rows point at the scratch copies of the chunk's own kv, precisely so that the window ring
+    can go on holding the PRE-CHUNK tokens while the whole chunk is answered in one call. That is the
+    part with no margin. Chunk position p+i writes ring slot (p+i) % win, which is exactly the slot
+    holding the oldest token of position p's own window -- so a pass that writes the ring before it
+    attends (the obvious implementation, and the one the reference's own decode branch does per
+    token) answers p's oldest window slots with tokens from p's FUTURE. It runs, and it is wrong, and
+    nothing but this comparison notices. (37, 6) is the case where every one of the s positions does
+    it; (12, 8) does it with a chunk wider than the ring's spare room.
+
+    Both stages are ONE layer and are handed the same payload, so this is a statement about the
+    chunk mechanics alone: no cross-layer arithmetic drift can enter, and none can be blamed.
+
+    The one licensed difference is the right-hand -1 padding: a chunk's positions have different
+    compressed read lengths and different indexer top-k widths, and one [b, s, k] tensor has to hold
+    all of them, so the short rows are padded with the kernel's own "no position". Asserted to be
+    exactly that -- trailing, and nothing but."""
+    monkey = pytest.MonkeyPatch()
+    try:
+        calls = _capture_sparse_attn(monkey)
+        oracle = REFCPU.build_oracle(args, SEED)
+        fast = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False, fast=True)
+        slow = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False)
+        ids, hp, hc = _payloads(args, prompt, s, seed=prompt * 31 + s)
+
+        fast.forward(hp, ids[:, :prompt], 0)                  # prefill attends too — not under test
+        calls.clear()
+        fast.forward(hc, ids[:, prompt:], prompt)
+        assert len(calls) == 1, "the fast path must answer the whole chunk in ONE attention call"
+        f_rows, f_kv = calls[0]
+        slow.forward(hp, ids[:, :prompt], 0)
+        calls.clear()
+        slow.forward(hc, ids[:, prompt:], prompt)
+        assert len(calls) == s, "the reference path is one call per position — the control"
+        win = args.window_size
+        base = (f_kv.size(1) - V4.V4_FAST_VERIFY_MAX, prompt)
+
+        for j in range(s):
+            got = _meaning(f_rows[0, j].tolist(), win, prompt + j, base)
+            want = _meaning(calls[j][0][0, 0].tolist(), win, prompt + j)
+            assert got[:len(want)] == want, (
+                f"chunk position {prompt + j} attends elsewhere than the loop does\n"
+                f"  chunked {got}\n  loop    {want}")
+            assert all(e == ("-",) for e in got[len(want):]), \
+                f"the chunked row's extra entries must be -1 padding, got {got[len(want):]}"
+            # ...and the places must still HOLD what the loop found in them. Comparing meanings alone
+            # would pass an implementation that writes the ring before it attends: the row still says
+            # "slot 3, which is position 35", and slot 3 now holds position 39. Same claim, different
+            # bytes. So the operands themselves are compared, gathered exactly as the kernel gathers.
+            s_kv, s_row = calls[j][1], calls[j][0][0, 0].tolist()
+            for k, (v_f, v_s) in enumerate(zip(f_rows[0, j].tolist(), s_row)):
+                if int(v_s) < 0:
+                    continue
+                assert torch.equal(f_kv[0, int(v_f)], s_kv[0, int(v_s)]), (
+                    f"chunk position {prompt + j} entry {k} points at {got[k]} in both, but the kv "
+                    f"there is not the kv the loop read — the ring was overwritten before it was read")
+    finally:
+        monkey.undo()
+
+
+@pytest.mark.parametrize("prompt,s", FAST_CASES)
+@pytest.mark.parametrize("li", (0, 2, 3))
+def test_fast_verify_leaves_the_same_state(args, li, prompt, s):
+    """Bit-identical window ring, compressed region and compressor accumulators after the chunk.
+
+    The other half of the mechanics: the chunk must not only READ what sequential decode reads, it
+    must LEAVE what sequential decode leaves -- the next round's window, the compressed slots this
+    chunk's boundaries emitted, and both fp32 accumulators (the layer's and, on a ratio-4 layer, the
+    indexer's). torch.equal, per layer, on the same input: the compressor is driven one position at a
+    time through the reference's OWN decode branch precisely so this can be exact rather than close.
+
+    A rejected chunk's rollback rests on this (`Stage._snapshot` restores the window and the
+    accumulators and argues the compressed region is always rewritten before it is read), so a fast
+    chunk that left a subtly different accumulator would make every rewind after it wrong."""
+    oracle = REFCPU.build_oracle(args, SEED)
+    fast = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False, fast=True)
+    slow = stage_from_oracle(oracle, args, li, li + 1, head=False, tail=False)
+    ids, hp, hc = _payloads(args, prompt, s, seed=prompt * 31 + s)
+
+    _drive(fast, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
+    _drive(slow, ids[:, :prompt], ids[:, prompt:], hp, hc, prompt)
+    for (name, got), (_, want) in zip(_state(fast), _state(slow)):
+        assert torch.equal(got, want), f"layer {li}: {name} diverged over a {s}-token chunk at {prompt}"
+    assert fast._pos == slow._pos == prompt + s
+
+
+@pytest.mark.parametrize("prompt,s", FAST_STREAM_CASES)
+def test_fast_verify_rows_are_the_greedy_rows(oracle, args, prompt, s):
+    """Whole 8-layer stage: the verify chunk's per-position greedy tokens are the loop's. Losslessness.
+
+    This is the bar the RING is settled against -- `_serve_tail` answers a spec chunk with
+    `[int(r.argmax()) for r in rows]`, one row per position at the same GEMM shape greedy decode uses
+    (v4_pipe.py:698), and a draft is accepted exactly when that token matches. So this compares the
+    thing acceptance is decided on, over a chunk that has been through all eight layers and therefore
+    carries whatever the batched GEMMs reassociated on the way.
+
+    AND IT IS A MEASUREMENT, NOT A THEOREM, WHICH IS WHY THE WIDTHS STOP AT 6. Swept over 18 random
+    chunks per width on this toy model: s = 2..6 preserved the stream 18/18 each (90/90 in total,
+    drift <= 24 bf16 ulps), s = 8 preserved it 9/18 at up to 53 ulps. The cliff is torch changing
+    kernels with size -- at 4 heads a chunk of 8 is the first one whose per-head tensors take the
+    vectorized `rsqrt` path -- so its exact location is an artifact of THIS shape and says nothing
+    about 64 heads on a GPU. What it does say is that the fast path's losslessness is empirical where
+    the loop's is structural, and that is the whole reason the flag defaults to off.
+
+    The three decode steps after the chunk are compared too: a chunk that committed a different
+    window or a different compressed slot would not necessarily move THIS round's tokens, but it
+    moves the next ones."""
+    fast = stage_from_oracle(oracle, args, 0, args.n_layers, fast=True)
+    slow = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    ids = _ids(prompt + s, args, seed=prompt * 7 + s)
+
+    rows = []
+    for st in (fast, slow):
+        st.forward(st.embed(ids[:, :prompt]), ids[:, :prompt], 0)
+        h = st.forward(st.embed(ids[:, prompt:]), ids[:, prompt:], prompt)
+        rows.append([st.logits_all(h[:, j:j + 1], full_logits=False) for j in range(s)])
+    assert [int(r.argmax()) for r in rows[0]] == [int(r.argmax()) for r in rows[1]], \
+        f"a {s}-token chunk at {prompt} verified different tokens than sequential decode"
+
+    tok = rows[1][-1].argmax(dim=-1).unsqueeze(1)
+    for i in range(3):
+        nxt = []
+        for st in (fast, slow):
+            h = st.forward(st.embed(tok), tok, prompt + s + i)
+            nxt.append(st.logits_all(h, full_logits=False))
+        assert int(nxt[0].argmax()) == int(nxt[1].argmax()), f"streams parted {i} steps after the chunk"
+        tok = nxt[1].argmax(dim=-1).unsqueeze(1)
+
+
+@pytest.mark.parametrize("prompt,s", FAST_CASES)
+def test_fast_verify_drift_is_reassociation_sized(oracle, args, prompt, s):
+    """What batching costs, measured rather than asserted away: |Δh| after a whole 8-layer chunk.
+
+    bf16 carries 8 mantissa bits, so one ulp of the payload's largest element is |h|max / 256. A
+    batched pass differs from the loop by a handful of those, amplified layer over layer: measured at
+    <= 24 for s <= 6 and <= 53 at s = 8. They enter wherever torch swaps kernel for size -- MKL's
+    M = 1 sgemm against its M = s one, and bf16 `rsqrt` taking its vectorized path once a tensor is
+    big enough -- and no implementation of a batched pass avoids them.
+
+    A TRIPWIRE, NOT A PRECISION CLAIM. The bound is two and a half times the worst measured value, so
+    it passes reassociation and fails structure: a mechanical regression (a stale window slot, a
+    compressed row one short) moves the payload by a factor, not by ulps, and lands orders of
+    magnitude past this."""
+    fast = stage_from_oracle(oracle, args, 0, args.n_layers, fast=True)
+    slow = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    ids = _ids(prompt + s, args, seed=prompt * 7 + s)
+    out = []
+    for st in (fast, slow):
+        st.forward(st.embed(ids[:, :prompt]), ids[:, :prompt], 0)
+        out.append(st.forward(st.embed(ids[:, prompt:]), ids[:, prompt:], prompt))
+    ulp = out[1].abs().float().max().item() / 256.0                       # one bf16 ulp at full scale
+    drift = (out[0].float() - out[1].float()).abs().max().item()
+    assert drift <= 128 * ulp, f"chunk drift {drift / ulp:.1f} ulps is structural, not reassociation"
+
+
+def test_fast_verify_is_off_by_default(args):
+    """OFF unless asked for, and OFF means the reference's own `Block` with the reference's buffers.
+
+    Not a style point. The whole argument for the fast path is that the per-token loop stays the
+    thing everything else is graded against, so a stage nobody opted in must be structurally unable
+    to take the branch -- not merely disinclined to."""
+    M = V4.ref()
+    plain = V4.Stage(0, 2, args, device="cpu")
+    assert type(plain.layers[0]) is M.Block, "the default stage must be the reference's own Block"
+    assert not plain._chunk_ok(4) and plain._chunk_cap == 0
+    win = args.window_size
+    assert plain.layers[0].attn.kv_cache.size(1) == win, "no scratch on a stage that cannot use it"
+
+    fast = V4.Stage(0, 2, args, device="cpu", fast_verify=True)
+    assert type(fast.layers[0]) is not M.Block and isinstance(fast.layers[0], M.Block)
+    assert fast.layers[0].attn.kv_cache.size(1) == win + V4.V4_FAST_VERIFY_MAX
+    assert fast._chunk_ok(4) and not fast._chunk_ok(1), "s=1 is the reference path, not a chunk"
+    assert not fast._chunk_ok(V4.V4_FAST_VERIFY_MAX + 1), "an oversized chunk falls back to the loop"
+
+
+def test_fast_verify_falls_back_over_the_scratch_width(oracle, args):
+    """A chunk wider than the scratch region is answered by the LOOP, bit-identically, not refused.
+
+    The cap is a VRAM decision (scratch rows per layer), not a contract, so meeting a wider chunk has
+    to be slow rather than fatal -- a coordinator that raises its speculation depth past the stage's
+    cap gets correct tokens at the old speed and a knob to turn, instead of a dead ring. Bit-identical
+    because it IS the loop: same code path, same shapes, same arithmetic."""
+    s = V4.V4_FAST_VERIFY_MAX + 2
+    fast = stage_from_oracle(oracle, args, 0, args.n_layers, fast=True)
+    slow = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    ids = _ids(PROMPT + s, args, seed=11)
+    out = []
+    for st in (fast, slow):
+        st.forward(st.embed(ids[:, :PROMPT]), ids[:, :PROMPT], 0)
+        out.append(st.forward(st.embed(ids[:, PROMPT:]), ids[:, PROMPT:], PROMPT))
+    assert torch.equal(out[0], out[1]), "the fallback must be the per-token loop itself"
+
+
+@pytest.mark.parametrize("k", (0, 2, 4))
+def test_fast_verify_rolls_back(oracle, args, k):
+    """A rejected fast chunk rewinds like any other: same checkpoint contract, same committed stream.
+
+    `_spec_ckpt` is taken in `forward` BEFORE the branch, so the fast path inherits it untouched --
+    this is the test that keeps it that way. The replay deliberately stays on the per-token loop
+    (correctness over speed on a path that only runs when speculation already lost), and what has to
+    hold afterwards is that the stage answers as if the rejected tail had never been fed: compared
+    against a stage that was fed the committed prefix one token at a time and never speculated."""
+    s = 4
+    fast = stage_from_oracle(oracle, args, 0, args.n_layers, fast=True)
+    fast._spec = True
+    ids = _ids(PROMPT + s, args, seed=13)
+    fast.forward(fast.embed(ids[:, :PROMPT]), ids[:, :PROMPT], 0)
+    fast.forward(fast.embed(ids[:, PROMPT:]), ids[:, PROMPT:], PROMPT)
+    assert fast._spec_ckpt["start_pos"] == PROMPT and fast._spec_ckpt["s"] == s
+    fast._seek(PROMPT + k)
+    assert fast._pos == PROMPT + k
+
+    want = stage_from_oracle(REFCPU.build_oracle(args, SEED), args, 0, args.n_layers)
+    want.forward(want.embed(ids[:, :PROMPT]), ids[:, :PROMPT], 0)
+    for j in range(k):
+        want.forward(want.embed(ids[:, PROMPT + j:PROMPT + j + 1]), ids[:, PROMPT + j:PROMPT + j + 1],
+                     PROMPT + j)
+    for i, ((h_got, l_got), (h_want, l_want)) in enumerate(
+            zip(stream(fast, _ids(1, args, seed=5), PROMPT + k, STEPS),
+                stream(want, _ids(1, args, seed=5), PROMPT + k, STEPS))):
+        assert int(l_got.argmax()) == int(l_want.argmax()), \
+            f"token stream diverged {i} steps after rewinding a fast chunk to +{k}"
