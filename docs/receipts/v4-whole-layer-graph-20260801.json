@@ -11,35 +11,41 @@
     "trimmed_for_synthetic_bench": {"n_routed_experts": 8, "max_seq_len": 2048, "vocab_size": 2048, "dtype": "bf16", "expert_dtype": "None"}
   },
   "parity": {
-    "capture_safe_block_vs_reference_CPU": "torch.equal on hidden, logits, and every KV/compressor buffer over 40 decode steps (positions 20-59, window 16, ratios 4 and 8) -- the attention core is bit-exact to model.py Block.forward, proven GPU-free (tests/test_v4_whole_layer.py)",
+    "CORRECTION_2026-08-01": "An earlier version of this receipt claimed the capture-safe block is bit-exact to the reference over the FULL decode run. That was WRONG and is corrected below. The claim passed under default CPU threading and FAILED at OMP_NUM_THREADS=1 (hidden diverged at pos 43, ~6e-3). Root cause is NOT reassociation and NOT the mask/compress logic: the scores over the valid columns are bit-identical (max|narrow - wide| = 0.0), but index_score is full of EXACT ties (relu_ floors negatives to a hard 0.0) and torch.topk's tie-break is an artifact of its partition that varies with the array WIDTH and with the CPU THREAD COUNT. The reference is therefore not reproducible against itself across thread counts, and a fixed-width read breaks ties differently again.",
+    "capture_safe_block_vs_reference_CPU": "torch.equal on hidden, logits, and every KV/compressor buffer wherever the Indexer's selection is UNAMBIGUOUS -- 15 steps at index_topk 8 (pos 20-34) and the full 40-step run at index_topk 16 (pos 20-59, wrapping the 16-slot window 2.5x and crossing ten ratio-4 and five ratio-8 compression boundaries). This is what pins the device-side position, the fixed max-width masked read, the -1 padding and the compress/no-compress split.",
+    "indexer_tie_break": "The ONE documented deviation. The capture-safe path selects by a STABLE sort -- (score DESC, column index ASC) -- so it is deterministic on every width, thread count and device, where the reference's topk is not. It agrees with the reference on every tie-free selection and may pick a different column of IDENTICAL score otherwise. Proven directly on the shipped selection function: the selected SCORE MULTISET always matches the reference's (never a lower-scoring column) and the selected SET matches whenever the k-th and (k+1)-th best valid scores differ (tests/test_v4_whole_layer.py::test_fixed_width_selection_matches_reference_selection, ::test_selection_is_deterministic_across_widths).",
+    "buffers_under_selection_pressure": "NOT claimed. A diverged selection in an early indexer layer changes the INPUT of later layers, so their KV/compressor buffers diverge downstream too -- an earlier draft of this receipt asserted buffer equality here and that test failed, correctly.",
     "whole_layer_graph_stub_vs_eager_GPU": "bit-exact over 40 decode steps crossing the 128-window wrap and the ratio-4 and ratio-128 compression boundaries",
-    "moe_eager_graph_vs_reference_GPU": "bit-exact -- the deployable path (attn+islands graphed, real routed MoE eager) reproduces the reference block byte for byte",
-    "stage_whole_mode_vs_eager_GPU": "a Stage with V4_CUDA_GRAPH=whole is bit-exact to the eager Stage (tests/test_v4_whole_layer.py::test_whole_layer_stage_is_bit_exact_to_eager)"
+    "moe_eager_graph_vs_reference_GPU": "bit-exact on this config -- the deployable path (attn+islands graphed, real routed MoE eager) reproduced the reference block byte for byte; note this is subject to the same tie-break caveat and is not a universal guarantee",
+    "stage_whole_mode_vs_eager_GPU": "a Stage with V4_CUDA_GRAPH=whole is bit-exact to the eager Stage (tests/test_v4_whole_layer.py::test_whole_layer_stage_is_bit_exact_to_eager) -- the graph bar itself, which is unconditional"
   },
   "timing_per_decode_layer_ms": {
     "position": 200,
     "reps": 300,
     "note": "cpu = perf_counter around the launch submit (dispatch cost); wall = CUDA events (GPU). This box is dispatch-bound (eager cpu ~= wall), which is the scattered-consumer-GPU regime the graph is for.",
     "sum_over_3_layers": {
-      "eager_real":  {"cpu_ms": 16.18, "wall_ms": 16.13},
-      "island_real": {"cpu_ms": 13.47, "wall_ms": 13.42},
-      "moe_eager":   {"cpu_ms":  7.68, "wall_ms":  7.64},
-      "eager_stub":  {"cpu_ms": 15.53, "wall_ms": 15.49},
+      "eager_real":  {"cpu_ms": 14.93, "wall_ms": 14.88},
+      "island_real": {"cpu_ms": 12.70, "wall_ms": 12.66},
+      "moe_eager":   {"cpu_ms":  7.16, "wall_ms":  7.12},
+      "eager_stub":  {"cpu_ms": 14.07, "wall_ms": 14.03},
       "whole_stub":  {"cpu_ms":  1.18, "wall_ms":  1.93}
     }
   },
   "multipliers": {
-    "island_vs_eager_realMoE":    {"cpu": 1.20, "wall": 1.20, "meaning": "the existing lever (hc islands only)"},
-    "moe_eager_vs_eager_realMoE": {"cpu": 2.11, "wall": 2.11, "meaning": "DEPLOYABLE today: attention core graphed, routed MoE eager, bit-exact to the reference"},
-    "whole_vs_eager_stubMoE":     {"cpu": 13.17, "wall": 8.02, "meaning": "CEILING: the whole layer graphed -- realized once the MoE is graph-safe (sibling grouped-fp4 MoE)"}
+    "measured_after_the_tie_break_fix": true,
+    "island_vs_eager_realMoE":    {"cpu": 1.18, "wall": 1.18, "meaning": "the existing lever (hc islands only)"},
+    "moe_eager_vs_eager_realMoE": {"cpu": 2.08, "wall": 2.09, "meaning": "DEPLOYABLE today: attention core graphed, routed MoE eager (bit-exact to the reference where the Indexer selection is unambiguous -- see parity.indexer_tie_break)"},
+    "whole_vs_eager_stubMoE":     {"cpu": 11.94, "wall": 7.26, "meaning": "CEILING: the whole layer graphed -- realized once the MoE is graph-safe (sibling grouped-fp4 MoE)"}
   },
   "how_the_attention_core_was_made_capture_safe": {
     "1_device_position": "start_pos enters as a length-1 device buffer; every kv_cache[:, p%win] / kv_state[:, p%ratio] / kv_cache[:, p//ratio] store becomes index_copy_ on a device-derived slot, chosen at replay not baked at capture",
-    "2_fixed_width_masked_read": "the Indexer scores q against the WHOLE kv_cache (fixed MAXW), masks columns >= end_pos//ratio to -inf, takes a FIXED topk of index_topk, and maps future-slot selections to -1; sparse_attn treats -1 as a no-op, so the fixed-width topk is byte-identical to the reference's growing-width one",
+    "2_fixed_width_masked_read": "the Indexer scores q against the WHOLE kv_cache (fixed MAXW), masks columns >= end_pos//ratio to -inf, selects a FIXED k = index_topk, and maps future-slot picks to -1; sparse_attn treats -1 as a no-op, and the scores over the valid columns are bit-identical to the reference's narrow einsum (0.0 difference). Selection is by a STABLE sort, not topk -- see parity.indexer_tie_break for why, and for the one place this is not a free rewrite",
     "3_two_graphs_by_position": "should_compress = (start_pos+1)%ratio is host-known, so the block is captured twice (compress / no-compress) and the replay picks by position -- zero data-dependent control flow inside a graph"
   },
   "risks": {
-    "fixed_width_indexer_cost": "the masked einsum reads MAXW = max_seq_len/ratio every step instead of a growing slice, so it does the full-context work even early; position-INVARIANT cost, a real trade for graphability",
+    "REFERENCE_TOPK_IS_NOT_DETERMINISTIC": "Found while chasing the pos-43 divergence, and it is a hazard for the RING independently of this lever: the vendored Indexer's `index_score.topk(...)` resolves exact ties (which are common -- relu_ floors negatives to a hard 0.0) by an artifact of its partition, so the SAME reference on the SAME input can select different compressed slots at different CPU thread counts, array widths, or devices. On a scattered ring that means two boxes running the same layer can disagree, and a speculative verify can reject its own drafter's tokens for no modelling reason. The capture-safe path pins this with a stable (score DESC, index ASC) sort; the eager reference path does NOT and is worth pinning the same way before the ring depends on cross-box determinism.",
+    "indexer_tie_break_deviation": "Because of the above, the capture-safe path is bit-exact to the reference only where the selection is tie-free; on an exact tie it may attend a different, equally-scoring compressed slot (measured effect at the toy config: ~6e-3 on the hidden state). It never selects a lower-scoring column (proven: identical selected score multiset). Serving is self-consistent -- every stage runs the same path -- but a receipt must not call this byte-identical to DeepSeek's reference.",
+    "fixed_width_indexer_cost": "the masked einsum reads MAXW = max_seq_len/ratio every step instead of a growing slice, so it does the full-context work even early; position-INVARIANT cost, a real trade for graphability. The stable sort that replaced topk also sorts MAXW rather than selecting k of it -- at the measured config the end-to-end multiplier moved 2.11x -> 2.08x and 8.02x -> 7.26x, but at a long max_seq_len (MAXW = max_seq_len/4) this is the first thing to re-measure",
     "kv_rewind_under_speculative_rollback": "the graph writes are position-parameterized so a rewind (_seek: restore snapshot + replay accepted prefix) advances the SAME slots the eager path would; the replay uses the eager per-token path (not the graph) by design (_replaying guard), so rollback correctness rides on the existing _snapshot/_seek proof, unchanged",
     "dispatch_bound_dependence": "the 8x is on a dispatch-bound box; a fast-CPU/uncontended box is nearer the GPU compute floor (~0.6ms/layer here, stub) and the multiplier is smaller -- but vast/consumer boxes are dispatch-bound, which is the target",
     "moe_is_the_ceiling": "the deployable multiplier is capped at ~2x until the routed MoE is graph-safe; the whole-layer 8x needs the sibling grouped-fp4 MoE to compose in"

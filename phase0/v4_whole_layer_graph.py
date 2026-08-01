@@ -25,12 +25,18 @@ kernels on the same bytes -- bit-exact, not reassociation-drifted. The three fix
      the same byte, chosen at REPLAY time from the copied-in position instead of frozen at capture.
 
   #2 FIXED MAX-WIDTH + MASK.  The Indexer's einsum reads the WHOLE `kv_cache` (a fixed [., MAXW, .])
-     and masks scores at positions >= end_pos//ratio to -inf; its topk takes a FIXED k = index_topk
-     and maps any selection that landed on a masked (future) slot to -1. sparse_attn already treats a
-     -1 index as "no position" (v4_sparse_attn_sm120.py: it zeroes that KV row and pushes the score to
-     -inf, contributing to neither numerator nor denominator), so a fixed-width topk padded with -1 is
-     BYTE-IDENTICAL to the reference's variable-width topk over the same valid set -- the extra -inf
-     blocks of the online softmax rescale by exp(0)=1 and add 0. The window/compress index LISTS
+     and masks scores at positions >= end_pos//ratio to -inf; its selection takes a FIXED k =
+     index_topk and maps any pick that landed on a masked (future) slot to -1. sparse_attn already
+     treats a -1 index as "no position" (v4_sparse_attn_sm120.py: it zeroes that KV row and pushes the
+     score to -inf, contributing to neither numerator nor denominator), so the -1 padding is exactly a
+     no-op -- the extra -inf blocks of the online softmax rescale by exp(0)=1 and add 0 -- and the
+     SCORES over the valid columns come out bit-identical to the reference's narrow einsum (measured:
+     max|narrow - wide| = 0.0). The ONE place this is not a free rewrite is the tie-break: the
+     reference's `topk` resolves EXACT ties (relu_ floors negatives to a hard 0.0, so they are common)
+     by an artifact of its partition that varies with array width AND CPU thread count, so it is not
+     reproducible even against itself. This selects by a STABLE sort -- (score DESC, index ASC) -- which
+     is deterministic everywhere and agrees with the reference on every tie-free selection; see the
+     `_indexer_decode_cs` comment and the `ties` risk in the receipt. The window/compress index LISTS
      (get_window_topk_idxs / get_compress_topk_idxs) are the reference's own, built eagerly per step
      into a static buffer and copied in before replay: they are a handful of tiny launches, not the
      GEMM-and-attention bulk the graph is for, and building them in-graph would mean transcribing
@@ -170,9 +176,37 @@ def _indexer_decode_cs(R, I, x, qr, pos, end_ratio, freqs_row, offset, arange_ma
     weights = I.weights_proj(x) * (I.softmax_scale * I.n_heads ** -0.5)
     index_score = torch.einsum("bshd,btd->bsht", q, I.kv_cache.narrow(0, 0, 1))
     index_score = (index_score.relu_() * weights.unsqueeze(-1)).sum(dim=2)
+    return select_compress_topk(index_score, end_ratio, index_topk, offset, arange_maxw)
+
+
+def select_compress_topk(index_score, end_ratio, index_topk, offset, arange_maxw):
+    """Fixed-width masked selection of the compressed slots to attend: the #2 rewrite, in one place.
+
+    Reference (Indexer.forward, decode): `index_score[..., :end_pos//ratio].topk(min(index_topk,
+    end_pos//ratio))[1] + offset` -- a GROWING read width and a GROWING k, neither capturable. Here the
+    scores arrive at a FIXED max width, columns past `end_ratio` are masked to -inf, k is the fixed
+    `index_topk`, and any pick that lands on a masked (future) column becomes -1, which sparse_attn
+    treats as "no position". Tested directly in tests/test_v4_whole_layer.py."""
     valid = (arange_maxw < end_ratio).view(1, 1, -1)
     index_score = index_score.masked_fill(~valid, float("-inf"))
-    topk_idxs = index_score.topk(index_topk, dim=-1)[1]
+    # DETERMINISTIC selection: top-k by (score DESC, column index ASC), via a STABLE sort.
+    #
+    # `topk` cannot be used here and this is the one place the fixed-width read is NOT a free
+    # rewrite of the reference. index_score is riddled with EXACT ties -- `relu_()` floors every
+    # negative score to a hard 0.0, and bf16 collides -- and torch.topk's tie-break is an artifact of
+    # its partition, so it depends on the array WIDTH (the reference's end_pos//ratio vs this fixed
+    # max width) and on the CPU thread count. Two runs of the SAME reference at different
+    # OMP_NUM_THREADS can pick different members of a tie, and a fixed-width read picks a different
+    # one again. A stable descending sort pins it: among equal scores the lowest column index wins,
+    # on every width, thread count, and device.
+    #
+    # So this is deterministic where the reference is not, and it agrees with the reference on every
+    # tie-FREE selection (a -inf column never outranks a finite one, so the top-k finite columns are
+    # the same set). Where the reference's own tie-break is ambiguous it may select a different
+    # column of IDENTICAL score -- see tests/test_v4_whole_layer.py, which proves the selected score
+    # multiset always matches, and docs/receipts/v4-whole-layer-graph-20260801.json's `ties` risk.
+    order = index_score.sort(dim=-1, descending=True, stable=True)[1]
+    topk_idxs = order[..., :index_topk]
     topk_idxs = torch.where(topk_idxs < end_ratio, topk_idxs + offset, topk_idxs.new_full((), -1))
     return topk_idxs.int()
 
