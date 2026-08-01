@@ -91,6 +91,12 @@ from collections import deque
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from safetensors import safe_open
 
+# The lever registry. Imported at module scope ON PURPOSE, and deliberately not guarded: a stage that
+# cannot audit its own levers is a stage whose numbers mean nothing, so a deploy that forgets this
+# file must fail at import -- loudly, in the launch log, before the ring forms -- rather than serve
+# unaudited. v4_levers imports nothing from here at module scope, so this cannot cycle.
+import v4_levers
+
 # Nothing here reads the checkpoint at import time (k3_stage's rule): resolving lazily costs one
 # memoized call and lets `import v4_stage` work on a box with no model on disk -- which is every box
 # that runs the parity tests.
@@ -1179,26 +1185,33 @@ class Stage:
                 f"graph={self._graph_mode if self._block_graphs is not None else 'off'} "
                 f"fast_verify={f'<={self._chunk_cap}' if self._fast else 'off'} "
                 f"moe={self._moe_status()} "
-                f"ref_slim={self._ref_slim_status()}>")
+                f"ref_slim={self._ref_slim_status()} "
+                f"levers={v4_levers.summary(self)}>")
 
     def _moe_status(self):
-        """Which MoE forward this stage will actually take, and whether the bank layout took.
+        """The WHOLE live MoE.forward chain, top first, and whether the bank layout took.
 
-        OBSERVED, not declared: it reads the function bound on the reference class, not the env flag,
-        because the whole point of this line is to answer "did the lever fire?" on a live ring. The
-        grouped install declines silently off-CUDA and the bank layout declines per layer, so
-        `V4_MOE_GROUPED=1` alone proves nothing.
+        OBSERVED, not declared: it reads the functions bound on the reference class, not the env
+        flags, because the whole point of this line is to answer "did the lever fire?" on a live
+        ring. The grouped install declines silently off-CUDA and the bank layout declines per layer,
+        so `V4_MOE_GROUPED=1` alone proves nothing.
 
-        BUT `grouped/8` DOES NOT PROVE IT EITHER, which this docstring used to claim. The N counts
-        layers that were BANKED at load, and a banked layer can still decline every decode step --
-        which is exactly what a 6-layer profile caught: `grouped/6` in the repr, and four of the six
-        on the reference path all night. Banked is a load-time fact; whether a layer grouped is a
-        run-time one, and the run-time answer is `v4_moe_grouped.coverage(self.layers)`."""
-        M = ref()
-        fwd = M.MoE.forward
-        kind = ("grouped" if getattr(fwd, "_v4_grouped", False) else
-                "decode" if getattr(fwd, "_v4_decode_fast", False) else "ref")
-        return f"{kind}/{self._moe_banked}" if kind == "grouped" else kind
+        THE CHAIN, NOT THE TOP OF IT. This used to classify the single bound function against the two
+        markers it knew and fall through to the string "ref" for anything else -- so a ring running
+        `V4_MOE_MULTI=1 V4_MOE_GROUPED=1`, where the live chain is multi -> grouped -> decode -> ref,
+        printed `moe=ref` on all six stages while the grouped kernel was installed and serving every
+        decode step. An operator chased that for a night. A partial observation is worse than none:
+        it reads as evidence. `v4_levers.moe_chain` walks every link, so a lever added later appears
+        instead of erasing the ones below it.
+
+        AND `grouped/8` STILL DOES NOT PROVE THE KERNEL FIRED. The N counts layers that were BANKED
+        at load, and a banked layer can still decline every decode step -- which is exactly what a
+        6-layer profile caught: `grouped/6` in the repr, and four of the six on the reference path
+        all night. Banked is a load-time fact; whether a layer grouped is a run-time one, and the
+        run-time answer is `v4_moe_grouped.coverage(self.layers)`."""
+        chain = v4_levers.moe_chain(ref())
+        s = ">".join(chain) or "?"
+        return f"{s}/{self._moe_banked}" if "grouped" in chain else s
 
     def _ref_slim_status(self):
         """Which v4_ref_slim overrides are live on the reference — same observed-not-declared rule."""
