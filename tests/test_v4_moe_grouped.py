@@ -296,13 +296,22 @@ def _painted(moe):
 
 def test_bank_layout_is_a_noop_with_the_flag_off(oracle, monkeypatch):
     """Default OFF has to mean the loader allocates nothing and moves nothing — every expert keeps
-    the exact tensor its constructor gave it, so a stage on the shipped default is byte-identical."""
+    the exact tensor its constructor gave it, so a stage on the shipped default is byte-identical.
+
+    `preserve=False` is checked here too, and it is the whole reason the rest of the v4 suite does
+    not have to re-prove itself against this change: the flag is read on `bank_layout`'s FIRST line,
+    before `preserve` is looked at, so with the env unset — which is every test that is not this file
+    — `Stage.__init__`'s new argument cannot reach a single tensor. Releasing before allocating is
+    unobservable on the default path, not merely harmless on it."""
     monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", False)
-    moe = _fp4_moe(oracle)
-    ptrs = [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS]
-    assert GROUPED.bank_layout(moe) == 0
-    assert [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS] == ptrs
-    assert not hasattr(moe, "_grouped_bank"), "the flag-off path must not even mark the module"
+    for preserve in (True, False):
+        moe = _fp4_moe(oracle)
+        ptrs = [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS]
+        assert GROUPED.bank_layout(moe, preserve=preserve) == 0
+        assert [getattr(e, k).weight.data_ptr() for e in moe.experts for k in _KINDS] == ptrs
+        assert all(getattr(e, k).weight.numel() for e in moe.experts for k in _KINDS), \
+            "the flag-off path must not void a parameter even under preserve=False"
+        assert not hasattr(moe, "_grouped_bank"), "the flag-off path must not even mark the module"
 
 
 def test_bank_layout_leaves_one_copy_of_the_weights_not_two(oracle, monkeypatch):
