@@ -1,0 +1,358 @@
+"""EVERY LEVER IN THE COMPOSED STACK ACTUALLY FIRES — one subprocess per env flag.
+
+WHY THIS FILE EXISTS. M2.5 once banked the conclusion "CUDA graphs don't help" off a ring where a
+forgotten env meant every job had run eager: the flag was set on the launcher and never reached the
+process that mattered, and nothing in the run could tell the difference between "the lever fired and
+did nothing" and "the lever never fired". That is the single most expensive failure mode a stack of
+seven opt-in flags has, and it is not a correctness bug — every test passes, the receipts verify, the
+number is just meaningless.
+
+So each lever here is armed in a FRESH INTERPRETER and the process is made to report the state it
+actually reached. A subprocess is not fussiness: every one of these flags is read at MODULE IMPORT
+(`V4_x = os.environ.get(...)` at the top of the file), so monkeypatching the env inside a running
+pytest proves nothing about a stage that imported the module ten tests ago. `Stage.__repr__` is the
+same surface an operator reads on the live ring, and it reports OBSERVED state — which forward is
+bound to the reference class, which overrides are live, how many layers took the bank — so these
+assertions and a ring's own logs are the same evidence.
+
+The CUDA-only levers (graphs, the grouped MoE kernel) cannot fire on a CPU box. What is proven here
+is the half that a CPU CAN prove and that the ring bug was actually in: the flag is READ, resolved to
+the right MODE, and declines LOUDLY with a reason rather than silently staying off.
+
+Run:  OMP_NUM_THREADS=1 python3 -m pytest tests/test_v4_full_stack.py -q
+"""
+import os
+import subprocess
+import sys
+import textwrap
+
+import pytest
+
+ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+PHASE0 = os.path.join(ROOT, "phase0")
+
+pytest.importorskip("torch")
+
+# Every probe here spawns a fresh interpreter -- these flags are read at module import, so
+# an in-process monkeypatch would prove nothing about a stage that imported the module first.
+pytestmark = pytest.mark.integration
+
+
+def run_probe(body, **env):
+    """Execute `body` in a fresh interpreter with `env` set, return its stdout. Fails loudly."""
+    e = dict(os.environ)
+    e.setdefault("OMP_NUM_THREADS", "1")
+    e.update({k: str(v) for k, v in env.items()})
+    e["PYTHONPATH"] = PHASE0 + os.pathsep + ROOT + os.pathsep + e.get("PYTHONPATH", "")
+    src = "import sys\nsys.path.insert(0, %r)\n" % PHASE0 + textwrap.dedent(body)
+    p = subprocess.run([sys.executable, "-c", src], capture_output=True, text=True, timeout=900, env=e)
+    assert p.returncode == 0, f"probe failed ({p.returncode})\n--- stdout\n{p.stdout}\n--- stderr\n{p.stderr}"
+    return p.stdout
+
+
+# ── the flags are READ, and read as the right thing ───────────────────────────────────────────────
+
+@pytest.mark.parametrize("val,mode", [
+    (None, "off"), ("0", "off"), ("", "off"),
+    ("1", "island"), ("island", "island"), ("on", "island"),
+    ("whole", "whole"), ("2", "whole"), ("eager", "whole"),
+    ("yes", "off"),          # unknown -> OFF, never a half-armed guess
+])
+def test_cuda_graph_env_resolves_to_the_documented_mode(val, mode):
+    """V4_CUDA_GRAPH is a MODE, not a bool, after the whole-layer merge — and an unrecognised value
+    must fall to `off` rather than to some default mode. Read in a fresh process because the module
+    binds it at import."""
+    env = {} if val is None else {"V4_CUDA_GRAPH": val}
+    out = run_probe("""
+        import v4_stage
+        print("MODE", v4_stage._graph_mode())
+    """, **env)
+    assert out.strip() == f"MODE {mode}"
+
+
+def test_every_lever_flag_is_read_at_import():
+    """One process, all flags on: each module-level flag must come back TRUE. This is the cheap gate
+    on the actual ring bug — a flag typo, a renamed env, a module that reads a different name than
+    the launcher sets — and it fails on the name, not on a silent no-op three hours into a run."""
+    out = run_probe("""
+        import v4_stage, v4_pipe, v4_moe_grouped, v4_ref_slim, v4_dspark_fast, v4_moe_decode
+        print("GRAPH", v4_stage._graph_mode())
+        print("FAST_VERIFY", v4_stage.V4_FAST_VERIFY, v4_stage.V4_FAST_VERIFY_MAX)
+        print("SPEC_DEPTH_ENV", __import__("os").environ["V4_SPEC_DEPTH"])
+        print("PIPELINED", v4_pipe.V4_PIPELINED_SPEC)
+        print("CONF_GATE", v4_pipe.V4_DSPARK_CONF_GATE)
+        print("MOE_GROUPED", v4_moe_grouped.V4_MOE_GROUPED)
+        print("MOE_DECODE", v4_moe_decode.V4_MOE_DECODE)
+        print("REF_SLIM", v4_ref_slim.V4_REF_SLIM, v4_ref_slim.V4_REF_SLIM_NOQAT)
+        print("DSPARK_FAST", v4_dspark_fast.V4_DSPARK_FAST)
+    """, V4_CUDA_GRAPH="whole", V4_FAST_VERIFY=1, V4_FAST_VERIFY_MAX=12, V4_SPEC_DEPTH=24,
+         V4_PIPELINED_SPEC=1, V4_DSPARK_CONF_GATE=1, V4_MOE_GROUPED=1, V4_MOE_DECODE=1,
+         V4_REF_SLIM=1, V4_REF_SLIM_NOQAT=1, V4_DSPARK_FAST=1)
+    got = dict(line.split(" ", 1) for line in out.strip().splitlines())
+    assert got["GRAPH"] == "whole"
+    assert got["FAST_VERIFY"] == "True 12"
+    assert got["SPEC_DEPTH_ENV"] == "24"
+    assert got["PIPELINED"] == "True"
+    assert got["CONF_GATE"] == "True"
+    assert got["MOE_GROUPED"] == "True"
+    assert got["MOE_DECODE"] == "True"
+    assert got["REF_SLIM"] == "True True"
+    assert got["DSPARK_FAST"] == "True"
+
+
+def test_no_lever_is_armed_by_default():
+    """The other half of the same bar, and the one that keeps "default = byte-identical to base"
+    honest: with a clean env every flag is off and the reference's own methods are still bound."""
+    out = run_probe("""
+        import v4_stage, v4_pipe, v4_moe_grouped, v4_ref_slim, v4_dspark_fast
+        import v4_ref_cpu
+        mod = v4_ref_cpu.load_ref()
+        print("GRAPH", v4_stage._graph_mode())
+        print("FLAGS", v4_stage.V4_FAST_VERIFY, v4_pipe.V4_PIPELINED_SPEC,
+              v4_pipe.V4_DSPARK_CONF_GATE, v4_moe_grouped.V4_MOE_GROUPED,
+              v4_ref_slim.V4_REF_SLIM, v4_ref_slim.V4_REF_SLIM_NOQAT,
+              v4_dspark_fast.V4_DSPARK_FAST)
+        print("REBOUND", getattr(mod.Indexer.forward, "_v4_ref_slim", False),
+              getattr(mod.act_quant, "_v4_ref_slim", False),
+              getattr(mod.MoE.forward, "_v4_grouped", False))
+    """, **{k: "" for k in ("V4_CUDA_GRAPH", "V4_FAST_VERIFY", "V4_PIPELINED_SPEC",
+                            "V4_DSPARK_CONF_GATE", "V4_MOE_GROUPED", "V4_REF_SLIM",
+                            "V4_REF_SLIM_NOQAT", "V4_DSPARK_FAST")})
+    assert "GRAPH off" in out
+    assert "FLAGS False False False False False False False" in out
+    assert "REBOUND False False False" in out
+
+
+# ── the flags REACH the object that acts on them ──────────────────────────────────────────────────
+
+STAGE_PROBE = """
+    import v4_ref_cpu, v4_stage
+    args = v4_ref_cpu.cpu_args()
+    st = v4_stage.Stage(0, 2, args, head=True, tail=False, device="cpu")
+    print("REPR", repr(st))
+    print("FAST", st._fast, st._chunk_cap, st._chunk_ok(1), st._chunk_ok(4))
+    print("SPEC_DEPTH", st._spec_depth, st._spec_ckpts.maxlen)
+    print("GRAPHMODE", st._graph_mode, st._block_graphs is None)
+    print("BANKED", st._moe_banked)
+"""
+
+# Appended to STAGE_PROBE (same indent — the two are dedented together) to report WHY the grouped
+# MoE could not arm on this box, rather than only that it did not.
+GROUPED_TAIL = """
+    import torch, v4_moe_grouped
+    mod = v4_ref_cpu.load_ref()
+    moe = st.layers[0].ffn
+    e = moe.experts[moe.experts_start_idx]
+    print("FLAG", v4_moe_grouped.V4_MOE_GROUPED)
+    print("EXPERT_DTYPE_IS_FP4", e.w1.weight.dtype == torch.float4_e2m1fn_x2)
+    print("CUDA", torch.cuda.is_available())
+    print("INSTALL", v4_moe_grouped.install(mod))
+"""
+
+
+def test_fast_verify_reaches_the_stage_and_never_claims_s_equals_1():
+    """V4_FAST_VERIFY arms the chunk path AND the chunk-block class — and `_chunk_ok(1)` is False,
+    which is the composition fact the pipelined recipe rests on: pipelining sends only s=1 frames, so
+    an armed fast-verify has nothing to claim and the per-token levers keep the position."""
+    out = run_probe(STAGE_PROBE, V4_FAST_VERIFY=1, V4_FAST_VERIFY_MAX=6)
+    assert "FAST True 6 False True" in out, out
+    assert "fast_verify=<=6" in out, "the repr must show the armed cap"
+
+    off = run_probe(STAGE_PROBE, V4_FAST_VERIFY="")
+    assert "FAST False 0 False False" in off
+    assert "fast_verify=off" in off
+
+
+def test_spec_depth_reaches_the_rollback_ring():
+    """The W-deep rollback ring is what lets pipelining stream W frames before the first is judged;
+    its depth must come from the env, not from a default nobody set."""
+    out = run_probe(STAGE_PROBE, V4_SPEC_DEPTH=24)
+    assert "SPEC_DEPTH 24 24" in out, out
+    assert "spec=off/24" in out, "the repr must show the depth even before the stage is armed"
+
+
+def test_graph_mode_reaches_the_stage_and_declines_loudly_on_cpu():
+    """A CUDA-only lever on a CPU box must decline with a REASON on stdout, never silently stay off.
+    That distinction is the whole point: `graph=off` with no line above it is indistinguishable from
+    a flag that was never set, which is exactly how m25 banked a wrong conclusion."""
+    for mode in ("island", "whole"):
+        out = run_probe(STAGE_PROBE, V4_CUDA_GRAPH=mode)
+        assert f"GRAPHMODE {mode} True" in out, out
+        assert "GRAPH REFUSED" in out and "CUDA" in out, "a CPU decline must say why"
+        assert "graph=off" in out, "the repr reports what was ARMED, not what was asked for"
+
+
+def test_ref_slim_reaches_the_reference_and_the_repr_reports_it():
+    """Item 1 and item 2 are separately gated; the repr names the ones that are actually live."""
+    both = run_probe(STAGE_PROBE, V4_REF_SLIM=1, V4_REF_SLIM_NOQAT=1)
+    assert "ref_slim=indexer+noqat" in both, both
+    only1 = run_probe(STAGE_PROBE, V4_REF_SLIM=1, V4_REF_SLIM_NOQAT="")
+    assert "ref_slim=indexer" in only1 and "noqat" not in only1.split("ref_slim=")[1]
+    only2 = run_probe(STAGE_PROBE, V4_REF_SLIM="", V4_REF_SLIM_NOQAT=1)
+    assert "ref_slim=noqat" in only2
+    off = run_probe(STAGE_PROBE, V4_REF_SLIM="", V4_REF_SLIM_NOQAT="")
+    assert "ref_slim=off" in off
+
+
+def test_grouped_moe_declines_on_this_box_for_the_documented_reason():
+    """The grouped MoE is the one lever a CPU box cannot arm, and it must decline for the reason the
+    module documents rather than for a reason nobody checked.
+
+    Two independent gates, both real: `install` refuses without CUDA (the kernel is tilelang), and
+    `bank_layout`/`_relayout_moe` refuses experts that are not fp4 (the CPU parity model is bf16 and
+    has to stay byte-identical). So on this box `V4_MOE_GROUPED=1` legitimately yields `moe=decode`
+    and `BANKED 0` — and the test asserts the CAUSE, not just the outcome, because "declined because
+    it is bf16 on a CPU" and "declined because the flag never arrived" look identical otherwise. The
+    layout mechanism itself is proven against an fp4 stand-in in tests/test_v4_moe_grouped.py; the
+    ON-A-REAL-CARD half is `moe=grouped/N` in the repr, which is what made the ring failure visible
+    (the lever read as on for every job while `N` was 0)."""
+    out = run_probe(STAGE_PROBE + GROUPED_TAIL, V4_MOE_GROUPED=1, V4_MOE_DECODE=1)
+    assert "FLAG True" in out, "the flag must be READ even where the lever cannot arm"
+    assert "EXPERT_DTYPE_IS_FP4 False" in out, "this box's decline reason is the bf16 parity model"
+    assert "CUDA False" in out and "INSTALL False" in out, "no CUDA -> the kernel install declines"
+    assert "BANKED 0" in out and "moe=decode" in out, out
+    assert "grouped-MoE bank layout" not in out, "a decline must not announce a layout it did not do"
+
+
+def test_dspark_fast_rebinds_the_tail_advance():
+    """V4_DSPARK_FAST collapses the drafter's wasted intermediate forwards; prove the rebind lands on
+    DSparkTail rather than being reported by a flag nobody consumed."""
+    out = run_probe("""
+        import v4_dspark_draft as D, v4_dspark_fast as F
+        took = F.install(D)
+        print("TOOK", took, getattr(D.DSparkTail.advance_and_draft, "_v4_dspark_fast", False))
+        print("IDEMPOTENT", F.install(D))
+    """, V4_DSPARK_FAST=1)
+    assert "TOOK True True" in out, out
+    assert "IDEMPOTENT False" in out, "a second install must not chain the fast path onto itself"
+
+    off = run_probe("""
+        import v4_dspark_draft as D, v4_dspark_fast as F
+        print("TOOK", F.install(D), getattr(D.DSparkTail.advance_and_draft, "_v4_dspark_fast", False))
+    """, V4_DSPARK_FAST="")
+    assert "TOOK False False" in off
+
+
+def test_pipelined_flag_reaches_the_coordinator_choice():
+    """The serve loop picks the coordinator from V4_PIPELINED_SPEC or the job's own `pipelined`; both
+    inputs must reach the same branch, and the default must stay serial."""
+    out = run_probe("""
+        import v4_pipe
+        print("ENV", v4_pipe.V4_PIPELINED_SPEC)
+        print("HAS", callable(v4_pipe.coordinate_dspark_pipelined))
+    """, V4_PIPELINED_SPEC=1)
+    assert "ENV True" in out and "HAS True" in out
+    off = run_probe("import v4_pipe; print('ENV', v4_pipe.V4_PIPELINED_SPEC)", V4_PIPELINED_SPEC="")
+    assert "ENV False" in off
+
+
+# ── the one combination that is REFUSED rather than silently ignored ──────────────────────────────
+
+def test_conf_gate_with_pipelining_is_refused_not_dropped():
+    """The confidence gate trims the tail's OFFERED BLOCK LENGTH. The pipelined coordinator streams
+    one s=1 frame per position and never sends a block, so there is nothing for the gate to trim.
+    Passing both must RAISE — a gate that silently did nothing would be measured on the ring as
+    "confidence gating did not help", which is the same lie as a graph that never captured."""
+    out = run_probe("""
+        import inspect, v4_pipe
+        src = inspect.getsource(v4_pipe._coord_cli)
+        assert "wants_conf" in src, "the serve loop no longer reconciles the two -- recheck"
+        assert "raise ValueError" in src
+        # the serial coordinator takes the knobs, the pipelined one does not even accept them
+        assert "conf_gate" in inspect.signature(v4_pipe.coordinate_dspark).parameters
+        assert "conf_gate" not in inspect.signature(v4_pipe.coordinate_dspark_pipelined).parameters
+        print("REFUSED OK")
+    """)
+    assert "REFUSED OK" in out
+
+
+def test_fast_verify_is_bypassed_by_every_s_equals_1_frame():
+    """The composition rule for the ring recipe, asserted on the dispatch itself rather than trusted.
+
+    Stage.forward tests `start_pos == 0 or s == 1` BEFORE `_chunk_ok(s)`, so a pipelined frame (always
+    s=1) takes `_run` — where the graphs, the grouped MoE and ref-slim live — and can never take the
+    chunk path. Fast-verify is therefore not additive with the per-token levers; it is the alternative
+    to them, and only the serial coordinator can reach it."""
+    out = run_probe("""
+        import ast, inspect, textwrap, v4_stage
+        tree = ast.parse(textwrap.dedent(inspect.getsource(v4_stage.Stage.forward)))
+        # Find the if/elif chain that dispatches the pass, and read its arms IN ORDER.
+        chain = None
+        for node in ast.walk(tree):
+            if isinstance(node, ast.If) and "_chunk_ok" in ast.dump(node):
+                chain = node
+                break
+        assert chain is not None, "Stage.forward no longer dispatches on _chunk_ok"
+        arms = []
+        n = chain
+        while isinstance(n, ast.If):
+            arms.append(ast.dump(n.test))
+            n = n.orelse[0] if len(n.orelse) == 1 and isinstance(n.orelse[0], ast.If) else None
+        assert "start_pos" in arms[0] and "'s'" in arms[0], arms
+        assert "_chunk_ok" in arms[1], arms
+        assert not any("_chunk_ok" in a for a in arms[:1]), "the chunk path moved ahead of s==1"
+        print("ARMS", len(arms))
+        print("ORDER OK")
+    """)
+    assert "ORDER OK" in out and "ARMS 2" in out
+
+
+# ── the levers do not change WHAT THE RING SERVES ────────────────────────────────────────────────
+
+TOKENS = __import__("re").compile(r"^\s*tokens \((\w+)\)\s+(\[[0-9, ]+\])\s*$", __import__("re").M)
+
+
+def selftest_streams(**env):
+    """Run the offline CPU ring selftest under `env`; return {path: token list} and require ALL PASS."""
+    out = run_probe("""
+        import v4_pipe
+        v4_pipe.selftest()
+    """, **env)
+    assert "ALL PASS" in out, f"the selftest itself failed under {env}\n{out}"
+    streams = dict(TOKENS.findall(out))
+    assert streams, f"no token lines parsed\n{out}"
+    return streams
+
+
+# The ring launch recipe, as documented in docs/V4_FULL_STACK.md. If this list changes, the doc and
+# this test change together — that is the point of pinning it in a test rather than only in prose.
+RING_RECIPE = dict(V4_PIPELINED_SPEC=1, V4_CUDA_GRAPH="whole", V4_DSPARK_FAST=1,
+                   V4_MOE_GROUPED=1, V4_MOE_DECODE=1, V4_REF_SLIM=1)
+
+
+def test_the_ring_recipe_serves_exactly_what_the_default_serves():
+    """THE BAR THIS BRANCH IS FOR. Every lever in the launch recipe on at once must emit the SAME
+    tokens as the all-off default, on every path the selftest drives.
+
+    "ALL PASS" is NOT this bar and cannot be. The selftest's own assertions compare each config's
+    ring against THAT CONFIG'S reference, so a lever that moved the ring and the reference together
+    passes in-config while changing what the ring actually serves. Only a cross-config comparison
+    catches that, and it did: it is what found V4_REF_SLIM_NOQAT below."""
+    base = selftest_streams()
+    lever = selftest_streams(**RING_RECIPE)
+    common = sorted(set(base) & set(lever))
+    assert set(common) >= {"ring", "ref", "spec", "dspark", "pipe"}, common
+    for path in common:
+        assert base[path] == lever[path], (
+            f"the ring recipe changed the {path} stream\n  default: {base[path]}\n  recipe:  {lever[path]}")
+
+
+def test_noqat_is_the_one_lever_that_changes_the_stream_and_is_therefore_not_in_the_recipe():
+    """V4_REF_SLIM_NOQAT removes a deliberate PRECISION REDUCTION (the reference quantizes KV/Q to
+    fp8/fp4 and dequantizes straight back, to simulate an fp8 KV deployment). Dropping it makes the
+    run strictly MORE precise than the reference — which is still a different answer, and on the toy
+    config it moves tokens from step 3 on.
+
+    It is documented APPROXIMATE in v4_ref_slim's module docstring, and the selftest passes with it
+    on because the ring and its reference move together. So it must stay OUT of any run whose claim
+    is "bit-identical to greedy", which is the headline claim of the pipelined arm. Asserting the
+    divergence rather than the equality keeps it that way: if a future change makes NOQAT lossless
+    this test fails and someone has to decide deliberately, instead of it drifting into the recipe."""
+    assert "V4_REF_SLIM_NOQAT" not in RING_RECIPE, "NOQAT is not lossless — keep it out of the recipe"
+    base = selftest_streams()
+    noqat = selftest_streams(V4_PIPELINED_SPEC=1, V4_REF_SLIM=1, V4_REF_SLIM_NOQAT=1)
+    assert base["ref"] != noqat["ref"], (
+        "NOQAT no longer changes the reference stream — re-derive whether it is now lossless "
+        "before letting it into the recipe")
+    # and it moves every path together, which is why the in-config selftest cannot see it
+    assert noqat["ref"] == noqat["ring"] == noqat["pipe"], noqat

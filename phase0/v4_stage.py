@@ -126,29 +126,11 @@ V4_FAST_VERIFY_MAX = int(os.environ.get("V4_FAST_VERIFY_MAX", "16") or 16)
 # launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
 # Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
 # through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
-V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0") not in ("", "0")
-# Every captured graph pins its own workspace pool; cap the set process-wide (3 graphs per layer).
-# Past the cap a layer stays EAGER (counted, never a crash), exactly like K3's K3_GRAPH_MAX.
-V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
-_GRAPH_COUNT = 0        # island graphs captured so far, across every Stage in this process
-_GRAPH_SKIPPED = 0      # island graphs a layer skipped because the cap was hit or a capture failed
-
-# CUDA graphs over a decode step, opt-in, default OFF (the default path stays byte-identical and the
-# CPU parity suite never touches this). UNLIKE K3, a V4 layer CANNOT be captured whole: three of its
-# pieces bake position or data into a graph and are wrong on replay --
-#   * the attention core writes `kv_cache[:, start_pos % win]` (a ROTATING ring slot), reads a
-#     COMPRESSED region whose valid width GROWS with position, and the Indexer's score einsum runs
-#     over `kv_cache[:, :end_pos // ratio]` (a growing slice); a graph freezes all three at capture.
-#   * the Compressor's `should_compress = (start_pos+1) % ratio == 0` is a per-position PYTHON branch,
-#     and its compressed write slot `kv_cache[:, start_pos // ratio]` grows.
-#   * the MoE picks its experts per token (`indices[0].tolist()` — a host sync even on the decode fast
-#     path), so a captured graph runs ONE token's expert set.
-# So the capture is PARTIAL: it graphs the POSITION- and DATA-INDEPENDENT islands the reference
-# exposes as pure Block methods -- the two `hc_pre` (mix + Sinkhorn), the two `hc_post`, and the two
-# attn/ffn RMSNorms -- and leaves `attn` and `ffn` eager between them (measured: ~68 of ~240
-# launches/layer, the MoE half and the position-dependent attention core stay eager BY CONSTRUCTION).
-# Bit-exact, not approximately: each island graph replays the reference's OWN kernels on operands fed
-# through static buffers, so a correct capture is the same math on the same bytes, no reassociation.
+#
+# ISLAND MODE IS NOT THE ONLY MODE ANY MORE. v4_whole_layer_graph.py makes the attention core itself
+# capture-safe (a fixed ring slot chosen at replay from a copied-in position, a bucketed indexer read,
+# a width-invariant selection), so "cannot be captured whole" above describes the REFERENCE's decode
+# branch as written, not the ceiling. The flag therefore takes a MODE, not a bool:
 # "0"/off (default), "1"/"island" (hc_pre/hc_post/norm islands only, attn+MoE eager), "whole"/"eager"
 # (the WHOLE decode layer -- the capture-safe attention core folded in too, real routed MoE eager
 # between two graphs, bit-exact to the reference; v4_whole_layer_graph.py). See _graph_mode.
