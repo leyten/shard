@@ -76,13 +76,17 @@ the same reasons:
                                           step the six ids are distinct and no host-side dedup — and
                                           so no sync — is needed.
 
-WEIGHT BANK. The per-step gather slices the routed experts out of ONE contiguous [n_experts, N, K]
-fp4 bank (+ its scale bank), not the reference's per-expert `nn.Parameter`s (which cannot be gathered
-in a single op). This file stacks them on first use and caches them on the module. That stack is a
-COPY, so on the real 158 GiB model it is a load-time layout choice a stage must make (store the
-experts as a bank and drop the per-expert tensors), not a per-forward duplication — see the report.
-For a single layer on a 32 GiB card, which is what the parity/bench harness builds, the cached copy
-is a few GiB and fine.
+WEIGHT BANK — AND THE VRAM BOUND THAT KEEPS THIS OFF A FULL RING FOR NOW. The per-step gather slices
+the routed experts out of ONE contiguous [n_experts, N, K] fp4 bank (+ its scale bank), not the
+reference's per-expert `nn.Parameter`s (which cannot be gathered in a single op). This file stacks
+them on first use and caches them on the module. THAT STACK IS A COPY: at the shipped dims it is
+~3.2 GiB per layer beside ~3.7 GiB of routed weights that are still alive, so a stage holding more
+than a layer or two cannot afford it. Making it affordable is a LOAD-TIME layout choice (store the
+experts as a bank and drop the per-expert tensors) that belongs in the loader and is NOT implemented
+here. Until it is, `_expert_bank` measures free VRAM and DECLINES — the layer falls back to the
+decode path and says so — rather than OOMing mid-first-token and taking the stage, and the ring, with
+it. For a single layer on a 32 GiB card, which is what the parity/bench harness builds, the cached
+copy fits and the fast path runs.
 
 Opt-in, default OFF: `V4_MOE_GROUPED=1` rebinds `MoE.forward` after `v4_moe_decode` has (it captures
 whatever forward it finds and falls back to it, so the two compose); with the env unset this module
@@ -239,18 +243,54 @@ def _gather_fp(t, ids):
     return t.view(torch.uint8)[ids.long()].view(t.dtype)
 
 
+# VRAM the bank build must leave FREE on the card after it copies. The bank is an exact DUPLICATE of
+# the layer's routed-expert weights (see _expert_bank), and it is built lazily, on the first decode
+# token, AFTER the graph pools are pinned and the KV cache is allocated — the worst possible moment to
+# discover the card is full. 2 GiB covers the per-step gathers, activations, and the compressed-KV
+# region still growing under a long job.
+_BANK_HEADROOM_BYTES = 2 << 30
+
+
+def _bank_fits(experts):
+    """Would stacking these experts leave `_BANK_HEADROOM_BYTES` free? (True off-CUDA: no bound to check.)"""
+    if not torch.cuda.is_available():
+        return True
+    need = sum(t.numel() * t.element_size()
+               for e in experts for t in (e.w1.weight, e.w1.scale, e.w3.weight, e.w3.scale,
+                                          e.w2.weight, e.w2.scale))
+    free, _total = torch.cuda.mem_get_info()
+    return free - need >= _BANK_HEADROOM_BYTES
+
+
 def _expert_bank(moe):
     """Stack this MoE's routed experts into contiguous [E, N, K] fp4 banks (+ e8m0 scale banks).
 
     Cached on the module the first time a decode step runs it. `_gather_fp` slices the six routed
     experts out of this bank per step; the reference's per-expert `nn.Parameter`s cannot be gathered
-    in one op, a bank can. The stack COPIES — a load-time layout choice on the real model, harmless
-    on the single test layer (see module doc)."""
+    in one op, a bank can.
+
+    THE STACK COPIES, AND ON THE REAL MODEL THAT IS A SECOND COPY OF THE LAYER'S EXPERTS. At the
+    shipped dims (dim 4096, moe_inter_dim 2048, 256 fp4 routed experts) that is ~3.2 GiB per layer
+    against ~3.7 GiB of routed weights — so a stage holding more than a layer or two CANNOT afford it
+    while the reference's per-expert `nn.Parameter`s are still alive. The fix is a LOAD-TIME layout
+    choice (store the experts as a bank and drop the per-expert tensors) that lives in the loader, not
+    here, and is NOT on this branch.
+
+    Until it is, this DECLINES rather than OOMs: returning None sends the caller to the reference
+    forward for good on this layer. That is the difference between a lever that quietly does not
+    engage and a stage process that dies mid-first-token and cascades the whole ring — nothing
+    upstream catches an OOM out of `ffn` (v4_stage's _BlockGraphs guards only the graph capture)."""
     bank = getattr(moe, "_grouped_bank", None)
     if bank is not None:
-        return bank
+        return bank if bank is not False else None
     lo, hi = moe.experts_start_idx, moe.experts_end_idx
     experts = [moe.experts[i] for i in range(lo, hi)]
+    if not _bank_fits(experts):
+        moe._grouped_bank = False                          # decided ONCE: never retry, never thrash
+        print(f"[v4] grouped MoE declined on layer {getattr(moe, 'layer_id', '?')} — the expert bank "
+              f"does not fit alongside the per-expert weights; this layer stays on the decode path. "
+              f"V4_MOE_GROUPED needs the load-time bank layout to run on a full stage.", flush=True)
+        return None
     bank = {
         "w1": torch.stack([e.w1.weight for e in experts]).contiguous(),
         "w1_s": torch.stack([e.w1.scale for e in experts]).contiguous(),
@@ -276,6 +316,8 @@ def grouped_forward(self, x, input_ids):
     weights, indices = self.gate(xv, input_ids.flatten())
     ids = indices[0].to(torch.int32)                       # [G] on device — no .tolist()
     bank = _expert_bank(self)
+    if bank is None:                                       # the bank would not fit — decline, loudly
+        return _REF_FORWARD(self, x, input_ids)
 
     # Gather the six routed experts into contiguous [G, N, K] banks (device-side, no host sync — see
     # `_gather_fp` on why a torch gather rather than a device-side kernel index). One gather per

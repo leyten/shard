@@ -159,8 +159,71 @@ def test_install_order_is_the_precedence_grouped_over_decode(monkeypatch):
     assert DECODE._REF_FORWARD is reference, "decode's fallback is still the untouched reference"
 
     rev = _stub_mod()                                      # the order that would silently kill it
-    assert GROUPED.install(rev) is True and DECODE.install(rev) is True
-    assert rev.MoE.forward is DECODE.decode_forward, "reversed: decode is on top and grouped is dead"
+    assert GROUPED.install(rev) is True
+    assert DECODE.install(rev) is False, "decode must refuse to install OVER grouped (cycle guard)"
+    assert rev.MoE.forward is GROUPED.grouped_forward
+
+
+def test_decode_refuses_to_install_over_grouped_and_make_a_cycle(monkeypatch):
+    """The trap the shipped order creates. Grouped captures `decode_forward` as its fallback; if
+    decode then re-installs it would capture `grouped_forward`, and the two would call each other
+    until the stack blows on the first prefill. load_ref runs the pair once so nothing reaches it
+    today — the guard is for the second install path that does not exist yet."""
+    DECODE = pytest.importorskip("v4_moe_decode")
+    monkeypatch.setattr(DECODE, "V4_MOE_DECODE", True)
+    monkeypatch.setattr(GROUPED, "V4_MOE_GROUPED", True)
+    monkeypatch.setattr(torch.cuda, "is_available", lambda: True)
+    for m, names in ((DECODE, ("_REF_FORWARD", "_WORLD_SIZE")),
+                     (GROUPED, ("_REF_FORWARD", "_MOD", "_WORLD_SIZE"))):
+        for n in names:
+            monkeypatch.setattr(m, n, getattr(m, n))
+
+    mod = _stub_mod()
+    DECODE.install(mod)
+    GROUPED.install(mod)
+    assert DECODE.install(mod) is False, "a second decode install would close the loop"
+    assert GROUPED._REF_FORWARD is DECODE.decode_forward
+    assert DECODE._REF_FORWARD is not GROUPED.grouped_forward, "the cycle must not be armed"
+
+
+def test_bank_declines_rather_than_ooms_when_it_would_not_fit(monkeypatch):
+    """The bank is an exact DUPLICATE of a layer's routed-expert weights (~3.2 GiB at shipped dims,
+    beside ~3.7 GiB still live), built lazily on the first decode token — after the graph pools are
+    pinned. Nothing upstream catches an OOM out of `ffn`, so a stage that tried and failed would DIE
+    and cascade the ring. It must decline instead: once, loudly, and permanently for that layer."""
+    calls = []
+
+    class _W:
+        def __init__(self):
+            self.weight = torch.zeros(4, 4, dtype=torch.uint8)
+            self.scale = torch.zeros(1, 1)
+
+    class _E:
+        def __init__(self):
+            self.w1, self.w2, self.w3 = _W(), _W(), _W()
+
+    moe = type("MoE", (), {})()
+    moe.experts_start_idx, moe.experts_end_idx, moe.layer_id = 0, 2, 7
+    moe.experts = [_E(), _E()]
+    monkeypatch.setattr(GROUPED, "_bank_fits", lambda experts: (calls.append(1), False)[1])
+    assert GROUPED._expert_bank(moe) is None, "a bank that does not fit must not be built"
+    assert moe._grouped_bank is False, "the refusal is cached, not re-decided every token"
+    assert GROUPED._expert_bank(moe) is None
+    assert len(calls) == 1, "the fit check must run ONCE per layer, not per decode step"
+
+    monkeypatch.setattr(GROUPED, "_bank_fits", lambda experts: True)
+    fresh = type("MoE", (), {})()
+    fresh.experts_start_idx, fresh.experts_end_idx, fresh.layer_id = 0, 2, 7
+    fresh.experts = [_E(), _E()]
+    assert GROUPED._expert_bank(fresh) is not None, "a bank that fits is still built"
+
+
+def test_bank_fit_check_leaves_headroom():
+    """The rule itself: it is not "does it fit", it is "does it fit and leave room to keep serving" —
+    the KV cache is still growing and the per-step gathers still need somewhere to land."""
+    assert GROUPED._BANK_HEADROOM_BYTES >= (1 << 30)
+    if not torch.cuda.is_available():
+        assert GROUPED._bank_fits([]) is True, "off-CUDA there is no bound to check"
 
 
 def test_both_flags_off_leaves_the_reference_forward(monkeypatch):
