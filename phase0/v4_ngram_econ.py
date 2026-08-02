@@ -31,8 +31,28 @@ re-predict the in-flight positions it overlaps. The coordinator now measures tha
 (`topup_accept_by_depth`, `topup_agree/topup_disagree`) — feed a live run's histogram back in with
 --accept and the biggest free input here disappears.
 
-    python3 phase0/v4_ngram_econ.py                    # 07-31 ring: floors, then the tap-free arms
-    python3 phase0/v4_ngram_econ.py --ring old         # the previous ten-stage-era calibration
+THE 0801 RING — THE COST STRUCTURE INVERTED, and the fill family repriced on it. V4_DSPARK_MOE
+made drafting ~free (tail on_box 14.64 -> 6.00 ms, draft ~0) and the ring came out FLAT:
+
+    on_box per stage   9.48 / 8.24 / 9.29 / 8.67 / 8.14 / 6.00 ms   (sum 49.8; the HEAD binds)
+    frame ceiling      105.4 frames/s;  measured 24.75 tok/s at frames/token 1.234 => 29% of it
+    g 11.13;  mean_inflight 4.18 (event-weighted) against the block+1 cap of 6
+
+Two consequences, both structural. First, the circuit barely shrank (wire is unchanged by compute)
+while the bottleneck stage fell ~2x, so the bandwidth-delay product L/tau_max moved from ~11 to
+~14-17 frames — the block+1=6 cap is now the binding constraint, twice over. Second, at 29% of the
+frame ceiling the stages are IDLE most of the wall clock, which is what makes speculative frames
+nearly free: waste only costs where the bottleneck is busy or where a cancel's correction queues
+behind fenced frames. Both are priced by the same replay below; `--ring 0801` is the calibration,
+and the wide-block arms (V4_DSPARK_BLOCK) price the one cap-lifter the MULTIBLOCK lockstep proof
+leaves open — MORE proposals from ONE tap. Their deep-slot acceptance is unmeasurable off-ring
+(the arms sweep it; `accept_by_depth[6..]` on the first widened run replaces the sweep), and so is
+the widening PERTURBATION of the trained slots (the block attends to itself bidirectionally), which
+the shallow-sensitivity rows bracket.
+
+    python3 phase0/v4_ngram_econ.py                    # 08-01 ring: floors, then the wide-block arms
+    python3 phase0/v4_ngram_econ.py --ring 0731        # the pre-MoE six-stage calibration
+    python3 phase0/v4_ngram_econ.py --ring old         # the ten-stage-era calibration
     python3 phase0/v4_ngram_econ.py --accept '{"1": [h, t], ...}'   # a live accept_by_depth
 """
 import argparse
@@ -43,6 +63,12 @@ import statistics
 RINGS = {
     # tau = per-stage on_box (ms); wire = measured circuit wire (ms); base = measured decode tok/s;
     # g/eta = measured tokens-per-cancel and tokens-per-frame the drafter fit must reproduce.
+    # 08-01, after V4_DSPARK_MOE: drafting ~0, tail 6.00 ms, the head binds at 9.48. `wire` is
+    # CARRIED from the 07-31 measurement (same boxes; compute levers do not move the wire) — the
+    # one number here that is not this config's own; inflight_time_avg on the next run replaces it
+    # via Little's law (L = fill / frame rate).
+    "0801": dict(tau=[9.48, 8.24, 9.29, 8.67, 8.14, 6.00], wire=110.7, base=24.75,
+                 g=11.13, eta=0.810),
     "0731": dict(tau=[16.71, 14.15, 12.56, 16.70, 13.71, 18.00], wire=110.7, base=17.64,
                  g=11.13, eta=0.618),
     # The ring the first tap-free verdict was priced on. Its drafter fits are kept verbatim
@@ -51,11 +77,15 @@ RINGS = {
                 g=None, eta=None),
 }
 B = 5
-# Marginal cost of one drafted block on the tail, ms: measured 20.3 on the previous ring, 30 as the
+# Marginal cost of one drafted block on the tail, ms: measured 20.3 on the 07-31 ring, 30 as the
 # pessimistic arm. A raised floor defeats lazy drafting (the hint licensing withholds the last
 # floor+1 positions), so the tail pays for blocks the lazy baseline skipped — charged below as
-# delta(blocks/frame) x this, onto the tail's stage time.
+# delta(blocks/frame) x this, onto the tail's stage time. AFTER V4_DSPARK_MOE the same charge is
+# ~0.4 ms (the whole tail is 6.00 ms with draft ~0) and the tail is 3.5 ms UNDER the binding head,
+# so the lazy-defeat bill prices to zero on the 0801 ring — kept as an arm so the claim is a row,
+# not an assumption.
 DRAFT_MS = (20.3, 30.0)
+DRAFT_MS_MOE = (0.4, 2.0)
 
 
 def q_curve(a1, rho, b=B):
@@ -68,7 +98,9 @@ def run(mode, W, aseq, q_ng=0.0, r_ng=1.0, floor=1, n=20000, seed=1):
 
     `mode`: dspark (block only), hybrid (block + tap-free top-up past it), ngram (no block).
     `floor`: V4_REFILL_FLOOR — consume a reply's block at or below this in-flight level, streaming
-    only positions past the deepest frame in flight, exactly as coordinate_dspark_pipelined does."""
+    only positions past the deepest frame in flight, exactly as coordinate_dspark_pipelined does.
+    The block WIDTH is `len(aseq)` — one per-index acceptance per slot — so a V4_DSPARK_BLOCK arm
+    is the trained curve extended by its deep-slot assumptions, nothing else changed."""
     rng = random.Random(seed)
     c = horizon = 0
     sent = {0: True}
@@ -91,7 +123,7 @@ def run(mode, W, aseq, q_ng=0.0, r_ng=1.0, floor=1, n=20000, seed=1):
         if mode != "ngram" and horizon - c + 1 <= floor:
             drafts += 1
             base = horizon
-            for i in range(B):
+            for i in range(len(aseq)):
                 p = pos + 2 + i
                 if p <= base:                          # in flight: never re-streamed
                     continue
@@ -147,7 +179,7 @@ def fit_drafter(g_meas, eta_meas):
 
 def main():
     ap = argparse.ArgumentParser()
-    ap.add_argument("--ring", default="0731", choices=sorted(RINGS))
+    ap.add_argument("--ring", default="0801", choices=sorted(RINGS))
     ap.add_argument("--accept", default=None,
                     help="a live run's accept_by_depth as JSON {'1': [hits, trials], ...}; replaces "
                          "the fitted drafter curve with the measured one")
@@ -198,8 +230,8 @@ def main():
 
         print(f"    {'policy':<34}{'eta':>7}{'Fbar':>6}{'g':>7}{'blk/f':>7}{'tok/s':>8}{'vs base':>9}")
 
-        def row(lbl, mode, W, floor=1, q=0.0, r=1.0, tmax=tau_max):
-            e, f, gg, d = run(mode, W, aseq, q, r, floor=floor)
+        def row(lbl, mode, W, floor=1, q=0.0, r=1.0, tmax=tau_max, curve=None):
+            e, f, gg, d = run(mode, W, curve if curve is not None else aseq, q, r, floor=floor)
             t = tps(e, f, tmax)
             print(f"    {lbl:<34}{e:>7.3f}{f:>6.2f}{gg:>7.2f}{d:>7.2f}{t:>8.2f}"
                   f"{(t / base - 1) * 100:>8.1f}%")
@@ -212,7 +244,7 @@ def main():
         # delta(blocks/frame) x the marginal draft cost on top of its stage time. drafts/frame at
         # floor 1 is the lazy baseline's (only consumed blocks are drafted).
         e5, f5, _, d5 = run("dspark", 16, aseq, floor=5)
-        for c_draft in DRAFT_MS:
+        for c_draft in (DRAFT_MS_MOE if a.ring == "0801" else DRAFT_MS):
             t_tail = tau[-1] + (d5 - d1) * c_draft
             tmax = max(tau_max, t_tail)
             t = tps(e5, f5, tmax)
@@ -238,6 +270,51 @@ def main():
                 hi = mid
         print(f"    BREAK-EVEN for a tap-free extension on top of floor=5, W=8: flat q >= {hi:.2f}"
               f"  (measured n-gram novel q = 0.016)")
+
+        # ── THE WIDE BLOCK (V4_DSPARK_BLOCK): more proposals from ONE tap ─────────────────────────
+        # The trained per-index curve extended by deep slots at q_deep, pinned by a floor at the
+        # width, streamed under W=16. q_deep is UNMEASURABLE off-ring, so it is swept; the first
+        # widened run's accept_by_depth[6..] replaces the sweep. The q_deep=0 row is the
+        # ZERO-BENEFIT FLOOR: what widening costs when no deep slot ever lands. The shallow rows
+        # price the widening PERTURBATION of the trained slots (bidirectional block attention) —
+        # multiply q_1..5 by s and keep the best deep assumption — which is the number that decides
+        # the lever, because it is the one that can make it lose to plain floor=5.
+        best5 = tps(e5, f5)
+        q5 = aseq[-1]
+        print(f"    {'-- wide block, vs floor=5 at trained width':<60}(floor=5 = {best5:.2f} tok/s)")
+        for k in (8, 10, 13):
+            for tag, q_deep in (("q5", q5), ("0.75*q5", 0.75 * q5), (".50", 0.5), (".20", 0.2),
+                                ("ZERO", 0.0)):
+                wide = aseq + [q_deep] * (k - B)
+                t, _, _ = row(f"wide k={k} floor={k} q_deep={tag}", "dspark", 16, floor=k,
+                              curve=wide)
+        for s in (0.98, 0.95, 0.90):
+            wide = [q * s for q in aseq] + [q5 * s] * (10 - B)
+            row(f"wide k=10 SHALLOW x{s:.2f} (q_deep=q5)", "dspark", 16, floor=10, curve=wide)
+        # The two numbers that FALSIFY the wide bet, computed rather than asserted:
+        #   * the flat deep-slot acceptance below which k=10 pinned loses to floor=5 at width 5;
+        #   * the shallow multiplier below which k=10 (deep at q5, scaled with it) loses the same.
+        lo, hi = 0.0, 1.0
+        for _ in range(14):
+            mid = (lo + hi) / 2
+            e, f, _, _ = run("dspark", 16, aseq + [mid] * 5, floor=10, n=6000)
+            if tps(e, f) < best5:
+                lo = mid
+            else:
+                hi = mid
+        q_star = hi
+        lo, hi = 0.5, 1.0
+        for _ in range(14):
+            mid = (lo + hi) / 2
+            curve = [q * mid for q in aseq] + [q5 * mid] * 5
+            e, f, _, _ = run("dspark", 16, curve, floor=10, n=6000)
+            if tps(e, f) < best5:
+                lo = mid
+            else:
+                hi = mid
+        print(f"    FALSIFIERS for wide k=10: deep-slot q >= {q_star:.2f} at intact shallow, OR "
+              f"shallow multiplier >= {hi:.3f} with deep at q5 — read both off accept_by_depth "
+              f"on the first V4_DSPARK_BLOCK ring run")
 
 
 if __name__ == "__main__":
