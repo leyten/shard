@@ -2332,6 +2332,7 @@ ENG_ENV = [
     "V4_FP8_WIRE",                                                              # wire codec
     "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT", "V4_REFILL_FLOOR",   # pipelined speculation
     "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
+    "V4_FP8_GEMV", "V4_FP8_SHARED",                                             # fp8 GEMV path
     "V4_GRAPH_MAX", "V4_MOE_IN_GRAPH",                                          # graph budget / scope
     "V4_DSPARK_FAST", "V4_DSPARK_GRAPH", "V4_DSPARK_MOE",                       # drafter
     "V4_DSPARK_CONF_GATE", "V4_DSPARK_CONF_MIN", "V4_DSPARK_CONF_THRESH",       # adaptive send-length

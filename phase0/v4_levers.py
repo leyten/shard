@@ -234,6 +234,53 @@ def _check_moe_in_graph(ctx):
     return req, f"on/{got}-of-{asked}", (_agree(req, "on") and got > 0)
 
 
+def _check_fp8_gemv(ctx):
+    """The occupancy-tiled fp8 GEMV path, whose observation is its own run-time proof.
+
+    v4_fp8_gemv gates every tile on a per-(N,K) probe — tuned kernel torch.equal the vendored
+    fp8_gemm, or the shape declines — so `gemv_status()` IS the live state: 'armed' before the
+    first claimed GEMM (probe is lazy; unjudged, never OK), 'on/k-of-n' once serving,
+    'declined/n' when every probe said no, 'invalid(...)' when the string never parsed. The
+    module-global `fp8_gemm` binding is checked too: requested with nothing rebound (a CPU box,
+    or an install that never ran) is a true finding, like V4_CUDA_GRAPH on a box that cannot
+    capture — reported, and why the default is loud-not-fatal."""
+    m = _mod("v4_fp8_gemv")
+    if m is None:
+        return "absent", "unloaded", None
+    raw = getattr(m, "V4_FP8_GEMV", "")
+    obs = m.gemv_status()
+    if not raw or raw == "0":
+        return "off", obs, _agree("off", obs)
+    if getattr(m, "_GEMV_MODE", None) is None:
+        return raw, obs, False                             # set but never parsed: a dead knob
+    if ctx.mod is not None and not getattr(ctx.mod.fp8_gemm, "_v4_fp8_gemv", False):
+        return "on", "not-installed", False
+    if obs == "armed":
+        return "on", obs, None
+    return "on", obs, obs.startswith("on/")
+
+
+def _check_fp8_shared(ctx):
+    """The fused shared-expert lever: the Expert.forward rebind, the per-stage bank count, and the
+    fused-launch verdicts, told apart the way _moe_check tells `grouped` apart — installed with an
+    empty bank is not engaged (instance 3 of the recurring bug, in this lever's costume)."""
+    m = _mod("v4_fp8_gemv")
+    req = _flag("v4_fp8_gemv", "V4_FP8_SHARED")
+    if m is None or ctx.mod is None:
+        return req, "unloaded", None
+    if not getattr(ctx.mod.Expert.forward, "_v4_fp8_shared", False):
+        return req, "off", _agree(req, "off")
+    obs = m.shared_status()
+    if ctx.stage is not None:
+        banked = getattr(ctx.stage, "_shared_banked", 0)
+        return req, f"{obs}/banked-{banked}", (None if obs == "armed"
+                                               else (_agree(req, "on") and banked > 0
+                                                     and obs.startswith("on/")))
+    if obs == "armed":
+        return req, obs, None
+    return req, obs, (_agree(req, "on") and obs.startswith("on/"))
+
+
 def _check_fast_verify(ctx):
     st = _mod("v4_stage")
     req = "on" if (st is not None and st.V4_FAST_VERIFY) else ("absent" if st is None else "off")
@@ -410,6 +457,10 @@ LEVERS = (
     Lever("V4_MOE_GROUPED", STAGE, "v4_moe_grouped",
           _moe_check("grouped", "v4_moe_grouped", "V4_MOE_GROUPED"),
           "grouped fp4 MoE kernel for the s==1 score-routed decode step (CUDA only)"),
+    Lever("V4_FP8_GEMV", STAGE, "v4_fp8_gemv", _check_fp8_gemv,
+          "occupancy-tiled fp8 GEMM at decode shapes (M<=32), self-gated torch.equal per (N,K)"),
+    Lever("V4_FP8_SHARED", STAGE, "v4_fp8_gemv", _check_fp8_shared,
+          "the shared expert's w1+w3 as one banked fp8 launch (+ one act_quant), gated per half"),
     Lever("V4_MOE_DECODE", STAGE, "v4_moe_decode",
           _moe_check("decode", "v4_moe_decode", "V4_MOE_DECODE"),
           "sync-free MoE dispatch at s==1 (DEFAULT ON)"),
@@ -623,9 +674,9 @@ def report(side=STAGE, stage=None, strict=None, out=None):
 # anywhere. `tests/test_v4_levers.py` asserts the derived set is exactly LEVERS + NON_LEVER_ENV.
 ENGINE_MODULES = (
     "v4_pipe.py", "v4_stage.py", "v4_levers.py", "v4_moe_grouped.py", "v4_moe_decode.py",
-    "v4_moe_multi.py", "v4_dspark_fast.py", "v4_dspark_moe.py", "v4_dspark_draft.py",
-    "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py",
-    "v4_sparse_attn_sm120.py",
+    "v4_moe_multi.py", "v4_fp8_gemv.py", "v4_dspark_fast.py", "v4_dspark_moe.py",
+    "v4_dspark_draft.py", "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py",
+    "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

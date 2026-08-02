@@ -682,6 +682,16 @@ class Stage:
         if banked:
             print(f"[v4] stage[{lo}:{hi}): grouped-MoE bank layout on {banked} layer(s) — the routed "
                   f"experts ARE the bank, no duplicate", flush=True)
+        # Same window, same mechanism, 1/96th the size: V4_FP8_SHARED re-lays each layer's SHARED
+        # expert w1/w3 as one contiguous [2*inter, dim] bank (weight + scale), repointing the
+        # Linears at slices so `load()` writes the checkpoint straight through the views — one copy
+        # on the card, the reference path reads the same bytes, and the fused single-launch path
+        # (v4_fp8_gemv._shared_forward) has its bank at serve time. No-op under V4_FP8_SHARED=0.
+        import v4_fp8_gemv
+        self._shared_banked = shared_banked = v4_fp8_gemv.shared_bank_layout(self.layers)
+        if shared_banked:
+            print(f"[v4] stage[{lo}:{hi}): shared-expert w13 bank on {shared_banked} layer(s) — "
+                  f"w1+w3 serve as ONE fp8 launch", flush=True)
         if self._fast:
             self._reserve_chunk_scratch()
         for m in self._owned_modules():
