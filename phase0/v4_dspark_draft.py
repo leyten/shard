@@ -133,6 +133,20 @@ def _v4():
     return v4_stage
 
 
+# THE INFERENCE-TIME BLOCK WIDTH (V4_DSPARK_BLOCK, 0 = the trained dspark_block_size). One draft
+# call proposes `block_size` tokens from ONE tap, and the pipelined in-flight cap is block+1 — the
+# lockstep docs/V4_MULTIBLOCK_VERDICT.md §2 proves cannot be chained past. Width is the one axis
+# that cap leaves open: no weight tensor is dimensioned by `block_size` and every vendored shape is
+# symbolic in it (forward_embed's noise ids, the block rows DSparkAttention concatenates, the
+# freqs_cis slice, forward_head's Markov loop), so a wider block is pure configuration on the same
+# math. THE HONEST PRICE, named where the knob is read: `get_dspark_topk_idxs` gives every block
+# query the SAME index set — the block attends to itself BIDIRECTIONALLY — so extra noise slots
+# perturb the trained slots' logits too. Widening is therefore not "the old block plus free extras":
+# acceptance may move at EVERY depth, which only a real ring can measure (`accept_by_depth` under
+# the widened width against the trained width, same prompts). Opt-in, default OFF, tail-only; the
+# coordinator adapts to whatever length the reply carries and needs no flag.
+V4_DSPARK_BLOCK = int(os.environ.get("V4_DSPARK_BLOCK", "0") or 0)
+
 # The two keys a DSparkBlock's state_dict has but a converted checkpoint deliberately does not.
 # `mtp[k].embed`/`mtp[k].head` are ASSIGNED the main model's modules (model.py:903-904), so they are
 # registered submodules pointing at storage that is already in the file under `embed.weight` /
@@ -240,6 +254,22 @@ class DSparkTail:
             # needs the rejection-sampling accept rule, not this one.
             blk.temperature = float(temperature)
         self.temperature = float(temperature)
+        # THE WIDTH OVERRIDE, applied where every consumer reads it: `self.block_size` plans the
+        # advance/cliff guards, each vendored block's own `block_size` shapes forward_embed and the
+        # forward_head loop, and the fast/MoE installers capture whatever is live here. Set BEFORE
+        # any weight loads or rebinds so no path ever sees two widths. The bound is well inside
+        # v4_pipe's `_SPEC_POS_MARGIN` (64), the overshoot a serial dspark reset declares for the
+        # chunk `[cur] + block` — a block wider than that could rope a verify chunk past the
+        # horizon the job promised its stages.
+        if V4_DSPARK_BLOCK:
+            if not 1 <= V4_DSPARK_BLOCK <= 32:
+                raise ValueError(
+                    f"v4 dspark: V4_DSPARK_BLOCK={V4_DSPARK_BLOCK} — the inference-time block "
+                    f"width must be 1..32 (0/unset = the trained width, "
+                    f"{a.dspark_block_size} in this checkpoint)")
+            self.block_size = int(V4_DSPARK_BLOCK)
+            for blk in self.mtp:
+                blk.block_size = self.block_size
         self.mtp.eval()
         self.alias_missing = []
         self._pos = None
@@ -758,6 +788,13 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
     print(f"[dspark] V4_DSPARK_MOE requested={v4_dspark_moe.V4_DSPARK_MOE} "
           f"observed={took}/{len(tail.mtp)} drafter MoEs on the pair path",
           file=sys.stderr, flush=True)
+    # THE WIDTH, recorded off the LIVE tail for the same reason the two levers above are: the
+    # drafter is built at the first dspark reset, long after the startup audit, so this is the
+    # first moment the width a run will actually draft at is knowable.
+    v4_levers.note("V4_DSPARK_BLOCK", str(tail.block_size) if V4_DSPARK_BLOCK else "off")
+    if V4_DSPARK_BLOCK:
+        print(f"[dspark] V4_DSPARK_BLOCK requested={V4_DSPARK_BLOCK} observed={tail.block_size} "
+              f"(trained width {tail.args.dspark_block_size})", file=sys.stderr, flush=True)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
     return RingDrafter(tail)

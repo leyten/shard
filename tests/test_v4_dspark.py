@@ -974,3 +974,80 @@ def test_spec_loop_with_a_perfect_drafter(oracle, args):
         drafts = perfect(None)
     assert out == want[:len(out)]
     assert max(accepted) == g, "the perfect drafter never reached a full block"
+
+
+# ── 9. the inference-time block width (V4_DSPARK_BLOCK) ──────────────────────────────────────────
+
+def test_width_override_is_off_by_default_and_bounded(oracle, args, monkeypatch):
+    """Default 0 = the trained width, exactly — and the guard refuses a width the serial reset's
+    declared overshoot (`v4_pipe._SPEC_POS_MARGIN`) could not cover, at build rather than as a
+    horizon violation mid-job."""
+    assert DS.V4_DSPARK_BLOCK == 0, "the width override must ship OFF"
+    _, dr = tail_from_oracle(oracle, args)
+    assert dr.block_size == args.dspark_block_size
+    for bad in (33, -1):
+        monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", bad)
+        with pytest.raises(ValueError, match="V4_DSPARK_BLOCK"):
+            tail_from_oracle(oracle, args)
+
+
+def test_width_override_drafts_wider_bit_equal_to_a_widened_reference(oracle, args, monkeypatch):
+    """RENT-NOT-REWRITE at the new width: the override only CONFIGURES the vendored blocks, so a
+    reference widened the same way must produce the same bytes — drafts, logits, confidence — for
+    every step, with the mtp caches identical after. `block_size` is instance state on DSparkBlock
+    and no weight tensor is dimensioned by it; this is the proof that stays true.
+
+    The oracle's own mtp blocks are widened directly (the same one-attribute change the lever
+    makes), so both sides run DeepSeek's forward at width 7 and the comparison is exact."""
+    WIDE = 7
+    monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", WIDE)
+    for blk in oracle.mtp:
+        blk.block_size = WIDE
+    ids = _ids(PROMPT, args)
+    st, dr, tok = prefilled(oracle, args, ids)
+    assert dr.block_size == WIDE and all(b.block_size == WIDE for b in dr.mtp)
+    for i in range(PROMPT, PROMPT + STEPS):
+        o_tok, _, o_main = oracle(tok.unsqueeze(1), i)
+        o_spec = oracle.forward_spec(o_tok, o_main, i)
+        tok, main = step(st, tok, i)
+        assert torch.equal(tok, o_tok), f"the stage half diverged at step {i}"
+        drafts, conf = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=i)
+        o_out, o_logits, o_conf = o_spec
+        assert drafts.shape == (BATCH, WIDE), "the widened drafter must return WIDE drafts"
+        assert torch.equal(dr.last_spec[0], o_out), f"widened draft ids diverged at step {i}"
+        assert torch.equal(dr.last_spec[1], o_logits), f"widened draft logits diverged at step {i}"
+        assert torch.equal(conf, o_conf), f"widened confidence diverged at step {i}"
+        assert dr.pos == i
+    for k, (got, want) in enumerate(zip(caches(dr), caches(oracle))):
+        assert torch.equal(got, want), f"mtp stage {k} cache diverged at width {WIDE}"
+
+
+def test_widening_perturbs_the_trained_slots_and_that_is_the_documented_price(oracle, args,
+                                                                              monkeypatch):
+    """THE HONEST PRICE, pinned as a fact rather than left as prose: `get_dspark_topk_idxs` gives
+    every block query the same index set, so the block attends to itself BIDIRECTIONALLY and the
+    extra noise slots feed back into the trained slots' logits. A widened block is therefore NOT
+    "the trained block plus free extras" — the per-depth acceptance of slots 1..B is a new
+    measurement under the lever, which is exactly what `accept_by_depth` on the first widened ring
+    run must be read for. If this assertion ever starts failing, the attention became causal and
+    the lever's risk paragraph should be rewritten, not this test deleted."""
+    WIDE = 7
+    ids = _ids(PROMPT, args)
+    st, dr, tok0 = prefilled(oracle, args, ids)
+    o_tok, _, o_main = oracle(tok0.unsqueeze(1), PROMPT)
+    tok, main = step(st, tok0, PROMPT)
+    narrow, _ = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=PROMPT)
+    narrow_logits = dr.last_spec[1][:, :args.dspark_block_size]
+
+    monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", WIDE)
+    oracle2 = REFCPU.build_oracle(args, SEED)
+    st2, dr2, tok0w = prefilled(oracle2, args, ids)
+    assert torch.equal(tok0w, tok0), "the main model must not see the drafter's width"
+    tokw, mainw = step(st2, tok0w, PROMPT)
+    assert torch.equal(tokw, tok), "the main model's stream is width-independent by construction"
+    wide, _ = dr2.advance_and_draft(tokw.unsqueeze(1), mainw, start_pos=PROMPT)
+    wide_logits = dr2.last_spec[1][:, :args.dspark_block_size]
+    assert wide.shape[1] == WIDE and narrow.shape[1] == args.dspark_block_size
+    assert not torch.equal(wide_logits, narrow_logits), (
+        "widening left the trained slots' logits bit-identical — the block attention has become "
+        "causal within the block, and V4_DSPARK_BLOCK's documented risk paragraph is now stale")

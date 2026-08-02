@@ -416,3 +416,75 @@ def test_the_drafter_moe_lever_serves_exactly_what_the_default_serves():
         assert base[path] == lever[path], (
             f"the drafter MoE lever changed the {path} stream\n  default: {base[path]}\n"
             f"  lever:   {lever[path]}")
+
+
+def test_the_wide_drafter_serves_exactly_what_the_default_serves():
+    """V4_DSPARK_BLOCK=7 over the whole recipe must emit the SAME tokens as the all-off default, on
+    EVERY path the selftest drives — greedy, spec, serial dspark, pipelined, lazy at three depths,
+    and the refill floor at three settings, all over real sockets against the same reference stream.
+
+    This is the lever's entire correctness claim in one comparison: width moves only what is
+    SPECULATED. A wider block perturbs every draft (the block attends to itself bidirectionally),
+    so acceptance may move at every depth — but a draft is only ever COMMITTED when the ring's own
+    reply equals it, so the served stream cannot. Like V4_MOE_MULTI above, it is deliberately NOT
+    in RING_RECIPE: bit-exact is proven here, the per-depth acceptance under widening is a ring
+    measurement (`accept_by_depth` at width 7+ vs the trained width), and an unmeasured lever has
+    no place in the documented recipe."""
+    base = selftest_streams()
+    wide = selftest_streams(**RING_RECIPE, V4_DSPARK_BLOCK=7)
+    common = sorted(set(base) & set(wide))
+    assert set(common) >= {"ring", "ref", "spec", "dspark", "pipe"}, common
+    for path in common:
+        assert base[path] == wide[path], (
+            f"the wide drafter changed the {path} stream\n  default: {base[path]}\n"
+            f"  wide:    {wide[path]}")
+
+
+def test_the_wide_drafter_lifts_the_pipelined_cap_on_a_real_ring():
+    """The cap the MULTIBLOCK verdict pinned at block+1, demonstrably LIFTED on a real localhost
+    socket ring: the tiny checkpoint's trained width is 3 (cap 4), and with V4_DSPARK_BLOCK=7 the
+    same ring holds 8 frames in flight — at zero acceptance (random weights), so the depth comes
+    from the streamed block alone, every cycle rewinds through the stages' checkpoint rings, and
+    the emitted stream still equals the vendored reference's greedy decode bit for bit. Floors 1
+    and 7 both serve the reference stream; the identity between them is the zero-accept floor
+    identity the selftest already pins, now at the widened cap."""
+    out = run_probe("""
+        import json, tempfile, torch, v4_pipe, v4_ref_cpu as R
+        from v4_pipe import (_write_tiny_checkpoint, _reference_tokens, _dspark_tiling,
+                             _spawn_ring, coordinate_dspark_pipelined, send_msg)
+        args = R.cpu_args()
+        d = tempfile.mkdtemp(prefix="v4wide_")
+        model = R.build_oracle(args)
+        _write_tiny_checkpoint(d, args, model)
+        import os
+        os.environ["V4_DIR"] = d
+        prompt, max_new = [168, 15, 493, 72, 22], 6
+        ref = _reference_tokens(model, prompt, max_new)
+        ranges = _dspark_tiling(args, 3)
+        pipe, ret = _spawn_ring(d, ranges, 1, dspark=True, tag="w")
+        outs = {f: coordinate_dspark_pipelined(pipe, ret, prompt, max_new, nonce=f"wide-{f}",
+                                               receipts=True, layer_count=args.n_layers,
+                                               timeout=120, depth=16, floor=f)
+                for f in (1, 7)}
+        send_msg(pipe, {"op": "stop"})
+        print("REF", json.dumps(ref))
+        for f, r in outs.items():
+            print("RUN", json.dumps({"floor": f, "tokens": r["tokens"],
+                                     "max_inflight": r["max_inflight"],
+                                     "block_len": r["block_len"],
+                                     "inflight_time_avg": r["inflight_time_avg"],
+                                     "frames_per_token": r["frames_per_token"],
+                                     "receipts_ok": r["receipts_ok"]}))
+    """, V4_DSPARK_BLOCK=7)
+    import json as _json
+    ref = _json.loads(next(l[4:] for l in out.splitlines() if l.startswith("REF ")))
+    runs = [_json.loads(line[4:]) for line in out.splitlines() if line.startswith("RUN ")]
+    assert len(runs) == 2
+    for r in runs:
+        assert r["tokens"] == ref, f"floor={r['floor']}: the widened ring left the greedy stream"
+        assert r["block_len"] == 7, "the tail did not draft at the widened width"
+        assert r["max_inflight"] == 8, (
+            f"width 7 must hold 8 frames in flight on the real ring (trained width 3 holds 4), "
+            f"got {r['max_inflight']}")
+        assert 0 < r["inflight_time_avg"] <= 8 and r["frames_per_token"] >= 1.0
+        assert r["receipts_ok"] is True

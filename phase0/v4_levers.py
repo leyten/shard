@@ -317,6 +317,26 @@ def _check_dspark_moe(ctx):
     return req, "no-drafter-yet", None
 
 
+def _check_dspark_block(ctx):
+    """The drafter's inference-time WIDTH — tail-only and judged like the two levers above, from the
+    fact `ring_drafter` records off the live DSparkTail at build. Requested is the owning module's
+    parsed override ('off' = the trained width); observed is the width the drafter actually carries,
+    so a run that drafted at the wrong width is a MISMATCH and not a slow mystery. Before the first
+    dspark job there is no drafter and nothing honest to claim."""
+    d = _mod("v4_dspark_draft")
+    if d is None:
+        req = "absent"
+    else:
+        v = getattr(d, "V4_DSPARK_BLOCK", 0)
+        req = str(v) if v else "off"
+    fact = _NOTES.get("V4_DSPARK_BLOCK")
+    if fact is not None:
+        return req, fact, (None if fact == "off" else False) if req == "absent" else req == fact
+    if ctx.stage is not None and not getattr(ctx.stage, "tail", False):
+        return req, "not-tail", None
+    return req, "no-drafter-yet", None
+
+
 def _ref_slim_check(attr, marker_of):
     def check(ctx):
         req = _flag("v4_ref_slim", attr)
@@ -432,6 +452,9 @@ LEVERS = (
           "tail only: cache-advance-only drafter forwards"),
     Lever("V4_DSPARK_MOE", STAGE, "v4_dspark_moe", _check_dspark_moe,
           "tail only: the drafter's block MoE as one grouped fp4 launch per matrix kind"),
+    Lever("V4_DSPARK_BLOCK", STAGE, "v4_dspark_draft", _check_dspark_block,
+          "tail only: draft the block at this width instead of the trained dspark_block_size — "
+          "deeper proposals from the same tap, lifting the pipelined in-flight cap to width+1"),
     Lever("V4_FP8_WIRE", STAGE, "v4_pipe", _check_fp8_wire,
           "fp8-pack h on the forward leg (every non-tail stage packs its own output)"),
     Lever("V4_SPEC_DEPTH", BOTH, "v4_pipe", _check_spec_depth,
