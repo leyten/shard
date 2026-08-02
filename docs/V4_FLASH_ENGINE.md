@@ -4,21 +4,62 @@ The V4-Flash engine is a **separate engine** from M2.5. All of its code lives in
 The vendored reference under `phase0/deepseek_v4_ref/` is kept **byte-identical** and is driven,
 never reimplemented. This file is the cross-session anchor: read it first, update it last.
 
-## RESUME HERE (2026-08-01)
+## RESUME HERE (2026-08-02)
 
-Best measured single-stream number on a real scattered ring: **5.91 tok/s end-to-end /
-7.78 decode-only** — 192 tokens, six distinct EU RTX 5090s, `V4_MOE_GROUPED=1 V4_CUDA_GRAPH=1`,
-`V4_SPEC_DEPTH=6`, pipelined DSpark. Output **bit-identical to greedy** (`pipelined_equals_greedy`),
-6/6 receipts, g = 6.4. That is **2.3x greedy** on the same ring (2.56 / 2.88).
+**24.3 tok/s decode / 20.5 e2e**, 512 tokens, novel prompt, six distinct EU RTX 5090s.
+Reproducible across four consecutive runs (24.25 / 24.34 / 24.27 / 24.17). Bit-identical to greedy,
+receipts verified. **4.5x on the session** (5.35 -> 24.3).
 
-Target is 20 tok/s and it is **not reachable on this ring shape** — see §1. Getting there needs a
-draft block >= 12 *and* roughly 8-16x on per-stage compute.
+Ring: `Poland[0:8) -> Czechia[8:16) -> Denmark[16:24) -> Estonia[24:32) -> Poland[32:40) ->
+Poland[40:43)`. Recipe: stages `V4_MOE_GROUPED=1 V4_MOE_MULTI=1 V4_CUDA_GRAPH=whole
+V4_MOE_IN_GRAPH=1` (graphs ON the tail too), coordinator `V4_LAZY_DRAFT=1 V4_SPEC_DEPTH=6`,
+refill floor 1 (the shipped default — see below).
 
-**MEASURE WARM, THREE TIMES, OR DO NOT MEASURE.** A single cold pass said grouped MoE was 2.3x
-SLOWER (2.2 -> 0.945). Warm, it is **1.6x faster** (2.90 -> 4.66) — the cold number was wrong by
-~3.7x in the wrong direction and would have discarded the most valuable lever in the engine. The
-grouped path JIT-compiles kernels the baseline never touches, and graph capture costs tens of
-seconds against a ~30 s window. Run every config three times and discard the first.
+### THE BINDING CONSTRAINT, measured per frame
+
+| stage | on_box | detail |
+|---|---|---|
+| s0-s4 | 8.3 - 10.0 ms | ~1.0 ms/layer, uniform across boxes |
+| **s5 tail** | **14.64 ms** | fwd 3.19 + **draft 9.16** + head/logits ~2.3 |
+
+**The DSpark draft is 63% of the bottleneck stage and therefore of the ring's ceiling
+(68.3 frames/s).** The drafter received NONE of the MoE work: `grouped_forward` returns on its
+first line when rows != 1 and `DSparkBlock` runs `dspark_block_size` rows by construction;
+`v4_moe_decode` is `s==1`-gated; `v4_moe_in_graph` captures `Stage.layers` only. Only the dispatch
+fix (`V4_MOE_MULTI`) ever reached it. Make a draft CHEAPER — not rarer, not more frequent — and the
+tail falls to ~5.5 ms, the bottleneck moves to Estonia at 10.04, and the ceiling goes to ~100
+frames/s.
+
+### THE REFILL FLOOR IS NEGATIVE ON THIS RING, and the reason matters
+
+`V4_REFILL_FLOOR` (built, correctness-proven, default 1 = shipped behaviour) refills the pipe
+before it drains to the frontier. It WORKS — in-flight 4.18 -> 5.07 at floor 3, -> 6.00 at floor 5.
+It still loses, because it defeats lazy drafting:
+
+| floor | in-flight | drafts issued | g | tail on_box | measured |
+|---|---|---|---|---|---|
+| 1 | 4.18 | 117 | 11.13 | 14.64 (draft 9.16) | **24.3** |
+| 3 | 5.07 | 411 | 9.48 | 28.00 (draft 22.86) | ~19 |
+| 5 | 6.00 | 510 | 8.68 | — | ~16 |
+
+A +21% fill gain against a **-48% ceiling loss**. Two independent models predicted +11%..+45% and
+both named the drafting bill as the risk; both under-priced it. **Fill is not closed — it is gated
+on cheap drafting.** Revisit the floor the moment the draft is cheap; the lever is already built.
+
+### Bimodality: GPU idle downclock, not the code
+
+Identical runs read 2.9 / 7.1 / 24.2 tok/s. Perfect correlation with `clocks.sm` minimum: slow runs
+sat at 24-300 MHz, fast runs at 2400. Containers cannot lock clocks (`nvidia-smi -lgc` needs host
+privileges), so a keepalive doing a 512x512 bf16 matmul every 100 ms holds the P-state. **Measured
+throughput-neutral** (24.27 with vs 24.16 without) and it removes the cold-start cliff. Always state
+the warm protocol with any number.
+
+### Do not repeat
+
+- **n-gram / tap-free proposers**: measured acceptance **0.012 on novel code, 0.007 on prose**
+  (0.96 edit-heavy). Worthless on a novel benchmark and dishonest to blend. Dead on merit.
+- **Wider rings**: 10 boxes measured SLOWER than 6. In-flight caps at `block_size + 1`.
+- **Box churn**: rebuilds cost 30-40 min of weight downloads each. Keep one ring, park spares.
 
 ## The model
 
