@@ -112,6 +112,13 @@ def load_ref():
         # unless one is set. See phase0/v4_ref_slim.py.
         import v4_ref_slim
         v4_ref_slim.install(mod)
+        # Independent of the MoE chain above: this rebinds the module-level `fp8_gemm` (what
+        # `linear()` resolves at call time) and `Expert.forward`, never `MoE.forward`. Both levers
+        # default OFF — with the envs unset this is a no-op and the reference is byte-identical.
+        # The occupancy-tiled kernel is CUDA-only and every tile it serves is probed torch.equal
+        # against the vendored kernel first; see phase0/v4_fp8_gemv.py.
+        import v4_fp8_gemv
+        v4_fp8_gemv.install(mod)
         _REF = mod
     return _REF
 
