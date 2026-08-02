@@ -302,6 +302,21 @@ def _check_dspark_fast(ctx):
     return req, obs, _agree(req, obs)
 
 
+def _check_dspark_moe(ctx):
+    """The drafter's grouped-MoE lever — tail-only, like V4_DSPARK_FAST, and judged the same way:
+    from the fact `ring_drafter` records at build (took == every drafter MoE banked + bound). The
+    drafter is built lazily at the first dspark job, so before one there is nothing to observe and
+    this says so rather than guessing; the class chain is untouched by design (the bind is per
+    INSTANCE), so no module-level rebind exists to inspect."""
+    req = _flag("v4_dspark_moe", "V4_DSPARK_MOE")
+    fact = _NOTES.get("V4_DSPARK_MOE")
+    if fact is not None:
+        return req, fact, _agree(req, fact)
+    if ctx.stage is not None and not getattr(ctx.stage, "tail", False):
+        return req, "not-tail", None
+    return req, "no-drafter-yet", None
+
+
 def _ref_slim_check(attr, marker_of):
     def check(ctx):
         req = _flag("v4_ref_slim", attr)
@@ -415,6 +430,8 @@ LEVERS = (
           "skip the inplace KV/Q QAT quant-simulation (APPROXIMATE — not in the ring recipe)"),
     Lever("V4_DSPARK_FAST", STAGE, "v4_dspark_fast", _check_dspark_fast,
           "tail only: cache-advance-only drafter forwards"),
+    Lever("V4_DSPARK_MOE", STAGE, "v4_dspark_moe", _check_dspark_moe,
+          "tail only: the drafter's block MoE as one grouped fp4 launch per matrix kind"),
     Lever("V4_FP8_WIRE", STAGE, "v4_pipe", _check_fp8_wire,
           "fp8-pack h on the forward leg (every non-tail stage packs its own output)"),
     Lever("V4_SPEC_DEPTH", BOTH, "v4_pipe", _check_spec_depth,
@@ -606,8 +623,9 @@ def report(side=STAGE, stage=None, strict=None, out=None):
 # anywhere. `tests/test_v4_levers.py` asserts the derived set is exactly LEVERS + NON_LEVER_ENV.
 ENGINE_MODULES = (
     "v4_pipe.py", "v4_stage.py", "v4_levers.py", "v4_moe_grouped.py", "v4_moe_decode.py",
-    "v4_moe_multi.py", "v4_dspark_fast.py", "v4_dspark_draft.py", "v4_ref_slim.py",
-    "v4_ref_cpu.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py", "v4_sparse_attn_sm120.py",
+    "v4_moe_multi.py", "v4_dspark_fast.py", "v4_dspark_moe.py", "v4_dspark_draft.py",
+    "v4_ref_slim.py", "v4_ref_cpu.py", "v4_whole_layer_graph.py", "v4_kernels_cpu.py",
+    "v4_sparse_attn_sm120.py",
 )
 
 _ENV_RE = re.compile(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""")

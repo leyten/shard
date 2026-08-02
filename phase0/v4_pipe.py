@@ -2333,7 +2333,7 @@ ENG_ENV = [
     "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT", "V4_REFILL_FLOOR",   # pipelined speculation
     "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
     "V4_GRAPH_MAX", "V4_MOE_IN_GRAPH",                                          # graph budget / scope
-    "V4_DSPARK_FAST", "V4_DSPARK_GRAPH",                                        # drafter
+    "V4_DSPARK_FAST", "V4_DSPARK_GRAPH", "V4_DSPARK_MOE",                       # drafter
     "V4_DSPARK_CONF_GATE", "V4_DSPARK_CONF_MIN", "V4_DSPARK_CONF_THRESH",       # adaptive send-length
     "V4_REF_SLIM", "V4_REF_SLIM_NOQAT",                                         # reference-compute slim
     "V4_FAST_VERIFY", "V4_FAST_VERIFY_MAX",                                     # chunked verify

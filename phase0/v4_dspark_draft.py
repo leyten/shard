@@ -746,6 +746,18 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
     print(f"[dspark] V4_DSPARK_FAST requested={v4_dspark_fast.V4_DSPARK_FAST} "
           f"observed={'on' if live else 'off'}", file=sys.stderr, flush=True)
     tail = DSparkTail(stage, temperature=temperature)
+    # THE DRAFTER'S MoE LEVER (V4_DSPARK_MOE), banked + bound between construction and load — the
+    # only window where the bank's `preserve=False` release-first layout is free (every routed-
+    # expert byte is still torch.empty) and `load()` then writes the checkpoint THROUGH the bank
+    # views. Per-instance: it touches these three MoEs and nothing else in the process. Recorded
+    # here for the same reason V4_DSPARK_FAST is — the tail is built long after the startup lever
+    # audit, so this is the first moment the rebind is knowable.
+    import v4_dspark_moe
+    took = v4_dspark_moe.install_drafter(tail)
+    v4_levers.note("V4_DSPARK_MOE", took == len(tail.mtp) and took > 0)
+    print(f"[dspark] V4_DSPARK_MOE requested={v4_dspark_moe.V4_DSPARK_MOE} "
+          f"observed={took}/{len(tail.mtp)} drafter MoEs on the pair path",
+          file=sys.stderr, flush=True)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
     return RingDrafter(tail)
