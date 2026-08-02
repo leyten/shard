@@ -69,6 +69,15 @@ they are trained at 5, and positions 5..9 would be noise slots conditioned only 
 Markov bias. That is a measurement no CPU test can make and a quality risk on the one thing
 speculation cannot trade away.
 
+> **ADDENDUM, 2026-08-02 — the lockstep above was re-checked after drafting became ~free
+> (V4_DSPARK_MOE) and it HOLDS: cost was never its term, so chained multi-block stays dead. The
+> width paragraph above is now a LEVER.** With the tail at 6.00 ms (3.5 ms under the binding head)
+> and the ring fill-bound at 29% of its frame ceiling, the inference-time width is priced at
+> +36..+61% for k=10 *if* the deep slots accept near the trained q5 — which remains exactly the
+> measurement this section said no CPU test can make, so it ships as opt-in `V4_DSPARK_BLOCK`
+> (default OFF) with `accept_by_depth` as its report card, bit-exactness proven at width on real
+> socket rings. Economics, falsifiers and the zero-benefit floor: docs/V4_FILL_ECONOMICS.md.
+
 ## 3. The acceptance-decay arithmetic, and the break-even
 
 Acceptance is not one number, and this is the load-bearing observation. Let `q_j` be the conditional
