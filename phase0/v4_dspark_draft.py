@@ -736,6 +736,15 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
     the baseline every A/B measures against."""
     import v4_dspark_fast
     v4_dspark_fast.install(sys.modules[__name__])
+    # THE TAIL IS BUILT AT THE FIRST DSPARK RESET, long after the stage's startup lever audit ran, so
+    # that audit can only ever report this lever as unloaded. Record the live rebind here, where it is
+    # finally knowable, and say it once in the tail's log — otherwise `V4_DSPARK_FAST=1` is a flag no
+    # process on the ring ever confirms, which is the whole class this engine keeps paying for.
+    import v4_levers
+    live = getattr(DSparkTail.advance_and_draft, "_v4_dspark_fast", False)
+    v4_levers.note("V4_DSPARK_FAST", live)
+    print(f"[dspark] V4_DSPARK_FAST requested={v4_dspark_fast.V4_DSPARK_FAST} "
+          f"observed={'on' if live else 'off'}", file=sys.stderr, flush=True)
     tail = DSparkTail(stage, temperature=temperature)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)

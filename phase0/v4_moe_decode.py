@@ -75,15 +75,17 @@ def install(mod):
     exec created, so there is nothing to rebind before. Idempotent, and a no-op under
     V4_MOE_DECODE=0 or on a module already installed (load_ref memoizes, but a test may not).
 
-    It also refuses when v4_moe_grouped is ALREADY on top, which is not an idempotence check but a
-    CYCLE guard: grouped installs after this one and captures `decode_forward` as its fallback, so
-    re-installing over it would capture `grouped_forward` here and make the two call each other
-    forever. load_ref runs the pair exactly once, so nothing reaches this today — it is the trap any
-    second install path would otherwise fall into."""
+    It also refuses when EITHER of the levers that install above it is already on top, which is not an
+    idempotence check but a CYCLE guard: both capture `decode_forward` as their fallback, so
+    re-installing over one of them would capture ITS forward here and make the two call each other
+    forever -- a RecursionError on the first prefill, not a slow path. load_ref runs the three exactly
+    once, so nothing reaches this today; it is the trap any second install path would fall into.
+    `_v4_multi` was missing from this guard until the lever audit went looking for a chain that could
+    eat itself and found that v4_moe_multi could close one."""
     global _REF_FORWARD, _WORLD_SIZE
     if not V4_MOE_DECODE or getattr(mod.MoE.forward, "_v4_decode_fast", False):
         return False
-    if getattr(mod.MoE.forward, "_v4_grouped", False):
+    if getattr(mod.MoE.forward, "_v4_grouped", False) or getattr(mod.MoE.forward, "_v4_multi", False):
         return False
     _REF_FORWARD = mod.MoE.forward
     _WORLD_SIZE = int(getattr(mod, "world_size", 1) or 1)

@@ -220,30 +220,143 @@ def test_a_clean_process_passes_the_same_gate():
 
 # ── the side table: which process must carry which var ────────────────────────────────────────────
 
-def test_a_coordinator_lever_set_on_a_stage_is_reported_as_the_wrong_process():
-    """INSTANCE 5, pinned. V4_LAZY_DRAFT is read by the coordinator loop and by nothing in a stage.
-    It was set on six stages for hours and did exactly nothing, with no signal anywhere."""
+def test_a_coordinator_lever_set_on_a_stage_says_where_it_belongs():
+    """INSTANCE 5, named. V4_LAZY_DRAFT is read by the coordinator loop and by nothing in a stage; it
+    was set on six stages for hours and did exactly nothing, with no signal anywhere.
+
+    A NOTICE and not an alarm, deliberately — see
+    test_the_documented_ring_recipe_does_not_trip_strict_on_a_stage for what happens when it is an
+    alarm. The line must still name the lever and say which process does read it."""
     out = run_probe("""
         import v4_pipe, v4_levers
         print(v4_levers.report(side=v4_levers.STAGE))
     """, V4_LAZY_DRAFT=1)
-    assert "V4_LAZY_DRAFT" in out and "WRONG PROCESS" in out, out
-    assert "coordinator-side lever set on a stage" in out, out
+    assert "V4_LAZY_DRAFT" in out and "OTHER SIDE" in out, out
+    assert "THIS stage process never reads it" in out, out
+    assert "it configures the coordinator" in out, out
+
+
+def test_the_coordinators_own_audit_is_where_a_dead_lazy_flag_shows_up():
+    """The actionable half of instance 5, on the side that can actually judge it. An operator who set
+    V4_LAZY_DRAFT on the stages and not here sees `requested=off` on the coordinator, which is the
+    one line that ends the search. And after a SERIAL round it is a MISMATCH rather than silence: the
+    serial path has no hint to skip a draft with, so lazy drafting there is not off, it is
+    unreachable."""
+    off = run_probe("""
+        import v4_pipe, v4_levers
+        print(v4_levers.report(side=v4_levers.COORDINATOR))
+    """)
+    assert "V4_LAZY_DRAFT" in off and "requested=off" in off, off
+    serial = run_probe("""
+        import v4_pipe, v4_levers
+        v4_levers.note("V4_LAZY_DRAFT", False)      # what coordinate_dspark records
+        print(v4_levers.report(side=v4_levers.COORDINATOR))
+    """, V4_LAZY_DRAFT=1)
+    assert "V4_LAZY_DRAFT" in serial and "MISMATCH" in serial, serial
+    src = __import__("inspect").getsource(VP.coordinate_dspark)
+    assert 'v4_levers.note("V4_LAZY_DRAFT", False)' in src, \
+        "the serial loop no longer records that lazy drafting is unreachable there"
 
 
 def test_a_stage_lever_on_a_coordinator_is_not_an_alarm():
-    """The check is one-directional ON PURPOSE, and this pins that it stays that way.
-
-    The coordinator normally runs on the launcher box and `_eng_env()` reads os.environ to build the
-    stages' environment, so every stage lever is legitimately exported there. Flagging that would put
-    a false alarm on every healthy ring, and an alarm that always fires is the same as no alarm — so
-    it is reported PROPAGATED and is not a problem. The real check lives in the stage's own audit."""
+    """Same NOTICE the other way, and it must stay a notice for the same reason."""
     out = run_probe("""
         import v4_pipe, v4_levers
         print(v4_levers.report(side=v4_levers.COORDINATOR))
     """, V4_FAST_VERIFY=1)
-    assert "V4_FAST_VERIFY" in out and "PROPAGATED" in out, out
+    assert "V4_FAST_VERIFY" in out and "OTHER SIDE" in out, out
     assert "PROBLEM(S)" not in out, "a launcher-exported stage lever must not raise an alarm"
+
+
+def test_the_documented_ring_recipe_does_not_trip_strict_on_a_stage():
+    """THE FALSE POSITIVE THAT WOULD HAVE KILLED A RING, pinned so it cannot come back.
+
+    `ENG_ENV` ships the COORDINATOR levers to every stage on purpose — v4_pipe says so above
+    V4_LAZY_DRAFT — so a stage launched with the documented recipe carries V4_PIPELINED_SPEC and
+    V4_LAZY_DRAFT it will never read. An earlier draft of this guard called that WRONG PROCESS, which
+    under V4_LEVERS_STRICT made `serve_stage` raise before it could bind a socket: no stage listens,
+    the ring never forms, and the guard meant to protect the measurement destroys the run.
+
+    So the recipe on a stage, under strict, must SERVE — while still naming the two coordinator
+    levers in the table so the operator can see where they belong."""
+    out = run_probe("""
+        import v4_ref_cpu, v4_stage, v4_pipe, v4_levers
+        args = v4_ref_cpu.cpu_args()
+        st = v4_stage.Stage(0, 2, args, head=True, tail=False, device="cpu")
+        print(v4_levers.report(side=v4_levers.STAGE, stage=st))
+        print("REPR", repr(st))
+    """, V4_MOE_DECODE=1, V4_MOE_MULTI=1, V4_PIPELINED_SPEC=1, V4_LAZY_DRAFT=1,
+         V4_SPEC_DEPTH=6, V4_LEVERS_STRICT=1)
+    assert "PROBLEM(S)" not in out, f"the ring recipe must not trip strict on a stage\n{out}"
+    assert "V4_LAZY_DRAFT" in out and "OTHER SIDE" in out, out
+    assert "levers=ok" in out, out
+
+
+def test_an_env_set_after_the_module_parsed_it_is_a_mismatch():
+    """`requested` is the module's PARSED value, which is what the run obeys — so an env set after
+    the import reads off on both sides and would pass as OK. `stage_launch_cmd` sets env at exec so a
+    launched stage cannot hit this, but every in-process ring, bench and research harness sets env in
+    the same interpreter, and those are the things that produce numbers."""
+    out = run_probe("""
+        import os, v4_moe_multi, v4_ref_cpu, v4_levers
+        os.environ["V4_MOE_MULTI"] = "1"            # too late: the module parsed it at import
+        v4_ref_cpu.load_ref()
+        print(v4_levers.report(side=v4_levers.STAGE))
+    """)
+    assert "V4_MOE_MULTI" in out and "MISMATCH" in out, out
+    assert "set after the module was imported" in out, out
+
+
+def test_a_chain_that_eats_itself_is_named_not_walked_past():
+    """A second install can close a loop (v4_moe_decode's cycle guard did not know about
+    v4_moe_multi), and a chain that cycles is a RecursionError on the first prefill, not a slow path.
+    The walk used to stop on the repeat and return three clean-looking levers. It must NAME it, and
+    every MoE lever on a broken chain must be a MISMATCH — nothing on that chain can be judged."""
+    out = run_probe("""
+        import v4_ref_cpu, v4_moe_decode, v4_levers
+        mod = v4_ref_cpu.load_ref()
+        v4_moe_decode._REF_FORWARD = mod.MoE.forward       # close the loop by hand
+        print("CHAIN", ">".join(v4_levers.moe_chain(mod)))
+        print(v4_levers.report(side=v4_levers.STAGE))
+    """, V4_MOE_DECODE=1)
+    assert "CYCLE" in out, out
+    assert "MISMATCH" in out, "a chain that cannot terminate cannot be OK"
+
+
+def test_the_decode_install_refuses_to_close_a_loop_with_multi():
+    """The other half: the guard that stops the cycle being created at all. v4_moe_decode refused to
+    install under grouped and not under multi, so a second install path could build the loop above."""
+    out = run_probe("""
+        import v4_ref_cpu, v4_moe_decode
+        mod = v4_ref_cpu.load_ref()
+        print("TOP", mod.MoE.forward.__module__)
+        print("REFUSED", v4_moe_decode.install(mod) is False)
+    """, V4_MOE_MULTI=1, V4_MOE_DECODE=1)
+    assert "TOP v4_moe_multi" in out and "REFUSED True" in out, out
+
+
+def test_a_grouped_kernel_that_banked_no_layer_is_not_engaged():
+    """INSTANCE 3, closed at the only moment it is knowable before a token. The kernel can be bound
+    while NOT ONE layer took the bank — `grouped/0`, which a ring ran on all night. Installed with an
+    empty bank is not engaged, so the audit must say MISMATCH rather than report the binding."""
+    out = run_probe("""
+        import v4_ref_cpu, v4_stage, v4_levers, torch
+        import v4_moe_grouped as G
+        args = v4_ref_cpu.cpu_args()
+        st = v4_stage.Stage(0, 2, args, head=True, tail=False, device="cpu")
+        mod = v4_stage.ref()
+        # arm the kernel the way a CUDA box would, without a CUDA box: the bank is separately
+        # declined here (bf16 experts), which is exactly the grouped/0 shape.
+        G.grouped_forward._v4_grouped = True
+        G._REF_FORWARD = mod.MoE.forward
+        mod.MoE.forward = G.grouped_forward
+        G.V4_MOE_GROUPED = True
+        f = {x.env: x for x in v4_levers.audit(v4_levers.STAGE, st)}["V4_MOE_GROUPED"]
+        print("BANKED", st._moe_banked)
+        print("VERDICT", f.requested, f.observed, f.verdict)
+    """)
+    assert "BANKED 0" in out, out
+    assert "VERDICT on on/0 MISMATCH" in out, out
 
 
 def test_a_v4_var_nothing_reads_is_reported_unknown():
