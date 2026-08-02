@@ -317,6 +317,23 @@ def _check_conf_gate(ctx):
     return req, fact, _agree(req, fact)
 
 
+def _check_refill_floor(ctx):
+    """COORDINATOR-side, and verified from the RUN, like V4_LAZY_DRAFT: the loop notes the floor it
+    actually refilled at, so the observation is a fact off a real round and not a re-read of the env.
+
+    A job may pass `floor=` without the env — like `pipelined` itself — so requested and observed
+    disagreeing is only a finding when the environment explicitly named a floor and the run then
+    refilled at another one, which is bug 5's shape (the operator set the lever somewhere it does
+    not act) wearing this lever's costume."""
+    vp = _mod("v4_pipe")
+    req = str(vp.V4_REFILL_FLOOR) if vp is not None else "absent"
+    fact = _NOTES.get("V4_REFILL_FLOOR")
+    if fact is None:
+        return req, "no-job-yet", None
+    set_here = os.environ.get("V4_REFILL_FLOOR", "") not in ("", "0")
+    return req, fact, (req == fact) if set_here else True
+
+
 def _value_check(modname, attr):
     """A KNOB, not a switch: prove the module resolved the value the operator set, not that something
     was rebound. Catches the other half of the propagation bug — a flag that arrives as the wrong
@@ -379,6 +396,9 @@ LEVERS = (
           "hint the tail to skip drafting a block the round will not consume"),
     Lever("V4_DSPARK_CONF_GATE", COORDINATOR, "v4_pipe", _check_conf_gate,
           "serial DSpark only: trim the tail's offered block length by confidence"),
+    Lever("V4_REFILL_FLOOR", COORDINATOR, "v4_pipe", _check_refill_floor,
+          "pipelined refill floor: consume a reply's block at or below this in-flight level "
+          "(1 = drain-only, the shipped round)"),
     # Knobs: a value the engine must have resolved, with no separate install to observe.
     Lever("V4_MOE_MULTI_MAX", STAGE, "v4_moe_multi", _value_check("v4_moe_multi", "V4_MOE_MULTI_MAX"),
           "widest block the multi-dispatch path claims", kind="knob"),

@@ -103,7 +103,10 @@ def test_engine_modules_accounts_for_every_v4_module_on_disk():
     """The scrape is only total if the module list is. A new phase0/v4_*.py must be classified as
     engine (scraped, and shipped to a box) or as a bench helper, deliberately."""
     on_disk = {os.path.basename(p) for p in glob.glob(os.path.join(PHASE0, "v4_*.py"))}
-    bench_only = {"v4_whole_layer_bench.py", "v4_wire_bench.py"}
+    bench_only = {"v4_whole_layer_bench.py", "v4_wire_bench.py",
+                  # measurement/pricing tools, never imported by a serving process: the workload-class
+                  # acceptance harness, the round-replay economics, and the discrete-event ring sim
+                  "v4_ngram_accept.py", "v4_ngram_econ.py", "v4_pipe_sim.py"}
     unclassified = on_disk - set(VL.ENGINE_MODULES) - bench_only
     assert not unclassified, (
         f"{sorted(unclassified)} is neither in v4_levers.ENGINE_MODULES (scraped for levers, and the "

@@ -1720,6 +1720,34 @@ V4_SPEC_DEPTH = int(os.environ.get("V4_SPEC_DEPTH", "16") or 16)
 # the hints on the frames, not to its own environment — and it rides ENG_ENV anyway so that an
 # operator exporting it on the launcher box gets it wherever v4_pipe runs, stage or coordinator.
 V4_LAZY_DRAFT = bool(int(os.environ.get("V4_LAZY_DRAFT", "0") or 0))
+# THE REFILL FLOOR. The shipped round consumes a fresh block only when the pipeline has DRAINED to
+# the frontier (`horizon == c`), so in-flight saws 6,5,4,3,2,6 and the ring idles between teeth —
+# while the tail is already drafting a fresh block on EVERY committed frame and the coordinator
+# throws every mid-run one away. The floor is the in-flight level at or below which a reply's block
+# is consumed instead of discarded: 1 is the shipped drain-only behaviour, frame for frame;
+# `dspark_block_size` (5) pins the pipe at block+1 by refilling on every reply.
+#
+# WHY THIS IS A LEVER NOW when docs/V4_MULTIBLOCK_VERDICT.md §4 measured the rolling top-up at +3%
+# and declined to build it: that price was a property of the OLD drafter (q5 = 0.680, g = 4.92).
+# The lever's value is almost entirely a function of q at the block's DEEPEST index — the one new
+# position a mid-run block adds is always its deepest draft — and the current ring's drafter
+# measures far better there (g = 11.13 on the 07-31 six-stage ring). Re-priced against that ring,
+# floor=5 models ~+21% where the old drafter modelled +3% (phase0/v4_ngram_econ.py). The family is
+# NON-MONOTONE — floor=2 prices BELOW floor=1, because the first thing a deeper floor changes is the
+# trial-depth mix (deepest-draft-only) and the fill gain only pays past that — so the operating
+# point is a measurement, not a monotone knob to max out.
+#
+# THE HONEST PRICE, stated where the knob is read. A mid-run block's deep drafts condition (through
+# the Markov head) on ITS OWN block prefix, not on the tokens already in flight at those positions;
+# when the two disagree, the topped-up frames answer a history the ring is not taking and are
+# wasted, and every one of them also enlarges the discarded future behind a rejection. The loop
+# therefore scores topped-up frames apart from drain-refill frames (`topup_accept_by_depth` vs
+# `accept_by_depth`) and counts the overlap disagreement directly (`topup_disagree`), so the first
+# real ring run measures the assumption the +21% rests on instead of inheriting it. It also defeats
+# lazy drafting in proportion: a reply at or below the floor consumes a block, so the hint proof
+# licenses fewer skips the higher the floor sits (none at all from floor 5), and the tail pays the
+# drafting the refills consume — `drafts_issued` against `frames` is that bill, per run.
+V4_REFILL_FLOOR = int(os.environ.get("V4_REFILL_FLOOR", "1") or 1)
 
 
 class _PipeSpecState:
@@ -1798,7 +1826,7 @@ class _FrameSender(threading.Thread):
 
 def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                                 swarm_id="swarm", job_id="job", layer_count=None, receipts=False,
-                                timeout=600.0, on_token=None, depth=None, lazy=None):
+                                timeout=600.0, on_token=None, depth=None, lazy=None, floor=None):
     """DSPARK speculative decode, PIPELINED — the same lossless round, streamed instead of chunked.
 
     Same contract as coordinate_dspark (same reset, same drafter, same accept rule, same emitted
@@ -1842,11 +1870,32 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     drafting the round threw away, and on the real ring the discarded share is the tail's whole
     margin over the next slowest stage. `lazy` (V4_LAZY_DRAFT) closes it; see `_hints`.
 
-    Returns coordinate()'s dict plus {frames, drafted, drafts_issued, lazy, generated, accepted,
-    cancels, cycles, g, accept_hist, max_inflight, mean_inflight, stale_replies, unsent_frames} —
-    `max_inflight` being the pipeline depth actually achieved, i.e. whether the thing pipelined at
-    all, and `drafts_issued` what the tail was billed for to achieve it."""
+    Returns coordinate()'s dict plus {frames, drafted, drafts_issued, lazy, floor, generated,
+    accepted, cancels, cycles, g, accept_hist, accept_by_depth, topups, topup_frames,
+    topup_accept_by_depth, topup_agree, topup_disagree, max_inflight, mean_inflight, stale_replies,
+    unsent_frames} — `max_inflight` being the pipeline depth actually achieved, i.e. whether the
+    thing pipelined at all, and `drafts_issued` what the tail was billed for to achieve it.
+
+    `accept_by_depth` maps a draft's DEPTH — how far ahead of the frontier it was streamed, 1 for a
+    block's first draft, B for its last — to `(hits, trials)`, counting only frames actually judged.
+    It exists because `g` alone cannot tell a drafter that is uniformly mediocre from one that is
+    sharp up close and blind far out, and only the second shape is changed by feeding the pipeline
+    differently; it is also the measured curve the pricing model takes in place of a two-point fit
+    (phase0/v4_ngram_econ.py). Truth/correction frames are depth 0 and are not predictions, so they
+    are never scored.
+
+    `floor` (V4_REFILL_FLOOR — see the note at the constant) is the in-flight level at or below
+    which a reply's fresh block is consumed. Frames a mid-run refill streams are scored in
+    `topup_accept_by_depth`, apart from `accept_by_depth`, because they are a different bet: a
+    mid-run block's deep drafts condition on its own prefix rather than on the frames already in
+    flight, and `topup_agree`/`topup_disagree` count exactly how often those two histories differ
+    where they overlap. At floor=1 every topup counter is structurally zero and the round is the
+    shipped one, frame for frame, hints included."""
     W = int(depth or V4_SPEC_DEPTH)
+    F = int(floor if floor is not None else V4_REFILL_FLOOR)
+    if F < 1:
+        raise ValueError(f"v4 pipelined dspark: refill floor {F} — the pipe refills at or below the "
+                         f"floor, so it must be at least 1 (1 = the shipped drain-only behaviour)")
     lazy = V4_LAZY_DRAFT if lazy is None else bool(lazy)
     # A coordinator lever has no rebound method for an audit to inspect -- `lazy` is an ARGUMENT to
     # this loop -- so the loop states what it ran with and v4_levers reports THAT, not a second read
@@ -1854,6 +1903,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     v4_levers.note("V4_LAZY_DRAFT", lazy)
     v4_levers.note("V4_SPEC_DEPTH", W)
     v4_levers.note("V4_PIPELINED_SPEC", True)
+    v4_levers.note("V4_REFILL_FLOOR", F)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True, "pipelined": True})
@@ -1886,12 +1936,16 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     sender = _FrameSender(pipe, st8)
     sender.start()
     sent = {}                                                 # pos -> token fed there in THIS epoch
+    ddepth = {}                                               # pos -> how far ahead it was drafted
+    dsrc = {}                                                 # pos -> "block" | "topup"
     horizon = c - 1                                           # highest position a frame has been sent for
     frames = drafted = accepted = cancels = run = stale = issued = 0
+    topups = topup_frames = topup_agree = topup_disagree = 0
     hist, depths = {}, []
+    by_depth, tu_by_depth = {}, {}                            # draft depth -> [hits, trials], per source
     prevhint = set()                                          # positions sent a `dprev` PREDICTION
 
-    def _feed(pos, tok, nxt=None, prev=False):
+    def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block"):
         """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
         `c - 1`, never `c`: the deepest rewind this coordinator can still ask for is `c` itself (a
         cancel commits at some p+1 > c and re-opens THERE), so anything ending at or before `c - 1` is
@@ -1899,15 +1953,27 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
 
         `nxt` is THE LAZY-DRAFT HINT and it is only ever set when this loop can prove two things about
         the frame at `pos + 1`: that it is already decided (`nxt` IS the token being streamed there)
-        and that this frame's reply therefore cannot be the one that drains the pipeline. See
+        and that this frame's reply therefore cannot be the one that consumes a block. See
         `_hints` — every frame the proof does not cover is sent without a hint, which the tail reads
         as "draft".
 
         `prev` is the SAME hint for the one frame `nxt` structurally cannot reach: the last of a
         burst, whose successor comes out of the block this burst has not been answered with yet. See
-        the DPREV comment where it is set."""
-        nonlocal horizon, frames
+        the DPREV comment where it is set.
+
+        `dep` is how far ahead of the frontier this token was DRAFTED — 1 for a block's first draft,
+        B for its last, 0 for a truth/correction frame, which is not a prediction at all — and `src`
+        is which refill streamed it. Both exist for one reason: `accept_by_depth` and
+        `topup_accept_by_depth` in the return dict. Acceptance is not one number — it decays with
+        draft depth, and a topped-up frame at the same depth is a different bet from a drain-refill
+        one — and a run that reported one blended acceptance could not say which of the two the
+        refill floor is spending. Nothing reads them to make a decision; they only report."""
+        nonlocal horizon, frames, topup_frames
         sent[pos] = int(tok)
+        ddepth[pos] = int(dep)
+        dsrc[pos] = src
+        if src == "topup":
+            topup_frames += 1
         horizon = max(horizon, pos)
         frames += 1
         f = {"op": "step", "ids": [[int(tok)]], "start_pos": pos, "epoch": st8.epoch, "cpos": c - 1}
@@ -1928,18 +1994,25 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         THE PROOF THE HINT STANDS ON. This loop consumes a block from the reply of position `p` in
         exactly three cases, which are the `need` predicate below: nothing is speculated at `p + 1`
         (`fed is None`), what is speculated there disagrees with the model's token and the round
-        cancels, or the pipeline has drained to the frontier (`horizon == p + 1`).
+        cancels, or in-flight has sagged to the refill floor (`horizon - p <= F` at the reply).
         After this burst the in-flight span is `c .. H` with `H = c + len(span) - 1`, CONTIGUOUS, and
-        horizon only ever grows. So for a frame at `p <= H - 2`: `sent[p + 1]` exists (contiguity),
-        and `p + 1 <= H - 1 < horizon`, so its reply cannot be the drain. The only way it can be the
-        round's last is a disagreement at `p + 1` — which is exactly what `dnxt` lets the tail test
-        for itself, off the model's own token, without this loop having to predict acceptance.
+        within an epoch horizon only ever grows — a cancel resets it, but a cancel also fences every
+        frame behind it, and a fenced frame's reply is dropped before it can be judged, so no hint on
+        it is ever acted on by this loop. So for a frame at `p <= H - F - 1`: `sent[p + 1]` exists
+        (contiguity), and in-flight at its reply is `horizon_then - p >= H - p >= F + 1 > F`, so its
+        reply cannot be the one that refills. The only way it can be the round's last is a
+        disagreement at `p + 1` — which is exactly what `dnxt` lets the tail test for itself, off the
+        model's own token, without this loop having to predict acceptance.
 
-        `H - 1` (the drain) and `H` (whose successor is not decided yet — it comes out of the block
-        the burst has not been answered with) get no hint, and the tail drafts on them. That is the
-        conservative half of the rule: an unhinted frame always drafts, so a hint that is merely
-        MISSING costs throughput and can never cost a block the round needed."""
-        return [span[i + 1] if i + 2 <= len(span) - 1 else None for i in range(len(span))]
+        The last `F + 1` positions get no hint, and the tail drafts on them: the deepest because its
+        successor is not decided yet (it comes out of a block not yet returned), the rest because
+        their replies may sit at or below the floor and be asked to refill. At the shipped floor of 1
+        that is exactly the old two — the drain and the frame past it. That is the conservative half
+        of the rule: an unhinted frame always drafts, so a hint that is merely MISSING costs
+        throughput and can never cost a block the round needed. It is also why a deeper floor defeats
+        lazy drafting by degrees — the guard swallows the whole span from floor 5 — which is part of
+        the floor's price and is visible per run as `drafts_issued` against `frames`."""
+        return [span[i + 1] if i <= len(span) - F - 2 else None for i in range(len(span))]
 
     if not stop:
         _feed(c, cur)                                         # the cur frame: its reply carries block 1
@@ -1994,11 +2067,18 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 f"the ring is not taking — one accept rule, and it is plan_verify_round.")
         m = int(rep["tokens"][0])                             # the model's token at pos+1, at M=b
         fed = sent.get(pos + 1)                               # what we streamed there, if anything yet
+        fdep = ddepth.get(pos + 1, 0)                         # 0 == a truth frame, i.e. not a trial
         ids.append(m)
         c = pos + 1
         toks.append(m)
         if on_token is not None:
             on_token(m)
+        if fdep:                                              # score the prediction at ITS draft depth
+            book = tu_by_depth if dsrc.get(pos + 1) == "topup" else by_depth
+            slot = book.setdefault(fdep, [0, 0])
+            slot[1] += 1
+            if fed == m:
+                slot[0] += 1
         if fed == m:
             accepted += 1
             run += 1
@@ -2010,12 +2090,13 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             continue
         blk = [int(t) for t in (rep.get("draft") or [])]
         issued += bool(blk)                                   # what the TAIL paid for, block for block
-        # THE ROUND'S LAST REPLY, named: the speculation ends here and the next block has to come off
-        # THIS reply — because nothing is speculated past the frontier (`fed is None`), or because the
-        # cancel below discards everything that was (`fed != m`), or because the pipeline has drained
-        # to it (`horizon == c`). It is exactly the condition the block is streamed under, hoisted so
-        # the lazy-draft hint can be audited against it.
-        need = fed is None or fed != m or horizon == c
+        # THE REPLY THE ROUND REFILLS FROM, named: the next block has to come off THIS reply —
+        # because nothing is speculated past the frontier (`fed is None`), or because the cancel
+        # below discards everything that was (`fed != m`), or because in-flight has sagged to the
+        # refill floor (`horizon - c + 1 <= F`; at the shipped floor of 1 that is the old drain,
+        # `horizon == c`, exactly). It is the condition the block is streamed under, hoisted so the
+        # lazy-draft hint can be audited against it.
+        need = fed is None or fed != m or horizon - c + 1 <= F
         if lazy and need and "draft" not in rep and pos not in prevhint:
             # LAZY DRAFTING SKIPPED A BLOCK THE ROUND NEEDED. A reply with no `draft` key AT ALL is a
             # tail that skipped one (a `_done` tail sends `"draft": []`, which is a different thing
@@ -2054,27 +2135,40 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 st8.epoch += 1
             for p in [p for p in sent if p > pos]:            # the discarded future
                 del sent[p]
+                ddepth.pop(p, None)
+                dsrc.pop(p, None)
             horizon = pos
             # start_pos == c IS the rewind command. The block on THIS reply was drafted off `m`, the
             # correction — the docstring's FRESH BLOCK COMES WITH THE REJECTION — so the span is the
             # correction plus that block, exactly as after a drain.
             _feed(c, m, hints[0])
-        # Stream the fresh block only when this reply opened the speculation — after a cancel, after
-        # the first frame, or when the previous block has been fully consumed (a full-accept run, whose
-        # last reply commits the bonus token and lands the horizon back on the frontier). Mid-run
-        # replies also carry a block, drafted one position further along; taking it would re-speculate
-        # positions already in flight, which the serial round does not do either.
-        if blk and horizon == c:
+        # Stream the fresh block when this reply opened the speculation — after a cancel, after the
+        # first frame, after a full-accept run whose last reply lands the horizon back on the
+        # frontier — or, above the shipped floor of 1, when in-flight has merely SAGGED to the floor.
+        # Mid-run replies carry a block either way (drafted one position further along); below the
+        # floor it is discarded exactly as before, at or under it the block's NEW positions are
+        # streamed and the ones already in flight are never re-streamed — a frame on the wire cannot
+        # be recalled, and the disagreement between it and the fresh block's re-prediction is the
+        # measurement (`topup_agree`/`topup_disagree`), not a decision.
+        if blk and horizon - c + 1 <= F:
+            base = horizon                                    # deepest frame already in flight
+            topup = base > c                                  # a refill past frames still unjudged
             drafted += 1
+            topups += topup
             for i, d in enumerate(blk[:nblk]):
-                # DPREV, on the last frame of the burst and only there. `_hints` cannot reach it: its
-                # successor at `H + 1` is the first draft of the block the frame at `H - 1` has not
-                # returned yet. But `H - 1` IS the drain (`max(c, H-1)`, and `H-1 >= c` because
-                # `nblk >= 1`), so this loop already knows it will consume that reply's block and
-                # stream it from `H + 1` — and the tail holds it, because an unhinted drain drafts.
-                # `dprev` says exactly that: "your successor is the head of the block you returned one
-                # frame ago". The tail re-checks its half (that it really did draft, at exactly
-                # `H - 1`, non-empty) and falls back to drafting when it cannot.
+                p = pos + 2 + i
+                if p <= base:                                 # in flight: measure agreement, feed nothing
+                    topup_agree += int(d) == sent[p]
+                    topup_disagree += int(d) != sent[p]
+                    continue
+                # DPREV, on the last frame of a floor-1 burst and only there. `_hints` cannot reach
+                # it: its successor at `H + 1` is the first draft of the block the frame at `H - 1`
+                # has not returned yet. But at floor 1 `H - 1` IS the drain (`max(c, H-1)`, and
+                # `H-1 >= c` because `nblk >= 1`), so this loop already knows it will consume that
+                # reply's block and stream it from `H + 1` — and the tail holds it, because an
+                # unhinted drain drafts. `dprev` says exactly that: "your successor is the head of
+                # the block you returned one frame ago". The tail re-checks its half (that it really
+                # did draft, at exactly `H - 1`, non-empty) and falls back to drafting when it cannot.
                 #
                 # `nblk >= 2` IS THE SOUNDNESS CONDITION AND IT IS NOT COSMETIC. A burst of one leaves
                 # the drain ON the frontier (`max(c, H-1) == c`), which is a frame already in flight —
@@ -2083,13 +2177,22 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 # block length does not move within a job, so requiring it here requires it of the
                 # next burst too; at W=2 the lever simply stays off, and the coordinator's loud check
                 # is what fires if that reasoning is ever wrong.
-                _feed(pos + 2 + i, d, hints[i + 1], prev=(i == nblk - 1 and nblk >= 2))
+                #
+                # `F == 1` IS PART OF THAT SOUNDNESS: above the shipped floor the refill reply is not
+                # the drain — it is whichever reply sags to the floor first — so "the block you
+                # returned one frame ago" stops naming the block this loop will stream from, and the
+                # prediction is withheld rather than made cleverer. The frames dprev would have
+                # covered simply draft, which a deeper floor needs of them anyway.
+                _feed(p, d, hints[i + 1], prev=(F == 1 and i == nblk - 1 and nblk >= 2),
+                      dep=p - c, src="topup" if topup else "block")
         # THE PIPELINE FILL, measured: positions c..horizon all have a frame in the ring and none of
         # them has been judged yet (replies land in order and this one was for c-1), so that span IS
         # the number of frames in flight. 1 means the pipeline never filled and this is greedy decode
         # with extra steps; B+1 is the block fully streamed.
         depths.append(horizon - c + 1)
         sent.pop(pos - 1, None)                               # settled two positions back: never read again
+        ddepth.pop(pos - 1, None)
+        dsrc.pop(pos - 1, None)
         prevhint.discard(pos)
 
     hist[run] = hist.get(run, 0) + 1
@@ -2107,9 +2210,13 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     return {"ok": True, "tokens": toks, "prompt_tokens": len(prompt_ids),
             "receipts": recs, "receipts_ok": receipts_ok,
             "frames": frames, "drafted": drafted, "drafts_issued": issued, "lazy": lazy,
-            "generated": gen, "accepted": accepted,
+            "floor": F, "generated": gen, "accepted": accepted,
             "cancels": cancels, "cycles": cycles, "rounds": cycles,
             "g": (gen / cycles) if cycles else float(gen), "accept_hist": hist,
+            "accept_by_depth": {d: tuple(v) for d, v in sorted(by_depth.items())},
+            "topups": topups, "topup_frames": topup_frames,
+            "topup_accept_by_depth": {d: tuple(v) for d, v in sorted(tu_by_depth.items())},
+            "topup_agree": topup_agree, "topup_disagree": topup_disagree,
             "max_inflight": max(depths) if depths else 0,
             "mean_inflight": round(sum(depths) / len(depths), 2) if depths else 0.0,
             "stale_replies": stale, "unsent_frames": st8.unsent}
@@ -2223,7 +2330,7 @@ GRAPH_MODE_VALUES = frozenset({"0", "1", "island", "on", "whole", "2", "eager"})
 # export of it RAISES rather than quietly winning or quietly losing).
 ENG_ENV = [
     "V4_FP8_WIRE",                                                              # wire codec
-    "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT",                      # pipelined speculation
+    "V4_PIPELINED_SPEC", "V4_SPEC_DEPTH", "V4_LAZY_DRAFT", "V4_REFILL_FLOOR",   # pipelined speculation
     "V4_MOE_GROUPED", "V4_MOE_DECODE", "V4_MOE_MULTI", "V4_MOE_MULTI_MAX",      # MoE kernels
     "V4_GRAPH_MAX",                                                             # graph budget
     "V4_DSPARK_FAST", "V4_DSPARK_GRAPH",                                        # drafter
@@ -2635,6 +2742,17 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
                                         receipts=True, layer_count=n_layers, timeout=120,
                                         depth=w, lazy=True)
          for w in (2, 3, 16)}
+    # THE REFILL FLOOR, on the same warm ring, at the settings that bracket it (2 = one past the
+    # shipped drain, 5 = refill on every reply). At random weights every block is rejected at its
+    # first draft, so in-flight never exceeds the floor mid-run and a mid-run refill never fires:
+    # each floor arm must therefore run the SHIPPED round frame for frame — same stream, same frame
+    # count, same cancels, same fill, zero topups. That is the lever's own floor ("a raised floor
+    # with nothing to keep up costs nothing"), proven on sockets through a rewind on every round.
+    # The regime where the floor actually tops up mid-run needs a block that ACCEPTS, which random
+    # weights cannot give; it lives in tests/test_v4_pipe.py against a scripted oracle drafter.
+    fl = {f: coordinate_dspark_pipelined(d_pipe, d_ret, list(prompt), max_new, nonce=f"floor-{f}",
+                                         receipts=True, layer_count=n_layers, timeout=120, floor=f)
+          for f in (2, 3, 5)}
     send_msg(d_pipe, {"op": "stop"})
 
     def cover(res, rs):
@@ -2683,6 +2801,25 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
         "lazy_never_drafts_more_than_eager": all(z[w]["drafts_issued"] <= y[w]["drafts_issued"]
                                                  for w in z),
         "lazy_receipts_settle": all(v["receipts_ok"] is True and cover(v, d_ranges) for v in z.values()),
+        # THE REFILL FLOOR in the zero-accept regime: lossless at every setting, and byte-identical
+        # to the shipped drain-only round — see the comment above `fl` for why identity is exactly
+        # what this regime must show. `stale + unsent` is compared as a sum: the split between a
+        # fenced frame dropped before the wire and one answered after depends on sender-thread
+        # timing, the sum is the deterministic count of frames the fence discarded.
+        "floor_lossless_at_every_setting": all(v["tokens"] == ref_tokens for v in fl.values()),
+        "floor_at_zero_accept_is_the_shipped_round": all(
+            v["frames"] == q["frames"] and v["cancels"] == q["cancels"]
+            and v["max_inflight"] == q["max_inflight"]
+            and v["stale_replies"] + v["unsent_frames"] == q["stale_replies"] + q["unsent_frames"]
+            and v["topups"] == 0 and v["topup_frames"] == 0
+            for v in fl.values()),
+        "floor_receipts_settle": all(v["receipts_ok"] is True and cover(v, d_ranges)
+                                     for v in fl.values()),
+        # the depth histogram: at zero accept every judged draft is a depth-1 miss off a cancel
+        # refill, so the block book must carry trials and no hits, and the topup book must be empty
+        "accept_by_depth_scores_the_misses": all(
+            v["accept_by_depth"] and all(h == 0 for h, _ in v["accept_by_depth"].values())
+            and v["topup_accept_by_depth"] == {} for v in fl.values()),
     }
     tag = f", tail box = {tail_box_g} GPUs (return relay)" if tail_box_g > 1 else ""
     print("\n=== V4 pipe offline selftest (CPU tiny config) ===")
@@ -2705,6 +2842,9 @@ def selftest(nstages=3, prompt=(168, 15, 493, 72, 22), max_new=6, tail_box_g=1):
           + "   ".join(f"W={w} eager {y[w]['drafts_issued']}/{y[w]['drafted']} "
                        f"lazy {z[w]['drafts_issued']}/{z[w]['drafted']}" for w in z)
           + "   (zero accept: every block is consumed, so there is nothing to skip)")
+    print("  floor  " + "   ".join(
+        f"F={f} frames={v['frames']} cancels={v['cancels']} topups={v['topups']} "
+        f"by_depth={v['accept_by_depth']}" for f, v in fl.items()))
     for name, v in checks.items():
         print(f"  [{'PASS' if v else 'FAIL'}] {name}")
     ok = all(checks.values())

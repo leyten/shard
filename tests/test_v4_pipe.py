@@ -883,6 +883,45 @@ def test_pipelined_zero_accept_degrades_to_greedy_and_stays_lossless():
     assert r["cancels"] == 3 and r["accept_hist"] == {0: 4}
 
 
+def test_accept_by_depth_scores_every_draft_at_its_own_depth():
+    """Acceptance is not one number. `g` alone cannot separate a drafter that is uniformly mediocre
+    from one that is sharp at depth 1 and blind at depth B, and only the second shape can be helped
+    by feeding the pipeline differently — so the coordinator reports hits/trials keyed by how far
+    AHEAD OF THE FRONTIER each token was drafted. A perfect drafter must therefore score 100% at
+    every depth of the block, and never score the truth/correction frames, which are not predictions."""
+    r, _ = _pipelined(_perfect_block, max_new=10)
+    by = r["accept_by_depth"]
+    assert set(by) == {1, 2, 3}, f"a block of 3 has exactly depths 1..3, got {sorted(by)}"
+    assert all(h == t for h, t in by.values()), f"a perfect drafter misses nothing: {by}"
+    assert sum(t for _, t in by.values()) == r["accepted"], \
+        "every accepted token came from a scored draft, and nothing else was scored"
+    assert r["topup_accept_by_depth"] == {}, "no mid-run refill ran, so the topup book must be empty"
+
+
+def test_accept_by_depth_blames_the_depth_that_actually_missed():
+    """The histogram has to attribute the miss to the position that was WRONG, not to the block. A
+    block that is right at depth 1 and wrong at depth 2 must show a clean depth 1 and a missing
+    depth 2 — and the emitted stream must still be greedy's, which is the point of scoring at all:
+    this is a measurement, never a decision."""
+    def blocks(q):
+        b = _perfect_block(q)
+        return [b[0], 777, 778]                       # depth 1 right, depth 2 diverges
+    r, _ = _pipelined(blocks, max_new=8)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 11)], "scoring must not touch the stream"
+    by = r["accept_by_depth"]
+    assert by[1][0] == by[1][1] and by[1][1] >= 2, f"depth 1 was always right: {by}"
+    assert by[2][0] == 0 and by[2][1] >= 2, f"depth 2 was never right: {by}"
+    assert 3 not in by, "depth 3 was fenced behind the depth-2 miss and never judged"
+
+
+def test_accept_by_depth_is_empty_when_nothing_was_ever_speculated():
+    """Depth 0 is not a depth. A run that only ever feeds truth frames (max_new reached before any
+    block is judged) has no trials at all, rather than a phantom bucket that would drag a measured
+    acceptance curve toward zero."""
+    r, _ = _pipelined(_perfect_block, max_new=1)
+    assert r["accept_by_depth"] == {}, f"nothing was judged, so nothing may be scored: {r}"
+
+
 def test_pipelined_stops_at_eos_inside_a_block():
     """EOS lands mid-block, with the frames behind it already in the ring: they must be drained and
     their tokens never emitted."""
@@ -1163,6 +1202,196 @@ def test_a_block_that_shrinks_mid_job_degrades_instead_of_killing_the_round(shri
 
     r, _ = _pipelined(blocks, max_new=12, lazy=True)
     assert r["tokens"] == [TRUTH[p] for p in range(3, 15)], "the shrinking block moved the stream"
+
+
+# ── 7e. THE REFILL FLOOR: consume the mid-run blocks the round already pays for ───────────────────
+#
+# The shipped round refills only when the pipe has DRAINED to the frontier, so in-flight saws
+# B+1 .. 2 and back — while the tail drafts a fresh block on every committed frame and the
+# coordinator discards every mid-run one. V4_REFILL_FLOOR consumes a reply's block at or below the
+# named in-flight level instead. These tests hold its three properties: floor=1 IS the shipped
+# round (not "close to"), a raised floor moves speculation and never the stream, and the lazy-draft
+# hint licensing stays a proof — not a heuristic — at every floor.
+
+
+def test_refill_floor_default_is_the_drain_and_changes_nothing():
+    """The lever ships at 1 and floor=1 is the shipped drain-only round exactly: same tokens, same
+    frame count, same cancels, same fill, same depth histogram, zero mid-run refills. This is the
+    identity the default rides on — an operator who never heard of the floor runs the round that
+    was measured before it existed."""
+    assert VP.V4_REFILL_FLOOR == 1, "the lever must ship at 1 (drain-only)"
+    base, _ = _pipelined(_perfect_block, max_new=12)
+    r, _ = _pipelined(_perfect_block, max_new=12, floor=1)
+    assert base["floor"] == 1 and r["floor"] == 1
+    assert _accept_pattern(r) == _accept_pattern(base), "floor=1 is not the shipped round"
+    assert r["accept_by_depth"] == base["accept_by_depth"]
+    assert r["topups"] == 0 and r["topup_frames"] == 0 and r["topup_accept_by_depth"] == {}, \
+        "the shipped floor ran a mid-run refill"
+
+
+def test_refill_floor_rejects_a_floor_below_one():
+    """0 would mean 'never refill', which is a pipeline that drains once and hangs — refuse it
+    loudly at the argument rather than as a stall mid-job."""
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    try:
+        with pytest.raises(ValueError, match="refill floor"):
+            VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 4,
+                                           timeout=10, floor=0)
+    finally:
+        ring.close()
+
+
+def test_refill_floor_at_block_pins_the_pipe_at_block_plus_one():
+    """THE LEVER. At floor >= B every accepted reply refills, so in-flight is pinned at B+1 instead
+    of sawing down to the drain — the fill the ten-agent model prices at ~+21% on the measured ring.
+    The stream must still be greedy's, token for token, because the floor moves only what is
+    SPECULATED: every commit is still the tail's own reply, and that is not a throughput claim, it
+    is the accept rule not having changed."""
+    base, _ = _pipelined(_perfect_block, max_new=14)
+    r, _ = _pipelined(_perfect_block, max_new=14, floor=3)
+    assert r["tokens"] == base["tokens"] == [TRUTH[p] for p in range(3, 17)]
+    assert r["cancels"] == 0, "a correct block was rejected under the floor"
+    assert r["max_inflight"] == 4, "block of 3 + the frontier frame must all be in flight"
+    assert r["mean_inflight"] > base["mean_inflight"], \
+        f"the floor did not lift the fill: {r['mean_inflight']} vs {base['mean_inflight']}"
+    assert r["topups"] > 0 and r["topup_frames"] > 0, "no mid-run refill ever fired at floor=B"
+    assert all(h == t for h, t in r["topup_accept_by_depth"].values()), \
+        f"a perfect drafter's topped-up frames must all land: {r['topup_accept_by_depth']}"
+    # A mid-run block re-predicts the positions already in flight; with a deterministic perfect
+    # drafter the re-prediction agrees everywhere, and the overlap is measured, never fed.
+    assert r["topup_agree"] > 0 and r["topup_disagree"] == 0
+
+
+def test_refill_floor_topups_are_the_deep_end_of_the_block():
+    """WHY THE FAMILY IS NON-MONOTONE, pinned as the mechanism rather than the number: the one to
+    three positions a mid-run block adds are always its DEEPEST drafts — depth 2 and 3 for a block
+    of 3 — never depth 1, which only a drain or a cancel ever streams. A floor of 2 therefore worsens
+    the trial-depth mix before its fill gain pays, which is why floor=2 can price BELOW floor=1 and
+    the operating point is a measurement."""
+    r, _ = _pipelined(_perfect_block, max_new=14, floor=2)
+    assert r["topups"] > 0, "floor=2 never topped up mid-run"
+    assert r["topup_accept_by_depth"] and min(r["topup_accept_by_depth"]) >= 2, \
+        f"a mid-run refill streamed a shallow draft: {r['topup_accept_by_depth']}"
+    assert set(r["accept_by_depth"]) == {1, 2, 3}, \
+        "drain/cancel refills still cover the whole block"
+
+
+def test_refill_floor_never_restreams_a_position_in_flight():
+    """A frame on the wire cannot be recalled, so a refill past frames still unjudged must feed only
+    the block's NEW positions. Read off the wire itself: within an epoch the streamed positions are
+    strictly increasing — a duplicate would be the coordinator re-speculating a position the ring
+    already holds, and a stage would compute both."""
+    for floor in (2, 3):
+        r, ring = _pipelined(_perfect_block, max_new=14, floor=floor)
+        assert r["tokens"] == [TRUTH[p] for p in range(3, 17)]
+        seen = {}
+        for ids, p, ep in ring.frames:
+            if len(ids) == 1:                          # s=1 step frames; the prefill is the chunk
+                assert ep not in seen or p > seen[ep], \
+                    f"floor={floor}: position {p} streamed twice (or out of order) in epoch {ep}"
+                seen[ep] = p
+
+
+def test_refill_floor_disagreement_is_measured_and_the_stream_survives():
+    """A mid-run block's deep drafts condition on ITS OWN prefix, not on the frames already in
+    flight — the honest price docs/V4_MULTIBLOCK_VERDICT.md §4 refused to pay blind. Script that
+    exact hazard: every block's deepest draft is wrong, so the in-flight tail and each fresh block's
+    re-prediction of it disagree, the topped-up frames ride behind a doomed one, and every cycle
+    cancels. The counters must SEE the disagreement, and the stream must still be greedy's — the
+    floor moves waste, never tokens."""
+    def blocks(q):
+        b = _perfect_block(q)
+        return [b[0], b[1], 90777]                    # deepest draft always wrong
+    base, _ = _pipelined(blocks, max_new=12)
+    r, _ = _pipelined(blocks, max_new=12, floor=3)
+    assert r["tokens"] == base["tokens"] == [TRUTH[p] for p in range(3, 15)], \
+        "a wrong topped-up frame moved the stream"
+    assert r["cancels"] > 0 and r["topups"] > 0
+    assert r["topup_disagree"] > 0, \
+        "the fresh blocks provably disagreed with the in-flight tail and nothing counted it"
+    # the wrong deepest draft is judged at ITS depth, in whichever book streamed it
+    misses = {d: (h, t) for d, (h, t) in
+              list(r["accept_by_depth"].items()) + list(r["topup_accept_by_depth"].items())
+              if h < t}
+    assert misses and max(misses) == 3, f"the depth-3 miss was not blamed at depth 3: {misses}"
+
+
+@pytest.mark.parametrize("floor", [2, 3])
+@pytest.mark.parametrize("bad_at", [6, 8, 11])
+def test_refill_floor_is_lossless_through_rejections_at_every_setting(floor, bad_at):
+    """Rejections under a raised floor: the cancel must fence the topped-up future with everything
+    else, rewind, and refill off the rejecting reply exactly as the shipped round does — and emit
+    greedy's stream whatever was in flight when the miss landed."""
+    def blocks(q):
+        return [(_WRONG_DRAFT if q + 2 + i == bad_at else TRUTH[q + 2 + i]) for i in range(3)]
+    r, _ = _pipelined(blocks, max_new=12, floor=floor)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 15)], \
+        f"floor={floor}, miss at {bad_at}: the stream moved"
+    assert r["cancels"] > 0, f"the draft poisoned at {bad_at} never caused a rejection"
+
+
+@pytest.mark.parametrize("floor", [1, 2, 3])
+def test_lazy_hint_licensing_holds_at_every_floor(floor):
+    """THE CORRECTNESS WORK THE FLOOR PRICES IN LAST, made a proof again. A raised floor moves which
+    reply consumes a block, so the shipped hint rule ("everything but the last two") would license
+    skips on replies the round now refills from — and a skipped refill is the loud
+    'tail skipped a block the round needed' raise, which kills the tail mid-job on a real ring.
+    `_hints` therefore withholds the last floor+1 positions: a hinted frame's reply sits strictly
+    above the floor (horizon is monotone within an epoch, and a cancel fences every frame it
+    outdates), so it is never asked to refill, and the hint stays a FACT the raise can police.
+
+    Driven with the real `wants_block` predicate on the scripted tail, through misses as well as
+    accepts: the licensed round must complete (no raise), emit greedy's stream, and run the same
+    accept pattern as the eager round at the same floor."""
+    def blocks(q):
+        return [(_WRONG_DRAFT if (q + 2) % 9 == 0 else TRUTH[q + 2]),
+                TRUTH[q + 3], TRUTH[q + 4]]           # a periodic depth-1 miss: cancels + refills
+    eager, _ = _pipelined(blocks, max_new=14, floor=floor)
+    ring = _ScriptedPipeRing(TRUTH, blocks)
+    ring.lazy = True
+    try:
+        lazy = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 14,
+                                              timeout=10, lazy=True, floor=floor)
+    finally:
+        ring.close()
+    assert lazy["tokens"] == [TRUTH[p] for p in range(3, 17)]
+    assert _accept_pattern(lazy) == _accept_pattern(eager), \
+        f"floor={floor}: lazy drafting moved something other than the drafting"
+    assert lazy["drafts_issued"] <= eager["drafts_issued"]
+
+
+def test_a_raised_floor_defeats_lazy_drafting_and_the_bill_is_visible():
+    """The floor's second price, pinned so nobody discovers it on a rented ring: at floor >= B every
+    reply may be asked to refill, the licensing can prove no skip safe, and the round must send NO
+    hints at all — the tail drafts on every frame and `drafts_issued` says so. A lever that quietly
+    kept hinting here would be trading the raise for a stall; a lever that quietly stopped reporting
+    the bill would be how this engine measures baselines and reports levers."""
+    ring = _ScriptedPipeRing(TRUTH, _perfect_block)
+    ring.lazy = True
+    try:
+        r = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 12,
+                                           timeout=10, lazy=True, floor=3)
+    finally:
+        ring.close()
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 15)]
+    assert set(ring.hints.values()) == {None}, "a hint was licensed at a floor that refills everywhere"
+    assert not any(ring.dprev.values()), "`dprev`'s drain premise is floor-1-only and must not arm"
+    eager, _ = _pipelined(_perfect_block, max_new=12, floor=3)
+    assert r["drafts_issued"] == eager["drafts_issued"], \
+        "the defeated lever must pay the eager bill, visibly"
+
+
+@pytest.mark.parametrize("floor", [1, 3])
+def test_a_tail_that_skips_a_needed_block_fails_loudly_at_any_floor(floor):
+    """The anti-silence raise survives the floor: whichever reply the round refills from, a tail
+    that answers it with no `draft` key at all under an armed lazy lever is a bug, not a slow path."""
+    ring = _NeverDrafts(TRUTH, _perfect_block)
+    try:
+        with pytest.raises(RuntimeError, match="carries no block and this round needs one"):
+            VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), 6,
+                                           timeout=10, lazy=True, floor=floor)
+    finally:
+        ring.close()
 
 
 def test_sender_side_epoch_fence_drops_queued_frames_without_stranding_the_receiver():
@@ -2041,6 +2270,110 @@ def test_lazy_drafting_is_a_noop_in_the_zero_accept_regime(tiny):
     assert r["cancels"] > 0, "the rejection path never ran"
     assert r["drafts_issued"] == e["drafts_issued"], \
         "a round that consumes every block it is given must still be billed for every one"
+
+
+@pytest.mark.parametrize("floor", [2, 3])
+def test_refill_floor_on_a_real_ring_is_lossless_and_lifts_the_fill(tiny, long_ref, floor):
+    """THE FLOOR ON REAL STAGES OVER REAL SOCKETS, in the forced-accept regime where it actually
+    tops up (at zero accept it is the shipped round frame for frame — the selftest pins that).
+    The stream must be the reference Transformer's own greedy tokens, the receipts must settle,
+    the mid-run refills must really have fired, and the fill must sit above the drain-only
+    baseline's — the thing the lever is for, measured on the wire it will ship on."""
+    d, args, _ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", _BlockScriptDrafter(d, _oracle_blocks(long_ref)))
+            base = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"floor-base-{floor}")
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", _BlockScriptDrafter(d, _oracle_blocks(long_ref)))
+            r = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"floor-{floor}", floor=floor)
+    finally:
+        ring.close()
+    assert base["tokens"] == long_ref and r["tokens"] == long_ref, \
+        f"floor={floor} on a real ring: {r['tokens']} != greedy {long_ref}"
+    assert r["cancels"] == 0, "a correct block was rejected under the floor"
+    assert r["receipts_ok"] is True, "a floored round must still settle its receipts"
+    assert r["topups"] > 0 and r["topup_frames"] > 0, \
+        f"floor={floor} never consumed a mid-run block on the real ring"
+    assert r["mean_inflight"] > base["mean_inflight"], \
+        f"floor={floor} did not lift the fill: {r['mean_inflight']} vs {base['mean_inflight']}"
+    assert all(h == t for h, t in r["topup_accept_by_depth"].values()), \
+        f"an oracle block's topped-up frame was rejected: {r['topup_accept_by_depth']}"
+    assert r["topup_disagree"] == 0, "a deterministic drafter's re-predictions disagreed"
+
+
+@pytest.mark.parametrize("boundary", [7, 11])
+def test_refill_floor_cancel_on_a_compression_boundary_is_lossless(tiny, long_ref, boundary):
+    """THE REJECTION UNDER A RAISED FLOOR, on real stages, landing exactly on a compression
+    boundary — the zero-margin case of the W-deep rollback, now with topped-up frames in the
+    discarded future. The fence must drop them with everything else, every stage must rewind onto
+    the boundary, and the stream must still be the reference's own."""
+    d, args, _ref = tiny
+    double = _BlockScriptDrafter(d, _oracle_blocks(long_ref, poison_at=(boundary,)))
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", double)
+            r = ring.pipelined(list(PROMPT), NEW_LONG, nonce=f"floor-b{boundary}", floor=3)
+    finally:
+        ring.close()
+    assert r["tokens"] == long_ref, \
+        f"floored rewind onto boundary {boundary}: {r['tokens']} != {long_ref}"
+    assert r["cancels"] == 1, "the poisoned draft did not cause exactly one rewind"
+    assert r["topups"] > 0, "no mid-run refill was in flight when the rejection landed"
+    assert r["receipts_ok"] is True
+
+
+def test_lazy_drafting_under_a_floor_on_a_real_ring_is_bit_identical(tiny, long_ref):
+    """The licensing proof, on the wire it protects: lazy + floor=2 on real stages must emit the
+    reference stream, run the eager round's exact accept pattern, and never skip a block a refill
+    then needed — a licensing bug here is the loud raise, which would kill the tail mid-job."""
+    d, args, _ref = tiny
+    eager = _BlockScriptDrafter(d, _oracle_blocks(long_ref))
+    lazy = _BlockScriptDrafter(d, _oracle_blocks(long_ref))
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=True, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", eager)
+            e = ring.pipelined(list(PROMPT), NEW_LONG, nonce="floor-eager", floor=2)
+        e_state = _drafter_state(eager)
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", lazy)
+            r = ring.pipelined(list(PROMPT), NEW_LONG, nonce="floor-lazy", floor=2, lazy=True)
+        r_state = _drafter_state(lazy)
+    finally:
+        ring.close()
+    assert r["tokens"] == long_ref, f"lazy under floor=2: {r['tokens']} != greedy {long_ref}"
+    assert _accept_pattern(r) == _accept_pattern(e), "lazy under a floor changed the round itself"
+    assert _same_state(r_state, e_state), "the drafter's mtp window/cursor diverged under the floor"
+    assert r["drafts_issued"] <= e["drafts_issued"]
+    assert r["receipts_ok"] is True
+
+
+def test_the_audit_observes_the_floor_a_real_round_actually_used(tiny, long_ref):
+    """V4_REFILL_FLOOR is a coordinator lever — an argument to a loop — so the audit's observation
+    is what the loop noted, off a real round on real sockets. A job-level floor with no env is
+    legal (like `pipelined` itself); an environment that names a floor the run then did not refill
+    at is the wrong-process bug in this lever's costume, and must read as a MISMATCH."""
+    import v4_levers as VL
+    d, args, _ref = tiny
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), receipts=False, dspark=True)
+    try:
+        with pytest.MonkeyPatch.context() as mp:
+            mp.setattr(VP, "TAIL_DRAFTER", _BlockScriptDrafter(d, _oracle_blocks(long_ref)))
+            ring.pipelined(list(PROMPT), NEW_LONG, nonce="floor-audit", floor=3)
+    finally:
+        ring.close()
+    assert VL.notes()["V4_REFILL_FLOOR"] == "3", "the audit did not see the floor the round ran"
+    found = {f.env: f for f in VL.audit(VL.COORDINATOR)}["V4_REFILL_FLOOR"]
+    assert found.observed == "3" and found.verdict == "OK", found
+    with pytest.MonkeyPatch.context() as mp:
+        mp.setenv("V4_REFILL_FLOOR", "5")             # the operator asked for 5...
+        mp.setattr(VP, "V4_REFILL_FLOOR", 5)          # ...the module parsed it...
+        found = {f.env: f for f in VL.audit(VL.COORDINATOR)}["V4_REFILL_FLOOR"]
+    assert found.verdict == "MISMATCH", \
+        f"a run that refilled at 3 against an env that says 5 must be a finding, got {found.verdict}"
 
 
 def _drive_pipelined(ring, prompt, steps, *, stale_at=None):
