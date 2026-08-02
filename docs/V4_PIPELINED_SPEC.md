@@ -228,10 +228,18 @@ step even before the WAN round-trip it also removes from the critical path.**
   with the *replay penalty* eating `g`, not necessarily with low `a`; the pipelined path removes that
   confound, so `a` should reflect the true MTP acceptance — which DeepSeek reports as high but on their
   own infra. First real-ring measurement of `a` is the single biggest input to these numbers.
-- **`dspark_block_size = 5` caps the per-block run.** `R > 5` (very high `a`) would leave the pipeline
-  under-fed unless we chain-draft the next block off the current block's predicted hidden (continuous /
-  multi-block speculation) — an upside lever that trades compounding acceptance risk for higher
-  utilization, beyond this base projection.
+- **`dspark_block_size = 5` caps the per-block run, and that cap is HARD — see
+  [`V4_MULTIBLOCK_VERDICT.md`](V4_MULTIBLOCK_VERDICT.md).** This bullet used to call multi-block
+  speculation ("chain-draft the next block off the current block's predicted hidden") an upside lever
+  beyond the base projection. It is not a lever; it is unreachable. There is no predicted hidden that
+  can stand in for `main_hidden`, a draft therefore needs a tap only the ring can produce, and the
+  reply carrying a frame's block is the same reply that advances the frontier past it — so in-flight
+  is pinned at `block+1 = 6` however deep the knob is set. Measured: depths 6, 8 and 12 are
+  byte-identical at `max_inflight = 6`.
+  **The consequence for §5 is the ring width.** `D` is not free above 6: stages past `block+1` idle
+  while still charging a hop, which is why the measured ten-box ring is *slower* than the six-box one
+  (4.39 vs 5.35 tok/s). Read the `D = 6` in this section's table as the ring width to rent, not a
+  starting point to scale up from.
 - **`τ = 26ms` is itself a target**, contingent on the grouped-MoE kernel + CUDA graphs landing on V4;
   `40ms` graphed is the nearer-term figure and still yields 10–12.5 tok/s.
 
