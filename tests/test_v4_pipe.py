@@ -1394,6 +1394,72 @@ def test_a_tail_that_skips_a_needed_block_fails_loudly_at_any_floor(floor):
         ring.close()
 
 
+# ── 7e. the WIDE block: the coordinator adapts to whatever width the reply carries ────────────────
+# V4_DSPARK_BLOCK widens the TAIL's block; the coordinator never reads the flag — it streams
+# `min(len(blk), W-1)` off every consumed reply, so these tests script the widened tail directly.
+
+WIDE = 8                                                   # a block past the trained 5, under W=16
+
+
+@pytest.mark.parametrize("floor", [1, WIDE])
+def test_a_wide_block_lifts_the_inflight_cap_and_stays_lossless(floor):
+    """THE CAP MOVES. docs/V4_MULTIBLOCK_VERDICT.md §2 pins in-flight at block+1 — widening the
+    block is the one axis that proof leaves open, and here a width-8 reply holds 9 frames in
+    flight where the trained width holds 6. The stream must still be greedy's token for token at
+    every floor, because width moves only what is SPECULATED: every commit is still the tail's own
+    reply at a committed position, and the accept rule never changed."""
+    r, _ = _pipelined(lambda q: _perfect_block(q, n=WIDE), max_new=14, floor=floor)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 17)], f"floor={floor}: the stream moved"
+    assert r["cancels"] == 0, "a correct wide block was rejected"
+    assert r["max_inflight"] == WIDE + 1, \
+        f"width {WIDE} must fill to {WIDE + 1}, got {r['max_inflight']}"
+    assert r["block_len"] == WIDE, "the observed width must be reported for the depth split"
+    if floor == WIDE:
+        assert r["topups"] > 0 and r["topup_accept_by_depth"], "the pinned pipe never topped up"
+        assert max(r["topup_accept_by_depth"]) == WIDE, \
+            "a pinned wide pipe's refills are its deepest index"
+
+
+def test_a_wide_block_is_still_capped_by_the_stages_rollback_depth():
+    """`W` is the stages' rollback ring as well as the window, so a block wider than W-1 must be
+    TRUNCATED on stream, never trusted past what a stage can rewind — the one way this path could
+    fail loudly on a real ring."""
+    r, _ = _pipelined(lambda q: _perfect_block(q, n=WIDE), max_new=12, depth=6)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 15)]
+    assert r["max_inflight"] == 6, f"W=6 must cap a width-{WIDE} block at 6 in flight"
+
+
+@pytest.mark.parametrize("floor", [1, WIDE])
+@pytest.mark.parametrize("bad_depth", [6, 7])
+def test_a_wide_block_miss_past_the_trained_depth_is_blamed_and_lossless(floor, bad_depth):
+    """The deep slots are the UNMEASURED bet the lever exists to measure: script them wrong at a
+    depth the trained block cannot even reach, and require (a) greedy's stream regardless, (b) the
+    miss scored at ITS depth in whichever book streamed it — the falsification measurement
+    accept_by_depth[6..] exists for."""
+    def blocks(q):
+        return [(_WRONG_DRAFT if i + 1 >= bad_depth else TRUTH[q + 2 + i]) for i in range(WIDE)]
+    r, _ = _pipelined(blocks, max_new=12, floor=floor)
+    assert r["tokens"] == [TRUTH[p] for p in range(3, 15)], \
+        f"floor={floor}, miss at depth {bad_depth}: the stream moved"
+    assert r["cancels"] > 0, "the poisoned deep slot never caused a rejection"
+    misses = {d for d, (h, t) in
+              list(r["accept_by_depth"].items()) + list(r["topup_accept_by_depth"].items())
+              if h < t}
+    assert misses and max(misses) == bad_depth, \
+        f"the depth-{bad_depth} miss was not blamed at its depth: {misses}"
+
+
+def test_time_average_inflight_is_reported_and_bounded():
+    """The fill number the pricing model takes: present, positive, never above the peak, over a
+    positive decode window — and `frames_per_token` is exactly frames/generated, the waste multiple
+    the ring's tok/s divides by."""
+    r, _ = _pipelined(_perfect_block, max_new=12, floor=3)
+    assert 0 < r["inflight_time_avg"] <= r["max_inflight"]
+    assert r["decode_wall_s"] > 0
+    assert r["frames_per_token"] == round(r["frames"] / r["generated"], 3)
+    assert r["block_len"] == 3
+
+
 def test_sender_side_epoch_fence_drops_queued_frames_without_stranding_the_receiver():
     """The other half of the fence, unit-tested because a live toy ring drains the queue too fast to
     hit it: when a cancel fires, frames already QUEUED for a now-dead epoch must never reach the wire,

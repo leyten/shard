@@ -1872,9 +1872,20 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
 
     Returns coordinate()'s dict plus {frames, drafted, drafts_issued, lazy, floor, generated,
     accepted, cancels, cycles, g, accept_hist, accept_by_depth, topups, topup_frames,
-    topup_accept_by_depth, topup_agree, topup_disagree, max_inflight, mean_inflight, stale_replies,
+    topup_accept_by_depth, topup_agree, topup_disagree, max_inflight, mean_inflight,
+    inflight_time_avg, decode_wall_s, frames_per_token, block_len, stale_replies,
     unsent_frames} — `max_inflight` being the pipeline depth actually achieved, i.e. whether the
     thing pipelined at all, and `drafts_issued` what the tail was billed for to achieve it.
+
+    `mean_inflight` is EVENT-weighted (one sample per judged reply) and overstates the fill a ring
+    actually held — a level is weighted by how many replies it survived, not by how long it lasted,
+    and on the live ring that bias measured ~6.5%. `inflight_time_avg` is the same span integrated
+    over the wall clock between every change of frontier or horizon, from the first streamed frame
+    to the commit that stops the run, over exactly `decode_wall_s` seconds — it is the number
+    Little's law wants (fill = frame rate x time-in-span), so it is what the pricing model takes.
+    `frames_per_token` is frames streamed per token emitted (the waste multiple, >= 1.0), and
+    `block_len` the widest block a reply actually carried — the trained width unless the tail was
+    built with V4_DSPARK_BLOCK.
 
     `accept_by_depth` maps a draft's DEPTH — how far ahead of the frontier it was streamed, 1 for a
     block's first draft, B for its last — to `(hits, trials)`, counting only frames actually judged.
@@ -1944,6 +1955,22 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     hist, depths = {}, []
     by_depth, tu_by_depth = {}, {}                            # draft depth -> [hits, trials], per source
     prevhint = set()                                          # positions sent a `dprev` PREDICTION
+    blen = 0                                                  # widest block a reply actually carried
+    # THE TIME-WEIGHTED FILL. `depths` samples the span once per judged reply, so `mean_inflight`
+    # weights a level by how many replies it survived rather than by how long it HELD, and that
+    # bias measured ~6.5% high on the live ring. `tick` instead integrates level x wall time across
+    # every change of `c` or `horizon`: the clock starts at the first streamed frame and freezes on
+    # the commit that sets `stop`, so the post-EOS drain dilutes nothing.
+    tick = {"t": None, "area": 0.0, "span": 0.0}
+
+    def _mark():
+        """Advance the fill integral to NOW at the CURRENT level — called BEFORE c/horizon moves."""
+        now = time.monotonic()
+        if tick["t"] is not None:
+            dt = now - tick["t"]
+            tick["area"] += (horizon - c + 1) * dt
+            tick["span"] += dt
+        tick["t"] = now
 
     def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block"):
         """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
@@ -1974,6 +2001,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         dsrc[pos] = src
         if src == "topup":
             topup_frames += 1
+        _mark()                                               # the old level held until this frame
         horizon = max(horizon, pos)
         frames += 1
         f = {"op": "step", "ids": [[int(tok)]], "start_pos": pos, "epoch": st8.epoch, "cpos": c - 1}
@@ -2068,6 +2096,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         m = int(rep["tokens"][0])                             # the model's token at pos+1, at M=b
         fed = sent.get(pos + 1)                               # what we streamed there, if anything yet
         fdep = ddepth.get(pos + 1, 0)                         # 0 == a truth frame, i.e. not a trial
+        _mark()                                               # the old level held until this reply
         ids.append(m)
         c = pos + 1
         toks.append(m)
@@ -2090,6 +2119,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             continue
         blk = [int(t) for t in (rep.get("draft") or [])]
         issued += bool(blk)                                   # what the TAIL paid for, block for block
+        blen = max(blen, len(blk))
         # THE REPLY THE ROUND REFILLS FROM, named: the next block has to come off THIS reply —
         # because nothing is speculated past the frontier (`fed is None`), or because the cancel
         # below discards everything that was (`fed != m`), or because in-flight has sagged to the
@@ -2137,6 +2167,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 del sent[p]
                 ddepth.pop(p, None)
                 dsrc.pop(p, None)
+            _mark()                                           # the fenced span held until the cancel
             horizon = pos
             # start_pos == c IS the rewind command. The block on THIS reply was drafted off `m`, the
             # correction — the docstring's FRESH BLOCK COMES WITH THE REJECTION — so the span is the
@@ -2219,6 +2250,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             "topup_agree": topup_agree, "topup_disagree": topup_disagree,
             "max_inflight": max(depths) if depths else 0,
             "mean_inflight": round(sum(depths) / len(depths), 2) if depths else 0.0,
+            "inflight_time_avg": round(tick["area"] / tick["span"], 2) if tick["span"] > 0 else 0.0,
+            "decode_wall_s": round(tick["span"], 3),
+            "frames_per_token": round(frames / gen, 3) if gen else 0.0,
+            "block_len": blen,
             "stale_replies": stale, "unsent_frames": st8.unsent}
 
 
