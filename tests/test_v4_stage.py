@@ -774,6 +774,46 @@ def test_multi_deep_rollback_at_a_larger_ratio(args):
             f"step {i}: W-deep rollback diverged at compress ratio 16"
 
 
+def test_multi_deep_rollback_at_the_shipped_depth_and_ratio_alternation(args):
+    """The SHIPPED shape of the problem, end to end: compress_ratios alternating 4/128 (the real
+    config's pattern — config.json ships [0,0,4,128,4,128,...]), a full V4_SPEC_DEPTH=16 frames in
+    flight, and a rejection at depth 16 rewinding across the ratio-128 boundary at p=127 (which is a
+    ratio-4 boundary too, 128 % 4 == 0 — both compressor kinds cross at once).
+
+    Two zero-margin facts are exercised together and neither is covered by the smaller cases: the
+    checkpoint ring holds exactly W=16 snapshots, so a rewind to the oldest streamed frame lands on
+    the ring's LAST live checkpoint; and a ratio-128 accumulator folds 128 positions before emitting
+    a slot, so the rejected tail poisons an accumulator that will not emit again for ~128 positions —
+    the restore has to put back the running state, not just the window."""
+    a = REFCPU.cpu_args(compress_ratios=(0, 0, 4, 128, 4, 128, 4, 0, 0, 0))
+    prompt, W, k = 115, 16, 0
+    assert W == int(os.environ.get("V4_SPEC_DEPTH", 16)), "W must be the shipped rollback depth"
+    assert any((p + 1) % 128 == 0 for p in range(prompt + k, prompt + W)), \
+        "the rejected tail must cross the ratio-128 boundary at p=127"
+    o = REFCPU.build_oracle(a, SEED)
+    ids = _ids(prompt + W, a)
+    head, chunk = ids[:, :prompt], ids[:, prompt:]
+
+    st = stage_from_oracle(o, a, 0, a.n_layers, spec_depth=W)
+    st._spec = True
+    run([st], head, 0)
+    stream_spec(st, chunk, prompt)
+    assert len(st._spec_ckpts) == W, "exactly W live checkpoints — the rewind has zero margin"
+    st._seek(prompt + k)
+    _poison_stale_compressed(st)
+
+    want = stage_from_oracle(REFCPU.build_oracle(a, SEED), a, 0, a.n_layers)
+    run([want], head, 0)
+    for j in range(k):
+        run([want], chunk[:, j:j + 1], prompt + j)
+
+    first = _ids(1, a, seed=5)
+    for i, ((h_got, l_got), (h_want, l_want)) in enumerate(
+            zip(stream(st, first, prompt + k, STEPS), stream(want, first, prompt + k, STEPS))):
+        assert torch.isfinite(h_got).all() and torch.equal(h_got, h_want) and torch.equal(l_got, l_want), \
+            f"step {i}: a depth-16 rollback across the 4/128 boundary diverged from sequential decode"
+
+
 def test_multi_deep_rollback_batched(args):
     """b=2. `_snapshot` clones whole buffers (all `max_batch_size` rows), not `[:bsz]`, and the
     reference indexes every write `[:bsz, ...]` — so a rollback must restore BOTH rows and the two
