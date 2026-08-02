@@ -373,6 +373,23 @@ with `check_chain=True` is asserted on every real-ring pipelined test.
   the structural claim. The in-process ring is GIL-serialised, so the wall clock there is meaningless —
   the depth is the observable, and it is reported per job (`max_inflight`, `mean_inflight`).
 
+### 9.5b THE REFILL FLOOR (added 2026-08-02) — `V4_REFILL_FLOOR`
+
+The shipped round above refills only when the pipe drains to the frontier, so in-flight saws
+`B+1 .. 2` while the tail drafts a block on **every** committed frame and the coordinator discards
+every mid-run one. `V4_REFILL_FLOOR` (coordinator lever, default 1 = the drain-only round frame for
+frame) consumes a reply's block at or below the named in-flight level, streaming only positions past
+the deepest frame in flight; `floor = B` pins in-flight at `block+1`. Priced at **+11..+45%** on the
+07-31 ring, the spread hanging on the per-depth acceptance decay — see
+`docs/V4_MULTIBLOCK_VERDICT.md` §4's correction and `phase0/v4_ngram_econ.py`. Three prices travel
+with it, all instrumented rather than assumed: a mid-run block's deep drafts condition on its own
+prefix, not the in-flight frames (`topup_agree/topup_disagree`, and topped-up frames scored apart in
+`topup_accept_by_depth`); the family is non-monotone at the low end (floor=2 can price below
+floor=1 — the marginal frames are the block's deepest); and a raised floor defeats lazy drafting by
+degrees (the `_hints` licensing withholds the last `floor+1` positions, so the skip stays a provable
+fact and the "tail skipped a block the round needed" raise stays sound at every floor — fully
+defeated at `floor >= B`, with the bill visible as `drafts_issued` against `frames`).
+
 ### 9.6 Remaining risk for a real-ring run
 
 1. **`a` and `L` are still unmeasured** (§6, unchanged). This build removes the confound; it does not

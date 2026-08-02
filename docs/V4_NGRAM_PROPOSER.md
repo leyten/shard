@@ -1,5 +1,17 @@
 # V4 pipelined speculation — the tap-free proposer, and what it is actually worth
 
+> **STATUS, 2026-08-02: measured, priced, and left UNMERGED.** The implementation this document
+> describes (`V4_PIPE_PROPOSER`, the match gate, the hybrid) lives on branch
+> `v4/ngram-pipe-proposer` and was deliberately not ported onto `v4/truth`: the verdict below —
+> ~+1% on real coding output, +69% only on copying — is why. The primary fill lever became the
+> refill floor instead (`V4_REFILL_FLOOR`, see `docs/V4_MULTIBLOCK_VERDICT.md` §4's correction),
+> which needs no new proposer and no workload luck. On the 07-31 ring the bar got harder, not
+> easier: on top of `floor=5` a tap-free extension breaks even only at flat q ≥ 0.62–0.89
+> (`phase0/v4_ngram_econ.py`), and measured n-gram acceptance on novel text is 0.016 — a 40× miss.
+> The acceptance harness (`phase0/v4_ngram_accept.py`) and the per-depth instrumentation are
+> merged; the proposer machinery stays on its branch until someone shows a tap-free proposer with
+> real acceptance on NOVEL text, which n-gram is not.
+
 ## The verdict, before anything else
 
 **The lever is safe, it is built, and on real agentic-coding output it is worth about +1%.** It is

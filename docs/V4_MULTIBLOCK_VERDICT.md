@@ -145,6 +145,20 @@ script refits three other shapes (miss-linear, miss-power-law, q-geometric) to t
 points. Every shape that can represent the data at all lands the top-up at **+3.0% to +3.2%** and puts
 `q_5` at 0.68-0.69. The verdict is a property of the measurement, not of the curve drawn through it.
 
+> **CORRECTION, 2026-08-02 — the +3% was a property of the OLD drafter, and the lever is now
+> built.** Everything above prices the top-up against `q_5 = 0.68` / `g = 4.92`; the 07-31 six-stage
+> ring measures `g = 11.13`, and the lever's value is almost entirely q at the block's deepest
+> index. Re-priced on that ring the same rolling refill models **+11% to +45%** (the spread hangs on
+> the per-depth decay shape — `phase0/v4_ngram_econ.py`, and a ten-agent discrete-event calibration
+> lands at +21% inside it). It ships as **`V4_REFILL_FLOOR`** (default 1 = the drain-only round this
+> section describes, frame for frame; `floor=B` pins in-flight at `block+1`), with the two risks this
+> section named turned into per-run measurements instead of assumptions: the re-prediction
+> disagreement is counted (`topup_agree`/`topup_disagree`) and topped-up frames are scored apart
+> from drain-refill frames by depth (`topup_accept_by_depth` vs `accept_by_depth`). The non-monotone
+> low end survives in both models — floor=2 prices between −2.5% and break-even — so the operating
+> point is a measurement, not a knob to max out. §2's cap argument is untouched: the floor fills the
+> pipe *up to* `block+1`; nothing here lifts it past that.
+
 ## 5. Usable ring width, as a function of block count
 
 This is the number to size against. Total traversal is `L = n_layers·tau_layer + D·hop`: a wider ring
