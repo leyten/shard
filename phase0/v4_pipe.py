@@ -1641,6 +1641,8 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         on_token(cur)
 
     block, confs = [], []                                     # round 1 is the bare [cur] chunk (no block)
+    d2s = []                                                  # the block's runner-up column (V4_DRAFT_TOP2)
+    rescue_by_depth = {}                                      # cancel depth -> [runner-up hits, cancels]
     drafted, sent = 0, 0                                       # rounds that carried a block; drafts offered
     send_hist = {}
     while len(toks) < max_new and cur not in eos:
@@ -1665,6 +1667,10 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
                 f"history the ring is not taking — one accept rule, and it is plan_verify_round.")
         accepted_total += n
         hist[n] = hist.get(n, 0) + 1
+        if n < len(drafts) and n < len(d2s):                  # THE TREE GATE: a cancel with a d2 to
+            slot = rescue_by_depth.setdefault(n + 1, [0, 0])  # judge — would the drafter's runner-up
+            slot[1] += 1                                      # at the missed slot have rescued it?
+            slot[0] += int(d2s[n] == int(rep["tokens"][n]))   # beta (docs/V4_TREE_VERDICT.md)
         if conf_probe is not None and block:                  # the FULL block's conf vs what accepted
             conf_probe(list(confs), n)
         stop = False
@@ -1680,6 +1686,7 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
         pos = len(ids) - 1                                    # `cur` sits here — the stage rewinds to it
         block = [int(t) for t in (rep.get("draft") or [])]    # the block drafted off what we committed
         confs = [float(c) for c in (rep.get("conf") or [])]   # its per-position confidence (gate input)
+        d2s = [int(t) for t in (rep.get("d2") or [])]         # its runner-up column, same alignment
         if stop:
             break
 
@@ -1691,6 +1698,7 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
             "receipts": recs, "receipts_ok": receipts_ok,
             "rounds": rounds, "drafted": drafted, "generated": gen, "accepted": accepted_total,
             "g": (gen / rounds) if rounds else float(gen), "accept_hist": hist,
+            "rescue_by_depth": {d: tuple(v) for d, v in sorted(rescue_by_depth.items())},
             "sent": sent, "send_hist": send_hist}
 
 
@@ -1949,11 +1957,13 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
     sent = {}                                                 # pos -> token fed there in THIS epoch
     ddepth = {}                                               # pos -> how far ahead it was drafted
     dsrc = {}                                                 # pos -> "block" | "topup"
+    dalt = {}                                                 # pos -> the drafter's runner-up there
     horizon = c - 1                                           # highest position a frame has been sent for
     frames = drafted = accepted = cancels = run = stale = issued = 0
     topups = topup_frames = topup_agree = topup_disagree = 0
     hist, depths = {}, []
     by_depth, tu_by_depth = {}, {}                            # draft depth -> [hits, trials], per source
+    rescue_by_depth = {}                                      # cancel depth -> [runner-up hits, cancels]
     prevhint = set()                                          # positions sent a `dprev` PREDICTION
     blen = 0                                                  # widest block a reply actually carried
     # THE TIME-WEIGHTED FILL. `depths` samples the span once per judged reply, so `mean_inflight`
@@ -1972,7 +1982,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             tick["span"] += dt
         tick["t"] = now
 
-    def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block"):
+    def _feed(pos, tok, nxt=None, prev=False, dep=0, src="block", alt=None):
         """Stream one s=1 frame. `cpos` is the settled watermark the stages free checkpoints against —
         `c - 1`, never `c`: the deepest rewind this coordinator can still ask for is `c` itself (a
         cancel commits at some p+1 > c and re-opens THERE), so anything ending at or before `c - 1` is
@@ -1994,11 +2004,16 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         `topup_accept_by_depth` in the return dict. Acceptance is not one number — it decays with
         draft depth, and a topped-up frame at the same depth is a different bet from a drain-refill
         one — and a run that reported one blended acceptance could not say which of the two the
-        refill floor is spending. Nothing reads them to make a decision; they only report."""
+        refill floor is spending. Nothing reads them to make a decision; they only report.
+
+        `alt` is the drafter's RUNNER-UP for this position (the reply's `d2` column, sliced exactly
+        as the draft was) — carried purely so a cancel can score it (`rescue_by_depth`). Nothing is
+        ever fed from it."""
         nonlocal horizon, frames, topup_frames
         sent[pos] = int(tok)
         ddepth[pos] = int(dep)
         dsrc[pos] = src
+        dalt[pos] = None if alt is None else int(alt)
         if src == "topup":
             topup_frames += 1
         _mark()                                               # the old level held until this frame
@@ -2108,6 +2123,10 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             slot[1] += 1
             if fed == m:
                 slot[0] += 1
+            elif dalt.get(pos + 1) is not None:               # THE TREE GATE: a cancel with a d2 to
+                slot2 = rescue_by_depth.setdefault(fdep, [0, 0])   # judge — would the runner-up have
+                slot2[1] += 1                                 # rescued this very cancel? beta is
+                slot2[0] += int(dalt[pos + 1] == m)           # hits/trials (docs/V4_TREE_VERDICT.md)
         if fed == m:
             accepted += 1
             run += 1
@@ -2118,6 +2137,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             sender.stop()                                     # settle `pending` before draining on it
             continue
         blk = [int(t) for t in (rep.get("draft") or [])]
+        alt2 = [int(t) for t in (rep.get("d2") or [])]        # runner-up per slot, aligned with blk
         issued += bool(blk)                                   # what the TAIL paid for, block for block
         blen = max(blen, len(blk))
         # THE REPLY THE ROUND REFILLS FROM, named: the next block has to come off THIS reply —
@@ -2167,6 +2187,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 del sent[p]
                 ddepth.pop(p, None)
                 dsrc.pop(p, None)
+                dalt.pop(p, None)
             _mark()                                           # the fenced span held until the cancel
             horizon = pos
             # start_pos == c IS the rewind command. The block on THIS reply was drafted off `m`, the
@@ -2215,7 +2236,8 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
                 # prediction is withheld rather than made cleverer. The frames dprev would have
                 # covered simply draft, which a deeper floor needs of them anyway.
                 _feed(p, d, hints[i + 1], prev=(F == 1 and i == nblk - 1 and nblk >= 2),
-                      dep=p - c, src="topup" if topup else "block")
+                      dep=p - c, src="topup" if topup else "block",
+                      alt=alt2[i] if i < len(alt2) else None)
         # THE PIPELINE FILL, measured: positions c..horizon all have a frame in the ring and none of
         # them has been judged yet (replies land in order and this one was for c-1), so that span IS
         # the number of frames in flight. 1 means the pipeline never filled and this is greedy decode
@@ -2224,6 +2246,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
         sent.pop(pos - 1, None)                               # settled two positions back: never read again
         ddepth.pop(pos - 1, None)
         dsrc.pop(pos - 1, None)
+        dalt.pop(pos - 1, None)
         prevhint.discard(pos)
 
     hist[run] = hist.get(run, 0) + 1
@@ -2248,6 +2271,7 @@ def coordinate_dspark_pipelined(pipe, ret, prompt_ids, max_new, *, eos_ids=(), n
             "topups": topups, "topup_frames": topup_frames,
             "topup_accept_by_depth": {d: tuple(v) for d, v in sorted(tu_by_depth.items())},
             "topup_agree": topup_agree, "topup_disagree": topup_disagree,
+            "rescue_by_depth": {d: tuple(v) for d, v in sorted(rescue_by_depth.items())},
             "max_inflight": max(depths) if depths else 0,
             "mean_inflight": round(sum(depths) / len(depths), 2) if depths else 0.0,
             "inflight_time_avg": round(tick["area"] / tick["span"], 2) if tick["span"] > 0 else 0.0,
@@ -2370,6 +2394,7 @@ ENG_ENV = [
     "V4_FP8_GEMV", "V4_FP8_SHARED",                                             # fp8 GEMV path
     "V4_GRAPH_MAX", "V4_MOE_IN_GRAPH",                                          # graph budget / scope
     "V4_DSPARK_FAST", "V4_DSPARK_GRAPH", "V4_DSPARK_MOE", "V4_DSPARK_BLOCK",    # drafter
+    "V4_DRAFT_TOP2",                                                            # tree-gate measurement
     "V4_DSPARK_CONF_GATE", "V4_DSPARK_CONF_MIN", "V4_DSPARK_CONF_THRESH",       # adaptive send-length
     "V4_REF_SLIM", "V4_REF_SLIM_NOQAT",                                         # reference-compute slim
     "V4_FAST_VERIFY", "V4_FAST_VERIFY_MAX",                                     # chunked verify

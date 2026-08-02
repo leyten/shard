@@ -191,6 +191,31 @@ def test_decode_draft_matches_oracle(oracle, args):
         assert torch.equal(got, want), f"mtp stage {k} cache diverged over {STEPS} steps"
 
 
+def test_second_choices_is_the_runner_up_at_the_drafts_own_slot(oracle, args):
+    """THE INVARIANT THE TREE GATE STANDS ON (V4_DRAFT_TOP2 / docs/V4_TREE_VERDICT.md).
+
+    `second_choices` claims `d2[i]` is the head's second choice for the SAME position that produced
+    `draft[i]`, under the same conditioning. That is only true because `forward_head` adds the Markov
+    bias to `logits[:, i]` IN PLACE and then samples slot i+1 from that same row (model.py:869-871)
+    — so the returned logits' top-1 IS the draft, and top-2 is the branch candidate a comb tree
+    would have flown. A re-vendored head that sampled first and biased after would silently turn d2
+    into plausible-looking garbage; the argmax assertion here is what fails instead."""
+    ids = _ids(PROMPT, args)
+    st, dr, tok = prefilled(oracle, args, ids)
+    tok, main = step(st, tok, PROMPT)
+    drafts, _ = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=PROMPT)
+    d2 = DS.second_choices(dr)
+    logits = dr.last_spec[1][0]                           # [block_size, vocab], biases already in
+    assert torch.equal(logits.argmax(-1), drafts[0]), \
+        "the returned logits' top-1 is not the draft — the bias-then-sample order changed under us"
+    top2 = logits.topk(2, dim=-1).indices[:, 1].tolist()
+    assert d2 == top2 and len(d2) == drafts.shape[1], "d2 must be the runner-up, slot for slot"
+    assert all(a != b for a, b in zip(d2, drafts[0].tolist())), \
+        "a runner-up equal to the draft is not a second choice"
+    dr.temperature = 0.5                                  # a sampling drafter: top-1 need not be the
+    assert DS.second_choices(dr) is None, "draft, so there is no runner-up to claim"
+
+
 # ── 3. the run ───────────────────────────────────────────────────────────────────────────────────
 
 def test_stepwise_advance_equals_oracle_sequence(oracle, args):

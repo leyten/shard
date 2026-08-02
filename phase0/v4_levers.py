@@ -384,6 +384,20 @@ def _check_dspark_block(ctx):
     return req, "no-drafter-yet", None
 
 
+def _check_draft_top2(ctx):
+    """The tree-gate measurement — tail-only, judged like the drafter levers above, from the fact
+    `ring_drafter` records off the live tail at build. The one wrinkle it reports honestly: an armed
+    flag over a SAMPLING drafter observes as off (there is no runner-up when top-1 is not the
+    draft), which is a mismatch worth seeing, not a silent no-op."""
+    req = _flag("v4_dspark_draft", "V4_DRAFT_TOP2")
+    fact = _NOTES.get("V4_DRAFT_TOP2")
+    if fact is not None:
+        return req, fact, _agree(req, fact)
+    if ctx.stage is not None and not getattr(ctx.stage, "tail", False):
+        return req, "not-tail", None
+    return req, "no-drafter-yet", None
+
+
 def _ref_slim_check(attr, marker_of):
     def check(ctx):
         req = _flag("v4_ref_slim", attr)
@@ -506,6 +520,9 @@ LEVERS = (
     Lever("V4_DSPARK_BLOCK", STAGE, "v4_dspark_draft", _check_dspark_block,
           "tail only: draft the block at this width instead of the trained dspark_block_size — "
           "deeper proposals from the same tap, lifting the pipelined in-flight cap to width+1"),
+    Lever("V4_DRAFT_TOP2", STAGE, "v4_dspark_draft", _check_draft_top2,
+          "tail only: ship the drafter's runner-up token per block slot, so the coordinators can "
+          "count the rescue rate that gates tree speculation (docs/V4_TREE_VERDICT.md)"),
     Lever("V4_FP8_WIRE", STAGE, "v4_pipe", _check_fp8_wire,
           "fp8-pack h on the forward leg (every non-tail stage packs its own output)"),
     Lever("V4_SPEC_DEPTH", BOTH, "v4_pipe", _check_spec_depth,

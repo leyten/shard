@@ -731,6 +731,7 @@ class _ScriptedPipeRing:
         self.frames = []                                  # (ids, start_pos, epoch) per step frame seen
         self.fenced = []                                  # the frames the fence dropped
         self.lie = None                                   # force an `acc` divergence
+        self.d2 = None                                    # committed pos -> the block's runner-up column
         self.lazy = False                                 # obey the lazy-draft hint, as a real tail does
         self.hints = {}                                   # start_pos -> the `dnxt` hint it carried
         self.dprev = {}                                   # start_pos -> did it carry `dprev`
@@ -779,6 +780,8 @@ class _ScriptedPipeRing:
                         if blk is not None:
                             out["draft"] = list(blk)
                             last = (pos, list(blk))
+                            if self.d2 is not None:       # V4_DRAFT_TOP2: the runner-up column rides
+                                out["d2"] = list(self.d2(pos))
                 send_msg(self.ret_a, out)
         except (OSError, EOFError) as e:                  # the coordinator closed: the run is over
             self.err = e
@@ -799,9 +802,10 @@ PIPE_PROMPT = [1, 2, 3]
 TRUTH = {p: 100 + p for p in range(3, 40)}
 
 
-def _pipelined(blocks, max_new, eos_ids=(), lie=None, truth=None, **kw):
+def _pipelined(blocks, max_new, eos_ids=(), lie=None, truth=None, d2=None, **kw):
     ring = _ScriptedPipeRing(truth or TRUTH, blocks)
     ring.lie = lie
+    ring.d2 = d2
     try:
         r = VP.coordinate_dspark_pipelined(ring.pipe_a, ring.ret_b, list(PIPE_PROMPT), max_new,
                                            eos_ids=eos_ids, timeout=10, **kw)
@@ -881,6 +885,40 @@ def test_pipelined_zero_accept_degrades_to_greedy_and_stays_lossless():
     # after the first cancels and re-opens. (The last one is not counted: max_new ends the run before
     # the rejection it would have been.)
     assert r["cancels"] == 3 and r["accept_hist"] == {0: 4}
+
+
+def test_rescue_counter_scores_the_runner_up_at_exactly_the_missed_slot():
+    """THE TREE GATE's counter (V4_DRAFT_TOP2 / docs/V4_TREE_VERDICT.md): when a cancel fires at
+    draft depth d and the block carried a runner-up column, `rescue_by_depth[d]` counts whether the
+    runner-up named the token the model actually committed there — the exact question a branch in
+    flight would have answered. Three arms, same wrong-at-depth-1 drafter:
+
+      runner-up == the model's token  ->  every scored cancel is a hit,
+      runner-up == other garbage      ->  the same trials, zero hits,
+      no d2 column at all             ->  no trials (the default-off wire counts nothing).
+
+    All three streams must stay greedy's — the counter reads replies, it feeds nothing."""
+    blocks = lambda q: [901, 902, 903]                    # wrong at depth 1, every block
+    want = [TRUTH[p] for p in range(3, 9)]
+
+    hit, _ = _pipelined(blocks, max_new=6, d2=lambda q: [_perfect_block(q)[0], 1, 1])
+    assert hit["tokens"] == want
+    hits, trials = hit["rescue_by_depth"].get(1, (0, 0))
+    misses = hit["accept_by_depth"][1][1] - hit["accept_by_depth"][1][0]
+    assert trials == misses > 0, \
+        "every scored miss carried a runner-up, so every one is a rescue trial — no more, no fewer " \
+        "(the run's last miss is a trial too, though max_new ends the run before its cancel)"
+    assert hits == trials, \
+        "the runner-up WAS the model's token at every missed slot — all trials must be hits"
+
+    miss, _ = _pipelined(blocks, max_new=6, d2=lambda q: [555, 556, 557])
+    assert miss["tokens"] == want
+    assert miss["rescue_by_depth"] == {1: (0, trials)}, \
+        "a garbage runner-up is a scored trial and never a hit"
+
+    off, _ = _pipelined(blocks, max_new=6)                # no d2 column: the shipped wire, untouched
+    assert off["tokens"] == want
+    assert off["rescue_by_depth"] == {}, "without the column there is nothing to score"
 
 
 def test_accept_by_depth_scores_every_draft_at_its_own_depth():
@@ -2154,6 +2192,35 @@ def test_pipelined_ring_matches_the_reference_and_the_serial_path(tiny):
     assert piped["max_inflight"] > 1, "nothing was ever pipelined — this is greedy with extra steps"
     assert piped["cancels"] > 0 and piped["stale_replies"] > 0, \
         "the rejection path (and with it the W-deep rewind) never ran"
+
+
+def test_draft_top2_on_a_real_ring_is_lossless_and_measures_the_gate(tiny, monkeypatch):
+    """V4_DRAFT_TOP2 on real stages over real sockets: the runner-up column rides the replies, the
+    coordinators count rescues, and the streams stay bit-identical to greedy — pipelined, serial,
+    and again with the lever back off on the SAME warm ring.
+
+    At random weights the drafter cancels at depth 1 essentially every cycle and every drafted block
+    carries a d2 column, so `rescue_by_depth` must show trials on both paths. Whether any trial is a
+    HIT is the model's business, not the protocol's — the counter is asserted structurally
+    (hits <= trials) and the tokens are asserted absolutely."""
+    d, args, ref = tiny
+    monkeypatch.setattr(VP._dspark(), "V4_DRAFT_TOP2", True)  # the stage threads read the module flag
+    ring = _Ring(d, args, VP._dspark_tiling(args, 3), dspark=True)
+    try:
+        piped = ring.pipelined(list(PROMPT), NEW, nonce="top2-pipe")
+        serial = ring.dspark(list(PROMPT), NEW, nonce="top2-serial")
+        monkeypatch.setattr(VP._dspark(), "V4_DRAFT_TOP2", False)
+        off = ring.pipelined(list(PROMPT), NEW, nonce="top2-off")
+    finally:
+        ring.close()
+    for r, what in ((piped, "pipelined"), (serial, "serial"), (off, "lever-off")):
+        assert r["tokens"] == ref, f"{what} under the tree gate: {r['tokens']} != greedy {ref}"
+    for r, what in ((piped, "pipelined"), (serial, "serial")):
+        book = r["rescue_by_depth"]
+        assert sum(t for _, t in book.values()) > 0, \
+            f"{what}: cancels fired and d2 rode every block, yet nothing was scored"
+        assert all(0 <= h <= t for h, t in book.values()), f"{what}: {book} is not a hits<=trials book"
+    assert off["rescue_by_depth"] == {}, "lever off must put the shipped wire back, column and count"
 
 
 def test_pipelined_ring_full_accept_fills_the_pipeline_and_never_rewinds(tiny):

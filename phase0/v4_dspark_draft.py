@@ -147,11 +147,43 @@ def _v4():
 # coordinator adapts to whatever length the reply carries and needs no flag.
 V4_DSPARK_BLOCK = int(os.environ.get("V4_DSPARK_BLOCK", "0") or 0)
 
+# THE TREE GATE (V4_DRAFT_TOP2). Branching speculation — several candidate continuations from one
+# tap — is priced in docs/V4_TREE_VERDICT.md at +18.3% x beta for the best buildable shape, where
+# beta is the RESCUE RATE: how often, at a cancel, the model's committed token is the drafter's own
+# RUNNER-UP at exactly the slot that missed. beta is the whole go/no-go and nothing measures it
+# today, so this lever ships the runner-up column on the existing linear round: `d2[i]` is the
+# second-highest-logit token at the same head slot that produced `draft[i]` (`forward_head` returns
+# the full per-slot logits, model.py:863, with the main path's Markov bias already applied — and at
+# a mismatch, the missed slot's predecessors are all committed, so its biased runner-up IS the
+# candidate a comb tree would have had in flight). The coordinators count, at each cancel, whether
+# `d2` named the committed token (`rescue_by_depth`). Reply metadata only — no frame, block, accept
+# rule or committed token changes — so losslessness is untouched by construction, and the tests pin
+# it on the real socket ring anyway. Opt-in, default OFF, tail-only, greedy drafter only (at
+# temperature > 0 the sampled draft need not be the top-1, and "runner-up" stops meaning anything).
+V4_DRAFT_TOP2 = os.environ.get("V4_DRAFT_TOP2", "0") not in ("", "0")
+
 # The two keys a DSparkBlock's state_dict has but a converted checkpoint deliberately does not.
 # `mtp[k].embed`/`mtp[k].head` are ASSIGNED the main model's modules (model.py:903-904), so they are
 # registered submodules pointing at storage that is already in the file under `embed.weight` /
 # `head.weight`; safetensors refuses to write one tensor twice, and convert.py:91 skips them.
 ALIAS_KEYS = ("embed.weight", "head.weight")
+
+
+def second_choices(tail):
+    """The drafter's runner-up token per slot of the block it JUST produced. -> [g] ints, or None.
+
+    `last_spec[1]` is `forward_head`'s logits, [b, block_size, vocab]: slot i's row produced
+    `draft[i]` (= output_ids[:, i+1]) by argmax AFTER the Markov bias landed in-place
+    (model.py:869-871), so its top-1 is the draft itself and its top-2 is the head's own second
+    choice for the same position under the same conditioning — the branch candidate the tree gate
+    counts. Both the reference and the V4_DSPARK_FAST path leave `last_spec` holding the kept
+    block's real triple, so this reads either one.
+
+    None when there is nothing sound to read: no block yet, or a sampling drafter (top-1 is then not
+    the draft, so "runner-up" would be a lie with plausible-looking values)."""
+    if tail.last_spec is None or tail.temperature != 0.0:
+        return None
+    return tail.last_spec[1][0].topk(2, dim=-1).indices[:, 1].tolist()
 
 
 def plan_verify_round(drafts, replies):
@@ -596,8 +628,13 @@ class RingDrafter:
         # and `main[:, :n+1]` are those positions' taps. Feeding the whole chunk instead passes every
         # check the drafter can make and drafts off a history the ring rejected.
         blk, conf = self.tail.advance_and_draft([committed], main[:, :n + 1], start_pos=start_pos)
-        return {"draft": blk[0].tolist(), "n": n,
-                "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        r = {"draft": blk[0].tolist(), "n": n,
+             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        if V4_DRAFT_TOP2:
+            d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
+            if d2 is not None:
+                r["d2"] = d2
+        return r
 
     def _on_chunk_pipelined(self, ids, msg, st, out):
         """One STREAMED `s=1` frame of a pipelined round. -> {acc, draft, conf}, merged into the reply.
@@ -699,8 +736,13 @@ class RingDrafter:
         blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
         draft = blk[0].tolist()
         self._last = (start_pos, draft)
-        return {"acc": True, "draft": draft,
-                "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        r = {"acc": True, "draft": draft,
+             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        if V4_DRAFT_TOP2:
+            d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
+            if d2 is not None:
+                r["d2"] = d2
+        return r
 
 
 def _fast():
@@ -795,6 +837,13 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
     if V4_DSPARK_BLOCK:
         print(f"[dspark] V4_DSPARK_BLOCK requested={V4_DSPARK_BLOCK} observed={tail.block_size} "
               f"(trained width {tail.args.dspark_block_size})", file=sys.stderr, flush=True)
+    # THE TREE GATE, recorded off the LIVE tail like the levers above: armed but useless (a sampling
+    # drafter has no runner-up) is reported as off, so the audit shows what replies will carry.
+    v4_levers.note("V4_DRAFT_TOP2", V4_DRAFT_TOP2 and tail.temperature == 0.0)
+    if V4_DRAFT_TOP2:
+        print(f"[dspark] V4_DRAFT_TOP2 requested=on observed="
+              f"{'on' if tail.temperature == 0.0 else 'off (sampling drafter)'}",
+              file=sys.stderr, flush=True)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
     return RingDrafter(tail)
