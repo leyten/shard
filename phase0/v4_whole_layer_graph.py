@@ -58,13 +58,51 @@ kernels on the same bytes -- bit-exact, not reassociation-drifted. The three fix
      happens once every `ratio` positions. A pure sliding-window layer (compress_ratio 0) has no
      Compressor and captures ONE graph.
 
-WHAT STAYS EAGER, AND WHY THAT IS HONEST.  The MoE routes per token through `bincount(...).tolist()`
-(a host sync) and a data-dependent expert loop, so it is un-graphable as written -- the sibling
-grouped-fp4-MoE kernel (phase0/v4_moe_grouped.py) is what makes it capture-safe. Until that composes,
-`moe_mode="stub"` runs a FIXED expert set (shared + a constant routed pair, the real decode
-activation count) so the WHOLE-LAYER graph mechanism and its timing are provable end to end, and
-`moe_mode="eager"` graphs attn+islands and leaves the real routed MoE eager between two graphs -- the
-honest intermediate. Neither stub number is passed off as the routed model's.
+THE MoE, AND WHICH PATH IT IS ON -- the difference between `moe_mode="eager"` and `"graph"`.
+The VENDORED MoE routes per token through `bincount(...).tolist()` (a host sync) and a data-dependent
+expert loop, and `v4_moe_decode`'s s==1 fast path still opens with `indices[0].tolist()`; NEITHER can
+go inside a graph, and a capture that took one anyway would bake the CAPTURE token's expert list into
+the replayed program and serve every later token through the wrong experts, silently, forever. That
+is why `moe_mode="eager"` (graph the attention core, run the real routed MoE eager between two
+graphs) was the honest intermediate, and `moe_mode="stub"` (a FIXED expert set, the real decode
+activation count) the timing probe.
+
+`v4_moe_grouped.grouped_forward` removed the sync. Under `V4_MOE_GROUPED=1` on a BANKED fp4 layer a
+decode step's whole routing is device-side -- a topk (or a `tid2eid` gather), a `_gather_fp` of the
+routed experts out of the layer's contiguous bank, two grouped GEMMs, a `[G, G]` keep-mask for hash
+duplicates and an `argsort` fold -- with no `.tolist()`, no `nonzero`, no `bincount` and no shape that
+depends on which experts were picked. So `moe_mode="graph"` captures the WHOLE layer, MoE included, as
+ONE graph. Audited rather than assumed, on CPU, in tests/test_v4_moe_in_graph.py: the block's aten
+program (op sequence, every shape, every non-tensor arg) is recorded at six DIFFERENT routings --
+including a hash layer whose ids repeat -- and required to be IDENTICAL, with a `TorchFunctionMode`
+watching for any device drain. Identical program + every routing input arriving through a static
+buffer is exactly the CUDA-graph replay contract.
+
+REFUSED, PER LAYER, RATHER THAN ASSUMED (`WholeBlockGraphs._moe_refusal`). The mode is a REQUEST; a
+layer whose MoE is not provably sync-free drops back to `moe_mode="eager"`, loudly and counted. Four
+checks, each closing a way the capture could replay stale routing:
+  * the live `MoE.forward` chain must reach `grouped_forward` at s == 1 (peeling `multi`, which hands
+    a single token straight down). A chain topped by `decode_forward` or the raw reference is the
+    failure above, and it is the DEFAULT chain -- `V4_MOE_GROUPED` is off unless asked for.
+  * the layer must already hold a real `_grouped_bank` from `bank_layout()` at load. Without one,
+    `_expert_bank` would STACK the bank on first call -- inside the capture, out of the graph's
+    PRIVATE memory pool -- and a later capture sharing that pool would hand those bytes to something
+    else while the module still pointed at them.
+  * `world_size == 1`, the same envelope the kernel itself declines outside.
+  * and then it is OBSERVED, not inferred: one eager probe step must increment `_grouped_steps` and
+    add no `_grouped_declined` entry. A lever that reads as on and is not on is this engine's most
+    expensive recurring bug (phase0/v4_levers.py); a capture is the worst place to start trusting one.
+`ids` becomes LOAD-BEARING in this mode -- the first `n_hash_layers` route on `tid2eid[input_ids]` --
+so `run()` refuses a `None` ids rather than replaying the capture step's token.
+
+WHAT IT COSTS: the per-step `_gather_fp` of the routed experts is an allocation INSIDE the capture, so
+it is pinned in the graph's private pool for the life of the graph -- at the shipped dims ~77 MiB per
+layer (6 slots x 8 MiB w13 + 4 MiB w2, plus scales), shared across that layer's bucket/compress
+variants because they share one pool. ~0.5 GiB on a 7-layer stage, against the ~6 GiB of headroom the
+bank layout left. It is not free and it is not the reason to refuse.
+
+Opt-in, default OFF: `V4_MOE_IN_GRAPH=1` (registered in phase0/v4_levers.py). With the env unset
+`v4_stage` builds `moe_mode="eager"` and this file behaves exactly as it did.
 
 HOW THIS IS GRADED (m25's two-tier bar, research/graph_aux_check.py -- the bar its CUDA graphs, the
 single biggest M2.5 win at +74%, actually shipped under):
@@ -103,6 +141,13 @@ INDEXER_BUCKETS = (16, 64, 256, 1024, 4096, 16384, 65536)
 V4_GRAPH_MAX = int(os.environ.get("V4_GRAPH_MAX", "192"))
 _GRAPH_COUNT = 0        # whole-layer graphs captured so far, across every Stage in this process
 _GRAPH_SKIPPED = 0      # captures a layer skipped because the cap was hit or a capture failed
+
+# Pull the routed MoE INSIDE the whole-layer graph (see the module docstring). Opt-in, default OFF:
+# it is only correct on a layer whose MoE reaches `v4_moe_grouped.grouped_forward`, which is itself
+# opt-in and CUDA-only, and a layer that cannot prove it drops back to `moe_mode="eager"`.
+V4_MOE_IN_GRAPH = os.environ.get("V4_MOE_IN_GRAPH", "0") not in ("", "0")
+_MOE_GRAPHED = 0        # layers whose MoE really was captured inside their whole-layer graph
+_MOE_REFUSED = 0        # layers that asked for it and were refused (each one printed why)
 
 
 def bucket_width(need, maxw, floor=0):
@@ -367,8 +412,101 @@ def moe_stub(L, x, ids=None):
 
 
 def real_moe(L, x, ids):
-    """The reference routed MoE (eager). Used as the `moe_eager` intermediate and the parity oracle."""
+    """The routed MoE as the process has it bound. The `moe_eager` intermediate, the parity oracle,
+    and -- when `_moe_refusal` clears the layer -- the thing captured INSIDE the whole-layer graph."""
     return L.ffn(x, ids)
+
+
+# ── may this layer's routed MoE go inside a graph? ───────────────────────────────────────────────
+
+def grouped_at_one_token(mod):
+    """Does a SINGLE-TOKEN step on `mod` reach `v4_moe_grouped.grouped_forward`?
+
+    `MoE.forward` is a CHAIN of rebinds (v4_levers.moe_chain): multi -> grouped -> decode -> ref, each
+    link capturing the one below as its fallback. `multi` declines `T == 1` on its first line and hands
+    the step straight down, so it is transparent here; every other link that sits ABOVE grouped -- i.e.
+    grouped absent from the chain, or `decode`/`ref` reached first -- means a decode token is dispatched
+    by a `.tolist()` and a data-dependent expert loop, which is precisely what must not be captured.
+
+    Reads the LIVE bound functions, never an env flag: `v4_moe_grouped.install()` declines silently off
+    CUDA and under `V4_MOE_GROUPED=0`, so the flag proves nothing about what this process will run."""
+    import v4_levers
+    chain = v4_levers.moe_chain(mod)
+    while chain and chain[0] == "multi":            # transparent at one token, by construction
+        chain = chain[1:]
+    return bool(chain) and chain[0] == "grouped"
+
+
+def moe_probe(L, dev, dt, ids):
+    """Run this layer's MoE ONCE, eagerly, and report whether the grouped path took the step.
+
+    OBSERVED, NOT INFERRED. Everything above is structural -- the right function is bound, the bank
+    exists -- and this engine's recurring bug is exactly a structure that looked right and did not
+    fire (v4_levers' six instances). `grouped_forward` counts its own steps and records every decline
+    with a reason, so one probe answers the question directly. The MoE is stateless, so the probe
+    perturbs nothing; the counters it moves are put back, because they are what `coverage()` reports
+    and a probe must not appear in that number.
+
+    Zeros rather than a random draw on purpose: every reason grouped can decline (token count, world
+    size, a missing bank) is a property of the SHAPE and the config, never of the activation, so the
+    cheapest deterministic input is a faithful observation. Returns None if it grouped, else why."""
+    moe = L.ffn
+    steps0 = getattr(moe, "_grouped_steps", 0)
+    declined0 = dict(getattr(moe, "_grouped_declined", {}) or {})
+    x = torch.zeros(1, 1, moe.dim, dtype=dt, device=dev)
+    with torch.no_grad():
+        moe(x, ids)
+    steps1 = getattr(moe, "_grouped_steps", 0)
+    declined1 = dict(getattr(moe, "_grouped_declined", {}) or {})
+    moe._grouped_steps = steps0
+    if declined0:
+        moe._grouped_declined = declined0
+    elif getattr(moe, "_grouped_declined", None) is not None:
+        moe._grouped_declined.clear()
+    new = [k for k in declined1 if declined1[k] != declined0.get(k, 0)]
+    if new:
+        return f"the probe step DECLINED grouping: {new}"
+    if steps1 != steps0 + 1:
+        return (f"the probe step did not reach the grouped kernel "
+                f"(_grouped_steps {steps0} -> {steps1}, expected +1)")
+    return None
+
+
+def _moe_refusal(L, dev, dt, ids, mod):
+    """Why this layer's routed MoE must NOT be captured, or None. See the module docstring.
+
+    Every branch here is a way a graph could replay STALE ROUTING or read freed memory, and each one
+    is cheaper to refuse than to detect afterwards -- a wrong-expert token is a plausible token."""
+    if not grouped_at_one_token(mod):
+        import v4_levers
+        return (f"a single-token step does not reach the grouped MoE (live chain: "
+                f"{'>'.join(v4_levers.moe_chain(mod))}) — capturing a `.tolist()` dispatch would "
+                f"freeze the capture step's expert set into every replay")
+    bank = getattr(L.ffn, "_grouped_bank", None)
+    if not bank:
+        return ("this layer has no load-time expert bank (bank_layout declined or never ran), so the "
+                "first grouped step would STACK one — an allocation out of the graph's private pool "
+                "that a later capture in that pool may hand to something else")
+    import v4_moe_grouped
+    if int(getattr(v4_moe_grouped, "_WORLD_SIZE", 1) or 1) > 1:
+        return "world_size > 1: the reference all-reduces the routed sum, and the grouped path cannot"
+    if ids is None:
+        return "no token ids: the first n_hash_layers route on tid2eid[input_ids]"
+    return moe_probe(L, dev, dt, ids)
+
+
+def moe_graph_coverage(stage):
+    """(captured, refused, undecided) MoE-in-graph layers on `stage`. The lever audit's observation.
+
+    Undecided is the honest third state and not a rounding error: capture is LAZY, so before the first
+    decode token every layer has ASKED and none has been judged. A stage that reports `0 captured` with
+    everything undecided has not run yet; one that reports it with everything refused is the finding.
+
+    Counts only the layers that ASKED (`moe_requested`), which survives the demotion a refusal makes."""
+    bgs = [bg for bg in (getattr(stage, "_block_graphs", None) or [])
+           if getattr(bg, "moe_requested", False)]
+    got = [bg.moe_in_graph for bg in bgs]
+    return sum(g is True for g in got), sum(g is False for g in got), sum(g is None for g in got)
 
 
 # ── a whole decode block, capture-safe, from static buffers ─────────────────────────────────────────
@@ -458,6 +596,9 @@ class WholeBlockGraphs:
       "eager"  attn + islands are graphed and the real routed MoE runs EAGER between two graphs
                (`g_pre` up to the ffn input, `g_post` the ffn hc_post). Real-serving-safe TODAY: the
                output is the reference's, bit-exact, with the attention core's dispatch folded away.
+      "graph"  the entire block is ONE graph WITH the real routed MoE inside it (V4_MOE_IN_GRAPH=1).
+               A REQUEST, not a promise: `_moe_refusal` judges the layer on the first decode step and
+               demotes it to "eager" if its MoE is not provably sync-free. See the module docstring.
 
     A compress-ratio layer captures a compress and a no-compress variant of every graphed region that
     contains the Compressor (g_pre / the whole block); the replay picks by (start_pos+1) % ratio. A
@@ -476,6 +617,11 @@ class WholeBlockGraphs:
         self.ratio = L.attn.compress_ratio
         self.has_indexer = bool(self.ratio) and L.attn.indexer is not None
         self.moe = moe_stub if moe_mode == "stub" else real_moe
+        # `moe_requested` survives a demotion (which rewrites moe_mode), so the audit can still tell
+        # "asked and was refused" from "never asked". `moe_in_graph` stays None until the first decode
+        # step judges it — capture is lazy, so "has not run yet" must not read as "declined".
+        self.moe_requested = moe_mode == "graph"
+        self.moe_in_graph = None
         self.eager = False
         # The compressed cache this layer reads, and therefore what a bucket is clamped to.
         if self.has_indexer:
@@ -546,10 +692,17 @@ class WholeBlockGraphs:
                 p = max(p - 1, 1)
         return p
 
-    def _feed_capture(self, compress, bucket):
-        """Point the static buffers at a valid representative step for capturing this variant."""
+    def _feed_capture(self, compress, bucket, ids=None):
+        """Point the static buffers at a valid representative step for capturing this variant.
+
+        `ids` seeds the token-id buffer with the step that triggered the capture. It changes nothing
+        about the graph (routing is recomputed from `ids_buf` at every replay), but it means the
+        warm-up runs on a real token rather than on the zero the constructor left, which is what a
+        hash-routed layer's `tid2eid[0]` would otherwise be."""
         p = self._capture_pos(compress, bucket)
         self.pos_buf.fill_(p)
+        if ids is not None:
+            self.ids_buf.copy_(ids.view(1, 1))
         self.win_topk_buf.copy_(build_win_topk(self.R.M, self.win, p))
         comp, _ = self._bufs_for(bucket)
         if comp is not None:
@@ -584,13 +737,41 @@ class WholeBlockGraphs:
         _GRAPH_COUNT += 1
         return g, out
 
-    def _capture(self, key):
+    def _resolve_moe_mode(self, ids):
+        """Judge ONCE whether this layer's routed MoE may be captured, and demote it if not.
+
+        Runs on the first decode step, before the first capture, because `_moe_refusal`'s last check
+        is a live probe and there is nothing to probe before the stage is loaded. A refusal leaves the
+        layer on the proven `moe_mode="eager"` path -- graphed attention core, eager routed MoE -- and
+        SAYS SO: this lever's whole risk is being believed while it is not on."""
+        global _MOE_GRAPHED, _MOE_REFUSED
+        why = _moe_refusal(self.L, self.dev, self.dt, ids, self.R.M)
+        self.moe_in_graph = why is None
+        if why is None:
+            _MOE_GRAPHED += 1
+            return
+        _MOE_REFUSED += 1
+        self.moe_mode = "eager"
+        print(f"[v4] V4_MOE_IN_GRAPH: layer {self.L.layer_id} keeps its routed MoE EAGER — {why}",
+              flush=True)
+
+    def _drop_moe_from_graph(self):
+        """A layer that fell back to no graph at all has no MoE in a graph either — say so.
+
+        The audit counts LIVE state, and `moe_in_graph` left True on a layer that never captured (an
+        exhausted budget, a failed capture) is the same lie the whole lever registry exists to stop."""
+        global _MOE_GRAPHED, _MOE_REFUSED
+        if self.moe_in_graph:
+            self.moe_in_graph, _MOE_GRAPHED, _MOE_REFUSED = False, _MOE_GRAPHED - 1, _MOE_REFUSED + 1
+        self.moe_mode = "eager" if self.moe_mode == "graph" else self.moe_mode
+
+    def _capture(self, key, ids=None):
         """Capture the graph(s) for one (bucket, compress) key. moe_eager captures g_pre (+ g_post once)."""
         bucket, compress = key
         # ALWAYS point the static buffers at a valid position for this variant FIRST: the warm-up runs
         # for real, and a compress variant captured at the zero-filled pos_buf would read
         # `freqs_cis[1 - ratio]`, i.e. a negative row.
-        self._feed_capture(compress, bucket)
+        self._feed_capture(compress, bucket, ids)
         if self.moe_mode != "eager":
             g, out = self._warm_and_capture(lambda: self._block(compress, bucket))
             return {"graph": g, "out": out}
@@ -629,24 +810,39 @@ class WholeBlockGraphs:
 
         A position whose bucket has no graph yet captures one HERE, lazily -- so a long decode crosses
         a rung at most `len(INDEXER_BUCKETS)` times and every other step is a pure replay. Past
-        V4_GRAPH_MAX the layer goes permanently eager, counted and logged (m25's budget discipline)."""
+        V4_GRAPH_MAX the layer goes permanently eager, counted and logged (m25's budget discipline).
+
+        `ids` IS LOAD-BEARING under moe_mode="graph" and only there: the first `n_hash_layers` route
+        their MoE on `tid2eid[input_ids]`, so a graph that never had the step's token copied into
+        `ids_buf` would replay the CAPTURE step's experts on every token after it -- plausible output,
+        wrong model. The other modes run the MoE outside the graph and pass `ids` to it directly, so
+        None there is merely the score-routed case and stays legal."""
         global _GRAPH_SKIPPED
         if self.eager:
             return self._eager(h, ids, start_pos)
+        if self.moe_requested and self.moe_in_graph is None:
+            self._resolve_moe_mode(ids)
+        if self.moe_mode == "graph" and ids is None:
+            raise RuntimeError(
+                f"v4 whole-layer graph: layer {self.L.layer_id} captured its routed MoE "
+                f"(V4_MOE_IN_GRAPH=1) and was handed no token ids — a hash-routed layer would replay "
+                f"the capture step's expert set. Carry the ids with the payload.")
         key = self._plan(start_pos)
         entry = self._graphs.get(key)
         if entry is None:
             need = 2 if (self.moe_mode == "eager" and self.g_post is None) else 1
             if _GRAPH_COUNT + need > V4_GRAPH_MAX:
                 self.eager, _GRAPH_SKIPPED = True, _GRAPH_SKIPPED + need
+                self._drop_moe_from_graph()
                 print(f"[v4] graph budget V4_GRAPH_MAX={V4_GRAPH_MAX} spent — layer "
                       f"{self.L.layer_id} stays eager", flush=True)
                 return self._eager(h, ids, start_pos)
             try:
-                entry = self._graphs[key] = self._capture(key)
+                entry = self._graphs[key] = self._capture(key, ids)
             except (torch.cuda.OutOfMemoryError, RuntimeError) as e:
                 torch.cuda.synchronize()
                 self.eager, self._graphs, _GRAPH_SKIPPED = True, {}, _GRAPH_SKIPPED + need
+                self._drop_moe_from_graph()
                 print(f"[v4] whole-layer capture failed for layer {self.L.layer_id} at bucket "
                       f"{key[0]}: {type(e).__name__}: {e} — layer stays eager", flush=True)
                 return self._eager(h, ids, start_pos)

@@ -721,8 +721,10 @@ def coverage(module):
     READ IT AS "DID THIS LAYER EVER GROUP", NOT AS A STEP COUNT, under CUDA graphs. The counters are
     host-side python, so a captured region runs them once at capture and never on replay — a graphed
     stage would report 1 step where it served hundreds. WHICH layers grouped stays exact, and that is
-    the question this exists to answer; the per-step number is only honest eager. (v4_stage runs the
-    real routed MoE eager in both graph modes today, so nothing captures this yet.)"""
+    the question this exists to answer; the per-step number is only honest eager. That is no longer
+    hypothetical: `V4_MOE_IN_GRAPH=1` captures this forward inside the whole-layer graph
+    (v4_whole_layer_graph), so on such a stage every grouped layer reports exactly the handful of
+    steps its captures and its probe ran, and `v4_levers`' MoE-in-graph coverage is the live count."""
     out = {}
     for m in module.modules() if hasattr(module, "modules") else [module]:
         if hasattr(m, "experts") and hasattr(m, "experts_start_idx"):

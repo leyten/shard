@@ -140,6 +140,10 @@ V4_FAST_VERIFY_MAX = int(os.environ.get("V4_FAST_VERIFY_MAX", "16") or 16)
 # "0"/off (default), "1"/"island" (hc_pre/hc_post/norm islands only, attn+MoE eager), "whole"/"eager"
 # (the WHOLE decode layer -- the capture-safe attention core folded in too, real routed MoE eager
 # between two graphs, bit-exact to the reference; v4_whole_layer_graph.py). See _graph_mode.
+# AND THE MoE ITSELF IS CAPTURABLE NOW, on a layer that reaches the grouped fp4 kernel: `.tolist()`
+# above describes the reference's dispatch and v4_moe_decode's, not v4_moe_grouped's, whose routing is
+# device-side end to end. `V4_MOE_IN_GRAPH=1` (default OFF, on top of whole mode) folds it in, per
+# layer, only where that is provable -- v4_whole_layer_graph's docstring has the audit and the refusal.
 V4_CUDA_GRAPH = os.environ.get("V4_CUDA_GRAPH", "0")
 
 
@@ -708,7 +712,12 @@ class Stage:
                 print(f"[v4] GRAPH REFUSED for stage[{lo}:{hi}): {why} — staying eager", flush=True)
             elif self._graph_mode == "whole":
                 import v4_whole_layer_graph as _wl
-                self._block_graphs = [_wl.WholeBlockGraphs(L, self, moe_mode="eager") for L in self.layers]
+                # V4_MOE_IN_GRAPH pulls the routed MoE INSIDE the capture, which is only correct on a
+                # layer whose MoE reaches the grouped fp4 kernel. It is a REQUEST: each layer judges
+                # itself on its first decode step and drops back to the eager-MoE split if it cannot
+                # prove it (v4_whole_layer_graph._moe_refusal). Default OFF.
+                mm = "graph" if _wl.V4_MOE_IN_GRAPH else "eager"
+                self._block_graphs = [_wl.WholeBlockGraphs(L, self, moe_mode=mm) for L in self.layers]
             else:
                 self._block_graphs = [_BlockGraphs(L, self) for L in self.layers]
 
@@ -987,7 +996,8 @@ class Stage:
         A single-token DECODE step (start_pos > 0, seqlen == 1) routes each layer through its captured
         graph when the stage is armed -- island mode replays the hc_pre/hc_post/norm islands (attn/ffn
         eager between), whole mode replays the whole layer incl. the capture-safe attention core (real
-        routed MoE eager between two graphs). Prefill, a multi-token chunk, and a rollback replay
+        routed MoE eager between two graphs, or INSIDE the one graph under V4_MOE_IN_GRAPH on a layer
+        that proved it can be). Prefill, a multi-token chunk, and a rollback replay
         (`_replaying`) all stay on the eager per-layer call -- the graph is a fixed b=1,s=1 shape and
         the reference's own decode branch is the thing it is proven against."""
         bg = self._block_graphs
