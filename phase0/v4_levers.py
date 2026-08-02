@@ -207,6 +207,33 @@ def _check_cuda_graph(ctx):
     return req, (f"{obs}(-{skipped})" if skipped else obs), _agree(req, obs)
 
 
+def _check_moe_in_graph(ctx):
+    """Requested = the module's parsed flag; observed = how many layers CAPTURED their routed MoE.
+
+    Rides on V4_CUDA_GRAPH=whole and is refused per layer (v4_whole_layer_graph._moe_refusal), so
+    every honest outcome has to be distinguishable and none of them may read as OK by default:
+      no-stage / off        no stage here, or this stage never built whole-layer graphs at all.
+      armed                 the layers asked and none has been judged — capture is LAZY, so this is
+                            the state before the first decode token and it is UNJUDGED, not OK.
+      on/N-of-M             N layers captured it, M asked. Anything less than M is reported and, at
+                            N == 0, is the finding: the lever is on and not one layer took it, which
+                            on a default chain (V4_MOE_GROUPED unset) is exactly what happens.
+    The refusals PRINT their reason as they happen; this is the one-line version an operator reads."""
+    wl = _mod("v4_whole_layer_graph")
+    req = _flag("v4_whole_layer_graph", "V4_MOE_IN_GRAPH")
+    if ctx.stage is None or wl is None:
+        return req, "no-stage" if wl is not None else "unloaded", None
+    if getattr(ctx.stage, "_block_graphs", None) is None:
+        return req, "off", _agree(req, "off")
+    got, refused, undecided = wl.moe_graph_coverage(ctx.stage)
+    asked = got + refused + undecided
+    if not asked:
+        return req, "off", _agree(req, "off")
+    if undecided == asked:
+        return req, f"armed/{asked}", None
+    return req, f"on/{got}-of-{asked}", (_agree(req, "on") and got > 0)
+
+
 def _check_fast_verify(ctx):
     st = _mod("v4_stage")
     req = "on" if (st is not None and st.V4_FAST_VERIFY) else ("absent" if st is None else "off")
@@ -359,6 +386,8 @@ LEVERS = (
           "sync-free MoE dispatch at the DSpark drafter's small block shape"),
     Lever("V4_CUDA_GRAPH", STAGE, "v4_stage", _check_cuda_graph,
           "decode-step CUDA graphs: off / island / whole"),
+    Lever("V4_MOE_IN_GRAPH", STAGE, "v4_whole_layer_graph", _check_moe_in_graph,
+          "capture the routed MoE INSIDE the whole-layer graph (needs whole mode + grouped)"),
     Lever("V4_FAST_VERIFY", STAGE, "v4_stage", _check_fast_verify,
           "chunked verify path (one pass per layer over a speculation chunk)"),
     Lever("V4_REF_SLIM", STAGE, "v4_ref_slim",
