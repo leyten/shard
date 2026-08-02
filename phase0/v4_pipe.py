@@ -1611,6 +1611,10 @@ def coordinate_dspark(pipe, ret, prompt_ids, max_new, *, eos_ids=(), nonce=None,
     min_send = V4_DSPARK_CONF_MIN if conf_min is None else int(conf_min)
     v4_levers.note("V4_DSPARK_CONF_GATE", gate)          # what the loop RAN with, for the audit
     v4_levers.note("V4_PIPELINED_SPEC", False)
+    # The serial round sends a block and waits for it; there is no hint to skip a draft with, so lazy
+    # drafting is not merely off here, it is unreachable. Recording False is what makes an operator
+    # who set V4_LAZY_DRAFT=1 on a serial ring see a MISMATCH instead of "no-job-yet" forever.
+    v4_levers.note("V4_LAZY_DRAFT", False)
     ret.settimeout(timeout)
     send_msg(pipe, {"op": "reset", "swarm_id": swarm_id, "job_id": job_id, "nonce": nonce,
                     "temp": 0.0, "seed": 0, "spec": True, "dspark": True,
@@ -2829,15 +2833,6 @@ def _coord_cli(a):
                                job_id=job_id, layer_count=layer_count, receipts=a.receipts,
                                temp=float(job.get("temperature", 0.0)), timeout=a.timeout,
                                on_token=_on_token)
-            if not audited:
-                # Once, and BEFORE the result is emitted: the coordinator levers are ARGUMENTS to a
-                # loop, so only a completed round turns "requested" into an observed fact
-                # (v4_levers.note). Before this the startup audit could only report what the env
-                # resolved to. Placed ahead of SHARD_JOB_DONE so that under V4_LEVERS_STRICT the job
-                # whose configuration cannot be trusted is reported FATAL rather than reported done
-                # and then contradicted.
-                v4_levers.report(side=v4_levers.COORDINATOR)
-                audited = True
             elapsed = time.time() - state["t0"]
             ngen = len(r["tokens"])
             _emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
@@ -2857,6 +2852,19 @@ def _coord_cli(a):
             # not the warm ring.
             _emit("SHARD_JOB_FATAL", jobId=job_id, error=f"{type(e).__name__}: {e}")
             continue
+        if not audited:
+            # ONCE, after the first job COMPLETES and OUTSIDE its try. The coordinator levers are
+            # ARGUMENTS to a loop, so only a finished round turns "requested" into an observed fact
+            # (v4_levers.note); the startup audit could only report what the env resolved to.
+            #
+            # Both halves of the placement are load-bearing. Outside the try, because inside it a
+            # STRICT finding would be caught as a job fault -- the finished generation discarded, a
+            # FATAL emitted for a job that worked, `audited` never set, and the whole thing repeated
+            # for every job after it, with no path that ever clears. And `audited` first, so even a
+            # raise cannot leave the flag unset. Under STRICT this ends the coordinator loudly, once,
+            # which is the honest response to "the round you just ran was not the one you asked for".
+            audited = True
+            v4_levers.report(side=v4_levers.COORDINATOR)
     return 0
 
 

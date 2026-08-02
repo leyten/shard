@@ -30,14 +30,20 @@ THE RULE THIS FILE ENFORCES. For every lever there are two facts and they must b
 finding. `V4_LEVERS_STRICT=1` turns a finding into a refusal to serve. The stage repr carries
 `levers=` so the same fact is on the line an operator already reads.
 
-FOUR KINDS OF FINDING, all of which have actually happened:
-  MISMATCH        requested and observed disagree (bug 1, 3, 4, 6)
-  WRONG PROCESS   the var is set here but this lever is read by the other side (bug 5). The side
-                  table below is the answer to "which process must carry which var".
+THE VERDICTS, all of which have actually happened:
+  MISMATCH        requested and observed disagree (bug 1, 3, 4, 6), OR the environment says on and
+                  the owning module parsed it off (an env set after import — every in-process ring
+                  and bench does that, and those are what produce numbers).
   UNKNOWN         a V4_* var is set that no module in the engine reads at all — a typo, or a lever
                   that was documented and never implemented (V4_TOPK_STABLE is exactly this today).
+  OTHER SIDE      the var is set here and this lever is read by the other side (bug 5). A NOTICE and
+                  never an alarm: ENG_ENV ships the coordinator levers to every stage on purpose, so
+                  a stage carrying V4_LAZY_DRAFT is the normal state of a healthy ring, and a process
+                  cannot see whether the other side has it too. The line that ends bug 5 is on the
+                  side that CAN judge it -- a coordinator reading `V4_LAZY_DRAFT requested=off`.
   UNJUDGED        the lever cannot be judged from here (a stage-bound lever with no stage, a MoE
                   lever in a process that never loaded the reference). Reported, never hidden.
+  VALUE           a knob: the resolved value, reported so a wrong one is visible, never called OK.
 
 ADDING A LEVER. Register it here. `tests/test_v4_levers.py` re-derives the lever set from the SOURCE
 of every module the engine imports, so a new `os.environ.get("V4_...")` anywhere in phase0 fails the
@@ -73,13 +79,20 @@ class Ctx:
     def __init__(self, side, stage=None):
         self.side = side
         self.stage = stage
-        # The EXEC'd reference module, if this process has one. Deliberately `sys.modules.get` and not
-        # `v4_ref_cpu.load_ref()`: an audit must not cause the very load it is auditing, and a
-        # coordinator legitimately never loads it. Note the name: `load_ref` execs model.py as
-        # `dsv4_model`, so importing `deepseek_v4_ref.inference.model` by package path yields a
-        # SECOND, UNPATCHED class object — a probe that did exactly that is how bug 6 was
-        # "confirmed". Read the copy the engine is bound to, and only that one.
-        self.mod = sys.modules.get("dsv4_model")
+        # The reference module the ENGINE IS BOUND TO, if this process has one, and nothing else.
+        # THREE WAYS TO GET THIS WRONG, all of them real:
+        #   * `deepseek_v4_ref.inference.model` by package path is a SECOND, unpatched class object
+        #     (load_ref execs model.py as `dsv4_model`) — a probe that did exactly that is how bug 6
+        #     was "confirmed";
+        #   * `sys.modules["dsv4_model"]` is only a NAME, and v4_moe_grouped._load_model_module()
+        #     re-execs model.py and rebinds it while v4_ref_cpu._REF keeps the original;
+        #   * calling `load_ref()` here would cause the very load the audit is meant to observe, and
+        #     a coordinator legitimately never loads it at all.
+        # So: read `v4_ref_cpu._REF` — the object `v4_stage.ref()` hands the layers — and never import.
+        rc = sys.modules.get("v4_ref_cpu")
+        self.mod = getattr(rc, "_REF", None) if rc is not None else None
+        if self.mod is None:
+            self.mod = sys.modules.get("dsv4_model")
 
 
 def _mod(name):
@@ -118,13 +131,20 @@ def moe_chain(mod):
     moe = getattr(mod, "MoE", None)
     fn = getattr(moe, "forward", None)
     out, seen = [], set()
-    while fn is not None and id(fn) not in seen:
+    while fn is not None:
+        if id(fn) in seen:
+            out.append("CYCLE")             # a chain that eats itself: RecursionError on first use
+            break
         seen.add(id(fn))
         for label, modname, marker in _MOE_LAYERS:
             if getattr(fn, marker, False):
                 out.append(label)
                 owner = _mod(modname)
-                fn = getattr(owner, "_REF_FORWARD", None) if owner is not None else None
+                if owner is None:
+                    out.append("ORPHAN")    # marker present, installer gone: the walk cannot finish
+                    fn = None
+                else:
+                    fn = getattr(owner, "_REF_FORWARD", None)
                 break
         else:
             out.append("ref")
@@ -138,7 +158,17 @@ def _moe_check(label, modname, attr):
         req = _flag(modname, attr)
         if ctx.mod is None:
             return req, "unloaded", None
-        obs = "on" if label in moe_chain(ctx.mod) else "off"
+        chain = moe_chain(ctx.mod)
+        broken = [w for w in ("CYCLE", "ORPHAN") if w in chain]
+        if broken:
+            return req, ">".join(chain), False        # nobody can be judged on a broken chain
+        obs = "on" if label in chain else "off"
+        if label == "grouped" and obs == "on" and ctx.stage is not None:
+            # INSTANCE 3 OF THE BUG, closed at the only moment it is knowable before a token: the
+            # kernel can be installed and bound while NOT ONE LAYER took the bank, which is the
+            # `grouped/0` a ring ran on all night. Installed with an empty bank is not engaged.
+            banked = getattr(ctx.stage, "_moe_banked", 0)
+            return req, f"on/{banked}", (_agree(req, obs) and banked > 0)
         return req, obs, _agree(req, obs)
     return check
 
@@ -160,13 +190,21 @@ def _check_cuda_graph(ctx):
     `V4_CUDA_GRAPH` is a mode, not a bool, and the stage refuses it loudly on a box that cannot
     capture (see `Stage._graph_refusal`), so `whole` requested against `off` observed on a CPU box is
     a true and expected finding rather than a false alarm — it is reported, and it is why the default
-    is loud-not-fatal."""
+    is loud-not-fatal.
+
+    ARMED, NOT CAPTURED, and the difference is real: capture is LAZY (`_BlockGraphs.run` builds on
+    the first decode step, `WholeBlockGraphs.__init__` only allocates buffers), so this cannot be
+    judged before a token and does not claim to. `V4_GRAPH_MAX=0`, an exhausted budget or a per-layer
+    capture failure would still read as armed here — v4_stage counts those in `_GRAPH_SKIPPED`, which
+    is appended when it is non-zero so the number is at least in front of the operator."""
     st = _mod("v4_stage")
     req = st._graph_mode() if st is not None else "absent"
     if ctx.stage is None:
         return req, "no-stage", None
     obs = ctx.stage._graph_mode if getattr(ctx.stage, "_block_graphs", None) is not None else "off"
-    return req, obs, _agree(req, obs)
+    st = _mod("v4_stage")
+    skipped = getattr(st, "_GRAPH_SKIPPED", 0) if st is not None else 0
+    return req, (f"{obs}(-{skipped})" if skipped else obs), _agree(req, obs)
 
 
 def _check_fast_verify(ctx):
@@ -201,7 +239,13 @@ def _check_fp8_wire(ctx):
     The fp8 wire is the worst case for a flag-shaped check: a ring where only some processes pack is
     merely inefficient, never wrong (`_recv_hids` dispatches on the frame), so nothing downstream can
     tell you it did not happen. Running the real builder on a 1-element tensor costs microseconds and
-    answers the only question that matters — does a frame leaving this process carry `h8`."""
+    answers the question the flag cannot — does a frame leaving THIS process carry `h8`.
+
+    WHAT IT CANNOT CATCH, stated so nobody over-reads it: the builder branches on the same module
+    global this reads, so a flag that never REACHED the process reads off on both sides and passes.
+    No in-process check can catch that — the process has no idea what the operator intended — which
+    is exactly why ENG_ENV and test_v4_pipe's propagation gate exist. What this catches is a builder
+    that stopped honouring the flag, and the env/module gate in `audit` catches a flag set too late."""
     vp = _mod("v4_pipe")
     req = _flag("v4_pipe", "V4_FP8_WIRE")
     if vp is None:
@@ -219,6 +263,9 @@ def _check_dspark_fast(ctx):
     """The drafter lever, and the one that is TAIL-ONLY: only the tail builds a DSparkTail, so a
     non-tail stage legitimately has nothing rebound. Judged only where the class exists."""
     req = _flag("v4_dspark_fast", "V4_DSPARK_FAST")
+    fact = _NOTES.get("V4_DSPARK_FAST")               # recorded by build_tail, which is where it lands
+    if fact is not None:
+        return req, fact, _agree(req, fact)
     d = _mod("v4_dspark_draft")
     if d is None:
         return req, "unloaded", None
@@ -395,7 +442,10 @@ class Finding:
 
     @property
     def bad(self):
-        return self.verdict in ("MISMATCH", "WRONG PROCESS", "UNKNOWN")
+        # OTHER SIDE is deliberately NOT here: ENG_ENV propagates coordinator levers to every stage
+        # by design, so counting that would fire on every healthy ring and, under STRICT, stop the
+        # ring forming. It is printed and explained; it is not an alarm.
+        return self.verdict in ("MISMATCH", "UNKNOWN")
 
     def __repr__(self):
         return f"<{self.env} req={self.requested} obs={self.observed} {self.verdict}>"
@@ -411,25 +461,26 @@ def _stray_env():
 
 
 def audit(side=STAGE, stage=None):
-    """Every registered lever's requested vs observed state, plus the side and stray checks."""
+    """Every registered lever's requested vs observed state, plus the side, env and stray checks."""
     ctx = Ctx(side, stage)
     out = []
     for lv in LEVERS:
         set_here = os.environ.get(lv.env, "") not in ("", "0")
         if set_here and not lv.wanted_here(side):
-            # ONE-DIRECTIONAL ON PURPOSE. A coordinator-side lever on a STAGE is a dead flag: nothing
-            # in that process reads it, which is instance 5 and cost a night. The reverse is NORMAL --
-            # the coordinator usually runs on the launcher box, and `_eng_env()` reads os.environ to
-            # build the stages' environment, so a stage lever exported there is doing its job. Calling
-            # that a problem would put a false alarm on every healthy ring, and an alarm that always
-            # fires is the same as no alarm.
-            if lv.side == COORDINATOR:
-                out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "WRONG PROCESS",
-                                   f"coordinator-side lever set on a {side} process — this process "
-                                   f"never reads it; set it where the coordinator runs"))
-            else:
-                out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "PROPAGATED",
-                                   "stage-side lever; this process forwards it via ENG_ENV"))
+            # NEITHER DIRECTION IS A PROBLEM, AND THAT IS DELIBERATE. ENG_ENV ships the coordinator
+            # levers to every stage ON PURPOSE (v4_pipe:ENG_ENV, and the note above V4_LAZY_DRAFT
+            # says so) because v4_pipe runs on both sides and an operator exporting a lever on the
+            # launcher should get it wherever it is read. So a stage seeing V4_LAZY_DRAFT is the
+            # NORMAL state of a healthy ring -- calling it a problem would fire on every launch and,
+            # under STRICT, would stop the ring forming at all. It is a NOTICE: named, explained, and
+            # not counted, because a process cannot see whether the other side has it too.
+            # The actionable version is on the side that CAN judge it: a coordinator whose
+            # V4_LAZY_DRAFT reads `requested=off` is the line that ends instance 5.
+            where = COORDINATOR if lv.side == COORDINATOR else STAGE
+            out.append(Finding(lv.env, lv.side, os.environ[lv.env], "n/a", "OTHER SIDE",
+                               f"{lv.side}-side lever: THIS {side} process never reads it. It is "
+                               f"carried here because ENG_ENV propagates it; it configures the "
+                               f"{where}, and only the {where}'s own audit can judge it."))
             continue
         if not lv.wanted_here(side):
             continue
@@ -437,6 +488,17 @@ def audit(side=STAGE, stage=None):
             req, obs, ok = lv.check(ctx)
         except Exception as e:                      # noqa: BLE001 — an audit never breaks the serve
             out.append(Finding(lv.env, lv.side, "?", "?", "UNJUDGED", f"check raised {type(e).__name__}: {e}"))
+            continue
+        # THE ENV/MODULE GATE, ahead of the observation. `requested` is the owning module's PARSED
+        # value, which is what the run obeys -- but that means an env set AFTER the module was
+        # imported reads as "off" on both sides and passes as OK. Every in-process ring, bench and
+        # research harness sets env in the same interpreter, and those are what produce numbers. So
+        # the two are compared directly: an environment that says on against a module that parsed
+        # off is a MISMATCH, whatever the live state then shows.
+        if set_here and req in ("off", "0", "False", "absent"):
+            out.append(Finding(lv.env, lv.side, os.environ[lv.env], f"module parsed {req}", "MISMATCH",
+                               f"{lv.env} is set in this process's environment but {lv.owner} parsed "
+                               f"it {req} — it was almost certainly set after the module was imported"))
             continue
         verdict = ("OK" if ok else
                    ("VALUE" if lv.kind == "knob" else "UNJUDGED") if ok is None else "MISMATCH")
@@ -560,10 +622,18 @@ def _selftest():
     assert chain == ["multi", "decode", "ref"], chain
     print(f"chain      {'>'.join(chain)}   (the shape that used to report 'ref')")
 
-    # a cycle must terminate rather than hang
+    # a cycle must terminate AND be named -- it is a RecursionError on the first prefill, not a
+    # slow path, and a walk that merely stopped early would have reported it as three clean levers
     mul._REF_FORWARD = mul_fwd
-    assert moe_chain(_Mod) == ["multi"], moe_chain(_Mod)
+    assert moe_chain(_Mod) == ["multi", "CYCLE"], moe_chain(_Mod)
+    ctx_cyc = Ctx(STAGE)
+    ctx_cyc.mod = _Mod
+    assert _moe_check("multi", "v4_moe_multi", "V4_MOE_MULTI")(ctx_cyc)[2] is False
     mul._REF_FORWARD = dec_fwd
+    # and a marker whose installer is gone cannot reach `ref`, so it must not claim to
+    del sys.modules["v4_moe_decode"]
+    assert moe_chain(_Mod) == ["multi", "decode", "ORPHAN"], moe_chain(_Mod)
+    sys.modules["v4_moe_decode"] = dec
 
     ctx = Ctx(STAGE)
     ctx.mod = _Mod
