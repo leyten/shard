@@ -133,11 +133,57 @@ def _v4():
     return v4_stage
 
 
+# THE INFERENCE-TIME BLOCK WIDTH (V4_DSPARK_BLOCK, 0 = the trained dspark_block_size). One draft
+# call proposes `block_size` tokens from ONE tap, and the pipelined in-flight cap is block+1 — the
+# lockstep docs/V4_MULTIBLOCK_VERDICT.md §2 proves cannot be chained past. Width is the one axis
+# that cap leaves open: no weight tensor is dimensioned by `block_size` and every vendored shape is
+# symbolic in it (forward_embed's noise ids, the block rows DSparkAttention concatenates, the
+# freqs_cis slice, forward_head's Markov loop), so a wider block is pure configuration on the same
+# math. THE HONEST PRICE, named where the knob is read: `get_dspark_topk_idxs` gives every block
+# query the SAME index set — the block attends to itself BIDIRECTIONALLY — so extra noise slots
+# perturb the trained slots' logits too. Widening is therefore not "the old block plus free extras":
+# acceptance may move at EVERY depth, which only a real ring can measure (`accept_by_depth` under
+# the widened width against the trained width, same prompts). Opt-in, default OFF, tail-only; the
+# coordinator adapts to whatever length the reply carries and needs no flag.
+V4_DSPARK_BLOCK = int(os.environ.get("V4_DSPARK_BLOCK", "0") or 0)
+
+# THE TREE GATE (V4_DRAFT_TOP2). Branching speculation — several candidate continuations from one
+# tap — is priced in docs/V4_TREE_VERDICT.md at +18.3% x beta for the best buildable shape, where
+# beta is the RESCUE RATE: how often, at a cancel, the model's committed token is the drafter's own
+# RUNNER-UP at exactly the slot that missed. beta is the whole go/no-go and nothing measures it
+# today, so this lever ships the runner-up column on the existing linear round: `d2[i]` is the
+# second-highest-logit token at the same head slot that produced `draft[i]` (`forward_head` returns
+# the full per-slot logits, model.py:863, with the main path's Markov bias already applied — and at
+# a mismatch, the missed slot's predecessors are all committed, so its biased runner-up IS the
+# candidate a comb tree would have had in flight). The coordinators count, at each cancel, whether
+# `d2` named the committed token (`rescue_by_depth`). Reply metadata only — no frame, block, accept
+# rule or committed token changes — so losslessness is untouched by construction, and the tests pin
+# it on the real socket ring anyway. Opt-in, default OFF, tail-only, greedy drafter only (at
+# temperature > 0 the sampled draft need not be the top-1, and "runner-up" stops meaning anything).
+V4_DRAFT_TOP2 = os.environ.get("V4_DRAFT_TOP2", "0") not in ("", "0")
+
 # The two keys a DSparkBlock's state_dict has but a converted checkpoint deliberately does not.
 # `mtp[k].embed`/`mtp[k].head` are ASSIGNED the main model's modules (model.py:903-904), so they are
 # registered submodules pointing at storage that is already in the file under `embed.weight` /
 # `head.weight`; safetensors refuses to write one tensor twice, and convert.py:91 skips them.
 ALIAS_KEYS = ("embed.weight", "head.weight")
+
+
+def second_choices(tail):
+    """The drafter's runner-up token per slot of the block it JUST produced. -> [g] ints, or None.
+
+    `last_spec[1]` is `forward_head`'s logits, [b, block_size, vocab]: slot i's row produced
+    `draft[i]` (= output_ids[:, i+1]) by argmax AFTER the Markov bias landed in-place
+    (model.py:869-871), so its top-1 is the draft itself and its top-2 is the head's own second
+    choice for the same position under the same conditioning — the branch candidate the tree gate
+    counts. Both the reference and the V4_DSPARK_FAST path leave `last_spec` holding the kept
+    block's real triple, so this reads either one.
+
+    None when there is nothing sound to read: no block yet, or a sampling drafter (top-1 is then not
+    the draft, so "runner-up" would be a lie with plausible-looking values)."""
+    if tail.last_spec is None or tail.temperature != 0.0:
+        return None
+    return tail.last_spec[1][0].topk(2, dim=-1).indices[:, 1].tolist()
 
 
 def plan_verify_round(drafts, replies):
@@ -240,6 +286,22 @@ class DSparkTail:
             # needs the rejection-sampling accept rule, not this one.
             blk.temperature = float(temperature)
         self.temperature = float(temperature)
+        # THE WIDTH OVERRIDE, applied where every consumer reads it: `self.block_size` plans the
+        # advance/cliff guards, each vendored block's own `block_size` shapes forward_embed and the
+        # forward_head loop, and the fast/MoE installers capture whatever is live here. Set BEFORE
+        # any weight loads or rebinds so no path ever sees two widths. The bound is well inside
+        # v4_pipe's `_SPEC_POS_MARGIN` (64), the overshoot a serial dspark reset declares for the
+        # chunk `[cur] + block` — a block wider than that could rope a verify chunk past the
+        # horizon the job promised its stages.
+        if V4_DSPARK_BLOCK:
+            if not 1 <= V4_DSPARK_BLOCK <= 32:
+                raise ValueError(
+                    f"v4 dspark: V4_DSPARK_BLOCK={V4_DSPARK_BLOCK} — the inference-time block "
+                    f"width must be 1..32 (0/unset = the trained width, "
+                    f"{a.dspark_block_size} in this checkpoint)")
+            self.block_size = int(V4_DSPARK_BLOCK)
+            for blk in self.mtp:
+                blk.block_size = self.block_size
         self.mtp.eval()
         self.alias_missing = []
         self._pos = None
@@ -489,11 +551,39 @@ class RingDrafter:
     SINGLE SEQUENCE. The reply protocol is row 0's alone (`_serve_tail` samples `logits[0]`), so a
     b>1 chunk cannot even express the other rows' accept lengths; it is refused rather than silently
     drafting for row 0 and advancing the whole batch's lockstep cache. Batching needs the ragged
-    accept path first."""
+    accept path first.
+
+    PIPELINED MODE (`self.pipelined`, armed per job by the reset's `pipelined` flag) serves
+    v4_pipe.coordinate_dspark_pipelined, which streams the block as separate `s=1` frames instead of
+    one chunk. The accept rule is the same rule applied one position at a time and the reply carries
+    `acc` (this frame's position is committed) where the chunked reply carries `n`; see
+    `_on_chunk_pipelined`.
+
+    LAZY DRAFTING, and the measurement that forced it. A pipelined round streams ONE block per cycle
+    and this class drafted one on EVERY committed frame, so the tail paid for `g` of them and the
+    coordinator threw `g - 1` away. On the 6-stage EU ring that discarded work is the tail's whole
+    margin: 7.33 ms of its 37.37 ms on-box is its own three layers, ~2.1 ms is lm_head + sampling
+    (measured against a greedy job on the same ring), and the remaining ~28 ms is this drafter — on
+    the stage that binds the entire ring, against a next-slowest of 26.0 ms. So the coordinator now
+    hints each frame (`dnxt`/`dprev`, see `wants_block`) and a hinted frame produces only its STATE,
+    via v4_dspark_fast's cache-advance-only write. Nothing about the round changes — same frames,
+    same blocks consumed, same cancels, same tokens — only what the tail computes for the blocks
+    nobody was ever going to read."""
 
     def __init__(self, tail):
         self.tail = tail                                   # a DSparkTail (its 4-method contract)
         self._done = False
+        # PIPELINED mode (v4_pipe.coordinate_dspark_pipelined), armed per JOB by the reset's
+        # `pipelined` flag. `_cfront` is the position of the last frame this tail judged COMMITTED and
+        # `_mfront` is the model's greedy token that frame produced -- i.e. the token that belongs at
+        # `_cfront + 1`. Those two scalars ARE the incremental accept rule; see _on_chunk_pipelined.
+        self.pipelined = False
+        self._cfront = None
+        self._mfront = None
+        # LAZY DRAFTING: (position, block) of the last block this drafter actually produced, which is
+        # what a `dprev` hint dereferences. Only ever written where a block is returned, so a fenced
+        # or skipped frame cannot age it into looking like the previous position's.
+        self._last = None
 
     def on_chunk(self, msg, st, out):
         ids = torch.as_tensor(msg["ids"], dtype=torch.long)
@@ -502,6 +592,8 @@ class RingDrafter:
         if ids.dim() != 2 or ids.shape[0] != 1:
             raise RuntimeError(f"v4 dspark: a drafted round is single-sequence today, got ids "
                                f"{tuple(ids.shape)} — see RingDrafter's docstring")
+        if self.pipelined:
+            return self._on_chunk_pipelined(ids, msg, st, out)
         start_pos = int(msg["start_pos"])
         main = st.tail_main_hidden()
         if start_pos == 0:
@@ -536,8 +628,171 @@ class RingDrafter:
         # and `main[:, :n+1]` are those positions' taps. Feeding the whole chunk instead passes every
         # check the drafter can make and drafts off a history the ring rejected.
         blk, conf = self.tail.advance_and_draft([committed], main[:, :n + 1], start_pos=start_pos)
-        return {"draft": blk[0].tolist(), "n": n,
-                "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        r = {"draft": blk[0].tolist(), "n": n,
+             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        if V4_DRAFT_TOP2:
+            d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
+            if d2 is not None:
+                r["d2"] = d2
+        return r
+
+    def _on_chunk_pipelined(self, ids, msg, st, out):
+        """One STREAMED `s=1` frame of a pipelined round. -> {acc, draft, conf}, merged into the reply.
+
+        Pipelined speculation does not send a chunk: it streams `B+1` separate one-token frames
+        back-to-back without waiting, so the drafter can no longer be advanced "over the round's
+        committed prefix" -- there is no round, and when a frame is forwarded nobody yet knows whether
+        its token will survive. `plan_verify_round` still decides every acceptance; it is just applied
+        ONE POSITION AT A TIME, and the tail applies it to itself.
+
+        THE INCREMENTAL ACCEPT RULE, and why two scalars are the whole of it. Frames reach the tail in
+        the order the coordinator injected them (the ring is FIFO per leg), so the tail sees the frame
+        at `q` after the frame at `q-1`. It computed that frame's greedy token `_mfront`, which IS the
+        model's token at `q` whenever position `q-1` is itself committed. So the frame at `q` is on the
+        committed path exactly when `q == _cfront + 1` and the token it carries equals `_mfront` --
+        which is `plan_verify_round`'s "does the draft match the model's reply at this position",
+        position by position. A rejected frame does not move `_cfront`, so every frame behind it fails
+        the `q == _cfront + 1` test as well: the poisoning of a speculative tail falls out of the rule
+        rather than needing a flag. The correction frame the coordinator sends after a cancel lands at
+        `_cfront + 1` carrying `_mfront`, and re-opens the frontier.
+
+        THE DRAFTER ADVANCES ONLY ON A COMMITTED FRAME, ONE POSITION, and drafts off the tap of THAT
+        frame -- `advance_and_draft(ids=[m], main=tap(q), start_pos=q)` leaves `_pos = q`, so the block
+        it returns proposes positions `q+2 .. q+B+1`. The coordinator commits `m` at `q+1` off this
+        same reply and streams `[m] + block` from `q+1`, which is exactly the serial path's
+        `[cur] + drafts` chunk decomposed into `s=1` frames. Advancing one position per call is
+        bit-identical to the serial path's `n+1`-position call: `advance_and_draft` loops per position
+        internally and keeps the last block, so the mtp cache walks the same committed positions in the
+        same order and the block for a given history is the same block.
+
+        NOTHING HERE ROLLS BACK, because nothing here is ever speculative -- the mtp cache only ever
+        records committed positions (the module docstring's WHY THE MTP CACHE NEVER NEEDS A ROLLBACK,
+        and test_cache_never_speculative). That is what makes the drafter side of pipelined speculation
+        free: only the main stage's window ring had to learn to rewind W frames deep."""
+        start_pos = int(msg["start_pos"])
+        main = st.tail_main_hidden()
+        if start_pos == 0:
+            # THE RING'S PREFILL, identical to the serial path: one forward_spec over 0..P-1, which
+            # drafts nothing. It also seeds the frontier -- the last prompt position is committed by
+            # construction and `out["token"]` is the model's token at the one after it, so the first
+            # streamed frame (the coordinator feeding that token at position P) accepts.
+            self.tail.reset()
+            self._done = False
+            self._last = None                              # a new job never dereferences the old one's
+            self.tail.prefill([int(out["token"])], main)
+            self._cfront, self._mfront = main.shape[1] - 1, int(out["token"])
+            return {"acc": True}
+        if self._cfront is None:
+            raise RuntimeError("v4 dspark: a pipelined frame before the prefill — the mtp window is "
+                               "empty and there is no committed frontier to judge this frame against")
+        if ids.shape[1] != 1:
+            raise RuntimeError(f"v4 dspark: a pipelined round streams s=1 frames, got s={ids.shape[1]} "
+                               f"— the whole point is that no stage replays a block position by "
+                               f"position, so a multi-token frame is a coordinator bug")
+        replies = out.get("tokens")
+        if replies is None:
+            raise RuntimeError(
+                "v4 dspark: a pipelined job's reset must arm `spec` as well — the accept rule needs "
+                "the model's greedy token at this frame's position, and the tail only computes those "
+                "when _spec is armed")
+        if start_pos != self._cfront + 1 or int(ids[0, 0]) != self._mfront:
+            return {"acc": False}                          # speculative, and wrong: judge nothing
+        m = int(replies[0])
+        self._cfront, self._mfront = start_pos, m
+        # THE CONTEXT CLIFF, as in the serial path: stop drafting (and stop advancing) before
+        # `advance_and_draft` would rope a block past max_seq_len, rather than raising inside the
+        # tail's serve loop and killing every later job. The frontier keeps moving, so the round
+        # degrades to a one-frame-in-flight pipeline, which is plain greedy decode.
+        self._done = self._done or (start_pos + self.tail.block_size + 1) > self.tail.args.max_seq_len
+        if self._done:
+            return {"acc": True, "draft": []}
+        if not wants_block(msg, m, self._last):
+            # LAZY DRAFTING: this frame's block would be discarded, so only its STATE is produced.
+            # `advance_and_draft` fuses the two — one `forward_spec` per committed position both
+            # writes the mtp KV slot and derives the block — but the WRITE is all a committed position
+            # leaves behind (`DSparkAttention.forward` writes `kv_cache[:, pos % win]` and nothing
+            # else), and v4_dspark_fast._advance_cache_only reproduces exactly those bytes. It is the
+            # same primitive the fast path already uses for the intermediate positions of a serial
+            # round, held to the reference's M=1 shapes and pinned bit-exact against the reference
+            # loop in tests/test_v4_dspark_fast.py — here it is simply applied one position at a time.
+            #
+            # THE CURSOR MOVES ANYWAY, and that is the whole trap: `_advance_cache_only` advances no
+            # cursor of its own, so skipping the block must still leave `_pos` on the position the
+            # ring committed. A drafter left behind the committed stream raises inside the next
+            # `advance_and_draft`, and there is no try/except around the tail's step handler — it
+            # would kill the serve loop and every job after it. The guards below are the reference's
+            # own, run BEFORE the write, so a hint that arrived on the wrong frame fails the job here
+            # rather than corrupting the window silently.
+            t = self.tail
+            if t.pos is None or start_pos != t.pos + 1:
+                raise RuntimeError(
+                    f"v4 dspark: a lazy advance at {start_pos} but the mtp cache stands at {t.pos} — "
+                    f"the drafter's cursor must walk exactly the committed positions whether or not "
+                    f"it drafts on them")
+            with torch.no_grad():
+                _fast()._advance_cache_only(t, t._hidden(main, want_s=1), start_pos)
+            t._pos = start_pos
+            return {"acc": True}
+        blk, conf = self.tail.advance_and_draft([[m]], main, start_pos=start_pos)
+        draft = blk[0].tolist()
+        self._last = (start_pos, draft)
+        r = {"acc": True, "draft": draft,
+             "conf": [round(c, 4) for c in conf[0].float().tolist()]}
+        if V4_DRAFT_TOP2:
+            d2 = second_choices(self.tail)                 # None on a sampling drafter: send nothing
+            if d2 is not None:
+                r["d2"] = d2
+        return r
+
+
+def _fast():
+    """v4_dspark_fast, memoised. Imported lazily like `_v4()` — that module rebinds THIS one's
+    `advance_and_draft` in `install()`, so a module-level import would be a cycle — and cached
+    because the lazy path dereferences it once per skipped frame."""
+    global _FAST
+    if _FAST is None:
+        import v4_dspark_fast
+        _FAST = v4_dspark_fast
+    return _FAST
+
+
+_FAST = None
+
+
+def wants_block(msg, m, last=None):
+    """Will the coordinator consume a block off this frame's reply? -> draft it, or don't.
+
+    UNHINTED MEANS DRAFT. `dnxt` is set only by a lazy-armed coordinator and only on frames it has
+    PROVEN cannot drain the pipeline (v4_pipe's `_hints`), so its absence — an eager coordinator,
+    an older one, or a frame the proof did not cover — falls through to the eager path. The lever
+    can cost throughput by hinting too little; it cannot cost the round a block it needed.
+
+    WHAT THE HINT IS. `dnxt` is the token the coordinator has already streamed at `start_pos + 1`.
+    The round ends on this reply exactly when that token disagrees with `m`, the model's own token
+    at that position — which is `plan_verify_round`'s accept test at one position, the same test
+    this class already applies to itself. Agreement means the frame at `start_pos + 1` is
+    committed too and the speculation runs on, so nothing will ask this reply for a block.
+
+    THE REJECTION STILL DRAFTS EAGERLY, and it has to: the reply that reveals a rejection is the
+    reply the coordinator refills from (coordinate_dspark_pipelined's FRESH BLOCK COMES WITH THE
+    REJECTION). Skipping there would drain the pipeline and idle a full ring traversal waiting for
+    a block — far more than the drafting it saves. So a mismatch drafts, and only agreement
+    skips.
+
+    `dprev` IS THE SAME HINT, DEREFERENCED HERE. The last frame of a burst has a successor the
+    coordinator had not decided when it sent the frame — it is the head of the block the drain reply
+    is about to return — so the coordinator names the source instead of the value, and `last` is what
+    this drafter returned on the frame one position back: `(position, block)`. Every condition that
+    makes the dereference sound is re-checked here rather than assumed, because the coordinator's
+    half of it (that the frame at `H - 1` is the drain) cannot be seen from this side: the block must
+    be ours, from EXACTLY the previous position, and non-empty. Any of those failing falls back to
+    drafting, which is always safe."""
+    nxt = msg.get("dnxt")
+    if nxt is None and msg.get("dprev") and last is not None:
+        at, blk = last
+        if blk and at == int(msg["start_pos"]) - 1:
+            nxt = blk[0]
+    return nxt is None or int(nxt) != m
 
 
 def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
@@ -545,8 +800,50 @@ def ring_drafter(stage, ckpt_dir=None, temperature=0.0):
 
     `ckpt_dir=None` skips the load, which is the in-process path where the weights were transferred
     by hand; a serving tail always passes the dir it loaded its own layers from, and a checkpoint
-    without `mtp.*` raises there rather than drafting out of uninitialised memory."""
+    without `mtp.*` raises there rather than drafting out of uninitialised memory.
+
+    Under `V4_DSPARK_FAST=1` this installs v4_dspark_fast, which rebinds `advance_and_draft` to the
+    cache-advance-only fast path (the intermediate committed positions cost one KV write each instead
+    of a full MoE forward). Default OFF and a no-op otherwise — the reference loop is bit-exact and
+    the baseline every A/B measures against."""
+    import v4_dspark_fast
+    v4_dspark_fast.install(sys.modules[__name__])
+    # THE TAIL IS BUILT AT THE FIRST DSPARK RESET, long after the stage's startup lever audit ran, so
+    # that audit can only ever report this lever as unloaded. Record the live rebind here, where it is
+    # finally knowable, and say it once in the tail's log — otherwise `V4_DSPARK_FAST=1` is a flag no
+    # process on the ring ever confirms, which is the whole class this engine keeps paying for.
+    import v4_levers
+    live = getattr(DSparkTail.advance_and_draft, "_v4_dspark_fast", False)
+    v4_levers.note("V4_DSPARK_FAST", live)
+    print(f"[dspark] V4_DSPARK_FAST requested={v4_dspark_fast.V4_DSPARK_FAST} "
+          f"observed={'on' if live else 'off'}", file=sys.stderr, flush=True)
     tail = DSparkTail(stage, temperature=temperature)
+    # THE DRAFTER'S MoE LEVER (V4_DSPARK_MOE), banked + bound between construction and load — the
+    # only window where the bank's `preserve=False` release-first layout is free (every routed-
+    # expert byte is still torch.empty) and `load()` then writes the checkpoint THROUGH the bank
+    # views. Per-instance: it touches these three MoEs and nothing else in the process. Recorded
+    # here for the same reason V4_DSPARK_FAST is — the tail is built long after the startup lever
+    # audit, so this is the first moment the rebind is knowable.
+    import v4_dspark_moe
+    took = v4_dspark_moe.install_drafter(tail)
+    v4_levers.note("V4_DSPARK_MOE", took == len(tail.mtp) and took > 0)
+    print(f"[dspark] V4_DSPARK_MOE requested={v4_dspark_moe.V4_DSPARK_MOE} "
+          f"observed={took}/{len(tail.mtp)} drafter MoEs on the pair path",
+          file=sys.stderr, flush=True)
+    # THE WIDTH, recorded off the LIVE tail for the same reason the two levers above are: the
+    # drafter is built at the first dspark reset, long after the startup audit, so this is the
+    # first moment the width a run will actually draft at is knowable.
+    v4_levers.note("V4_DSPARK_BLOCK", str(tail.block_size) if V4_DSPARK_BLOCK else "off")
+    if V4_DSPARK_BLOCK:
+        print(f"[dspark] V4_DSPARK_BLOCK requested={V4_DSPARK_BLOCK} observed={tail.block_size} "
+              f"(trained width {tail.args.dspark_block_size})", file=sys.stderr, flush=True)
+    # THE TREE GATE, recorded off the LIVE tail like the levers above: armed but useless (a sampling
+    # drafter has no runner-up) is reported as off, so the audit shows what replies will carry.
+    v4_levers.note("V4_DRAFT_TOP2", V4_DRAFT_TOP2 and tail.temperature == 0.0)
+    if V4_DRAFT_TOP2:
+        print(f"[dspark] V4_DRAFT_TOP2 requested=on observed="
+              f"{'on' if tail.temperature == 0.0 else 'off (sampling drafter)'}",
+              file=sys.stderr, flush=True)
     if ckpt_dir is not None:
         tail.load(ckpt_dir)
     return RingDrafter(tail)

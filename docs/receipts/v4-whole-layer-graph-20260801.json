@@ -1,0 +1,108 @@
+{
+  "what": "Whole-layer CUDA graphs for a DeepSeek-V4-Flash decode step: the attention core made capture-safe so the whole layer (attn + islands, and with a graph-safe MoE the FFN too) captures as one graph.",
+  "date": "2026-08-01",
+  "box": "vast.ai RTX 5090 (sm_120), torch 2.10.0+cu128, tilelang 0.1.12",
+  "backend": "tilelang (real sm120 sparse-attn + act_quant); hadamard via v4_kernels_cpu shim (fast_hadamard_transform extension absent on this box)",
+  "weights": "synthetic at V4's real attention dims; no 158GiB checkpoint",
+  "config": {
+    "dim": 4096,
+    "n_heads": 64,
+    "head_dim": 512,
+    "rope_head_dim": 64,
+    "window_size": 128,
+    "index_topk": 512,
+    "index_head_dim": 128,
+    "index_n_heads": 64,
+    "compress_ratios_measured": [
+      4,
+      128,
+      0
+    ],
+    "note": "layer 0 = indexer (ratio 4), layer 1 = compressor (ratio 128), layer 2 = pure sliding window; the three kinds a stage contains",
+    "trimmed_for_synthetic_bench": {
+      "n_routed_experts": 8,
+      "max_seq_len": 2048,
+      "vocab_size": 2048,
+      "dtype": "bf16",
+      "expert_dtype": "None"
+    }
+  },
+  "parity": {
+    "CORRECTION_2026-08-01": "An earlier version of this receipt claimed the capture-safe block is bit-exact to the reference over the full decode run. That was WRONG. It passed under default CPU threading and FAILED at OMP_NUM_THREADS=1 (hidden diverged at pos 43). Root cause is NOT reassociation and NOT the mask/compress logic -- the scores over the valid columns are bit-identical (max|narrow - wide| = 0.0). index_score is bf16 behind a relu_() that floors negatives to a hard 0.0, so ties at the k-th rank are routine (23 of 120 steps), and torch.topk's tie order is undefined, backend-specific and NOT length-invariant -- so a wide/bucketed read selected a different compressed slot than the reference's narrow one. Independently reproduced and triaged on branch v4/whole-layer-graph-fix (e1db515), whose _select_topk_width_invariant and block-faithful sparse_attn are reconciled into this branch.",
+    "capture_safe_block_vs_reference_CPU": "torch.equal on hidden, logits and every KV/compressor buffer wherever the Indexer's selection is unambiguous -- 15 steps at index_topk 8 (pos 20-34) and the full 40-step run at index_topk 16 (pos 20-59, wrapping the 16-slot window 2.5x, crossing ten ratio-4 and five ratio-8 compression boundaries). Green at OMP_NUM_THREADS=1 and at default threading.",
+    "buffers_under_selection_pressure": "NOT claimed. A diverged selection in an early indexer layer changes the INPUT of later layers, so their KV/compressor buffers diverge downstream too -- an earlier draft of this receipt asserted buffer equality here and that test failed, correctly.",
+    "whole_layer_graph_stub_vs_eager_GPU": "bit-exact over 40 decode steps crossing the 128-window wrap and the ratio-4 and ratio-128 compression boundaries",
+    "moe_eager_graph_vs_reference_GPU": "see tier2_graph_vs_reference_measured -- 40/40 steps bit-exact, 0.0 max divergence, but that is a MEASUREMENT on this config and not a universal guarantee (the tie-break caveat still applies)",
+    "stage_whole_mode_vs_eager_GPU": "a Stage with V4_CUDA_GRAPH=whole is bit-exact to the eager Stage over the regime where the Indexer's selection is unambiguous (tests/test_v4_whole_layer.py::test_whole_layer_stage_is_bit_exact_to_eager). It is a Tier-2 comparison past that point, because the eager Stage runs the VENDORED block; the unconditional Tier-1 gate is graphed-vs-eager-twin.",
+    "GRADING_BAR": "Two-tier, m25's (research/graph_aux_check.py) -- the bar its CUDA graphs, the biggest M2.5 win at +74%, actually shipped under. TIER 1 (hard, torch.equal): graphed == the EAGER TWIN (WholeBlockGraphs._eager) -- same math, same bucket decisions, no capture. TIER 2 (named + bounded): vs the VENDORED reference, where token-identity is not a bar the reference can meet (its topk tie-break is not reproducible against itself across array widths or OMP_NUM_THREADS). Plus a FRESHNESS GATE: the same input at a DIFFERENT position must MOVE the output.",
+    "tier1_graph_vs_eager_twin": "torch.equal, per position, including across a bucket-rung crossing (tests/test_v4_whole_layer.py::test_graph_output_is_fresh_across_positions). This is the real capture-correctness proof: a graph replays the same kernels on the same bytes.",
+    "tier2_graph_vs_reference_measured": "At real dims (dim 4096, 64x512 heads, window 128, index_topk 512, ratios 4/128/0), 40 decode steps from a 120-token prefill: 40/40 steps bit-exact, max|graph - reference| = 0.000e+00 with the stable-sort lane order. A genuine k-th-rank tie can still select a different equally-scoring slot; that is the named, bounded Tier-2 residual, not a rounding drift.",
+    "freshness_gate": "PASS -- the same input at three positions (one in a different bucket rung) produces three different outputs, each equal to the eager twin at that position. Cheapest insurance against position baked in at capture, the failure m25 shipped once as stale EAGLE aux.",
+    "reconciled_with_e1db515": "TAKEN from that branch: (a) the block-faithful v4_kernels_cpu.sparse_attn -- the CPU oracle reduced in one flat pass, so -1 padding regrouped its pairwise tree and changed last bits on ~1% of calls, while the real kernel walks fixed 64-wide blocks where an all-masked block rescales by exp(0)==1 and adds 0, making padding bitwise free; a GPU-less oracle has to emulate that blocking to be faithful. Verified here: 0 mismatches in 200 trials x 3 pad widths. (b) the width-invariant selection contract and its two-tier framing. KEPT from this branch: bucketing (INDEXER_BUCKETS, m25 DECODE_BUCKETS' shape) as the cost lever, the V4_GRAPH_MAX budget with counted/logged eager fallback, the moe_eager two-graph path, the whole-layer stub ceiling and the timing bench.",
+    "IMPROVEMENT_lane_order": "One place this branch goes further than e1db515. Both selections are width-invariant, but the tie-admission form (k-th value + cumsum) emits its picks in ascending INDEX order, whereas torch.topk hands sparse_attn its picks in DESCENDING SCORE order -- and sparse_attn's per-block reduction is order-sensitive, so re-laning the same support set regroups the sum. Measured at real dims, moe_eager vs the vendored reference over 40 decode steps: ascending-index lanes 2/40 steps bit-exact (max 9.4e-2); a STABLE DESCENDING SORT, which is the same (value DESC, index ASC) total order but keeps the reference's lane order, 40/40 bit-exact (0.0). This branch ships the sort. It costs a little more than the cumsum trick and removes a whole class of Tier-2 noise, leaving genuine ties as the only difference.",
+    "tier1_width_is_a_cost_knob": "THE headline bar, and the one that would have caught the original bug with no reference at all: driving the same decode at max width and at bucketed widths gives torch.equal hidden, logits and every KV buffer -- 120 steps x 3 seeds (7, 11, 23), green at OMP_NUM_THREADS=1. Seeds matter: the first cut failed on 7 and 11 at different positions and PASSED on 23, which is exactly how it survived a green run.",
+    "indexer_tie_break": "The one deviation that survives: on an EXACT tie at the k-th rank the capture-safe path may attend a different, equally-scoring compressed slot than the reference. It never selects a lower-scoring column (proven: identical selected score multiset). The reference's own answer there is torch's arbitrary order, which already differs between its CPU and CUDA backends and across thread counts."
+  },
+  "timing_per_decode_layer_ms": {
+    "position": 200,
+    "reps": 300,
+    "note": "cpu = perf_counter around the launch submit (dispatch cost); wall = CUDA events (GPU). This box is dispatch-bound (eager cpu ~= wall), which is the scattered-consumer-GPU regime the graph is for.",
+    "sum_over_3_layers": {
+      "eager_real": {
+        "cpu_ms": 15.05,
+        "wall_ms": 15.0
+      },
+      "island_real": {
+        "cpu_ms": 12.37,
+        "wall_ms": 12.33
+      },
+      "moe_eager": {
+        "cpu_ms": 7.01,
+        "wall_ms": 6.97
+      },
+      "eager_stub": {
+        "cpu_ms": 14.16,
+        "wall_ms": 14.11
+      },
+      "whole_stub": {
+        "cpu_ms": 1.18,
+        "wall_ms": 1.93
+      }
+    }
+  },
+  "multipliers": {
+    "measured_after_reconciling_e1db515_selection_and_oracle": true,
+    "selection_cost": "The width-invariant stable sort replaced a plain topk; measured effect on the end-to-end multipliers is within run-to-run noise (moe_eager 2.08-2.15x across runs).",
+    "island_vs_eager_realMoE": {
+      "cpu": 1.22,
+      "wall": 1.22,
+      "meaning": "the existing lever (hc islands only)"
+    },
+    "moe_eager_vs_eager_realMoE": {
+      "cpu": 2.15,
+      "wall": 2.15,
+      "meaning": "DEPLOYABLE: attention core graphed, routed MoE eager. Tier-1 bit-exact to the eager twin; Tier-2 measured 0.0 over 40 steps at real dims"
+    },
+    "whole_vs_eager_stubMoE": {
+      "cpu": 12.01,
+      "wall": 7.31,
+      "meaning": "CEILING: whole layer graphed -- needs the sibling graph-safe grouped-fp4 MoE to realise"
+    }
+  },
+  "how_the_attention_core_was_made_capture_safe": {
+    "1_device_position": "start_pos enters as a length-1 device buffer; every kv_cache[:, p%win] / kv_state[:, p%ratio] / kv_cache[:, p//ratio] store becomes index_copy_ on a device-derived slot, chosen at replay not baked at capture",
+    "2_fixed_width_masked_read": "BUCKETED read (m25_stage.py DECODE_BUCKETS discipline: round the read up to a rung, one graph per rung, capture a new one lazily on a crossing, budget-capped by V4_GRAPH_MAX with over-budget layers staying eager, counted and logged). Columns past end_pos//ratio are masked to -inf and picks that land on them become -1, which sparse_attn treats as a no-op. Scores over the valid columns are bit-identical to the reference's narrow einsum (0.0). Selection is a STABLE sort, NOT topk -- v4_stage's own _chunk_indexer already documents why ('Masking a common-width score to fake the shorter reads would change which slots a topk near-tie picks'), and width-independence is what makes a bucket crossing invisible instead of a silent change of answer.",
+    "3_two_graphs_by_position": "should_compress = (start_pos+1)%ratio is host-known, so the block is captured twice (compress / no-compress) and the replay picks by position -- zero data-dependent control flow inside a graph"
+  },
+  "risks": {
+    "REFERENCE_TOPK_IS_NOT_DETERMINISTIC": "Independent of this lever and worth acting on: the vendored Indexer's topk resolves exact ties by an artifact of its selection algorithm -- undefined order, backend-specific, and not length-invariant. The same reference on the same input can select different compressed slots at different array widths, CPU thread counts, or devices. On a scattered ring that means two boxes running the same layer can disagree, and a speculative verify can reject its own drafter for no modelling reason. The capture-safe path pins it with a total order; the eager reference path does NOT, and should be pinned the same way before the ring depends on cross-box determinism.",
+    "indexer_tie_break_deviation": "Because of the above, the capture-safe path is bit-exact to the reference only where the selection is tie-free; on an exact tie it may attend a different, equally-scoring compressed slot (measured effect at the toy config: ~6e-3 on the hidden state). It never selects a lower-scoring column (proven: identical selected score multiset). Serving is self-consistent -- every stage runs the same path -- but a receipt must not call this byte-identical to DeepSeek's reference.",
+    "fixed_width_indexer_cost": "RESOLVED by bucketing. The read was max_seq_len/ratio at every position (full-context work from token one); it is now the smallest rung >= end_pos//ratio, so an early decode reads 64 compressed slots rather than 512. This is also what paid for the stable sort: the CPU suite went 32s -> ~5s and the measured multipliers came back up (moe_eager 2.13x, whole 7.66x).",
+    "kv_rewind_under_speculative_rollback": "the graph writes are position-parameterized so a rewind (_seek: restore snapshot + replay accepted prefix) advances the SAME slots the eager path would; the replay uses the eager per-token path (not the graph) by design (_replaying guard), so rollback correctness rides on the existing _snapshot/_seek proof, unchanged",
+    "dispatch_bound_dependence": "the 8x is on a dispatch-bound box; a fast-CPU/uncontended box is nearer the GPU compute floor (~0.6ms/layer here, stub) and the multiplier is smaller -- but vast/consumer boxes are dispatch-bound, which is the target",
+    "moe_is_the_ceiling": "the deployable multiplier is capped at ~2x until the routed MoE is graph-safe; the whole-layer 8x needs the sibling grouped-fp4 MoE to compose in",
+    "bucket_rung_crossings": "A rung crossing captures a NEW graph mid-decode (a one-capture stall) and pins more workspace. Bounded a priori by len(INDEXER_BUCKETS)=7 per (layer, compress) variant, and by V4_GRAPH_MAX process-wide; past the cap the layer runs eager, counted and logged.",
+    "DSPARK_TAP_MUST_STAY_OUTSIDE_THE_GRAPH": "Not a bug today, a tripwire for the next change. V4's DSpark tap is taken in v4_stage._run, OUTSIDE the captured region, so it is recomputed per step and is fresh. The moment a graph spans more than one layer (or the tap moves inside one), it becomes exactly m25's stale-EAGLE-aux bug: a Python-level side effect inside a captured region is recorded ONCE at capture and skipped by every replay, so the drafter would feed on the capture-step's aux forever, behind valid receipts and plausible numbers. The freshness gate is the test that would catch it.",
+    "cpu_oracle_must_stay_kernel_faithful": "v4_kernels_cpu.sparse_attn now emulates the kernel's fixed 64-wide blocking. That is not cosmetic: with a flat reduction the oracle disagreed with itself under -1 padding on ~1% of calls, so a GPU-less parity test would fail something the GPU passes. Any future edit to that function has to preserve the blocking."
+  }
+}

@@ -89,6 +89,36 @@ def load_ref():
         # shape (V4_MOE_DECODE=0 to A/B it).
         import v4_moe_decode
         v4_moe_decode.install(mod)
+        # THEN the grouped fp4 kernel, and the ORDER OF THESE TWO IS THE PRECEDENCE. Each install
+        # captures whatever `MoE.forward` is bound at that moment as its own fallback, so installing
+        # grouped SECOND makes the chain grouped -> decode -> reference: the grouped kernel claims the
+        # single-token score-routed decode step (V4_MOE_GROUPED=1, CUDA only), hands everything it
+        # declines (s>1, world_size>1, hash-routed layers) to the decode fast path, and that hands
+        # what IT declines to the untouched reference. Both off => reference, byte-identical.
+        # Installing them the other way round would bury the grouped kernel under the decode path and
+        # it would never run — this line's position is the whole wiring.
+        import v4_moe_grouped
+        v4_moe_grouped.install(mod)
+        # LAST of the three, and again the position IS the precedence. Both levers above are gated on
+        # ONE token, so the DSpark drafter — whose MoEs run at `dspark_block_size` rows, never 1 —
+        # falls through both and lands on the vendored dispatch loop, on the tail, every drafted
+        # round. This claims that small-block shape and hands every single-token step DOWN to the
+        # chain above, so the main decode path is untouched. V4_MOE_MULTI=1 to arm it; default OFF.
+        import v4_moe_multi
+        v4_moe_multi.install(mod)
+        # Same window, same reason: reference-compute "slim" overrides that remove removable per-layer
+        # work (the indexer while context is short; the inplace KV/Q QAT sim). Both behind default-OFF
+        # env flags (V4_REF_SLIM / V4_REF_SLIM_NOQAT), so this is a no-op — reference byte-identical —
+        # unless one is set. See phase0/v4_ref_slim.py.
+        import v4_ref_slim
+        v4_ref_slim.install(mod)
+        # Independent of the MoE chain above: this rebinds the module-level `fp8_gemm` (what
+        # `linear()` resolves at call time) and `Expert.forward`, never `MoE.forward`. Both levers
+        # default OFF — with the envs unset this is a no-op and the reference is byte-identical.
+        # The occupancy-tiled kernel is CUDA-only and every tile it serves is probed torch.equal
+        # against the vendored kernel first; see phase0/v4_fp8_gemv.py.
+        import v4_fp8_gemv
+        v4_fp8_gemv.install(mod)
         _REF = mod
     return _REF
 

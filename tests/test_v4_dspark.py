@@ -191,6 +191,31 @@ def test_decode_draft_matches_oracle(oracle, args):
         assert torch.equal(got, want), f"mtp stage {k} cache diverged over {STEPS} steps"
 
 
+def test_second_choices_is_the_runner_up_at_the_drafts_own_slot(oracle, args):
+    """THE INVARIANT THE TREE GATE STANDS ON (V4_DRAFT_TOP2 / docs/V4_TREE_VERDICT.md).
+
+    `second_choices` claims `d2[i]` is the head's second choice for the SAME position that produced
+    `draft[i]`, under the same conditioning. That is only true because `forward_head` adds the Markov
+    bias to `logits[:, i]` IN PLACE and then samples slot i+1 from that same row (model.py:869-871)
+    — so the returned logits' top-1 IS the draft, and top-2 is the branch candidate a comb tree
+    would have flown. A re-vendored head that sampled first and biased after would silently turn d2
+    into plausible-looking garbage; the argmax assertion here is what fails instead."""
+    ids = _ids(PROMPT, args)
+    st, dr, tok = prefilled(oracle, args, ids)
+    tok, main = step(st, tok, PROMPT)
+    drafts, _ = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=PROMPT)
+    d2 = DS.second_choices(dr)
+    logits = dr.last_spec[1][0]                           # [block_size, vocab], biases already in
+    assert torch.equal(logits.argmax(-1), drafts[0]), \
+        "the returned logits' top-1 is not the draft — the bias-then-sample order changed under us"
+    top2 = logits.topk(2, dim=-1).indices[:, 1].tolist()
+    assert d2 == top2 and len(d2) == drafts.shape[1], "d2 must be the runner-up, slot for slot"
+    assert all(a != b for a, b in zip(d2, drafts[0].tolist())), \
+        "a runner-up equal to the draft is not a second choice"
+    dr.temperature = 0.5                                  # a sampling drafter: top-1 need not be the
+    assert DS.second_choices(dr) is None, "draft, so there is no runner-up to claim"
+
+
 # ── 3. the run ───────────────────────────────────────────────────────────────────────────────────
 
 def test_stepwise_advance_equals_oracle_sequence(oracle, args):
@@ -802,6 +827,122 @@ def test_ring_drafter_degrades_to_greedy_at_the_context_limit():
     assert rep == {"draft": [], "n": 0} and tail.calls == []
 
 
+# ── 7b. PIPELINED mode: the same accept rule, one streamed s=1 frame at a time ────────────────────
+
+
+def _pframe(ids, start_pos, tokens=None, token=None):
+    """One streamed frame + the reply the tail has already built for it (the model's greedy token at
+    this frame's position), in RingDrafter.on_chunk's (msg, st, out) shape."""
+    msg, out = _chunk(ids, start_pos, tokens=tokens, token=token)
+    return msg, _TapStage(len(ids)), out
+
+
+def _pipelined_drafter(prompt_len=4, first=99, **kw):
+    """A pipelined RingDrafter with the ring's prefill already behind it. -> (drafter, tail)."""
+    tail = _RecordingTail(**kw)
+    dr = DS.RingDrafter(tail)
+    dr.pipelined = True
+    dr.on_chunk(*_pframe(list(range(prompt_len)), 0, token=first))
+    tail.calls.clear()
+    return dr, tail
+
+
+def test_pipelined_prefill_seeds_the_frontier_and_drafts_nothing():
+    """Identical to the serial prefill — the whole prompt's taps, no block — plus the one thing the
+    streamed path needs from it: the frontier. The last prompt position is committed by construction
+    and the reply's own token is the model's at the one after it, which is exactly what the first
+    streamed frame will carry."""
+    tail = _RecordingTail()
+    dr = DS.RingDrafter(tail)
+    dr.pipelined = True
+    assert dr.on_chunk(*_pframe([5, 6, 7, 8], 0, token=99)) == {"acc": True}
+    assert tail.calls == [("reset",), ("prefill", [99], [0, 1, 2, 3])]
+    assert (dr._cfront, dr._mfront) == (3, 99)
+
+
+def test_pipelined_committed_frame_advances_exactly_one_position_and_drafts():
+    """A frame carrying the model's own token at the frontier is COMMITTED: the drafter advances over
+    that one position, pairing this frame's tap with this frame's greedy reply, and the block it
+    returns is the speculation the coordinator streams behind the token it is about to commit."""
+    dr, tail = _pipelined_drafter(prompt_len=4, first=99)
+    rep = dr.on_chunk(*_pframe([99], 4, tokens=[63]))
+    assert rep == {"acc": True, "draft": [71, 72, 73], "conf": [0.5, 0.5, 0.5]}
+    assert tail.calls == [("advance", [63], [0], 4)], "one position, its own tap, at the frontier"
+
+
+def test_pipelined_rejects_a_speculative_frame_and_everything_streamed_behind_it():
+    """THE INCREMENTAL ACCEPT RULE, including the part that is easy to get wrong.
+
+    A frame whose token is not the model's at that position is speculative-and-wrong: it must not move
+    the frontier and must not touch the drafter. Neither may ANY frame streamed behind it — and the
+    frame behind it here carries exactly the greedy token the REJECTED frame produced, which is what a
+    naive "does this match the last reply" rule would accept, drafting off a history the ring threw
+    away. The frontier test (`q == cfront + 1`) is what refuses it. The coordinator's correction lands
+    back AT the frontier with the model's own token, and re-opens."""
+    dr, tail = _pipelined_drafter(prompt_len=4, first=99)
+    dr.on_chunk(*_pframe([99], 4, tokens=[63]))                # committed: frontier 4, model says 63
+    tail.calls.clear()
+    assert dr.on_chunk(*_pframe([500], 5, tokens=[64])) == {"acc": False}, "a wrong draft"
+    assert dr.on_chunk(*_pframe([64], 6, tokens=[65])) == {"acc": False}, "poisoned: behind a reject"
+    assert tail.calls == [], "a speculative frame must never advance the drafter"
+    rep = dr.on_chunk(*_pframe([63], 5, tokens=[77]))          # the correction, at the frontier
+    assert rep["acc"] is True and tail.calls == [("advance", [77], [0], 5)]
+
+
+def test_pipelined_refuses_a_multi_token_frame():
+    """The whole point of the lever is that no stage replays a block position by position, so a
+    pipelined frame is s=1 by construction and anything else is a coordinator bug."""
+    dr, _tail = _pipelined_drafter()
+    with pytest.raises(RuntimeError, match="streams s=1 frames"):
+        dr.on_chunk(*_pframe([99, 7], 4, tokens=[63, 64]))
+
+
+def test_pipelined_degrades_to_greedy_at_the_context_limit():
+    """The context cliff, pipelined: stop drafting before a block would rope past max_seq_len, but
+    keep judging frames — the frontier has to keep moving or the coordinator's next frame is refused.
+    The run degrades to one frame in flight, which is plain greedy decode."""
+    dr, tail = _pipelined_drafter(prompt_len=4, first=99, max_seq_len=20)
+    at = tail.args.max_seq_len - tail.block_size               # a block from here ropes past the end
+    dr._cfront, dr._mfront = at - 1, 99
+    assert dr.on_chunk(*_pframe([99], at, tokens=[7])) == {"acc": True, "draft": []}
+    assert tail.calls == [], "nothing may reach the drafter once it would raise"
+    assert (dr._cfront, dr._mfront) == (at, 7), "the frontier still has to advance"
+    assert dr.on_chunk(*_pframe([7], at + 1, tokens=[8])) == {"acc": True, "draft": []}
+
+
+def test_pipelined_stepwise_advance_equals_one_multiposition_advance(oracle, args):
+    """The decomposition the pipelined drafter rests on: advancing ONE position per streamed frame is
+    bit-identical to the serial round's single call over the whole committed run.
+
+    It has to be, and not merely "close": if the two cadences produced different mtp state, the two
+    coordinators would propose different blocks off the same history, and every acceptance measurement
+    taken on one path would say nothing about the other. `advance_and_draft` loops per position
+    internally and keeps the last block, so this is really the assertion that the loop has no state
+    outside the drafter — proven on two independent drafters prefilled from the same tensors."""
+    ids = _ids(PROMPT, args, seed=LOOP_SEED)
+    st, serial, tok = prefilled(oracle, args, ids)
+    main0 = st.tail_main_hidden()                              # the prompt's taps, still the last forward
+    _st_b, streamed = tail_from_oracle(oracle, args)
+    streamed.prefill(tok, main0)
+
+    forced = [torch.full((BATCH,), t, dtype=torch.long) for t in (7, 151, 293)[:RUN]]
+    toks = [tok] + forced
+    chunk = torch.cat([t.unsqueeze(1) for t in toks[:RUN]], dim=1)
+    h = st.forward(st.embed(chunk), chunk, PROMPT)
+    main = st.tail_main_hidden()
+    committed = torch.cat([t.unsqueeze(1) for t in toks[1:]], dim=1)
+
+    d_serial, c_serial = serial.advance_and_draft(committed, main, start_pos=PROMPT)
+    for j in range(RUN):                                       # the pipelined cadence: one at a time
+        d_stream, c_stream = streamed.advance_and_draft(committed[:, j:j + 1], main[:, j:j + 1],
+                                                        start_pos=PROMPT + j)
+    assert serial.pos == streamed.pos == PROMPT + RUN - 1
+    assert torch.equal(d_serial, d_stream), "the block differs between the two cadences"
+    assert torch.equal(c_serial, c_stream), "the confidence differs between the two cadences"
+    for k, (a, b) in enumerate(zip(caches(serial), caches(streamed))):
+        assert torch.equal(a, b), f"mtp stage {k} cache differs between the two cadences"
+
+
 def test_ring_drafter_over_the_real_drafter(oracle, args):
     """The same adapter, over a real Stage + DSparkTail: one drafted round, graded on the oracle.
 
@@ -858,3 +999,80 @@ def test_spec_loop_with_a_perfect_drafter(oracle, args):
         drafts = perfect(None)
     assert out == want[:len(out)]
     assert max(accepted) == g, "the perfect drafter never reached a full block"
+
+
+# ── 9. the inference-time block width (V4_DSPARK_BLOCK) ──────────────────────────────────────────
+
+def test_width_override_is_off_by_default_and_bounded(oracle, args, monkeypatch):
+    """Default 0 = the trained width, exactly — and the guard refuses a width the serial reset's
+    declared overshoot (`v4_pipe._SPEC_POS_MARGIN`) could not cover, at build rather than as a
+    horizon violation mid-job."""
+    assert DS.V4_DSPARK_BLOCK == 0, "the width override must ship OFF"
+    _, dr = tail_from_oracle(oracle, args)
+    assert dr.block_size == args.dspark_block_size
+    for bad in (33, -1):
+        monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", bad)
+        with pytest.raises(ValueError, match="V4_DSPARK_BLOCK"):
+            tail_from_oracle(oracle, args)
+
+
+def test_width_override_drafts_wider_bit_equal_to_a_widened_reference(oracle, args, monkeypatch):
+    """RENT-NOT-REWRITE at the new width: the override only CONFIGURES the vendored blocks, so a
+    reference widened the same way must produce the same bytes — drafts, logits, confidence — for
+    every step, with the mtp caches identical after. `block_size` is instance state on DSparkBlock
+    and no weight tensor is dimensioned by it; this is the proof that stays true.
+
+    The oracle's own mtp blocks are widened directly (the same one-attribute change the lever
+    makes), so both sides run DeepSeek's forward at width 7 and the comparison is exact."""
+    WIDE = 7
+    monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", WIDE)
+    for blk in oracle.mtp:
+        blk.block_size = WIDE
+    ids = _ids(PROMPT, args)
+    st, dr, tok = prefilled(oracle, args, ids)
+    assert dr.block_size == WIDE and all(b.block_size == WIDE for b in dr.mtp)
+    for i in range(PROMPT, PROMPT + STEPS):
+        o_tok, _, o_main = oracle(tok.unsqueeze(1), i)
+        o_spec = oracle.forward_spec(o_tok, o_main, i)
+        tok, main = step(st, tok, i)
+        assert torch.equal(tok, o_tok), f"the stage half diverged at step {i}"
+        drafts, conf = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=i)
+        o_out, o_logits, o_conf = o_spec
+        assert drafts.shape == (BATCH, WIDE), "the widened drafter must return WIDE drafts"
+        assert torch.equal(dr.last_spec[0], o_out), f"widened draft ids diverged at step {i}"
+        assert torch.equal(dr.last_spec[1], o_logits), f"widened draft logits diverged at step {i}"
+        assert torch.equal(conf, o_conf), f"widened confidence diverged at step {i}"
+        assert dr.pos == i
+    for k, (got, want) in enumerate(zip(caches(dr), caches(oracle))):
+        assert torch.equal(got, want), f"mtp stage {k} cache diverged at width {WIDE}"
+
+
+def test_widening_perturbs_the_trained_slots_and_that_is_the_documented_price(oracle, args,
+                                                                              monkeypatch):
+    """THE HONEST PRICE, pinned as a fact rather than left as prose: `get_dspark_topk_idxs` gives
+    every block query the same index set, so the block attends to itself BIDIRECTIONALLY and the
+    extra noise slots feed back into the trained slots' logits. A widened block is therefore NOT
+    "the trained block plus free extras" — the per-depth acceptance of slots 1..B is a new
+    measurement under the lever, which is exactly what `accept_by_depth` on the first widened ring
+    run must be read for. If this assertion ever starts failing, the attention became causal and
+    the lever's risk paragraph should be rewritten, not this test deleted."""
+    WIDE = 7
+    ids = _ids(PROMPT, args)
+    st, dr, tok0 = prefilled(oracle, args, ids)
+    o_tok, _, o_main = oracle(tok0.unsqueeze(1), PROMPT)
+    tok, main = step(st, tok0, PROMPT)
+    narrow, _ = dr.advance_and_draft(tok.unsqueeze(1), main, start_pos=PROMPT)
+    narrow_logits = dr.last_spec[1][:, :args.dspark_block_size]
+
+    monkeypatch.setattr(DS, "V4_DSPARK_BLOCK", WIDE)
+    oracle2 = REFCPU.build_oracle(args, SEED)
+    st2, dr2, tok0w = prefilled(oracle2, args, ids)
+    assert torch.equal(tok0w, tok0), "the main model must not see the drafter's width"
+    tokw, mainw = step(st2, tok0w, PROMPT)
+    assert torch.equal(tokw, tok), "the main model's stream is width-independent by construction"
+    wide, _ = dr2.advance_and_draft(tokw.unsqueeze(1), mainw, start_pos=PROMPT)
+    wide_logits = dr2.last_spec[1][:, :args.dspark_block_size]
+    assert wide.shape[1] == WIDE and narrow.shape[1] == args.dspark_block_size
+    assert not torch.equal(wide_logits, narrow_logits), (
+        "widening left the trained slots' logits bit-identical — the block attention has become "
+        "causal within the block, and V4_DSPARK_BLOCK's documented risk paragraph is now stale")
