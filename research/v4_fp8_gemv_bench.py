@@ -88,7 +88,7 @@ def main():
 
     # the vendored kernel, exactly as linear() would call it
     sys.path.insert(0, os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                                    "phase0", "deepseek_v4_ref", "inference"))
+                                    "vendor", "deepseek_v4_ref", "inference"))
     import kernel as vk
     FG._REF_FP8_GEMM = FG._REF_FP8_GEMM or vk.fp8_gemm
     sd = torch.float8_e8m0fnu

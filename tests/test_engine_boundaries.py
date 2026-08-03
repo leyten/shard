@@ -37,13 +37,16 @@ import pathlib
 import pytest
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PHASE0 = ROOT / "phase0"
+ENGINES = ROOT / "engines"
 SPINE = ROOT / "shard"
 
-# module-name prefix -> the engine it belongs to. Vendored reference trees are NOT engines: they are
-# byte-identical upstream code that a single engine drives, so they are excluded from the scan.
+# module-name prefix -> the engine it belongs to. The directory name is now the boundary, but the
+# PREFIX stays the thing we key on: engines ship as flat modules on purpose (a stage runs as
+# `python3 v4_pipe.py stage ...` with the files copied next to each other on a rented box), so a
+# foreign import is still spelled exactly like a local one and still needs catching.
+# Vendored trees under vendor/ are NOT engines — they are byte-identical upstream code that a
+# single engine drives — so they are never scanned.
 ENGINE_PREFIXES = {"v4_": "deepseek_v4", "k3_": "kimi_k3", "m25_": "minimax_m25"}
-VENDORED = ("deepseek_v4_ref", "kimi_k3_ref")
 
 
 def _engine_of(module_name):
@@ -69,10 +72,16 @@ def _imports(path):
 
 
 def _engine_files():
-    if not PHASE0.is_dir():
-        return []
-    return [p for p in sorted(PHASE0.glob("*.py"))
-            if _engine_of(p.name) and not any(v in str(p) for v in VENDORED)]
+    """Every engine module, wherever it lives — engines/<name>/ today, phase0/ before the move.
+
+    Scanning both means this test kept its teeth ACROSS the reorganisation instead of silently
+    matching nothing on either side of it, which is the failure mode a boundary test can least
+    afford (see test_the_scan_actually_sees_the_engines)."""
+    out = []
+    for root in (ENGINES, ROOT / "phase0"):
+        if root.is_dir():
+            out += [p for p in sorted(root.rglob("*.py")) if _engine_of(p.name)]
+    return out
 
 
 def test_the_scan_actually_sees_the_engines():

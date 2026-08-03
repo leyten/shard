@@ -24,7 +24,7 @@ fr = pytest.importorskip("fake_ring")                # bootstraps env + imports 
 S = fr.S
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-_STAGE = os.path.join(_REPO, "phase0", "m25_stage.py")
+_STAGE = os.path.join(_REPO, "engines", "minimax_m25", "m25_stage.py")
 
 
 def _model_dir(hidden):

@@ -15,7 +15,8 @@ import sys
 
 import pytest
 
-_PHASE0 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "phase0")
+_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+_PHASE0 = os.path.join(_ROOT, "phase0")
 sys.path.insert(0, _PHASE0)
 
 import model_tools as MT                                   # noqa: E402
@@ -100,7 +101,7 @@ def _load_gateway(model_id):
         os.environ["M25_MODEL_ID"] = model_id
     try:
         spec = importlib.util.spec_from_file_location(
-            f"_gw_{abs(hash(model_id))}", os.path.join(_PHASE0, "m25_gateway.py"))
+            f"_gw_{abs(hash(model_id))}", os.path.join(_ROOT, "engines", "minimax_m25", "m25_gateway.py"))
         mod = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(mod)
         return mod
@@ -168,7 +169,7 @@ def test_gateway_k3_streaming_never_leaks_the_response_channel_marker():
 def test_pipe_binds_through_the_seam_not_by_direct_import():
     """m25_pipe imports torch and m25_stage at module scope, so it cannot be imported here. Read the
     source instead: the direct `from m25_tools import ...` must be gone."""
-    src = open(os.path.join(_PHASE0, "m25_pipe.py")).read()
+    src = open(os.path.join(_ROOT, "engines", "minimax_m25", "m25_pipe.py")).read()
     assert "from m25_tools import" not in src
     assert "from model_tools import for_model" in src
     assert "render_ids, parse_completion = _TOOLS.render_ids, _TOOLS.parse_completion" in src
@@ -177,5 +178,5 @@ def test_pipe_binds_through_the_seam_not_by_direct_import():
 def test_model_tools_is_in_the_deploy_push_set():
     """m25_pipe and m25_gateway import it at module scope: a box that does not get this file cannot
     start a stage. m25_scatter_pipe's push list is that box's whole world."""
-    src = open(os.path.join(_PHASE0, "m25_scatter_pipe.py")).read()
+    src = open(os.path.join(_ROOT, "engines", "minimax_m25", "m25_scatter_pipe.py")).read()
     assert '"phase0/model_tools.py"' in src

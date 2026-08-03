@@ -65,7 +65,7 @@ def test_the_vendored_reference_is_the_pinned_bytes(name, digest):
     re-vendor updates all three and reads the fixture diff below as the changelog."""
     import hashlib
     ref = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
-                       "phase0", "kimi_k3_ref")
+                       "vendor", "kimi_k3_ref")
     with open(os.path.join(ref, name), "rb") as f:
         assert hashlib.sha256(f.read()).hexdigest() == digest
     assert digest in open(os.path.join(ref, "__init__.py")).read()

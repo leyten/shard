@@ -37,6 +37,22 @@ import pytest
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 PHASE0 = os.path.join(ROOT, "phase0")
+_SEARCH = [os.path.join(ROOT, "engines", d) for d in sorted(
+    os.listdir(os.path.join(ROOT, "engines")))] + [PHASE0] if os.path.isdir(
+    os.path.join(ROOT, "engines")) else [PHASE0]
+
+
+def _module_file(name):
+    """Resolve an engine module NAME to its file, wherever its engine lives.
+
+    Levers name the module that reads them; that name is flat (`v4_moe_grouped`) because the
+    engines ship flat onto a box. Finding it therefore has to search the engine directories rather
+    than assume one, so this keeps working when a fourth engine lands."""
+    for d in _SEARCH:
+        cand = os.path.join(d, name + ".py")
+        if os.path.isfile(cand):
+            return cand
+    raise FileNotFoundError(f"no module {name}.py under {_SEARCH}")
 sys.path.insert(0, PHASE0)
 
 pytest.importorskip("torch")
@@ -94,7 +110,7 @@ def test_every_lever_names_the_module_that_actually_reads_it():
     """`owner` is what an operator is told to look at when a lever misbehaves, so it has to be the
     module that really parses the var — checked against the source, not against the docstring."""
     for lv in VL.LEVERS:
-        src = open(os.path.join(PHASE0, lv.owner + ".py")).read()
+        src = open(_module_file(lv.owner)).read()
         assert re.search(r"""environ(?:\.get)?[.(\[]+["']%s["']""" % lv.env, src), \
             f"{lv.env} is registered to {lv.owner}, which does not read it"
 

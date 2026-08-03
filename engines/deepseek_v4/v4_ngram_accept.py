@@ -52,7 +52,23 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from ngram_draft import NgramDrafter                                   # noqa: E402
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-TOKENIZER = os.path.join(ROOT, "phase0", "deepseek_v4_ref", "tokenizer.json")
+def _vendored(name):
+    """Locate a vendored reference tree, in the repo AND on a deployed box.
+
+    The repo keeps upstream trees under vendor/ so the engine directories hold only our code. A
+    rented stage does NOT have that layout: deploy copies the modules flat into /root with the
+    reference tree beside them, which is the whole reason the engines are flat modules. So try the
+    sibling first (deployed), then the repo's vendor/. Resolving only one way silently breaks the
+    other, and the box is the one that would not be caught by a test run."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, name),
+                 os.path.join(here, os.pardir, os.pardir, "vendor", name)):
+        if os.path.isdir(cand):
+            return os.path.normpath(cand)
+    return os.path.join(here, name)
+
+
+TOKENIZER = os.path.join(_vendored("deepseek_v4_ref"), "tokenizer.json")
 
 
 def load_tokenizer(path=None):
