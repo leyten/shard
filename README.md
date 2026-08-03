@@ -15,11 +15,38 @@ into contiguous blocks of layers — one shard per GPU — and a request is serv
 streaming activations through the shards in order, over the open internet. No
 datacenter, no single host, and no node ever holds the whole model.
 
-Shard is the serving engine for [c0mpute](https://c0mpute.ai). The engine is built to
-run *any* model behind one interface ([docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md));
-**MiniMax-M2.5 is the current betanet target — the proof-of-concept for sharded
-inference** — and the GLM-5.2 and gpt-oss-120B runs below proved the engine scales
-from consumer cards to frontier size.
+Shard is the serving engine for [c0mpute](https://c0mpute.ai). It is a protocol **spine**
+— wire, ring, receipts, placement — plus one engine per model, because getting a model to
+interactive speed over the open internet means tuning it down to the kernels. Three engines
+exist today: **MiniMax-M2.5** (the betanet proof-of-concept), **Kimi-K3**, and
+**DeepSeek-V4-Flash** (newest, below). The long-run direction is to drive all of them behind a
+single `ModelRuntime` interface ([docs/MODEL_RUNTIME.md](docs/MODEL_RUNTIME.md)) so the network
+runs any model; the GLM-5.2 and gpt-oss-120B runs below proved the engine scales from consumer
+cards to frontier size.
+
+## DeepSeek-V4-Flash (284B) on six consumer RTX 5090s in four countries
+
+**30.15 tok/s, bit-identical to running the same model on one machine.** Six *distinct*
+RTX 5090s — Poland, Czechia, Denmark, Estonia — connected over the public internet, 8 layers
+per card, no datacenter and no shared host. Speculative decoding runs on DeepSeek's own DSpark
+drafter, whose three MTP blocks tap the last three layers and therefore live entirely on the
+tail box.
+
+| Setup | tok/s (warm) | Output |
+|-------|--------------|--------|
+| DeepSeek-V4-Flash 284B (13B active) FP4, 6× RTX 5090 across 4 EU countries, WAN, pipelined DSpark speculation | **30.15** | greedy, bit-identical to single-machine |
+
+Median of three consecutive warm runs within 0.17 of each other (30.18 / 30.29 / 30.12).
+A context × workload matrix (math, code, prose, agentic; 0–2k context) is in
+[`docs/receipts/v4-flash-matrix-20260802.json`](docs/receipts/v4-flash-matrix-20260802.json):
+**51/51 cells bit-identical to a greedy baseline on the same ring, 68/68 signed receipts, 0 faults.**
+
+Two results from that work are worth more than the number, and both are in
+[docs/V4_FLASH_ENGINE.md](docs/V4_FLASH_ENGINE.md). Throughput is *useful in-flight work over
+round-trip latency*, and every lever that fills the pipe costs acceptance at roughly 1:1 — forcing
+the pipe to 99.6% of its cap **halves** throughput, because the added frames speculate on a history
+the ring then does not take. And the draft block has an interior optimum that only appears if you
+measure the middle rather than the endpoints.
 
 ## GLM-5.2 (744B) across seven scattered prosumer GPUs, over the open internet
 
@@ -161,15 +188,27 @@ gpt-oss-120B is the faster, consumer-card build target the network is bootstrapp
 
 ## Repository layout
 
-    phase0/   the live engine + deploy: m25_*.py (MiniMax-M2.5 stage/pipe/gateway —
-              the current betanet serve path), wire.py (sealed framing), mesh.py
-              (edge RTTs), specpipe.py (pipelined coordinator), launch + bench tooling
-    shard/    model-agnostic engine package: node.py (the ModelRuntime interface),
+    shard/    the protocol SPINE, model-agnostic: node.py (the ModelRuntime interface),
               transport, scheduler, topology, manifest, fetch, receipt, challenge
-    research/ experiments — the GLM-5.2 swarm drivers (glm_swarm_nvfp4_*) and the M2.5
-              probes that fed the proven path
+    phase0/   the engines, one per model, plus deploy tooling. Module prefix is the
+              engine boundary:
+                m25_*.py  MiniMax-M2.5   — the betanet serve path
+                k3_*.py   Kimi-K3
+                v4_*.py   DeepSeek-V4-Flash
+              alongside wire.py (sealed framing), mesh.py (edge RTTs), launch + bench
+              tooling, and the vendored reference trees (*_ref/), kept byte-identical
+              and driven, never reimplemented
+    research/ experiments — the GLM-5.2 swarm drivers (glm_swarm_nvfp4_*), the V4
+              profilers, and the M2.5 probes that fed the proven path
     docs/     ARCHITECTURE, ROADMAP, MODEL_RUNTIME, NETWORK, INTEGRATION, PROOF.md,
-              receipts/, and the research records
+              V4_FLASH_ENGINE.md, receipts/, and the research records
+
+Engines are meant to diverge — each is tuned to its model down to the kernels — but the
+spine must not. `tests/test_engine_boundaries.py` enforces both rules mechanically: no engine
+may import another engine, and `shard/` may not import any engine. It also carries a named,
+shrink-only list of the places that rule is still broken, so the debt is visible rather than
+assumed. Flattening this into `engines/<model>/` + `vendor/` is planned; the boundary is the
+part that matters, and it is already a test rather than a convention.
 
 ## Roadmap
 
