@@ -4,16 +4,61 @@ The V4-Flash engine is a **separate engine** from M2.5. All of its code lives in
 The vendored reference under `phase0/deepseek_v4_ref/` is kept **byte-identical** and is driven,
 never reimplemented. This file is the cross-session anchor: read it first, update it last.
 
-## RESUME HERE (2026-08-02)
+## RESUME HERE (2026-08-02, end of day)
 
-**24.3 tok/s decode / 20.5 e2e**, 512 tokens, novel prompt, six distinct EU RTX 5090s.
-Reproducible across four consecutive runs (24.25 / 24.34 / 24.27 / 24.17). Bit-identical to greedy,
-receipts verified. **4.5x on the session** (5.35 -> 24.3).
+**30.15 tok/s decode median**, 512 tokens, novel prompt, six distinct EU RTX 5090s. Three
+consecutive warm runs within 0.17 of each other (30.18 / 30.29 / 30.12; run 1 cold at 19.31).
+Bit-identical to greedy, receipts verified. **5.6x on the session** (5.35 -> 30.15).
 
 Ring: `Poland[0:8) -> Czechia[8:16) -> Denmark[16:24) -> Estonia[24:32) -> Poland[32:40) ->
 Poland[40:43)`. Recipe: stages `V4_MOE_GROUPED=1 V4_MOE_MULTI=1 V4_CUDA_GRAPH=whole
-V4_MOE_IN_GRAPH=1` (graphs ON the tail too), coordinator `V4_LAZY_DRAFT=1 V4_SPEC_DEPTH=6`,
-refill floor 1 (the shipped default — see below).
+V4_MOE_IN_GRAPH=1 V4_DSPARK_MOE=1 V4_FP8_GEMV=1 V4_FP8_SHARED=1 V4_DSPARK_BLOCK=8`,
+coordinator `V4_LAZY_DRAFT=1`, depth >= cap, refill floor 1. `V4_MAX_SEQ=8192`.
+
+### THE FILL FAMILY IS CLOSED — the gap is unfillable, not unfilled
+
+Throughput is **useful in-flight over round-trip latency**, where useful in-flight is
+`inflight_time_avg / frames_per_token`. Every fill lever raises in-flight AND raises
+frames_per_token by at least as much, so the useful figure pins near **4.6** whatever you pull:
+
+| config | tavg / f_per_tok = useful | tok/s |
+|---|---|---|
+| block 5, floor 1 | 4.89 / 1.234 = 3.96 | 29.2 |
+| block 6, floor 1 | 5.32 / 1.277 = 4.17 | 28.3 |
+| **block 8, floor 1** | **7.27 / 1.568 = 4.64** | **30.5** |
+| block 10, floor 1 | 9.50 / 2.189 = 4.34 | 27.1 |
+| block 8, floor 8 | 8.96 / 2.389 = 3.75 | 14.1 |
+
+The refill floor at block 8 fills the pipe to **8.96 of a cap of 9 (99.6%) and HALVES throughput**.
+`topup_disagree` goes 0 -> 1496 as it fills: a topped-up block's deep drafts condition on its own
+block prefix, not on the tokens already in flight, so the added frames answer a history the ring
+does not take. **The gap to the cap ceiling is not empty pipe; it is space only wrong frames fit.**
+
+Two corollaries. The draft block has an **interior optimum at 8** (cap 9) — not the trained 5, not
+10; only the endpoints had ever been tested. And **depth is clamped by the cap**: at block 8, depth
+9/12/16 are byte-identical (same g, tavg, f/tok, stale); below it the pipe starves (depth 4 ->
+tavg 2.72 -> 17 tok/s). The rule is `depth >= block + 1`, nothing more.
+
+L is ~152 ms of which only ~50 ms is compute; the rest is wire between countries. With the boxes
+fixed, the only lever left is **acceptance** — better frames, not more. `V4_DRAFT_TOP2` measures
+the rescue rate that would justify building tree speculation (see docs/V4_TREE_VERDICT.md).
+
+### Measurement discipline on shared boxes
+
+Identical work (same g, same tokens, `same=True`) measured a **6x spread** — block 5 read median
+6.59 against best 21.39. Congestion only ever slows a run, so **best-of-N is the honest estimator**,
+and a single sample means nothing. Verify observed levers on the PYTHON process environ, never the
+bash wrapper. Long mixed runs also drift: the same control prompt read 20.61 / 13.48 / 10.62 across
+one 30-minute matrix run at constant g, most likely allocator fragmentation from interleaving big
+and small prefills. A fresh ring holds 30.1 steady.
+
+### Context costs throughput, because prefill headroom comes out of KV
+
+Prefill crosses the ring as ONE frame. At `V4_MAX_SEQ=8192` a 2048-token prefill OOM'd s0 (8 layers
+plus the embedding) with 108 MiB free; at 4096 it fits but 3072 OOMs. Dropping MAX_SEQ to buy that
+headroom costs ~1.5x: the same control prompt reads **30.15 at 8192 and 20.61 at 4096**. The
+context x workload matrix (docs/receipts/v4-flash-matrix-20260802.json) is therefore a RELATIVE
+instrument; its absolute numbers understate the engine.
 
 ### THE BINDING CONSTRAINT, measured per frame
 
