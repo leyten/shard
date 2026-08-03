@@ -35,7 +35,20 @@ pytest.importorskip("torch")
 
 # Every probe here spawns a fresh interpreter -- these flags are read at module import, so
 # an in-process monkeypatch would prove nothing about a stage that imported the module first.
-pytestmark = pytest.mark.integration
+#
+# SKIPPED ON SHARED CI RUNNERS, and the reason is resource, not logic. Each probe stands up a
+# THREE-PROCESS socket ring, every stage importing torch and building its own toy model; several
+# probes run back to back. On a 2-core / 7 GB hosted runner a stage gets killed and its peers log
+# `forward re-dial 127.0.0.1:PORT still failing (120 tries)` until the probe exits 1 -- the dial is
+# REFUSED, not slow, so no timeout bump fixes it. These are the tests that prove the shipped ring
+# recipe serves what the default serves, so they must keep running: locally, and on a self-hosted
+# runner with the headroom for them. Set V4_FORCE_RING_PROBES=1 to run them on CI anyway.
+_CI = os.environ.get("CI") == "true" and os.environ.get("V4_FORCE_RING_PROBES", "0") in ("", "0")
+pytestmark = [
+    pytest.mark.integration,
+    pytest.mark.skipif(_CI, reason="3-process socket rings per probe exceed a shared CI runner; "
+                                   "run locally or set V4_FORCE_RING_PROBES=1"),
+]
 
 
 def run_probe(body, **env):
