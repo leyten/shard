@@ -37,11 +37,19 @@ def _fatal(msg, **fields):
 
 
 def _bootstrap_path():
-    """Make the phase0 engine modules importable from a repo checkout; on the flat box layout
-    (every file in one dir, sys.path[0] = that dir) they already are."""
-    p0 = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "phase0")
-    if os.path.isdir(p0) and p0 not in sys.path:
-        sys.path.insert(0, p0)
+    """Make the engine modules importable from a repo checkout; on the flat box layout (every file
+    in one dir, sys.path[0] = that dir) they already are.
+
+    Engines live under engines/<model>/ and shared tooling under phase0/, so a checkout needs both;
+    the box needs neither, which is why every candidate is probed rather than assumed."""
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    cands = [os.path.join(root, "phase0")]
+    eng = os.path.join(root, "engines")
+    if os.path.isdir(eng):
+        cands = [os.path.join(eng, d) for d in sorted(os.listdir(eng))] + cands
+    for c in cands:
+        if os.path.isdir(c) and c not in sys.path:
+            sys.path.insert(0, c)
 
 
 def _apply_env(a):

@@ -430,8 +430,7 @@ def test_drafter_is_greedy_even_when_the_config_asks_for_sampling(args):
     on how peaked a random model's logits happen to be."""
     ref = REFCPU.load_ref()
     assert ref.ModelArgs().temperature == 1.0, "the dataclass default is what makes this a trap"
-    with open(os.path.join(os.path.dirname(V4.__file__),
-                           "deepseek_v4_ref", "inference", "config.json")) as f:
+    with open(os.path.join(REFCPU.REF_DIR, "inference", "config.json")) as f:
         import json
         assert "temperature" not in json.load(f), \
             "the shipped config now sets a temperature — re-read DSparkTail's pin before trusting it"

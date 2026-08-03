@@ -49,7 +49,23 @@ import torch
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import v4_kernels_cpu
 
-REF_DIR = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek_v4_ref")
+def _vendored(name):
+    """Locate a vendored reference tree, in the repo AND on a deployed box.
+
+    The repo keeps upstream trees under vendor/ so the engine directories hold only our code. A
+    rented stage does NOT have that layout: deploy copies the modules flat into /root with the
+    reference tree beside them, which is the whole reason the engines are flat modules. So try the
+    sibling first (deployed), then the repo's vendor/. Resolving only one way silently breaks the
+    other, and the box is the one that would not be caught by a test run."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, name),
+                 os.path.join(here, os.pardir, os.pardir, "vendor", name)):
+        if os.path.isdir(cand):
+            return os.path.normpath(cand)
+    return os.path.join(here, name)
+
+
+REF_DIR = _vendored("deepseek_v4_ref")
 INFERENCE_DIR = os.path.join(REF_DIR, "inference")
 # encoding_dsv4.encode_messages -- the chat template the real prompts go through. Nothing here uses
 # it yet; step 3 (a real prompt on a real ring) does, and it lives next to the model, not on pip.

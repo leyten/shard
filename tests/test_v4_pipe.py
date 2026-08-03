@@ -2877,10 +2877,16 @@ _EMITTED_DIRECTLY = {"V4_DIR", "V4_DEV", "V4_CUDA_GRAPH"}
 def _levers_the_stage_process_reads():
     """Every V4_* env var read anywhere in the stage's import closure, scraped from the SOURCE."""
     here = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    # The stage's import closure is V4 engine source, which lives in engines/deepseek_v4/ (and used
+    # to live in phase0/). Resolve against the engine dir with a phase0 fallback, so this scrape
+    # cannot silently return an EMPTY set and turn the propagation gate into a no-op.
+    roots = [os.path.join(here, "engines", "deepseek_v4"), os.path.join(here, "phase0")]
     found = set()
     for name in _STAGE_IMPORT_CLOSURE:
-        p = os.path.join(here, "phase0", name)
-        if os.path.exists(p):
+        p = next((c for c in (os.path.join(r, name) for r in roots) if os.path.exists(c)), None)
+        if p is None:
+            continue
+        if True:
             with open(p) as f:
                 found |= set(re.findall(r"""environ(?:\.get)?[.(\[]+["'](V4_[A-Z0-9_]+)["']""", f.read()))
     return found

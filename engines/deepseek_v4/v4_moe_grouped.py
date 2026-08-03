@@ -832,7 +832,23 @@ def real_dims_args(mod):
 def _load_model_module():
     import importlib.util
     import sys
-    inf = os.path.join(os.path.dirname(os.path.abspath(__file__)), "deepseek_v4_ref", "inference")
+def _vendored(name):
+    """Locate a vendored reference tree, in the repo AND on a deployed box.
+
+    The repo keeps upstream trees under vendor/ so the engine directories hold only our code. A
+    rented stage does NOT have that layout: deploy copies the modules flat into /root with the
+    reference tree beside them, which is the whole reason the engines are flat modules. So try the
+    sibling first (deployed), then the repo's vendor/. Resolving only one way silently breaks the
+    other, and the box is the one that would not be caught by a test run."""
+    here = os.path.dirname(os.path.abspath(__file__))
+    for cand in (os.path.join(here, name),
+                 os.path.join(here, os.pardir, os.pardir, "vendor", name)):
+        if os.path.isdir(cand):
+            return os.path.normpath(cand)
+    return os.path.join(here, name)
+
+
+    inf = os.path.join(_vendored("deepseek_v4_ref"), "inference")
     if inf not in sys.path:
         sys.path.insert(0, inf)
     spec = importlib.util.spec_from_file_location("dsv4_model", os.path.join(inf, "model.py"))
