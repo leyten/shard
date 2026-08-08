@@ -1,6 +1,6 @@
 """python -m shard.stage — the stage entrypoint the node daemon execs (c0mpute NODE_DAEMON.md §4).
 
-Promotes the operator SSH launch string (phase0/m25_scatter_pipe.py:stage_cmd) into a first-class
+Promotes the operator SSH launch string (engines/minimax_m25/m25_scatter_pipe.py:stage_cmd) into a first-class
 CLI: the ring assignment arrives as flags, the engine env is derived HERE (not in a hand-built
 shell prefix), and the process speaks a machine-readable stdout contract a supervisor can wait on:
 
@@ -109,7 +109,7 @@ def main(argv=None):
         import m25_pipe as MP             # heavy: torch + m25_stage's module-level M25_DIR init
     except ImportError as e:
         return _fatal(f"engine import failed: {e}",
-                      hint="run from a shard checkout (phase0/ beside shard/) or the flat box layout")
+                      hint="run from a shard checkout (engines/minimax_m25/ + phase0/ beside shard/) or the flat box layout")
 
     if a.check:
         import torch

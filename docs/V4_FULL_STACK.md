@@ -377,8 +377,8 @@ Both pipe selftests, every config, ALL PASS (14/14 assertions each):
 ```
 OMP_NUM_THREADS=1 python3 -m pytest tests/ -q -k v4
 OMP_NUM_THREADS=1 python3 -m pytest tests/test_v4_full_stack.py -q
-OMP_NUM_THREADS=1 python3 phase0/v4_pipe.py selftest
-OMP_NUM_THREADS=1 python3 phase0/v4_pipe.py selftest-relay
+OMP_NUM_THREADS=1 python3 engines/deepseek_v4/v4_pipe.py selftest
+OMP_NUM_THREADS=1 python3 engines/deepseek_v4/v4_pipe.py selftest-relay
 ```
 
 `OMP_NUM_THREADS=1` is not decoration: the toy-config tests run ~22× faster with it, and `torch.topk`'s
