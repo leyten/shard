@@ -20,7 +20,53 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-07-29 (LATEST) — LANDING DAY: every stranded launch fix is on master; sidecar v0.2.0; NEXT = the capstone ring
+### ⇒ 2026-08-08 (LATEST) — PRE-LAUNCH AUDIT: #166 path residue fixed, speed truth established, drafter fork on leyten
+**Full launch audit (3 Opus agents: readiness + metrics + adversarial verify). Verdict: the 07-29
+"all engineering done" claim had rotted in two places — both fixed — and the launch-day speed story
+is now honest.** No ring touched real hardware since #166 landed; nothing here needed spend.
+- **FIXED (shard #167 + c0mpute #62, both merged):** #166 left 4 hardcoded `phase0/` path STRINGS
+  dangling — the worker's `pullProbeSliceRaw` (every first-join enroll → ENOENT, the true blocker),
+  the scatter_pipe scp push list, the `--external-tail` home-box runbook, m25_scatter (silent). CI
+  never saw it because the push-list guard asserted a substring of the ONE file that didn't move; a
+  new existence-sweep test (proven RED on the pre-fix tree) closes the class. Also in #62: the npm
+  pre-flight gated `≥2.8.3` but npm's 2.8.3 IS the classic shard-free worker published 08-06 (gate
+  → 3.0.0, `C0MPUTE_BETANET_GOLIVE=1` publish gate documented), and `shard.coordinate --max-ctx`
+  defaulted 131072 while stages hard-fail past `M25_KV_MAXLEN` 40960 (daemon now mirrors the env).
+- **SPEED TRUTH (adversarially verified against receipts):** stranger-daemon path = **4.2–4.9 tok/s
+  warm, g=1** (`stranger-serve-confirm-20260728`), and graph-aux was ALREADY ON for that number
+  (c0mpute #51 predates it) — no free 2× hiding in the daemon. The gap to the operator scorecard is
+  the DRAFTER: manifest ships no EAGLE head, `shard.fetch`/`weightkeys` cannot even express one
+  (`layer_of()` returns None for every eagle tensor; stray safetensors are quarantined), daemon
+  never sets `M25_EAGLE`. Uplift when armed = **1.6–3.4× measured** (warmring 07-18: 3.42×;
+  batched-sweep 07-10: 1.60× — g rose 16× but EAGLE rounds serialize to depth 1), NOT the 4.6×
+  g-ratio. Fix shape: head is COORDINATOR-side (`_eagle_singleton`), coordinator runs on the head
+  stranger's box ⇒ ~0.4 GB to ONE node/ring, outside `MODEL_DIR`, planner already reserves
+  `head_reserve_mb: 4096`; stages need blanket `M25_EAGLE=1` (safe: head-less coordinator sends
+  `eagle:0`, stages self-silence). Traps: P11 sticky degrade (`coordRestarts>=2` → `M25_EAGLE=0`
+  for the swarm session), L1 latch irreversible per-drafter. NO receipt A/Bs EAGLE on the daemon
+  path — one warm-ring A/B required before quoting.
+- **Public scorecard = the 07-12 K-tuned receipts, with 3 label fixes** (verifier caught): tools
+  24.2 K6 (29.7 is the K8 arm), mix-B1 17.1 K6 / 22.5 K8 (label the K), B8-mix 16.9/stream pairs
+  with 135.0 agg (112.4 belongs to a 13.9/stream tree-off arm). 42.1 B1 / 160.6 agg B8 are
+  `fleet-multiswarm` on a 2-hop 2×Pro6000 pair — never quote as a scattered ring. fp8-aux confirm
+  (`SWEEP_FP8AUX_ARMS`) was NEVER BUILT — 07-12 stays conservative-correct. 30k prefill ≈ 34.7s on
+  a warm operator ring (`m25-paper-bench-20260703`, real 30,054-tok prompts — the verifier's
+  refutation of this one number was itself wrong; spot-checked directly).
+- **Money-ops doc corrected** (untracked `ZERO_LAUNCH_CHECKLIST.md`): the dry-run kill-switch
+  procedure was a silent no-op — `KEEPER_DRY_RUN` lives in the systemd UNIT (armed `false` today)
+  and the keeper's env loader never overrides systemd env, so `.env.local` edits do nothing;
+  `WORKER_STAKE_THRESHOLD` 500k not 1M; `BUYBACK_SLIPPAGE` default 5 PERCENT not 0.01.
+- **Still open (small):** >40k-prompt rejection (gateway-side token count — a long prompt still
+  kills a ring), `SHARD_JOB_METRICS` worker parser (tok_s dropped, ttft never implemented), churn
+  truncation → `finish_reason:"stop"` (refund correctness). Placement stickiness unchanged (top
+  post-launch win). Both leyten decisions still unmade: seed box (`SWARM_SEED_ADDRS`) + auditor key
+  (`SWARM_AUDITOR_PUBKEYS`).
+
+**⇒ THE ONE NEXT ACTION: leyten's fork — launch honest at 4–5 tok/s, or one ring session first
+(arm the drafter on the daemon path + A/B + re-measure on today's master, which no ring has ever
+run).** Everything else on his list is unchanged and the runbooks now match the code.
+
+### ⇒ 2026-07-29 — LANDING DAY: every stranded launch fix is on master; sidecar v0.2.0; NEXT = the capstone ring
 **Everything the 07-28 first-token ring had to hand-patch is now genuinely on master, the release
 artifacts match the code, and the only engineering left before the leyten-gated publishes is ONE
 capstone ring session.** (K3 work is a PARALLEL session's lane — hands off here; see auto-memory

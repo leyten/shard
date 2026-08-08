@@ -5,7 +5,32 @@
 > lights up on a live map, and it works — with nobody (no operator, no SSH, no hand-holding) in the loop.
 >
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
-> _Last synced: 2026-07-29._
+> _Last synced: 2026-08-08._
+>
+> **2026-08-08 PRE-LAUNCH AUDIT (full-repo + receipts, adversarially verified):**
+> - **FIXED — refactor #166 had silently broken the launch path** (hardcoded `phase0/` strings, invisible
+>   to CI): the worker's probe-slice pull (every first-join enroll died ENOENT), the operator ring
+>   launcher's scp push list, the home-tail runbook, the legacy scatter. shard #167 + c0mpute #62, with a
+>   push-list existence guard so a moved file can never pass CI again. Also fixed in #62: the npm
+>   pre-flight gated on ≥2.8.3 but npm's 2.8.3 IS the classic shard-free worker (gate now 3.0.0), and the
+>   coordinator admitted 131072-token contexts while stages hard-fail past `M25_KV_MAXLEN` 40960 (the
+>   daemon now passes a mirrored `--max-ctx`).
+> - **⚠️ THE SPEED TRUTH (leyten's decision):** the stranger-daemon path serves **~4–5 tok/s warm, g=1** —
+>   graph-aux is already on; the whole gap to the 17–29 tok/s operator scorecard is the EAGLE drafter,
+>   which never arms for strangers (the NVFP4 manifest ships no head, `shard.fetch` cannot even express
+>   one, and the daemon deliberately doesn't set `M25_EAGLE`). Honest uplift when armed: **1.6–3.4×
+>   measured on-ring** (not the g-ratio 4.6×). The fix is smaller than it sounds: the drafter runs
+>   coordinator-side, so the ~0.4 GB head (`thoughtworks/MiniMax-M2.5-Eagle3`) goes to ONE box per ring
+>   (the head), lives outside `MODEL_DIR` (no manifest change), and the planner already reserves its VRAM
+>   (`head_reserve_mb`); stages need blanket `M25_EAGLE=1`, which is safe by construction (a head-less
+>   coordinator broadcasts `eagle:0` and stages self-silence). Needs: a head-fetch hook in the daemon +
+>   the env flip + ONE warm-ring A/B — no receipt has ever measured EAGLE on this path. **Fork: launch
+>   honest at 4–5 tok/s, or spend one ring session arming + measuring the drafter first.** Known trap
+>   either way: P11 degraded-restart flips `M25_EAGLE=0` sticky after one stall trip.
+> - **Still open, small:** oversized-prompt rejection (>40k prompt alone still kills a ring — needs
+>   gateway/orchestrator-side token count), `SHARD_JOB_METRICS` has no worker-side parser (tok_s/ttft
+>   dropped; ttft never implemented), churn truncation still returns `finish_reason:"stop"` (refund
+>   correctness). Relay multiaddrs now recorded for leyten in the launch report (were bus-factor-1).
 >
 > **REMAINING BLOCKERS AT A GLANCE (2026-07-29 EOD): ALL P0 + P1 ENGINEERING IS ✅ DONE.**
 > The capstone ring took all three proofs (receipt `capstone-ring2-20260729.json`): **settlement PAID
@@ -49,7 +74,9 @@
 
 ## ✅ DONE — the mountain you already climbed (do NOT re-litigate these)
 The **physics is proven, with receipts, repeatedly.** These are settled:
-- **Interactive speed** — 20–30 tok/s solo (graph-aux).
+- **Interactive speed** — 20–30 tok/s solo (graph-aux) *on operator-provisioned rings with the EAGLE
+  head placed by hand; the stranger-daemon path is ~4–5 tok/s warm until the drafter ships — see the
+  08-08 audit block above.*
 - **Permissionless join + measured admission** — a box probes itself → the network assigns its role.
 - **Torrent weight propagation** — nodes pull their model shards from *peers*, every byte CID-verified.
 - **Verifiable serving** — per-stage signed receipts, fail-closed (a cheating node is catchable).
