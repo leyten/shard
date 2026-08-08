@@ -15,18 +15,19 @@
 >   pre-flight gated on ≥2.8.3 but npm's 2.8.3 IS the classic shard-free worker (gate now 3.0.0), and the
 >   coordinator admitted 131072-token contexts while stages hard-fail past `M25_KV_MAXLEN` 40960 (the
 >   daemon now passes a mirrored `--max-ctx`).
-> - **⚠️ THE SPEED TRUTH (leyten's decision):** the stranger-daemon path serves **~4–5 tok/s warm, g=1** —
->   graph-aux is already on; the whole gap to the 17–29 tok/s operator scorecard is the EAGLE drafter,
->   which never arms for strangers (the NVFP4 manifest ships no head, `shard.fetch` cannot even express
->   one, and the daemon deliberately doesn't set `M25_EAGLE`). Honest uplift when armed: **1.6–3.4×
->   measured on-ring** (not the g-ratio 4.6×). The fix is smaller than it sounds: the drafter runs
->   coordinator-side, so the ~0.4 GB head (`thoughtworks/MiniMax-M2.5-Eagle3`) goes to ONE box per ring
->   (the head), lives outside `MODEL_DIR` (no manifest change), and the planner already reserves its VRAM
->   (`head_reserve_mb`); stages need blanket `M25_EAGLE=1`, which is safe by construction (a head-less
->   coordinator broadcasts `eagle:0` and stages self-silence). Needs: a head-fetch hook in the daemon +
->   the env flip + ONE warm-ring A/B — no receipt has ever measured EAGLE on this path. **Fork: launch
->   honest at 4–5 tok/s, or spend one ring session arming + measuring the drafter first.** Known trap
->   either way: P11 degraded-restart flips `M25_EAGLE=0` sticky after one stall trip.
+> - **✅ THE SPEED GAP — DRAFTER AUTO-DOWNLOAD SHIPPED (c0mpute #63, leyten's call, same day).** The
+>   stranger-daemon path served **~4–5 tok/s warm at g=1** — graph-aux already on; the whole gap to the
+>   17–29 tok/s operator scorecard was the EAGLE drafter, whose head no stranger box ever received (the
+>   manifest cannot express it, `shard.fetch` quarantines strays, the daemon never set `M25_EAGLE`).
+>   Now: `ensureDrafter()` stages the pinned `thoughtworks/MiniMax-M2.5-Eagle3` head (0.46 GB,
+>   immutable rev + per-file sha256, re-verified each boot, NON-FATAL) on every node at enroll, and
+>   `perfDefaults()` arms `M25_EAGLE=1` + `M25_EAGLE_DIR` — operator `M25_EAGLE=0` still wins (the
+>   playbook's nuclear switch), P11 sticky degrade unchanged, and a head-less coordinator broadcasts
+>   `eagle:0` so stages self-silence. Functionally proven offline (sha-verified pull 19s / idempotent
+>   0.5s / corruption self-repairs). **Remaining for the checkmark: the warm-ring EAGLE on/off A/B on
+>   the daemon path — no receipt has ever measured it there; expect 1.6–3.4× (≈12–17 tok/s), rides the
+>   rehearsal ring.** Known trap: P11 flips `M25_EAGLE=0` sticky for a swarm session after one stall
+>   trip — a wedge silently returns that ring to g=1 until re-form.
 > - **Still open, small:** oversized-prompt rejection (>40k prompt alone still kills a ring — needs
 >   gateway/orchestrator-side token count), `SHARD_JOB_METRICS` has no worker-side parser (tok_s/ttft
 >   dropped; ttft never implemented), churn truncation still returns `finish_reason:"stop"` (refund
