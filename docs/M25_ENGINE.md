@@ -62,9 +62,17 @@ is now honest.** No ring touched real hardware since #166 landed; nothing here n
   post-launch win). Both leyten decisions still unmade: seed box (`SWARM_SEED_ADDRS`) + auditor key
   (`SWARM_AUDITOR_PUBKEYS`).
 
-**⇒ THE ONE NEXT ACTION: leyten's fork — launch honest at 4–5 tok/s, or one ring session first
-(arm the drafter on the daemon path + A/B + re-measure on today's master, which no ring has ever
-run).** Everything else on his list is unchanged and the runbooks now match the code.
+**RESOLVED same day — leyten called it: the drafter ships (c0mpute #63, merged).** `ensureDrafter()`
+stages the pinned Eagle3 head (0.46 GB, immutable rev + sha256/file, re-verified each boot,
+non-fatal) on EVERY node at enroll — any node can become head after a churn re-form — and
+`perfDefaults()` arms `M25_EAGLE=1` + `M25_EAGLE_DIR` (operator env wins; P11 degrade unchanged;
+head-less coordinator broadcasts `eagle:0` so stages self-silence). Functionally proven offline:
+sha-verified fresh pull 19.1s, idempotent re-run 548ms, corrupted weights self-repair.
+
+**⇒ THE ONE NEXT ACTION: the rehearsal ring, now doing double duty — first hardware run of
+post-#166 master AND the EAGLE on/off A/B on the daemon path** (no receipt has ever measured it
+there; expect 1.6–3.4× ⇒ ~12–17 tok/s vs the measured 4–5 floor). Everything else on leyten's
+list is unchanged and the runbooks now match the code.
 
 ### ⇒ 2026-07-29 — LANDING DAY: every stranded launch fix is on master; sidecar v0.2.0; NEXT = the capstone ring
 **Everything the 07-28 first-token ring had to hand-patch is now genuinely on master, the release
