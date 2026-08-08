@@ -119,7 +119,7 @@ You have a working decentralized inference network. What's left is turning "I ca
    at launch scale, circuit addrs rank below direct in dial order)._
 
 4. ~~**OpenAI-API correctness** (audit M2)~~ ✅ **DONE** (verified 2026-07-15; was remediated in the
-   audit fix, PR #96 — LAUNCH.md was stale). `phase0/m25_gateway.py`: strict `max_tokens`/`max_completion_tokens`
+   audit fix, PR #96 — LAUNCH.md was stale). `engines/minimax_m25/m25_gateway.py`: strict `max_tokens`/`max_completion_tokens`
    cap separated from context headroom + truncated via `_cap_output`; earliest-EOS enforced on BOTH the
    streaming (`_cap_output` before `detok.feed`) and final paths; `tool_choice` none/named/required validated
    AND enforced (errors if a required tool call is missing); non-greedy `temperature`/`top_p`/`top_k` rejected

@@ -180,3 +180,18 @@ def test_model_tools_is_in_the_deploy_push_set():
     start a stage. m25_scatter_pipe's push list is that box's whole world."""
     src = open(os.path.join(_ROOT, "engines", "minimax_m25", "m25_scatter_pipe.py")).read()
     assert '"phase0/model_tools.py"' in src
+
+
+def test_deploy_path_strings_exist_in_the_tree():
+    """Repo-relative paths in the scatter launchers are STRINGS, not imports — a refactor that moves
+    a file leaves them dangling and no import error ever fires (#166 broke 4 of them this way).
+    Every quoted phase0/engines/shard path in these files must exist."""
+    import re
+    for rel in (("engines", "minimax_m25", "m25_scatter_pipe.py"),
+                ("engines", "minimax_m25", "m25_scatter.py"),
+                ("engines", "deepseek_v4", "v4_ngram_accept.py")):
+        src = open(os.path.join(_ROOT, *rel)).read()
+        paths = re.findall(r'"((?:phase0|engines|shard)/[^"\s]+\.(?:py|sh|json|md))"', src)
+        assert paths, f"no repo-relative path strings found in {'/'.join(rel)} — pattern drifted?"
+        missing = [p for p in paths if not os.path.exists(os.path.join(_ROOT, p))]
+        assert not missing, f"{'/'.join(rel)} references files that do not exist: {missing}"

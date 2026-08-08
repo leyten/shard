@@ -58,9 +58,11 @@ def push_code(host, port):
     # model_tools is a hard import of m25_pipe/m25_gateway (the per-model tools seam) -- a box without
     # it cannot start. k3_tools is NOT pushed: it needs the whole phase0/kimi_k3_ref package, and
     # model_tools only imports a family when that model is the one being served.
-    for f in ["phase0/m25_pipe.py", "phase0/m25_stage.py", "phase0/m25_tools.py", "phase0/model_tools.py",
+    for f in ["engines/minimax_m25/m25_pipe.py", "engines/minimax_m25/m25_stage.py",
+              "engines/minimax_m25/m25_tools.py", "phase0/model_tools.py",
               "phase0/ngram_draft.py", "phase0/eagle_draft.py",
-              "phase0/tree_spec.py", "phase0/node_kv.py", "phase0/confidence.py", "phase0/m25_gateway.py",
+              "phase0/tree_spec.py", "phase0/node_kv.py", "phase0/confidence.py",
+              "engines/minimax_m25/m25_gateway.py",
               "phase0/safe_kill.sh",                       # every box gets the self-match-proof killer for ad-hoc ops (bash /root/safe_kill.sh PATTERN)
               "shard/transport.py", "shard/receipt.py", "shard/manifest.py"]:
         dst = "/root/" + f.split("/")[-1]
@@ -406,9 +408,9 @@ def main():
         relay = et["maddr"].split("/p2p-circuit")[0]
         print("[pipe] EXTERNAL TAIL — the home box must ALREADY be running these (no SSH from here):", flush=True)
         print(f"  sidecar: ~/sidecar -key ~/.shard_reach.key -listen /ip4/0.0.0.0/tcp/{LIBP2P} -quic -relays {relay} -inbound 127.0.0.1:{ENG_IN}", flush=True)
-        print(f"  stage:   cd ~/shard && PYTHONPATH=$HOME/shard/phase0:$HOME/shard/shard SHARD_TRANSPORT=libp2p "
+        print(f"  stage:   cd ~/shard && PYTHONPATH=$HOME/shard/engines/minimax_m25:$HOME/shard/phase0:$HOME/shard/shard SHARD_TRANSPORT=libp2p "
               f"M25_ENGINE_BIND=127.0.0.1 M25_MOE_BACKEND=auto M25_CUDA_GRAPH=0 M25_DIR=$HOME/m25 "
-              f"SHARD_SWARM_TOKEN={swarm_token} python phase0/m25_pipe.py stage --stage {n-1} --nstages {n} --lo {et['lo']} --hi {et['hi']} --port {ENG_IN}", flush=True)
+              f"SHARD_SWARM_TOKEN={swarm_token} python engines/minimax_m25/m25_pipe.py stage --stage {n-1} --nstages {n} --lo {et['lo']} --hi {et['hi']} --port {ENG_IN}", flush=True)
         print(f"  wired -> predecessor s{n-2} ({pred['pid'][:12]}..) sends the ring, head s0 ({head0['pid'][:12]}..) sends the return, both to {et['maddr'][:44]}..", flush=True)
     head = nodes[0]
     if a.warm_only:                               # warm + STOP: run the measurement as the sole coordinator on the head (nxt_sock breaks if anything connects first)

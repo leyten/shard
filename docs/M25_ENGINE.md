@@ -631,7 +631,7 @@ scratchpad/build_globe.py → cp to /var/www. Ops in memory [[shard-demo-deploym
    assignment `isHead` + matching swarmId) drive generation → emit `swarm:job_token {jobId,delta}` per commit →
    `swarm:job_complete {swarmId,jobId,nonce,tokensGenerated,response,receipts}`. Shim-fakeable (extend
    `scripts/shard-python-shim.py` + `shard-runner.ts` `runCoordinator`).
-2. **`python -m shard.coordinate`** (shard): thin entrypoint over `phase0/m25_pipe.py coordinate_pipe` — job on
+2. **`python -m shard.coordinate`** (shard): thin entrypoint over `engines/minimax_m25/m25_pipe.py coordinate_pipe` — job on
    stdin (messages+params+swarm_id/job_id/nonce), stdout contract `SHARD_JOB_TOKEN/DONE/FATAL`, threads the
    settlement nonce, sweeps receipts. (m25_gateway.py already does this over HTTP; make it socket-drivable.)
 3. **Return tunnel** tail→coordinator on the head sidecar (real-topology, like the forward-leg) — for the real
@@ -1191,7 +1191,7 @@ this order of leyten's emphasis — all on-thesis "make it more torrent":**
    - **THE gating question = NVFP4 kernel portability.** The checkpoint is `nvidia/MiniMax-M2.5-NVFP4` (4-bit
      experts, Blackwell-native sm_120). Can a 4090 (Ada sm_89) / 3090 (Ampere sm_86) run the NVFP4 MoE at all,
      or only Blackwell (5090/5080/5070)? **Lead found this session:** the MoE backend is already selectable —
-     `M25_MOE_BACKEND` = `cutlass | emulation | marlin` (phase0/m25_stage.py ~L213). cutlass is the sm_120 fast
+     `M25_MOE_BACKEND` = `cutlass | emulation | marlin` (engines/minimax_m25/m25_stage.py ~L213). cutlass is the sm_120 fast
      path; `emulation`/`marlin` are the likely non-Blackwell fallbacks (dequant NVFP4→fp8/bf16). VERIFY on a
      single rented 4090/3090 (~$0.30, one-box probe): does the shard load + run a block, at what VRAM cost
      (4-bit→8/16-bit inflates 2-4×, so a 4090 holds fewer layers) and what layer_ms.
@@ -1448,7 +1448,7 @@ rabbit holes (a truncated-download bug, then a size mismatch) babysat by hand. U
 orchestration (automated fault detection + recovery), like the detached `swarm_master.sh`-style flow, not inline
 poll-and-debug. Sort the robust provisioning approach BEFORE the next ring session.
 
-**Verified weight-fetch (#45/#46) status:** the deploy path (`fetch_block_range` + `phase0/m25_pull_verified.py`)
+**Verified weight-fetch (#45/#46) status:** the deploy path (`fetch_block_range` + `engines/minimax_m25/m25_pull_verified.py`)
 + manifest generate/verify are shipped and CPU-tested; a real 5GB M2.5 shard pulled + sha-matched the signed
 manifest launcher-side. But the full-ring validation is INCOMPLETE and **#46 (the truncated-download resume fix)
 has a bug: it produced OVER-sized downloads on the live ring (5,018,451,080 vs the manifest+HF x-linked-size
@@ -2073,7 +2073,7 @@ EAGLE-3 only if the stock head underperforms (~$400–2000, SpecForge).
   - **DNS fix:** many boxes have a dead local resolver → `echo nameserver 8.8.8.8 > /etc/resolv.conf` first.
   - **hf_transfer stalls** (freezes mid-download): fall back `HF_HUB_ENABLE_HF_TRANSFER=0`.
   - Prefer non-Asia for low-latency rings; use `inet_down` filter but it's often wrong — verify.
-- **Ring launch:** `phase0/m25_scatter_pipe.py --order REGION:iid:lo:hi ... --K 8 --depth 4 [--batch B]
+- **Ring launch:** `engines/minimax_m25/m25_scatter_pipe.py --order REGION:iid:lo:hi ... --K 8 --depth 4 [--batch B]
   [--warm-only]`. `--warm-only` warms stages+sidecars then STOPS so a measurement tool runs as the SOLE first
   coordinator (the ring's nxt_sock breaks if a gateway connects first → ALWAYS re-warm before a new coordinator
   process). M2.5 needs ≥5 stages on 5090s (115 GB / 32 GB). fp8 KV (`M25_KV_FP8=1`) for B≥4 at ≥16k.
@@ -2083,14 +2083,14 @@ EAGLE-3 only if the stock head underperforms (~$400–2000, SpecForge).
   (bootstrap pre-curated iids). They push code + `/tmp/sidecar` + `.hf_token` + pull layer ranges.
 
 ## KEY FILES + FLAGS
-- `phase0/m25_stage.py` — the M2.5 PP stage. Flags: `M25_BATCH`(=B), `M25_BATCH_MOE`(batched grouped-GEMM),
+- `engines/minimax_m25/m25_stage.py` — the M2.5 PP stage. Flags: `M25_BATCH`(=B), `M25_BATCH_MOE`(batched grouped-GEMM),
   `M25_MOE_BACKEND`(cutlass|emulation|marlin), `M25_KV_FP8`, `M25_KV_MAXLEN`, `M25_SDPA`, `M25_EAGLE`(aux capture),
   `M25_EAGLE_AUX`(=1,30,58). `_AUX` holds captured aux hidden states.
-- `phase0/m25_pipe.py` — `coordinate_pipe`(single, +`reasoning`, +`_unpack`/`_eagle_seed` EAGLE seeding),
+- `engines/minimax_m25/m25_pipe.py` — `coordinate_pipe`(single, +`reasoning`, +`_unpack`/`_eagle_seed` EAGLE seeding),
   `coordinate_pipe_batch`(batched, decode-rate timer fix), `serve`(+`_merge_aux` aux threading),
   `make_drafter`(THE drafter factory: n-gram, or n-gram+EAGLE hybrid when `M25_EAGLE=1`; `M25_EAGLE_DIR`=head).
 - `phase0/eagle_draft.py` — `EagleDrafter` + `HybridDrafter` (the split). `phase0/ngram_draft.py` — `+matched` flag.
-- `phase0/m25_tools.py` — `render_ids(reasoning=)`. `phase0/m25_gateway.py` — OpenAI /v1, `reasoning`/`reasoning_effort`.
+- `engines/minimax_m25/m25_tools.py` — `render_ids(reasoning=)`. `engines/minimax_m25/m25_gateway.py` — OpenAI /v1, `reasoning`/`reasoning_effort`.
 - Benchmarks: `research/m25_honest_bench.py` (THE honest measure), `m25_eagle_gonogo.py` (vLLM accept),
   `m25_ctx_table.py` (ctx sweep), `m25_batched_moe_bench.py` (per-stage decode ms).
 - Receipts: `docs/receipts/m25-honest-reasoning-baseline-20260629.md`, `m25-batched-serving-fixed`(memory).

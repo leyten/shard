@@ -129,7 +129,7 @@ def _edit_heavy(src, seed=1):
 def workloads():
     """(name, prompt_text, output_text) — the output is what a target model would be generating."""
     draft_src = _read("phase0/ngram_draft.py")
-    moe_src = _read("phase0/v4_moe_decode.py")
+    moe_src = _read("engines/deepseek_v4/v4_moe_decode.py")
     verdict = _read("docs/V4_MULTIBLOCK_VERDICT.md")
     prose = "\n".join(l for l in verdict.split("\n") if not l.startswith(("|", "```", "    ")))
     return [

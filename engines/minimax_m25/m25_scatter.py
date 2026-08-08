@@ -18,7 +18,7 @@ REPO = "/root/.openclaw/workspace/shard"
 
 
 def push_code(host, port):
-    for src, dst in [("phase0/m25_ring.py", "/root/m25_ring.py"), ("phase0/m25_stage.py", "/root/m25_stage.py"),
+    for src, dst in [("engines/minimax_m25/m25_ring.py", "/root/m25_ring.py"), ("engines/minimax_m25/m25_stage.py", "/root/m25_stage.py"),
                      ("phase0/ngram_draft.py", "/root/ngram_draft.py"), ("shard/transport.py", "/root/transport.py")]:
         subprocess.run(["scp", *SSHO, "-P", str(port), f"{REPO}/{src}", f"root@{host}:{dst}"], capture_output=True, text=True)
 

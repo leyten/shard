@@ -79,7 +79,7 @@ Always create boxes with `--env '-p 29600:29600'` (inter-stage transport unreach
 ## Deploy — serve the OpenAI /v1 gateway over the ring
 Once the ring is warm (stages WARM, sidecars up), serve it as an OpenAI-compatible endpoint in one command:
 
-    python m25_scatter_pipe.py --order <region:iid:lo:hi ...> --K 8 --depth 4 --serve [--receipts]
+    python engines/minimax_m25/m25_scatter_pipe.py --order <region:iid:lo:hi ...> --K 8 --depth 4 --serve [--receipts]
 
 `--serve` brings up the ring then starts `m25_gateway.py` on the head (127.0.0.1:18000, persistent, via
 setsid/nohup) instead of a one-shot coord job, and prints the tunnel command. Reach it:
