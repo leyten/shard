@@ -1,0 +1,43 @@
+{
+  "receipt": "stranger-hetero-suite-20260808",
+  "date": "2026-08-08",
+  "what": "FIRST speed receipt on the stranger-daemon path, on the FIRST heterogeneous permissionless ring (RTX PRO 6000 + 2x RTX 5090 + 2x RTX 4090, 5 EU countries) — and the live validation of the EAGLE drafter auto-download (c0mpute #63): the head staged itself at enroll, armed without operator action, and lifted the path from its measured 4.2-4.9 tok/s g=1 floor to 9-14 tok/s median.",
+  "builds_under_test": {
+    "shard": "master bca9308 (incl #167 path fixes, #168/#169 docs)",
+    "c0mpute_worker": "master f2dff67 (incl #62 enroll/max-ctx fixes, #63 drafter auto-download + M25_EAGLE default)",
+    "orchestrator": "shard-daemon-sim --port 3903 --nodes 5 --stages 5 --full --suite --reps 3 --debounce 30000 --real-seam; PROD UNTOUCHED",
+    "manifest": "session-signed mf1:m25-nvfp4-v1@bafkreih4zy753xkx3zyrpms7nzjl5vmdh4ldywnhqvyrvo4yhutdomqk3m (test key; the launch manifest is leyten's offline-key publish)"
+  },
+  "ring": {
+    "shape": "5 stages, 5 countries (SE/EE/SK/NL/FR pool), public IPs redacted per repo policy",
+    "tiling_by_settlement": "Pro6000[0:32) head+coordinator -> 5090[32:43) -> 4090[43:47) -> 5090[47:59) -> 4090[59:62)",
+    "planner": "REAL capability planner (SubprocessSeam -> python -m shard.plan) on probe-measured vectors; predicted 288ms/step, 3.47 tok/s per unit g",
+    "eagle": "armed via ensureDrafter() auto-download on every node (0.46GB, pinned rev+sha256); no operator action",
+    "env": "perfDefaults: M25_CUDA_GRAPH=1 M25_STATIC_KV=1 M25_SDPA=1 M25_EAGLE=1; coordinator --max-ctx 40960 (#62); K=8 depth=4 daemon defaults (NOT K-routed)"
+  },
+  "scorecard_warm_medians_of_3": {
+    "A_prose":   { "tok_s": 14.0, "ttft_ms": 1292,  "tokens": 258, "coherent": true },
+    "B_chat":    { "tok_s": 9.0,  "ttft_ms": 1069,  "tokens": 259, "coherent": true },
+    "C_code":    { "tok_s": 9.9,  "ttft_ms": 1750,  "tokens": 390, "coherent": true },
+    "D_longctx": { "tok_s": 5.8,  "ttft_ms": 20332, "tokens": 33,  "coherent": false }
+  },
+  "reps_raw": {
+    "warmup_cold": { "A": [7.4, 8057], "B": [11.8, 1894], "C": [13.2, 1396], "D": [3.6, 22161] },
+    "A_prose":   [[14.0, 1292], [11.9, 5046], [14.6, 1047]],
+    "B_chat":    [[13.4, 1027], [9.0, 1256], [7.5, 1069]],
+    "C_code":    [[13.3, 873], [2.7, 1750], [9.9, 1769]],
+    "D_longctx": [[5.8, 20131], [4.7, 44650], [9.4, 20332]]
+  },
+  "baseline_ab": "off-arm = the measured g=1 floor: 4.2-4.9 tok/s warm (stranger-serve-confirm-20260728) and 4.68-5.09 null-drafter (m25-paper-bench-20260703). Uplift ~2-3x, inside the banked 1.6-3.4x band. Same-ring EAGLE-off arm queued (ring was reaped before it ran — see ops finding F3).",
+  "settlement": "EVERY job settled with all 5 stages paid by layers — including the 4090s' 4-layer and 3-layer blocks (e.g. 390 tokens -> 201/69/25/76/19). Heterogeneous pay-by-layers live end to end on the permissionless path.",
+  "findings": {
+    "F1_marlin_capacity": "A 4090 (Ada, no sm_120 cutlass) probes at ~4057 MB/layer under marlin vs ~2330 on sm_120 cards => 4 layers per 24GB card (3 as tail). The probe->announce->planner honesty pipeline carried it end to end: the planner first REFUSED a pool that summed to exactly 62 layers (tail_reserve made it 61 — correct), and accepted once a second 4090 made the sum 64+. 4090-class supply is real but small per card.",
+    "F2_per_shape_speed": "The ring hit its predicted physics (prose 14.0 vs predicted ~12-14 at measured g). The gap to the 17-29 operator scorecard is SHAPE, not regression: 07-12 rings were uniform tight-EU 5090s (hops 8-37ms); this pool contained one box with ~88ms RTT legs to every peer (~170ms/step of pure network) plus two marlin stages. Corollary: a fat card only buys speed when it REPLACES hops — the same planner offered 107ms/step (~30 tok/s) for a 2x Pro6000 ring. NEVER quote a speed without the ring shape.",
+    "F3_ops_deadman": "The dead-man switch correctly reaped the warm ring 45min after the session (and its heartbeat loop) died mid-suite. Keepalive now runs as a systemd unit with RuntimeMaxSec=12h: survives session death, still fails safe. The suite results survived in the sim log.",
+    "F4_longctx_incoherent_OPEN": "D-longctx produced 33 tokens, incoherent, all 3 reps (TTFT 20-45s). Not a speed problem — a correctness lead. Under diagnosis on the follow-up ring.",
+    "F5_daemon_K_untuned_OPEN": "The daemon coordinator runs fixed K=8 depth=4; the operator scorecard is K-routed per content class (worth +20-100% on g-bound classes). K-routing on the daemon path is a real launch-quality item.",
+    "F6_vast_attrition": "8 rentals for 5 serving boxes: 1 container-create failure, 1 SSH hard-dead, 3 key-propagation/proxy failures (2 recovered via direct-endpoint SSH + vastai attach). Direct endpoints beat the ssh proxy; a 'failed' create can still open a billing contract — verify instances after every create."
+  },
+  "cost_usd": { "night1_incl_zombie": 10.6, "balance_after": 143.68 },
+  "evidence": "sim-side scorecard + settlement lines preserved from the orchestrator log (engine-truth SHARD_JOB_METRICS were on the head box's daemon.log, destroyed with the ring — captured on the follow-up ring instead)"
+}
