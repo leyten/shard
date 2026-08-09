@@ -1,0 +1,41 @@
+{
+  "receipt": "stranger-suite-final-20260809",
+  "date": "2026-08-09",
+  "what": "The FIRST fully coherent (12/12) performance suite on the stranger-daemon path — all-sm120 4-stage EU ring, reasoning-off serve default, think-split live, needle retrieval green 3/3 — plus the engine-truth decomposition that found the L1 draft-budget latch silently returning a ring to g=1 mid-session. Closes the 08-08/09 rehearsal arc (receipt stranger-hetero-suite-20260808 is the companion).",
+  "builds_under_test": {
+    "shard": "master 672a57c (incl #171 think-split)",
+    "c0mpute": "master 3b66e49 (incl #62-#66: enroll/max-ctx fixes, drafter auto-download, needle reasoning:false, suite budgets + zero-visible guard, reasoning-off serve default)",
+    "orchestrator": "shard-daemon-sim --nodes 4 --stages 4 --full --suite --reps 3 --debounce 30000 --real-seam; PROD UNTOUCHED"
+  },
+  "ring": {
+    "shape": "4 stages, all sm_120 (1x RTX PRO 6000 + 3x RTX 5090), 4 EU countries; the two 4090s parked to keep aux layers off marlin (see F_marlin_aux)",
+    "tiling": "5090[0:3) head+coordinator -> 5090[3:15) -> 5090[15:27) -> Pro6000[27:62) tail",
+    "planner_predicted": "207.1 ms/step, 4.83 tok/s per unit g"
+  },
+  "scorecard_client_medians_of_3": {
+    "note": "sim tok/s is VISIBLE-token count over the post-think decode window (upward-biased for the reasoning canary); engine truth below is authoritative for rates. TTFT is the honest user wait.",
+    "A_prose_reasoning_off":   { "tok_s": 7.6,  "ttft_ms": 647,   "tokens": 764, "coherent": "3/3" },
+    "B_chat_reasoning_ON":     { "tok_s": 25.7, "ttft_ms": 38247, "tokens": 455, "coherent": "3/3", "note": "the opt-in reasoning canary: TTFT = thinking time (20-56s), then the answer floods" },
+    "C_code_reasoning_off":    { "tok_s": 8.1,  "ttft_ms": 440,   "tokens": 350, "coherent": "3/3" },
+    "D_longctx_needle":        { "tok_s": 6.9,  "ttft_ms": 10811, "tokens": 7,   "coherent": "3/3", "note": "6k prompt; warm prefill ~4s (one 95s transient); answers with just the code" }
+  },
+  "engine_truth_two_regimes": {
+    "drafter_armed_jobs_1_8":  { "tok_s": "10.6-18.0 (chat 17.2, code 18.0, prose 10.6-11.8, needle 3.8-6.6)", "accept": "0.74-1.70", "toks_per_traversal": "1.74-2.70" },
+    "after_L1_latch_jobs_9_16": { "tok_s": "6.2-8.4", "accept": "0.008-0.75", "toks_per_traversal": "~1.0", "draft_s": "~0.01 (drafter disabled)" },
+    "mechanism": "mid-suite one draft step exceeded the L1 draft-budget twice -> HybridDrafter.disable_eagle latched IRREVERSIBLY for the coordinator's lifetime; every later job ran plain chain. The scorecard medians blend both regimes."
+  },
+  "findings": {
+    "F_first_green_suite": "12/12 coherent across prose/chat/code/needle — the stranger path serves CORRECT answers end to end for the first time (07-28: first tokens; 08-08: first speeds; today: first correctness sweep).",
+    "F_cot_leak_fixed": "shard #171: the daemon path streamed chain-of-thought as user content on every reply (captured live); now split at the tools-seam THINK_END — content-only stream, reasoning as its own DONE field, settlement still pays all generated tokens.",
+    "F_greedy_think_loops": "under greedy decode, long-form thinking degenerates into loops ('We need to explain each change. We need to mention...') — 1024-1536 tokens of chain-of-thought with zero answer on prose/code. Serve default is now reasoning:false (c0mpute #66); chat closes its think reliably (905 chars) and stays the opt-in canary.",
+    "F_marlin_aux_wedge_OPEN": "an eagle:1 reset wedges a stage holding aux layers [1,30,58] on the marlin backend (Ada/4090): frames sent, no ack, stage silent, 90s first-ack watchdog -> P11 EAGLE-off restart. Reproduced twice with a 4090 head (aux layer 1); the identical ring serves EAGLE-off, and last-night's ring with aux on sm_120 drafted fine. Until fixed, 4090s cannot hold aux layers with EAGLE armed — the planner does not know this (it seated a 4090 head twice by RTT centrality).",
+    "F_L1_latch_too_sticky_OPEN": "the L1 draft-budget latch (P0-#5) is irreversible per coordinator process: ONE transient slow draft step costs the ring its drafter until restart — measured here as a mid-session 17->7 tok/s cliff with no operator signal. Fix shape: re-arm per job (the budget still bounds each job's drafting).",
+    "F_daemon_accept_low_OPEN": "armed acceptance 0.74-1.70 vs 3-4.5 on K-tuned operator rings — fixed K=8 depth=4 daemon defaults leave ~2x on the table (K-routing per content class is the quantified lever).",
+    "F_zombie_coordinator_OPEN": "a coordinator from a superseded swarm survived head-reassignment and wedged its box's engine in the successor ring (no ack on the new ring's first reset). Churn re-forms move heads in production; the worker should stop CoordinatorProcess when an assignment makes the node non-head.",
+    "F_pull_socket_flap": "heavy first-pulls flap the daemon's orchestrator socket (repeated DEGRADED/re-form during load; the anti-storm debounce + 'ring still loading' deferral contained it). A daemon-side keepalive during fetch would quiet it.",
+    "F_ops": "5090 supply healthy; 3 of 8 round-2 rentals were key-propagation duds (vastai attach + direct-endpoint SSH rescued 1 of 4 attempts; direct endpoints beat the ssh proxy); a 'failed' create can still open a billing contract — verify instances after every create."
+  },
+  "session_prs": "shard #167 #168 #169 #170 #171; c0mpute #62 #63 #64 #65 #66",
+  "cost_usd": { "session_total_approx": 25, "balance_after_approx": 138 },
+  "next": "leyten's residential 4090 join/swap on this warm ring (churn + NAT admission), then the go-live checklist (npm 3.0.0, offline-key manifest, relays, payouts)."
+}
