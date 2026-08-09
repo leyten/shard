@@ -20,7 +20,43 @@
 
 ## RESUME HERE  (the one next action)
 
-### ⇒ 2026-08-08 (LATEST) — PRE-LAUNCH AUDIT: #166 path residue fixed, speed truth established, drafter fork on leyten
+### ⇒ 2026-08-09 (LATEST) — THE REHEARSAL RINGS: first correct stranger-path suite; the reasoning stack rebuilt live
+**Two days of live hetero rings (~$25, receipts `stranger-hetero-suite-20260808` +
+`stranger-suite-final-20260809`) took the stranger path from "leaks chain-of-thought on every
+reply" to a 12/12-coherent suite with sub-second TTFT — and surfaced every launch-quality gap
+with numbers attached.** Ring still WARM (Pro6000 ES + 5090 PL/DK/DE serving; 4090 EE/FR parked
+with cached weights). Session PRs: shard #167-#171, c0mpute #62-#66, all merged.
+- **BANKED GREEN:** drafter auto-download armed itself fleet-wide (c0mpute #63 live); the first
+  hetero permissionless ring (Pro6000+2×5090+2×4090, 5 countries) served 9-14 tok/s median and
+  settlement paid all 5 stages incl. 4- and 3-layer marlin blocks; the all-sm120 ring then ran the
+  first fully coherent suite — prose/code TTFT 440-650 ms at engine 10.6-18.0 tok/s armed, 6k
+  needle 3/3 (warm prefill ~4 s), churn/self-heal exercised throughout (P11, re-forms, warm
+  re-joins all fired for real).
+- **THE REASONING STACK, rebuilt from live evidence:** (a) shard #171 — coordinate was streaming
+  the think block as user content (captured: `…So answer: "Paris".</think>…Paris`); now split at
+  the tools-seam THINK_END, reasoning an additive DONE field, settlement still pays think tokens.
+  (b) greedy long-form thinking LOOPS ("We need to explain each change. We need to…" ×1536 tokens,
+  zero answer) ⇒ serve default `reasoning:false`, opt-in per request (c0mpute #66); chat closes
+  its think reliably and is the suite's canary. (c) the needle class needed `reasoning:false` +
+  realistic budgets (#64/#65) — the two-ring "long-context bug" was this, not retrieval.
+- **QUANTIFIED OPEN (launch-quality, self-healing covers all):** L1 draft-budget latch is
+  per-PROCESS — one slow draft step silently costs a ring its drafter (17→7 tok/s cliff measured);
+  re-arm per job. Marlin-aux: eagle:1 reset hangs a 4090 stage holding aux layers [1,30,58]
+  (2× reproduced; P11 recovers EAGLE-off) — 4090s must not hold aux until fixed, and the planner
+  doesn't know. Daemon accept 0.74-1.70 vs 3-4.5 K-tuned (~2× on the table). Worker: kill a
+  superseded coordinator on head-reassignment (zombie wedged a successor ring); fetch-time socket
+  keepalive (pulls flap announces).
+- **OPS:** deadman reaped the night-1 warm ring when the session died (results survived in the sim
+  log); keepalive now = systemd unit w/ 12 h TTL. Vast round-2: 3/8 rentals key-propagation duds;
+  direct endpoints beat the ssh proxy; a "failed" create can still bill — verify instances after
+  every create.
+
+**⇒ THE ONE NEXT ACTION: leyten's residential 4090 join/swap on the warm ring** (kill a rented
+node → his WSL box joins via relay → re-form seats it → serve) — the last rehearsal item; then the
+go-live list is pure leyten (npm 3.0.0, offline-key manifest, relays.json, payout flip, rehearsal
+day) with the three quantified items as the post-launch perf/robustness queue.
+
+### ⇒ 2026-08-08 — PRE-LAUNCH AUDIT: #166 path residue fixed, speed truth established, drafter fork on leyten
 **Full launch audit (3 Opus agents: readiness + metrics + adversarial verify). Verdict: the 07-29
 "all engineering done" claim had rotted in two places — both fixed — and the launch-day speed story
 is now honest.** No ring touched real hardware since #166 landed; nothing here needed spend.

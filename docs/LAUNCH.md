@@ -7,6 +7,25 @@
 > This file is THE list. If it's not here, it's not a launch blocker — stop carrying it in your head.
 > _Last synced: 2026-08-08._
 >
+> **2026-08-09 REHEARSAL VERDICT (receipt `stranger-suite-final-20260809.json` + companion
+> `stranger-hetero-suite-20260808.json` — the two-day live-ring arc):**
+> - **✅ THE STRANGER PATH SERVES CORRECTLY — 12/12 coherent suite, first ever** (all-sm120 4-stage EU
+>   ring): prose/code answer instantly (**TTFT 440–650 ms**, engine 10.6–18.0 tok/s drafter-armed),
+>   the 6k needle retrieval is green 3/3 (warm prefill ~4 s), and opt-in reasoning arrives as its own
+>   API field (chat canary: thinks 20–56 s, then floods). Found + FIXED along the way: the daemon path
+>   was streaming chain-of-thought as user content on every reply (shard **#171**); greedy long-form
+>   thinking loops, so the serve default is now `reasoning:false`, opt-in per request (c0mpute
+>   **#66**); the needle class was structurally unpassable at a 32-token budget (c0mpute #64/#65).
+> - **⚠️ THREE QUANTIFIED OPEN ITEMS (launch-quality, not launch-gating — the ring self-heals through
+>   all three):** (1) **L1 draft-budget latch too sticky** — one transient slow draft step disables
+>   the drafter for the coordinator's LIFETIME (measured: a silent mid-session 17→7 tok/s cliff);
+>   re-arm per job. (2) **marlin-aux reset wedge** — an eagle:1 reset hangs a stage holding aux
+>   layers [1,30,58] on a 4090/marlin box (reproduced 2×; P11 recovers the ring EAGLE-off); until
+>   fixed, 4090s must not hold aux layers — the planner doesn't know that and seated a 4090 head
+>   twice. (3) **daemon acceptance 0.74–1.70 vs 3–4.5 K-tuned** — fixed K=8 leaves ~2× on the table.
+>   Plus two worker items: stop a superseded coordinator on head-reassignment (a zombie wedged the
+>   successor ring's first reset), and a fetch-time socket keepalive (heavy pulls flap announces).
+>
 > **2026-08-08 PRE-LAUNCH AUDIT (full-repo + receipts, adversarially verified):**
 > - **FIXED — refactor #166 had silently broken the launch path** (hardcoded `phase0/` strings, invisible
 >   to CI): the worker's probe-slice pull (every first-join enroll died ENOENT), the operator ring
