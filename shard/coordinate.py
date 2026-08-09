@@ -8,8 +8,12 @@ serves jobs read as JSON lines on stdin. A supervisor waits on the stdout contra
     SHARD_COORD_OK    {...}   --check preflight passed (engine imports, model dir sane), exit 0
     SHARD_COORD_READY {...}   pipe + return channel connected; jobs accepted on stdin
     SHARD_JOB_START   {jobId, maxNew}  the job line was READ off stdin and handed to the ring
-    SHARD_JOB_TOKEN   {jobId, delta}   one committed decode delta (streamed per ring round)
-    SHARD_JOB_DONE    {jobId, ok, response, tokensGenerated, receipts, receiptsOk, nonce}
+    SHARD_JOB_TOKEN   {jobId, delta}   one committed VISIBLE-content delta (streamed per ring round;
+                                       with reasoning on, the think block is withheld — an API user
+                                       must never receive chain-of-thought as message content)
+    SHARD_JOB_DONE    {jobId, ok, response, reasoning?, tokensGenerated, receipts, receiptsOk, nonce}
+                                       response = visible content only; reasoning = the think text
+                                       (present only when a think block was produced and split)
     SHARD_JOB_FATAL   {jobId?, error}  job failed (process continues) or boot failed (exit 1)
 
 Job line: {"jobId", "swarmId", "nonce", "messages", "maxNew"?, "reasoning"?, "tools"?}.
@@ -247,11 +251,34 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
     on the old sockets would eat a late in-flight reply as its ack (the tail only goes stale on a
     fresh hello_return). A retry that also fails returns its resumable-failure dict — serve_jobs
     bails for a clean daemon restart. Deltas are capped at the first EOS so joined deltas == the
-    final response text."""
+    final VISIBLE response text.
+
+    Reasoning split: with reasoning on, M2.5's template hardwires "<think>\n" into the generation
+    prompt, so the raw decode stream is `...chain-of-thought...</think>\n\n visible-content`. The
+    daemon path was relaying that stream verbatim — every OpenAI-endpoint user got the model's
+    thinking as message content (and a short-budget job burned its whole budget before the answer).
+    The marker comes from the per-model tools seam (`MP._TOOLS.THINK_END`); models without one, and
+    reasoning:false jobs (whose completion contains no think block), stream unchanged."""
     job_id = job["jobId"]
     max_new = max(1, min(int(job.get("maxNew") or 512), 4096))
-    state = {"text": "", "eos_at": None}
+    state = {"text": "", "eos_at": None, "marker_end": None, "vis_sent": 0}
     tick = watchdog.tick if watchdog is not None else None
+    think_end = getattr(getattr(MP, "_TOOLS", None), "THINK_END", None)
+    split = bool(job.get("reasoning", True)) and bool(think_end)
+
+    def _visible(text):
+        """The user-facing slice of the raw decode stream (think block + boundary newlines gone)."""
+        if not split:
+            return text
+        if state["marker_end"] is None:
+            j = text.find(think_end)
+            if j < 0:
+                return ""                        # still thinking — nothing visible yet
+            state["marker_end"] = j + len(think_end)
+        k = state["marker_end"]
+        while k < len(text) and text[k] == "\n":  # boundary "\n\n" may straddle commits
+            k += 1
+        return text[k:]
 
     def on_commit(out, _dt):
         if tick:
@@ -265,8 +292,11 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
         ids = out[: state["eos_at"]] if state["eos_at"] is not None else out
         text = tok.decode(ids, skip_special_tokens=True)
         if len(text) > len(state["text"]):
-            delta = text[len(state["text"]):]
             state["text"] = text
+        visible = _visible(state["text"])
+        if len(visible) > state["vis_sent"]:
+            delta = visible[state["vis_sent"]:]
+            state["vis_sent"] = len(visible)
             emit("SHARD_JOB_TOKEN", jobId=job_id, delta=delta)
 
     def _attempt(resume_ids=None):
@@ -279,10 +309,21 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
             job_nonce=job.get("nonce") or None,
             resume_ids=resume_ids, resumable=True, on_progress=tick)
 
+    def _finish(r):
+        """Split the FINAL text the same way the stream was split, so DONE.response == joined
+        deltas. A completion that never closed its think block (budget exhausted mid-reasoning)
+        honestly returns response '' with the whole text under `reasoning`."""
+        if split and r.get("ok"):
+            raw = r.get("text", "")
+            j = raw.find(think_end)
+            r["reasoning_text"] = raw[:j] if j >= 0 else raw
+            r["text"] = _visible(raw)
+        return r
+
     eagle_arm = MP.eagle_armed()
     r = _attempt()
     if r.get("ok") or not r.get("resumable") or not eagle_arm or redial is None:
-        return r
+        return _finish(r)
     committed = list(r.get("output_ids") or [])
     emit("SHARD_JOB_RETRY", jobId=job_id, reason=str(r.get("error", ""))[:200], committed=len(committed))
     print(f"[coordinate] EAGLE-implicated edge fault on job {job_id} -> degraded retry "
@@ -300,7 +341,7 @@ def run_job(MP, tok, eos_set, chans, a, job, emit=_emit, watchdog=None, redial=N
         tick()                               # the successful redial is progress
     r2 = _attempt(resume_ids=committed)
     r2["degraded_retry"] = True
-    return r2
+    return _finish(r2)
 
 
 def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
@@ -350,6 +391,9 @@ def serve_jobs(MP, tok, pipe, ret, a, lines, emit=_emit, redial=None):
                     emit("SHARD_JOB_METRICS", jobId=job_id, **metrics)
                 emit("SHARD_JOB_DONE", jobId=job_id, ok=True,
                      response=r.get("text", ""), tokensGenerated=int(r.get("n_tokens", 0)),
+                     # additive field: only present when a think block was split off (deployed
+                     # daemons ignore unknown keys — the proven contract-evolution path)
+                     **({"reasoning": r["reasoning_text"]} if r.get("reasoning_text") is not None else {}),
                      # Hand settlement the SIGNED body: each stage tags its receipt with a `stage`
                      # debug label after signing, and shard.verify signs-all-but-sig (stays strict),
                      # so an un-stripped tag is InvalidSignature at the one call site that pays.
