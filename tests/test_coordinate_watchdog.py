@@ -106,8 +106,10 @@ def _serve(T, lines, ring_kw=None, retry_ring_kw=None, args_kw=None):
 
 
 def _job(job_id="j-1", max_new=48, nonce="ab" * 16):
+    # reasoning:False — these synthetic streams carry no think block; a defaulted job would
+    # correctly withhold everything as chain-of-thought (see the reasoning-split tests)
     return json.dumps({"jobId": job_id, "swarmId": "sw-1", "nonce": nonce, "maxNew": max_new,
-                       "messages": [{"role": "user", "content": "fake"}]})
+                       "messages": [{"role": "user", "content": "fake"}], "reasoning": False})
 
 
 # ---- L2: the degraded retry ------------------------------------------------------------------------
