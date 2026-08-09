@@ -24,10 +24,19 @@
 >   `perfDefaults()` arms `M25_EAGLE=1` + `M25_EAGLE_DIR` — operator `M25_EAGLE=0` still wins (the
 >   playbook's nuclear switch), P11 sticky degrade unchanged, and a head-less coordinator broadcasts
 >   `eagle:0` so stages self-silence. Functionally proven offline (sha-verified pull 19s / idempotent
->   0.5s / corruption self-repairs). **Remaining for the checkmark: the warm-ring EAGLE on/off A/B on
->   the daemon path — no receipt has ever measured it there; expect 1.6–3.4× (≈12–17 tok/s), rides the
->   rehearsal ring.** Known trap: P11 flips `M25_EAGLE=0` sticky for a swarm session after one stall
->   trip — a wedge silently returns that ring to g=1 until re-form.
+>   0.5s / corruption self-repairs). **PROVEN LIVE 2026-08-08 (receipt
+>   `stranger-hetero-suite-20260808.json`): the first speed receipt ever taken on the stranger path,
+>   on the first heterogeneous permissionless ring (Pro 6000 + 2×5090 + 2×4090, 5 EU countries).**
+>   The head auto-staged on every node, EAGLE armed itself, and the ring served **9–14 tok/s median
+>   warm (prose 14.0 / code 9.9 / chat 9.0, TTFT 1–1.8 s)** vs the 4.2–4.9 g=1 floor — the ~2–3×
+>   uplift, inside the banked 1.6–3.4× band, at the planner's own predicted step time. Settlement
+>   paid ALL five stages by layers on every job, including the 4090s' 4- and 3-layer marlin blocks.
+>   **Speed is per ring shape — never quote it bare:** this pool held one ~88 ms-RTT box + two
+>   marlin stages; the same planner offers ~107 ms/step (~30 tok/s) on a 2×Pro 6000 pool. Open from
+>   the receipt: D-longctx incoherent (33 tokens, all reps — correctness lead, under diagnosis);
+>   daemon coordinator runs untuned K=8 (K-routing = launch-quality item); same-ring EAGLE-off arm +
+>   engine-truth metrics ride the follow-up ring. Known trap: P11 flips `M25_EAGLE=0` sticky for a
+>   swarm session after one stall trip — a wedge silently returns that ring to g=1 until re-form.
 > - **Still open, small:** oversized-prompt rejection (>40k prompt alone still kills a ring — needs
 >   gateway/orchestrator-side token count), `SHARD_JOB_METRICS` has no worker-side parser (tok_s/ttft
 >   dropped; ttft never implemented), churn truncation still returns `finish_reason:"stop"` (refund
