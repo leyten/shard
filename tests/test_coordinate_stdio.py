@@ -158,9 +158,13 @@ def _serve_ring(head_srv, ret_srv, T, ready):
 
 def _job(job_id="j-stdio-1", max_new=32):
     """The daemon's swarm:job -> CoordinatorProcess.submit payload (shard-worker.ts:484-509);
-    `reasoning`/`tools` are absent because JSON.stringify drops undefined."""
+    `tools` is absent because JSON.stringify drops undefined. reasoning:False because the
+    synthetic ring's stream carries no think block — a defaulted (reasoning:True) job would
+    correctly withhold the whole stream as chain-of-thought (see the reasoning-split tests in
+    test_shard_coordinate.py); the daemon sends the flag through since the think-split fix."""
     return {"jobId": job_id, "swarmId": "sw-stdio", "nonce": "ab" * 32,
-            "messages": [{"role": "user", "content": "fake"}], "maxNew": max_new}
+            "messages": [{"role": "user", "content": "fake"}], "maxNew": max_new,
+            "reasoning": False}
 
 
 def test_job_submitted_on_socketpair_stdin_is_served():

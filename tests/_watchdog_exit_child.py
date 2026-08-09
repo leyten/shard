@@ -31,7 +31,7 @@ ring.start()
 
 a = argparse.Namespace(K=8, depth=4, ngram_n=3, max_ctx=0, timeout=60, prefill_chunk=24)
 job = json.dumps({"jobId": "j-child", "nonce": "aa" * 16, "maxNew": 32,
-                  "messages": [{"role": "user", "content": "fake"}]})
+                  "messages": [{"role": "user", "content": "fake"}], "reasoning": False})
 rc = C.serve_jobs(FR.MP, FakeTok(T[:60]), c_pipe, c_ret, a, iter([job]))
 # unreachable when the watchdog fires (os._exit): reaching here means it never tripped
 print("CHILD_SURVIVED rc=%d" % rc, flush=True)

@@ -53,8 +53,11 @@ def _run_jobs(T, prompt_len, lines, max_ring_jobs=4):
 
 def test_serve_jobs_streams_and_completes():
     T = repetitive_T(400)
+    # reasoning:False — the fake stream carries no think block, and with the seam's real
+    # THINK_END a reasoning job would correctly stream nothing (still "thinking"). The plain
+    # contract this test pins is the reasoning:False path.
     job = {"jobId": "j-1", "swarmId": "sw-1", "nonce": "aa" * 16, "maxNew": 64,
-           "messages": [{"role": "user", "content": "fake"}]}
+           "messages": [{"role": "user", "content": "fake"}], "reasoning": False}
     rc, emits, ring = _run_jobs(T, 40, [json.dumps(job)])
     assert rc == 0
     done = [f for t, f in emits if t == "SHARD_JOB_DONE"]
@@ -112,3 +115,77 @@ def test_cli_missing_model_dir_is_fatal():
                        capture_output=True, text=True, cwd=REPO, env=_clean_env(), timeout=120)
     assert r.returncode == 1
     assert any(l.startswith("SHARD_JOB_FATAL ") for l in r.stdout.splitlines())
+
+
+class ThinkTok(FakeTok):
+    """A decode whose GENERATED stream contains a think block: positions 0-2 are reasoning
+    tokens, position 3 renders the close marker, everything after is visible content. Prefix-
+    monotone (text only appends as ids extend), like a real detokenizer."""
+
+    def decode(self, ids, skip_special_tokens=True):
+        parts = []
+        for i, t in enumerate(ids):
+            if i < 3:
+                parts.append(f"r{int(t)}")
+            elif i == 3:
+                parts.append("</think>\n\n")
+            else:
+                parts.append(f"w{int(t)}")
+        return " ".join(parts)
+
+
+def test_reasoning_split_streams_only_visible_content():
+    """The daemon-path leak: with reasoning on, the raw decode stream is thought + '</think>' +
+    answer, and the coordinator used to relay ALL of it as SHARD_JOB_TOKEN deltas — API users got
+    chain-of-thought as message content (found live, stranger-hetero-suite-20260808). With the
+    per-model THINK_END on the tools seam: deltas carry the visible slice only, DONE.response ==
+    joined deltas, and the think text arrives once under DONE.reasoning."""
+    import types
+    T = repetitive_T(400)
+    job = {"jobId": "j-think", "swarmId": "sw-1", "nonce": "bb" * 16, "maxNew": 16,
+           "messages": [{"role": "user", "content": "fake"}]}   # reasoning defaults True
+    old_tools = getattr(FR.MP, "_TOOLS", None)
+    FR.MP._TOOLS = types.SimpleNamespace(THINK_END="</think>")
+    try:
+        c_pipe, r_pipe = socket.socketpair()
+        c_ret, r_ret = socket.socketpair()
+        c_ret.settimeout(30)
+        ring = FakeRing(r_pipe, r_ret, T)
+        ring.tail_slack = 4
+        ring.start()
+        tok = ThinkTok(T[:40])
+        emits = []
+        rc = C.serve_jobs(FR.MP, tok, c_pipe, c_ret, _args(), iter([json.dumps(job)]),
+                          emit=lambda tag, **f: emits.append((tag, f)))
+        for s in (c_pipe, c_ret):
+            try: s.close()
+            except OSError: pass
+        ring.join(2)
+    finally:
+        if old_tools is None:
+            del FR.MP._TOOLS
+        else:
+            FR.MP._TOOLS = old_tools
+    assert rc == 0
+    done = [f for t, f in emits if t == "SHARD_JOB_DONE"]
+    assert len(done) == 1 and done[0]["ok"]
+    deltas = "".join(f["delta"] for t, f in emits if t == "SHARD_JOB_TOKEN")
+    raw = ThinkTok(T).decode(T[40:40 + 16])
+    think_txt, visible = raw.split("</think>", 1)
+    assert done[0]["response"] == deltas, "DONE.response must equal the joined stream"
+    assert done[0]["response"] == visible.lstrip("\n"), "only post-think content is user-visible"
+    assert "</think>" not in deltas and "r" + str(int(T[40])) not in deltas, "no thought leaks"
+    assert done[0]["reasoning"] == think_txt, "the think text arrives once, as its own field"
+    assert done[0]["tokensGenerated"] == 16, "settlement still counts ALL generated tokens"
+
+
+def test_reasoning_split_absent_marker_means_unchanged_stream():
+    """Models without a THINK_END on their tools seam (and reasoning:false jobs) stream verbatim."""
+    T = repetitive_T(400)
+    job = {"jobId": "j-plain", "swarmId": "sw-1", "nonce": "cc" * 16, "maxNew": 16,
+           "messages": [{"role": "user", "content": "fake"}], "reasoning": False}
+    rc, emits, ring = _run_jobs(T, 40, [json.dumps(job)])
+    assert rc == 0
+    done = [f for t, f in emits if t == "SHARD_JOB_DONE"][0]
+    assert done["response"] == FakeTok(T).decode(T[40:40 + 16])
+    assert "reasoning" not in done
