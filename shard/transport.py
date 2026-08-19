@@ -53,7 +53,7 @@ _DSIZE = {d: torch.empty(0, dtype=d).element_size() for d in set(_DTYPES.values(
 MAX_FRAME = int(os.environ.get("M25_MAX_FRAME") or 256 * 1024 * 1024)
 
 
-def _pack_parts(obj) -> list:
+def _pack_parts(obj) -> list[bytes | memoryview]:
     """encode one message as a list of wire segments (bytes-likes) whose concatenation IS the
     frame body — byte-identical to the historical _pack output. Kept segmented so send_msg can
     hand the pieces straight to sendmsg() with zero concatenation copies; tensor blobs are
@@ -85,7 +85,7 @@ def _pack(obj) -> bytes:
     return b"".join(_pack_parts(obj))
 
 
-def _unpack(buf):
+def _unpack(buf: bytes | bytearray | memoryview):
     mv = memoryview(buf)                    # zero-copy blob slices (a bytes slice copies)
     (hlen,) = struct.unpack_from("!I", mv, 0)
     head = json.loads(bytes(mv[4:4 + hlen]))
@@ -124,7 +124,7 @@ def _unpack(buf):
 _IOV_CAP = 512      # segments per sendmsg() call, safely under the kernel's UIO_MAXIOV (1024)
 
 
-def _sendall_vectored(sock: socket.socket, parts: list) -> None:
+def _sendall_vectored(sock: socket.socket, parts: list[bytes | memoryview]) -> None:
     """sendall for a list of bytes-like segments via scatter/gather sendmsg — the segments are
     never concatenated (the old path copied every blob into one frame buffer, then copied that
     again for the length prefix: ~2× the message in transient memcpy per hop per direction)."""
@@ -171,5 +171,5 @@ def key_from_env(var: str = "SHARD_PSK") -> None:
     return None
 
 
-def use_key(material) -> None:
+def use_key(material: None) -> None:
     return None
