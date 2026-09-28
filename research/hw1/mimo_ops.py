@@ -52,7 +52,8 @@ MOE = {0: False, 1: True, 5: True}                  # moe_layer_freq[0] == 0 (la
 T_GRID = (1, 2, 4, 8, 9, 16, 17, 32, 64, 128, 256, 900, 2048)
 PREFILL_T = (900, 2048)
 SPAN_LAYERS = 8
-PREFILL_PREFIX = 8192       # the global-layer prefix for the "replay deep in a session" variant
+PREFILL_PREFIX = 8192
+N_SWA, N_FULL = 39, 9       # hybrid_layer_pattern: 39 SWA, 9 global of 48       # the global-layer prefix for the "replay deep in a session" variant
 
 
 # ── synthetic checkpoint (tiny, MiMo names/dtypes/packing) ──────────────────────────────────────
@@ -165,22 +166,34 @@ def router(L, x):
 
 
 class TorchExperts:
+    """Reference experts: exact MXFP4 dequant (on CPU, shard.formats) of only the experts a call routes
+    to, cached on the device up to `budget_gb` (all 256 of a real layer would be 12.9 GB of bf16 and
+    OOM a 24 GB card). A fallback, never calibration grade; used as the marlin_vs_ref reference."""
     backend = "torch_dequant"
 
-    def __init__(self, L):
-        p, d = L.prefix + "mlp.experts.", L.d
-        deq = lambda e, nm: dequant_mxfp4(L.raw[f"{p}{e}.{nm}.weight"], L.raw[f"{p}{e}.{nm}.weight_scale"])
-        self.w1 = torch.stack([deq(e, "gate_proj") for e in range(d["experts"])]).bfloat16().to(L.device)
-        self.w3 = torch.stack([deq(e, "up_proj") for e in range(d["experts"])]).bfloat16().to(L.device)
-        self.w2 = torch.stack([deq(e, "down_proj") for e in range(d["experts"])]).bfloat16().to(L.device)
+    def __init__(self, L, budget_gb=4.0):
+        self.L, self.p, self.cache, self.bytes, self.budget = L, L.prefix + "mlp.experts.", {}, 0, budget_gb * 2**30
+
+    def _w(self, e):
+        if e in self.cache:
+            return self.cache[e]
+        raw, dev = self.L.raw, self.L.device
+        ws = tuple(dequant_mxfp4(raw[f"{self.p}{e}.{nm}.weight"], raw[f"{self.p}{e}.{nm}.weight_scale"])
+                   .bfloat16().to(dev) for nm in ("gate_proj", "up_proj", "down_proj"))
+        nb = sum(t.numel() * 2 for t in ws)
+        if self.bytes + nb <= self.budget:
+            self.cache[e] = ws
+            self.bytes += nb
+        return ws
 
     def __call__(self, x, ids, w):
         out = torch.zeros(x.shape[0], x.shape[1], dtype=torch.float32, device=x.device)
         for e in torch.unique(ids).tolist():
+            w1, w3, w2 = self._w(e)
             tok, slot = (ids == e).nonzero(as_tuple=True)
             h = x[tok]
-            a = torch.nn.functional.silu((h @ self.w1[e].t()).float()) * (h @ self.w3[e].t()).float()
-            out.index_add_(0, tok, (a.bfloat16() @ self.w2[e].t()).float() * w[tok, slot, None])
+            a = torch.nn.functional.silu((h @ w1.t()).float()) * (h @ w3.t()).float()
+            out.index_add_(0, tok, (a.bfloat16() @ w2.t()).float() * w[tok, slot, None])
         return out.to(x.dtype)
 
 
@@ -220,6 +233,11 @@ class MarlinExperts:
         import k3_moe_mxfp4 as K
         K.spec(qc)
         self.m = K.MarlinRoutedExperts(cfg, qc, device=L.device).load(get_tensor, L.prefix + "mlp")
+        try:                                      # the kernel class vLLM really dispatched to, not a label
+            self.kernel = type(K.fused_experts_of(self.m.quant_method)).__name__
+        except Exception as e:  # noqa: BLE001
+            self.kernel = f"unknown ({type(e).__name__})"
+        self.param_bytes = sum(t.numel() * t.element_size() for t in self.m.experts.parameters())
 
     def __call__(self, x, ids, w):
         return self.m.moe_infer(x, ids, w)
@@ -293,10 +311,11 @@ class FlashInferSinkAttn:
         return self.bind(*a)()
 
 
-def sink_effect_check(res, attn, d, device, tol=2e-2, seed=0):
-    """Gate: sinks must change the output, and the backend must match the reference. Returns bool."""
+def sink_effect_check(res, attn, d, device, tol=2e-2, seed=0, S=4096):
+    """Gate: sinks must change the output, and the backend must match the reference. S >> window, so a
+    wrong window_left fails too. Returns bool."""
     g = torch.Generator().manual_seed(seed)
-    T, S = 9, 64
+    T = 9
     hq, hkv = d["heads"], d["kv_swa"]
     q = torch.randn(T, hq, d["qk"], generator=g).bfloat16().to(device)
     k = torch.randn(S, hkv, d["qk"], generator=g).bfloat16().to(device)
@@ -318,6 +337,24 @@ def sink_effect_check(res, attn, d, device, tol=2e-2, seed=0):
     return ok
 
 
+def full_attn_check(res, attn, d, device, tol=2e-2, seed=1, S=4096):
+    """Gate for the global-attention wrapper (no sinks, no window) against the reference."""
+    g = torch.Generator().manual_seed(seed)
+    T, hq, hkv = 9, d["heads"], d["kv_full"]
+    q = torch.randn(T, hq, d["qk"], generator=g).bfloat16().to(device)
+    k = torch.randn(S, hkv, d["qk"], generator=g).bfloat16().to(device)
+    v = torch.randn(S, hkv, d["v"], generator=g).bfloat16().to(device)
+    try:
+        out = attn(q, k, v, None, 0, S - T).float()
+    except Exception as e:  # noqa: BLE001
+        res.check("full_attn", False, f"{attn.backend}: {type(e).__name__}: {e}", backend=attn.backend)
+        return False
+    ref = attn_ref(q, k, v, None, 0, S - T).float()
+    err = (out - ref).abs().max().item() / (ref.abs().max().item() + 1e-9)
+    res.check("full_attn", err < tol, f"{attn.backend}: rel err vs ref {err:.3e}", backend=attn.backend, rel_err=err)
+    return err < tol
+
+
 def marlin_check(res, L, fast, ref, tol=3e-2, seed=0):
     g = torch.Generator().manual_seed(seed)
     x = (torch.randn(17, L.d["hidden"], generator=g) * 0.5).bfloat16().to(L.device)
@@ -325,7 +362,8 @@ def marlin_check(res, L, fast, ref, tol=3e-2, seed=0):
     a, b = fast(x, ids, w).float(), ref(x, ids, w).float()
     err = (a - b).abs().max().item() / (b.abs().max().item() + 1e-9)
     ok = err < tol
-    res.check("marlin_vs_ref", ok, f"{fast.backend} vs {ref.backend}: rel err {err:.3e}", rel_err=err)
+    res.check("marlin_vs_ref", ok, f"{fast.backend} vs {ref.backend}: rel err {err:.3e}", rel_err=err,
+              kernel=getattr(fast, "kernel", None))
     return ok
 
 
@@ -335,6 +373,9 @@ def pick_experts(res, L, want, max_tokens):
         try:
             m = MarlinExperts(L, max_tokens)
             if marlin_check(res, L, m, ref):
+                ref.cache.clear()                  # the reference's device cache is not part of the stage
+                if L.device == "cuda":
+                    torch.cuda.empty_cache()
                 return m
         except Exception as e:  # noqa: BLE001 -- fall back, labelled
             res.check("marlin_vs_ref", False, f"marlin unavailable: {type(e).__name__}: {e}")
@@ -355,22 +396,44 @@ def pick_attn(res, d, device, want):
     return None
 
 
+def pick_full(res, swa, d, device):
+    """The global-layer attention backend: flashinfer (window -1) if the SWA one is, gated; else torch."""
+    if swa is not None and swa.backend == "flashinfer_sink":
+        a = attn_full(swa, d, device)
+        if a is not None and full_attn_check(res, a, d, device):
+            return a
+    t = TorchAttn()
+    full_attn_check(res, t, d, device)
+    return t
+
+
 # ── the timed grid ──────────────────────────────────────────────────────────────────────────────
-def _hid(T, d, device, inputs, seed=0):
-    if inputs is not None:
-        x = inputs.reshape(-1, inputs.shape[-1])
-        reps = -(-T // x.shape[0])
-        return x.repeat(reps, 1)[:T].bfloat16().to(device)
+INPUT_KEYS = {"attn": "L1.attn_in", "ffn": "L1.ffn_in"}     # golden t32 (mimo_ref): normalised layer inputs
+
+
+def _hid(T, d, device, inputs, role="ffn", seed=0):
+    """T rows of layer input. Real golden rows first (never repeated: repeats would cap the distinct
+    routing patterns); rows beyond the real count are fresh random rows at the real rows' RMS."""
     g = torch.Generator().manual_seed(seed)
-    return (torch.randn(T, d["hidden"], generator=g) * 0.5).bfloat16().to(device)
+    if inputs is None:
+        return (torch.randn(T, d["hidden"], generator=g) * 0.5).bfloat16().to(device)
+    x = inputs[INPUT_KEYS[role]].float().reshape(-1, d["hidden"])[:T]
+    if x.shape[0] < T:
+        rms_ = x.pow(2).mean().sqrt()
+        x = torch.cat([x, torch.randn(T - x.shape[0], d["hidden"], generator=g) * rms_])
+    return x.bfloat16().to(device)
 
 
-def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iters, inputs):
+FALLBACK_EXPERTS_MAX_T = 64
+
+
+def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iters, inputs, full=None):
     for L in Ls:
         for T in tgrid:
-            x = _hid(T, d, device, inputs)
+            xa = _hid(T, d, device, inputs, "attn")
+            x = _hid(T, d, device, inputs, "ffn")
             prm = {"layer": L.li, "T": T}
-            st = C.time_fn(lambda: x @ L.wqkv.t(), warmup=warmup, iters=iters, device=device)
+            st = C.time_fn(lambda: xa @ L.wqkv.t(), warmup=warmup, iters=iters, device=device)
             res.record("B3", "qkv", prm, st)
             a = torch.zeros(T, d["heads"] * d["v"], dtype=torch.bfloat16, device=device)
             st = C.time_fn(lambda: a @ L.wo.t(), warmup=warmup, iters=iters, device=device)
@@ -380,13 +443,18 @@ def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iter
                 res.record("B1", "router", prm, st)
                 ids, w = router(L, x)
                 ex = experts[L.li]
+                if ex.backend != "marlin" and device == "cuda" and T > FALLBACK_EXPERTS_MAX_T:
+                    res.record("B1", "experts", prm, skipped=f"fallback {ex.backend}: not timed above "
+                               f"T={FALLBACK_EXPERTS_MAX_T} (not calibration grade)")
+                    continue
                 st = C.time_fn(lambda: ex(x, ids, w), warmup=warmup, iters=iters, device=device)
-                res.record("B1", "experts", prm, st, backend=ex.backend)
+                res.record("B1", "experts", prm, st, backend=ex.backend, kernel=getattr(ex, "kernel", None),
+                           distinct_experts=int(torch.unique(ids).numel()))
     if attn is None:
         res.record("B2", "attn", {}, skipped="no attention backend passed the sink_effect gate")
         return
     for kind, hkv, win in (("swa", d["kv_swa"], d["window"]), ("full", d["kv_full"], 0)):
-        use = attn if kind == "swa" or attn.backend == "torch_sink" else (attn_full(attn, d, device) or TorchAttn())
+        use = attn if kind == "swa" else (full or TorchAttn())
         # prefill shapes (the replay-rate input). A replayed chunk of a long session attends a prefix: the
         # global layers are also timed at a PREFILL_PREFIX-token prefix (SWA cost is window-bounded).
         for T in [t for t in tgrid if t in PREFILL_T]:
@@ -401,13 +469,13 @@ def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iter
             for B in bs:
                 for s in ss:
                     prm = {"kind": kind, "B": B, "ctx": ctx, "s": s}
-                    q = torch.randn(s, d["heads"], d["qk"]).bfloat16().to(device)
-                    k = torch.randn(ctx + s, hkv, d["qk"]).bfloat16().to(device)
-                    v = torch.randn(ctx + s, hkv, d["v"]).bfloat16().to(device)
                     sk = torch.zeros(d["heads"], device=device) if kind == "swa" else None
-                    # B sequences of the same shape: B calls (a batched plan is the R5 job; this is the
-                    # per-sequence cost -- recorded as such, not as a batched kernel)
-                    fns = [use.bind(q, k, v, sk, win, ctx) for _ in range(B)]
+                    # B sequences, each with its OWN q/K/V (one shared KV would sit in L2 and flatter B>1):
+                    # B calls. A batched plan is R5's job; this is the per-sequence cost, labelled as such.
+                    fns = [use.bind(torch.randn(s, d["heads"], d["qk"]).bfloat16().to(device),
+                                    torch.randn(ctx + s, hkv, d["qk"]).bfloat16().to(device),
+                                    torch.randn(ctx + s, hkv, d["v"]).bfloat16().to(device), sk, win, ctx)
+                           for _ in range(B)]
                     st = C.time_fn(lambda: [f() for f in fns], warmup=warmup, iters=iters, device=device)
                     res.record("B2", "attn", prm, st, backend=use.backend, batched_kernel=False)
 
@@ -441,7 +509,7 @@ def invariance(res, L, ex, d, device, mixes=11, seed=0):
 
 
 def attn_ms(recs, T, ctx=8192, start=0):
-    """attention per layer at shape T, weighted by the Flash pattern (1 global : 5 SWA). Prefill T ->
+    """attention per layer at shape T, weighted by the Flash pattern (39 SWA : 9 global). Prefill T ->
     attn_prefill; decode T (s) -> attn at B=1, the ctx closest to `ctx`."""
     def one(kind):
         if T in PREFILL_T:
@@ -457,7 +525,7 @@ def attn_ms(recs, T, ctx=8192, start=0):
     swa, full = one("swa"), one("full")
     if swa is None or full is None:
         return None
-    return (5 * swa + full) / 6
+    return (N_SWA * swa + N_FULL * full) / (N_SWA + N_FULL)
 
 
 def derive(res, d):
@@ -501,7 +569,7 @@ def main(argv=None):
     ap.add_argument("--mode", default="ops", choices=("ops", "dump"))
     ap.add_argument("--weights", help="dir with layer-000NN.safetensors (python -m shard.fetch ranged)")
     ap.add_argument("--layers", default="0,1,5")
-    ap.add_argument("--inputs", help="safetensors with real layer-0 outputs (first tensor used)")
+    ap.add_argument("--inputs", help="golden t32 safetensors (mimo_ref): uses L1.attn_in / L1.ffn_in")
     ap.add_argument("--experts", default="marlin", choices=("marlin", "torch"))
     ap.add_argument("--attn", default="flashinfer", choices=("flashinfer", "torch"))
     ap.add_argument("--tgrid", default=",".join(map(str, T_GRID)))
@@ -525,8 +593,11 @@ def main(argv=None):
     inputs = None
     if a.inputs:
         from safetensors.torch import load_file
-        inputs = next(iter(load_file(a.inputs).values()))
-    res.doc["derived"]["inputs"] = "real_layer0_outputs" if inputs is not None else "random"
+        inputs = load_file(a.inputs)
+        missing = [k for k in INPUT_KEYS.values() if k not in inputs]
+        if missing:
+            sys.exit(f"--inputs lacks {missing}")
+    res.doc["derived"]["inputs"] = "real_rows_then_rms_matched_random" if inputs is not None else "random"
     Ls = []
     for li in ints(a.layers):
         if device == "cuda":
@@ -544,17 +615,22 @@ def main(argv=None):
             before = torch.cuda.memory_allocated() if device == "cuda" else 0
             experts[L.li] = pick_experts(res, L, a.experts if device == "cuda" else "torch", maxT)
             ex_bytes = sum(v.numel() * v.element_size() for k, v in L.raw.items() if ".experts." in k)
-            res.record("K7", "footprint_experts", {"layer": L.li}, backend=experts[L.li].backend,
-                       disk_bytes=ex_bytes,
-                       resident_bytes=(torch.cuda.memory_allocated() - before) if device == "cuda" else None)
+            ex = experts[L.li]
+            res.record("K7", "footprint_experts", {"layer": L.li}, backend=ex.backend, disk_bytes=ex_bytes,
+                       resident_bytes=getattr(ex, "param_bytes", None),          # parameters, not workspace
+                       allocated_delta=(torch.cuda.memory_allocated() - before) if device == "cuda" else None)
     attn = pick_attn(res, d, device, a.attn if device == "cuda" else "torch")
+    full = pick_full(res, attn, d, device)
+    res.doc["derived"]["calibration_grade"] = bool(
+        inputs is not None and attn is not None and attn.backend == "flashinfer_sink"
+        and full.backend == "flashinfer_sink" and all(e.backend == "marlin" for e in experts.values()))
     if a.mode == "dump":
         import xfamily
         xfamily.dump(res, Ls, experts, attn, d, device, inputs, a.dump or a.out + ".safetensors", router, rms)
         res.write(a.out)
         return 0
     run_ops(res, Ls, experts, attn, d, device, ints(a.tgrid), ints(a.bs), ints(a.ctxs), ints(a.ss),
-            a.warmup, a.iters, inputs)
+            a.warmup, a.iters, inputs, full)
     for L in Ls:
         if L.moe:
             invariance(res, L, experts[L.li], d, device)

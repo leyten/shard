@@ -137,7 +137,8 @@ def curve(res, S, layers, ctxs, bs, ss, moes, graphed_modes, warmup, iters, mixe
                             if graphed:
                                 gr = S.BatchGraphRunner(layers, S.vllm_ctx(), B, s)
                                 alen = gr._bucket(ctx + s)
-                                fn = lambda: gr.run(starts, x)
+                                host = [ctx] * B                   # the engine passes a HOST list (no sync)
+                                fn = lambda: gr.run(host, x)
                                 st = C.time_fn(fn, warmup=warmup, iters=iters, device=S.dev)
                                 ran_graphed = alen in gr.graphs     # _manual_ok / capture failure -> eager
                             else:

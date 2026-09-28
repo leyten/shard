@@ -70,7 +70,8 @@ def fake_stage(batch=4, maxlen=160, graph_alen_max=64):
 
     class BatchGraphRunner(_Runner):
         def run(self, starts, x):
-            return self._run(int(starts.max()) + x.shape[1], x)
+            assert isinstance(starts, list), "the engine's graph runner takes a HOST list"
+            return self._run(max(starts) + x.shape[1], x)
 
     class RowGraphRunner(_Runner):
         def run(self, row, start, x):
@@ -118,6 +119,9 @@ def test_validate_rejects_meaningless_timings():
                          "method": "perf_counter", "warmup": 3, "n": 5}]
     r.doc["device"]["kind"] = "cuda"                       # a GPU number timed without cuda events
     assert any("cuda_event" in e for e in C.validate(r.doc))
+    r.doc["records"][0]["timed_on"] = "cpu"                # a host-side op (sha256, codec) on a GPU box is fine
+    assert C.validate(r.doc) == []
+    r.doc["records"][0]["timed_on"] = "cuda"
     with pytest.raises(ValueError):
         r.write("/tmp/never.json")
 
@@ -204,6 +208,8 @@ def test_mimo_ops_stub(tmp_path):
     assert mimo_ops.main(MIMO_FAST + ["--out", str(out)]) == 0
     d = load(out)
     assert [c["pass"] for c in d["checks"] if c["id"] == "sink_effect"] == [True]
+    assert [c["pass"] for c in d["checks"] if c["id"] == "full_attn"] == [True]
+    assert d["derived"]["calibration_grade"] is False                    # torch fallbacks + random inputs
     ops = {r["op"] for r in d["records"] if not r["skipped"]}
     assert {"qkv", "o_proj", "router", "experts", "attn", "attn_prefill", "probe_bytes",
             "footprint", "footprint_experts"} <= ops
@@ -211,6 +217,22 @@ def test_mimo_ops_stub(tmp_path):
     assert d["derived"]["replay_tok_s_span"] > 0 and d["derived"]["layer_ms_T9"] > 0
     assert 0 < d["derived"]["replay_tok_s_T900_prefix8k"]                 # global layers at an 8k prefix
     assert d["derived"]["inputs"] == "random"
+
+
+def test_mimo_real_inputs_by_role(tmp_path):
+    from safetensors.torch import save_file
+    d = mimo_ops.TINY
+    g = torch.Generator().manual_seed(5)
+    gold = {"L1.attn_in": torch.randn(32, d["hidden"], generator=g).bfloat16(),
+            "L1.ffn_in": (torch.randn(32, d["hidden"], generator=g) * 3).bfloat16(),
+            "L1.topk_idx": torch.zeros(32, 8, dtype=torch.int64)}           # first key: never used as input
+    save_file(gold, str(tmp_path / "gold.safetensors"))
+    x = mimo_ops._hid(40, d, "cpu", gold, "ffn")
+    assert torch.equal(x[:32], gold["L1.ffn_in"]) and not torch.equal(x[32:], x[:8])   # fresh, not repeated
+    assert x[32:].float().pow(2).mean().sqrt() == pytest.approx(gold["L1.ffn_in"].float().pow(2).mean().sqrt(), rel=0.3)
+    out = tmp_path / "b.json"
+    assert mimo_ops.main(MIMO_FAST + ["--inputs", str(tmp_path / "gold.safetensors"), "--out", str(out)]) == 0
+    assert load(out)["derived"]["inputs"] == "real_rows_then_rms_matched_random"
 
 
 def test_sink_gate_catches_a_backend_that_ignores_sinks():
@@ -327,6 +349,9 @@ def _synthetic_results(tmp_path):
         for s, ms in ((1, 4.0), (2, 4.4), (4, 5.0), (9, 6.4), (17, 9.0)):
             r.record("A2", "decode_row", {"ctx": 8192, "s": s, "graphed_req": True, "layers": 8}, T(ms),
                      graphed=True, r_s=ms / 4.0, ms_per_layer=ms / 8)
+        for ctx, ms in ((1024, 6.0), (8192, 7.0), (32768, 9.0)):                      # eager s=1 -> K4
+            r.record("A2", "decode_row", {"ctx": ctx, "s": 1, "graphed_req": False, "layers": 8}, T(ms),
+                     graphed=False, r_s=1.0, ms_per_layer=ms / 8)
 
     def curve(r):
         for ctx in (1024, 32768):
@@ -343,7 +368,7 @@ def _synthetic_results(tmp_path):
         r.record("A4", "kv_import", {"F": 32768, "delta": 32768, "layers": 8}, T(40.0), bytes=1, gb_per_s=12.0)
 
     def mimo(r):
-        r.doc["derived"].update(replay_tok_s_span=2500.0, layer_ms_T9=1.6)
+        r.doc["derived"].update(replay_tok_s_span=2500.0, layer_ms_T9=1.6, calibration_grade=True)
 
     def sysb(r):
         r.record("C", "sha256", {"kib": 8, "rows": 2048}, T(1.0), us_per_row=3.0)
@@ -372,13 +397,22 @@ def test_calib_fit_gates_and_refuses_stub(tmp_path):
     assert p["r9"] == pytest.approx(1.6) and p["m25_ms_per_layer_s9"] == pytest.approx(0.8)
     rows = {int(k): v for k, v in p["rows_table"].items()}
     assert rows[1] == 1.0 and rows[9] == pytest.approx(1.6) and max(rows) == 32 * 9   # A1 spliced on
-    assert p["kfac"] == pytest.approx(1.6 / 1.0)                                       # 8 ms / 8 L
+    assert rows[36] == pytest.approx(1.6 * 14 / 8) and rows[288] == pytest.approx(1.6 * 60 / 8)  # s=9 only
+    assert all(rows[a] <= rows[b] for a, b in zip(sorted(rows), sorted(rows)[1:]))     # monotone
+    assert p["kfac"] == pytest.approx(1.6 / 0.8)                  # vs the SAME A2 s=9 basis the sim scales
     assert g["K1"]["pass"] and g["K3"]["pass"] and g["K6"]["pass"]
     assert g["K2"]["value"] == pytest.approx((144 / 32) / (9 / 8))                     # 4.0x
-    assert g["K4"]["value"] == pytest.approx(1.5) and g["K5"]["pass"] is False
+    assert g["K4"]["value"] == pytest.approx(1.5) and g["K5"]["pass"] is False          # A2 eager 9/6
     assert g["K9"]["pass"] and g["K8"]["value"] > 0
     assert cal["mesh"]["replay_rate_tok_s"] == 2500.0 and cal["stub"] is True
     assert g["K12"]["pass"] is False and g["K12"]["value"] == {"cpu": False}   # torch fallback != fast path
+    doc = json.load(open(paths[4]))                                            # not calibration grade:
+    doc["derived"]["calibration_grade"] = False                                # no verdict, no calib value
+    json.dump(doc, open(paths[4], "w"))
+    calib_fit.main(paths + ["--out", str(out), "--allow-stub"])
+    cal = json.load(open(out))
+    assert cal["gates"]["K5"]["pass"] is None and cal["gates"]["K6"]["pass"] is None
+    assert cal["pipespec"]["kfac"] is None and cal["mesh"]["replay_rate_tok_s"] is None
 
 
 def test_calib_changes_both_sims(tmp_path):
@@ -391,7 +425,7 @@ def test_calib_changes_both_sims(tmp_path):
                                     text=True, timeout=300)
     m0, m1 = run("mesh_calc.py"), run("mesh_calc.py", "--calib", str(cal))
     assert m0.returncode == 0 and m1.returncode == 0, m1.stderr
-    assert "MEAS mirror import" in m1.stdout and " 2500 " in m1.stdout and m0.stdout != m1.stdout
+    assert "MEAS mirror import" in m1.stdout and "2500" in m1.stdout and m0.stdout != m1.stdout
     p0, p1 = run("pipespec_sim.py", "--part", "mimo"), run("pipespec_sim.py", "--part", "mimo", "--calib", str(cal))
     assert p0.returncode == 0 and p1.returncode == 0, p1.stderr
     assert "CALIBRATED" in p1.stdout and "(STUB DATA)" in p1.stdout

@@ -81,31 +81,33 @@ def fit(docs):
         gates["K3"] = {"value": pip["r9"], "threshold": "<= 2.5 (>= 3 -> pertoken default)",
                        "pass": None if pip["r9"] is None else pip["r9"] <= 2.5}
 
-    # ── A1: service curve (eager, batched MoE, like-for-like) ──
-    a1 = [(p, r) for p, r in _recs(docs, "m25_curve", "curve", "decode_b") if not r["graphed"]]
+    # ── A1: service curve (eager REQUESTED, batched MoE, like-for-like; a graphed request that fell back
+    #    to eager is not an eager record) ──
+    a1 = [(p, r) for p, r in _recs(docs, "m25_curve", "curve", "decode_b") if not r["params"]["graphed_req"]]
     c1 = _pick_ctx(sorted({r["params"]["ctx"] for _, r in a1}))
     bat = {(r["params"]["B"], r["params"]["s"]): r for _, r in a1
            if r["params"]["ctx"] == c1 and r["params"]["moe"] == "batched"}
-    if (1, 1) in bat:
-        base = bat[(1, 1)]["ms"]
-        batch_table = {B * s: r["ms"] / base for (B, s), r in bat.items()}
+    if (1, 9) in bat:
+        # B streams x s=9 only (never mix s=1 rows in: different attention path, non-monotone), anchored
+        # at rows = 9: rows(9B) = tau(9) * ms(B, 9) / ms(1, 9); rows <= 17 come from A2
+        base = bat[(1, 9)]["ms"]
+        batch9 = {B * 9: r["ms"] / base for (B, s), r in bat.items() if s == 9}
         src["curve"] = sorted({p for p, _ in a1})
         src["curve_ctx"] = c1
-        if tau_table:
-            top = max(tau_table)
-            rows = dict(tau_table)
-            for k, v in batch_table.items():
-                if k > top:
-                    rows[k] = tau_table[top] * v / _interp(batch_table, top)
-        else:
-            rows = batch_table
+        anchor9 = tau_table.get(9, 1.0) if tau_table else 1.0
+        rows = dict(tau_table) if tau_table else {1: 1.0}
+        top = max(rows)
+        for k, v in batch9.items():
+            if k > top:
+                rows[k] = anchor9 * v
         pip["rows_table"] = {str(k): v for k, v in sorted(rows.items())}
         if (16, 9) in bat and (1, 9) in bat:
             gain = (16 * 9 / bat[(16, 9)]["ms"]) / (9 / bat[(1, 9)]["ms"])
             gates["K2"] = {"value": gain, "threshold": ">= 3.5x tokens/ms (2.5-3.5 cap S 16; < 2.5 fork)",
                            "pass": gain >= 3.5}
-    k4 = {r["params"]["ctx"]: r["ms_per_layer"] for _, r in a1
-          if r["params"]["B"] == 1 and r["params"]["s"] == 1 and r["params"]["moe"] == "perstream"}
+    # K4 from A2 eager s=1 (bf16 KV at every context; A1's 32k process runs fp8 KV)
+    k4 = {r["params"]["ctx"]: r["ms_per_layer"] for _, r in a2
+          if r["params"]["s"] == 1 and not r["params"]["graphed_req"]}
     lo_c, hi_c = (min(k4), max(k4)) if k4 else (None, None)
     if k4 and hi_c >= 4 * lo_c:
         v = k4[hi_c] / k4[lo_c]
@@ -123,18 +125,27 @@ def fit(docs):
     cal = [x for x in mimo if x[1]["device"]["family"] == "blackwell"] or mimo[:1]
     for path, d in cal[:1]:
         dv = d["derived"]
+        grade = bool(dv.get("calibration_grade"))       # Marlin + flashinfer both kinds + real inputs
+        note = "" if grade else " [NOT calibration grade: fallback backend or random inputs -> no verdict]"
         if dv.get("replay_tok_s_span"):
-            r = mesh["replay_rate_tok_s"] = dv["replay_tok_s_span"]
+            r = dv["replay_tok_s_span"]
             src["replay"] = path
-            gates["K5"] = {"value": r, "threshold": ">= 4000 tok/s (1500-4000 k>=3,S<=16; <1000 drop claim)",
-                           "pass": r >= 4000}
+            if grade:
+                mesh["replay_rate_tok_s"] = r
+            gates["K5"] = {"value": r, "pass": (r >= 4000) if grade else None,
+                           "threshold": ">= 4000 tok/s (1500-4000 k>=3,S<=16; <1000 drop claim)" + note}
         if dv.get("layer_ms_T9"):
-            mesh["c_layer_ms"] = dv["layer_ms_T9"]
-            m25 = bat.get((1, 9)) if a1 else None
-            if m25:
-                pip["kfac"] = dv["layer_ms_T9"] / m25["ms_per_layer"]
-                src["kfac"] = [path, "A1 eager B=1 s=9 ctx %s" % c1]
-                gates["K6"] = {"value": pip["kfac"], "threshold": "<= 2.0 (> 3 re-plan)", "pass": pip["kfac"] <= 2.0}
+            # kfac is applied by the sim to m25_ms_per_layer_s9 (A2, tau_mode): divide by THAT record;
+            # A1 eager only when A2 is missing
+            basis = pip["m25_ms_per_layer_s9"] or (bat[(1, 9)]["ms_per_layer"] if (1, 9) in bat else None)
+            if basis:
+                k = dv["layer_ms_T9"] / basis
+                src["kfac"] = [path, "A2 s=9 %s" % tau_mode if pip["m25_ms_per_layer_s9"] else "A1 eager B=1 s=9"]
+                if grade:
+                    pip["kfac"] = k
+                    mesh["c_layer_ms"] = dv["layer_ms_T9"]
+                gates["K6"] = {"value": k, "threshold": "<= 2.0 (> 3 re-plan)" + note,
+                               "pass": (k <= 2.0) if grade else None}
     for path, d in mimo:
         fam = d["device"]["family"]
         chk = {c["id"]: c for c in d["checks"]}
@@ -158,8 +169,10 @@ def fit(docs):
         mesh["mirror_gb_per_s"] = big["gb_per_s"]
         t = MIMO_MIRROR_BYTES_32K / (big["gb_per_s"] * 1e9)
         gates["K9"] = {"value": t, "threshold": "<= 0.5 s (32k session, 8-layer span import)", "pass": t <= 0.5}
-    sha = {r["params"]["kib"]: r for _, r in _recs(docs, "sys_bench", None, "sha256")}
-    frm = {r["params"]["n"]: r for _, r in _recs(docs, "sys_bench", None, "frame_rt")}
+    box = [(p, d) for p, d in docs if d["script"] == "sys_bench" and d["device"]["kind"] == "cuda"]
+    sysd = box[:1] or [(p, d) for p, d in docs if d["script"] == "sys_bench"][:1]   # the GPU box, not the entry host
+    sha = {r["params"]["kib"]: r for _, r in _recs(sysd, "sys_bench", None, "sha256")}
+    frm = {r["params"]["n"]: r for _, r in _recs(sysd, "sys_bench", None, "frame_rt")}
     if 8 in sha and 9 in frm and (16, 9) in bat:
         ovh_ms = (16 * 9 * sha[8]["us_per_row"] + 16 * frm[9]["us_per_msg"]) / 1e3
         frac = ovh_ms / bat[(16, 9)]["ms"]

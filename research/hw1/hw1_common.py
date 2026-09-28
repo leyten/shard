@@ -114,7 +114,7 @@ def time_fn(fn, *, warmup=3, iters=8, device="cuda"):
     q = lambda f: per_sorted[min(len(per_sorted) - 1, int(f * len(per_sorted)))]
     return {"ms": statistics.median(per), "ms_p10": q(0.1), "ms_p90": q(0.9),
             "ms_mean": statistics.fmean(per), "n": iters, "warmup": warmup, "method": method,
-            "wall_ms_per_iter": wall}
+            "timed_on": "cuda" if cuda else "cpu", "wall_ms_per_iter": wall}
 
 
 def now():
@@ -193,8 +193,8 @@ def validate(doc):
             e.append(f"{w}: warmup < {MIN_WARMUP} (warm-up must be discarded)")
         if not isinstance(r.get("n"), int) or r["n"] < MIN_ITERS:
             e.append(f"{w}: n < {MIN_ITERS}")
-        if dev.get("kind") == "cuda" and r.get("method") != "cuda_event":
-            e.append(f"{w}: cuda box but not cuda_event timing")
+        if dev.get("kind") == "cuda" and r.get("method") != "cuda_event" and r.get("timed_on") != "cpu":
+            e.append(f"{w}: cuda box but not cuda_event timing (and not a host-side op)")
     for i, c in enumerate(doc.get("checks") or []):
         if not isinstance(c, dict) or not c.get("id") or not isinstance(c.get("pass"), bool):
             e.append(f"checks[{i}]: id/pass required")

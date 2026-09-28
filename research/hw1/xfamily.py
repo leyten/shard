@@ -33,7 +33,8 @@ K11_RATIO = 2.5                       # pre-registered (README K11); b / a with 
 def dump(res, Ls, experts, attn, d, device, inputs, path, router, rms):
     from safetensors.torch import save_file
     if inputs is not None:
-        x = inputs.reshape(-1, inputs.shape[-1])[:DUMP_T]
+        import mimo_ops
+        x = inputs[mimo_ops.INPUT_KEYS["attn"]].reshape(-1, d["hidden"])[:DUMP_T]
     else:
         g = torch.Generator().manual_seed(1234)
         x = torch.randn(DUMP_T, d["hidden"], generator=g) * 0.5
