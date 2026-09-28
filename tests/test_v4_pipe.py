@@ -1518,6 +1518,83 @@ def test_sender_side_epoch_fence_drops_queued_frames_without_stranding_the_recei
         assert state.unsent == 1 and list(state.outstanding) == [(9, 1)]
     for s in (a, b):
         s.close()
+
+
+class _FakeTail(_FakeStage):
+    """_FakeStage with the tail's logits signature: one [b, vocab] row per call (argmax 3)."""
+
+    def logits_all(self, h, full_logits=False):
+        return super().logits_all(h)[:, -1]
+
+
+def test_tail_fence_reply_goes_to_the_reconnected_coordinator(monkeypatch):
+    """The TAIL half of the fence, after a coordinator restart. A reconnecting coordinator's return
+    socket is swapped into the tail's `_RetChannel` (and the old one closed) under a serve loop that
+    never stops, so every reply has to go through that channel. A fenced reply written to the socket
+    the tail was BORN with lands on a closed fd: the live coordinator never sees it, and the OSError
+    kills the tail loop and the warm ring with it.
+
+    The REAL _serve_tail over loopback TCP, with a fake stage: the coordinator reconnects, streams its
+    epoch, then a frame of an older epoch arrives. It must be answered `fenced` on the NEW channel,
+    echoing the epoch and position the receiver matches replies against, and the loop must go on
+    serving."""
+    monkeypatch.setattr(VP, "SWARM_TOKEN", None)
+    srv = socket.socket()
+    srv.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+    srv.bind(("127.0.0.1", 0))
+    srv.listen(4)
+    port = srv.getsockname()[1]
+    err = []
+
+    def tail():
+        try:
+            VP._serve_tail(_FakeTail(), srv, 0, 1, None, False, 5)
+        except Exception as e:  # noqa: BLE001 — surfaced by the asserts below
+            err.append(e)
+
+    def dial_return():
+        r = socket.create_connection(("127.0.0.1", port), timeout=5)
+        r.settimeout(2)
+        send_msg(r, {"op": "hello_return"})
+        assert recv_msg(r) == "ret_ok"
+        return r
+
+    def step(pos, epoch):
+        frame, _ = VP._make_step_frame(_h()[:, :1], _ids(1), pos, None)
+        send_msg(pred, {**frame, "epoch": epoch})
+
+    t = threading.Thread(target=tail, daemon=True)
+    t.start()
+    ret = dial_return()
+    pred = socket.create_connection(("127.0.0.1", port), timeout=5)
+    send_msg(pred, {"op": "reset", "spec": True})
+    assert recv_msg(ret) == "ok"
+
+    ret2 = dial_return()                              # the coordinator restarts on the warm ring
+    ret.close()
+    send_msg(pred, {"op": "reset", "spec": True})
+    assert recv_msg(ret2) == "ok"
+    step(5, 2)
+    r = recv_msg(ret2)
+    assert (r["epoch"], r["pos"]) == (2, 5)
+    step(6, 1)                                        # in flight from a cancelled epoch
+    try:
+        reply = recv_msg(ret2)
+    except socket.timeout:
+        reply = None
+    assert reply == {"fenced": True, "epoch": 1, "pos": 6}, \
+        f"fenced reply {reply!r} missed the reconnected coordinator; tail loop: {err!r}"
+    step(6, 2)
+    r = recv_msg(ret2)
+    assert (r["epoch"], r["pos"]) == (2, 6), "the tail stopped serving after the fence"
+    send_msg(pred, {"op": "stop"})
+    assert recv_msg(ret2) == {"token": None}
+    t.join(5)
+    assert not t.is_alive() and not err, f"tail loop: {err!r}"
+    for s in (pred, ret2, srv):
+        s.close()
+
+
 # ── 7d. the job horizon the reset frame carries for v4_ref_slim ───────────────────────────────────
 # v4_ref_slim's indexer skip may drop the Indexer's COMPRESSOR — which is state, not a query — but
 # only for a job that provably never leaves the select-all regime. Under-declare the horizon and the
