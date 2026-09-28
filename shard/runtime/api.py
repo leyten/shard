@@ -28,7 +28,8 @@ Contract summary (details on each method of `StageRuntime`):
     they are computed), which is how long prefill chunks and rebuilds stay legal.
   * SWA layers keep (window - 1 + spec_window) rows, so a rollback to the frontier after a
     full speculative window still finds every row it reads.
-  * Mirroring exports global-attention KV rows [lo, hi) below the frontier; a takeover imports
+  * Mirroring exports global-attention KV rows [lo, hi) below the frontier in one canonical,
+    backend-independent row layout (so a 5090 can take over from a Mac); a takeover imports
     [0, upto), calls `rebuild_from(F)` and feeds `rebuild` segments over [a, F). During a
     rebuild, global layers READ mirrored rows below `upto` and never overwrite them.
   * Determinism (numerics_mode == "invariant"): batch invariance, row independence (a row
@@ -36,6 +37,20 @@ Contract summary (details on each method of `StageRuntime`):
     other segments), replayability of the recorded schedule, partition invariance for the
     canonical wire. `chunk_invariant` additionally makes a rebuild bit-equal to the
     fault-free state.
+  * The tail returns token ids drawn on the device (greedy, or a counter RNG keyed by
+    (seed, position)), so a verify step never has to ship [rows x vocab] logits to the host.
+
+Threading and failure: one caller (the node's batcher) drives a runtime; calls are not
+thread-safe. Every refusal is raised BEFORE any state changes. A backend fault after
+validation (device error, OOM) leaves the sessions of that step undefined: the caller must
+close them and fail over (§8).
+
+Deliberately NOT in this contract yet (each is an additive change when its PR needs it):
+tree verify (Segment positions / tree_parent), token ids at non-head stages (V4-style hash
+routing; MiMo needs ids at the head only, and C12 keeps them off middle hops), a "recurrent"
+layer kind with checkpointed rollback (K3/V4/linear attention), a per-segment output codec
+(the node quantizes fp8 wire rows today), and an on-device drafter hook for the tail (D3; the
+tail exposes hidden rows, embed() and project() meanwhile).
 """
 from __future__ import annotations
 
@@ -52,21 +67,37 @@ import numpy as np
 BACKENDS = ("cuda", "mlx", "rocm", "cpu")
 # Numeric formats a device can compute in. "hw" = native matmul/tensor-core support;
 # "emulated" = loadable but dequantized or emulated (e.g. MXFP4 weights on sm_86 via W4A16).
-FORMATS = ("fp32", "bf16", "fp16", "fp8_e4m3", "fp8_e5m2", "mxfp4", "nvfp4", "int8", "int4", "int32")
+FORMATS = ("fp32", "bf16", "fp16", "fp8_e4m3", "fp8_e4m3fnuz", "fp8_e5m2", "mxfp4", "nvfp4",
+           "int8", "int4", "int32")
 LAYER_KINDS = ("global", "swa")
 SEG_KINDS = ("prefill", "verify", "decode", "rebuild")
-LOGITS_MODES = ("none", "last", "all")
+LOGITS_MODES = ("none", "last", "all")          # also the modes of Segment.tokens
 TAP_MODES = ("raw", "fc_partial")
 NUMERICS_MODES = ("invariant", "fast")
-# Logical dtype -> numpy storage dtype of a Rows array.
-STORAGE = {"bf16": np.uint16, "f32": np.float32, "fp8_e4m3": np.uint8, "i32": np.int32, "i64": np.int64}
+# Logical dtype -> numpy storage dtype of a Rows array. "fp8_e4m3" is OCP E4M3FN (NVIDIA,
+# Apple, most CPUs); "fp8_e4m3fnuz" is the variant AMD MI300 computes in. Both carry per-row
+# scales. "f16" is IEEE half (e.g. MLX fp16 KV).
+STORAGE = {"bf16": np.uint16, "f16": np.float16, "f32": np.float32, "fp8_e4m3": np.uint8,
+           "fp8_e4m3fnuz": np.uint8, "i32": np.int32, "i64": np.int64}
+FP8_DTYPES = ("fp8_e4m3", "fp8_e4m3fnuz")
 ID_DTYPES = ("i32", "i64")
+# Canonical mirror row layout, versioned into every kv_layout_id: for one global layer at one
+# position, K of every KV head (head-major, post-RoPE) then V of every KV head (after any value
+# scale the kernel folds into the cache), in the stage's kv_dtype. A backend whose cache is
+# paged, blocked or transposed converts at export/import; it never ships its internal layout.
+KV_LAYOUT_VERSION = "kvl-canon-1"
 
 
 # ── errors ────────────────────────────────────────────────────────────────────────────────────
 
 class StageRuntimeError(Exception):
-    """Base of every contract refusal. A refused call leaves every session unchanged."""
+    """Base of every contract refusal. A refused call leaves every session unchanged.
+    `sid` names the offending session when one segment of a batched step caused the refusal,
+    so the node can drop that frame and resubmit the rest."""
+
+    def __init__(self, msg: str = "", *, sid: int | None = None):
+        super().__init__(msg)
+        self.sid = sid
 
 
 class KVFull(StageRuntimeError):
@@ -134,12 +165,12 @@ class Rows:
             raise BadRequest(f"Rows must be [n] or [n, width], got shape {d.shape}")
         if not d.flags.c_contiguous:
             object.__setattr__(self, "data", np.ascontiguousarray(d))
-        if self.dtype == "fp8_e4m3":
+        if self.dtype in FP8_DTYPES:
             s = self.scale
             if not isinstance(s, np.ndarray) or s.dtype != np.float32 or s.shape != (d.shape[0],):
-                raise BadRequest("fp8_e4m3 Rows need per-row fp32 scales of shape [n]")
+                raise BadRequest(f"{self.dtype} Rows need per-row fp32 scales of shape [n]")
         elif self.scale is not None:
-            raise BadRequest(f"only fp8_e4m3 Rows carry scales, not {self.dtype}")
+            raise BadRequest(f"only fp8 Rows carry scales, not {self.dtype}")
 
     @property
     def n(self) -> int:
@@ -254,7 +285,7 @@ class KVBlob:
                 data = np.frombuffer(buf, dtype=STORAGE[dt], count=int(np.prod(shape)), offset=off).reshape(shape).copy()
                 off += nb
                 scale = None
-                if dt == "fp8_e4m3":
+                if dt in FP8_DTYPES:
                     if off + 4 * shape[0] > len(buf):
                         raise BadRequest("truncated KVBlob scales")
                     scale = np.frombuffer(buf, dtype=np.float32, count=shape[0], offset=off).copy()
@@ -277,9 +308,15 @@ class KVBlob:
     __hash__ = None
 
 
-def kv_layout_id(model: str, layers: Iterable[int], kv_dtype: str, kv_width: int) -> str:
-    """Identity of a span's global-KV layout; an import must match it byte for byte."""
-    blob = json.dumps([model, list(layers), kv_dtype, int(kv_width)], separators=(",", ":"))
+def kv_layout_id(model: str, layers: Iterable[int], kv_dtype: str,
+                 geometry: tuple[int, int, int]) -> str:
+    """Identity of a span's mirrored global-KV rows: the canonical layout version
+    (KV_LAYOUT_VERSION), the model, the global layers, the KV dtype and the per-layer geometry
+    (n_kv_heads, k_head_dim, v_head_dim). Equal ids promise equal meaning of every byte, so
+    placement can pick a compatible backup from describe() alone; import refuses any other id."""
+    n_kv, kd, vd = (int(g) for g in geometry)
+    blob = json.dumps([KV_LAYOUT_VERSION, model, list(layers), kv_dtype, n_kv, kd, vd],
+                      separators=(",", ":"))
     return "kvl1-" + hashlib.sha256(blob.encode()).hexdigest()[:24]
 
 
@@ -292,9 +329,11 @@ class DeviceInfo:
     arch_class: the compute capability or its equivalent, e.g. "sm_86" (3090), "sm_89" (4090),
     "sm_120" (5090 / RTX 6000 Pro), "sm_121" (GB10 Spark), "apple_m2", "gfx1100", "cpu-x86_64".
     host_arch: the host CPU ISA ("x86_64", "aarch64" on a Spark, "arm64" on a Mac).
-    unified_memory: device and host share one pool (Apple silicon, GB10, CPU); free memory then
-    competes with the host OS. mem_bw_bytes_s is an estimate; mem_bw_source says whether it was
-    measured, taken from a spec sheet, or is unknown (0.0)."""
+    free_mem_bytes: what THIS backend can still allocate, not the raw free counter: under the
+    wired limit on a Mac (iogpu.wired_limit_mb), minus the host reserve on unified memory.
+    unified_memory: device and host share one pool (Apple silicon, GB10, CPU), so host copies
+    at the Rows boundary are cheap. mem_bw_bytes_s is an estimate; mem_bw_source says whether
+    it was measured, taken from a spec sheet, or is unknown (0.0)."""
     backend: str
     device_name: str
     arch_class: str
@@ -334,9 +373,11 @@ class DeviceInfo:
 class Capability:
     """describe(): the stage as the directory, router, admission and batcher see it.
 
-    Static facts (span, layer kinds, KV geometry, limits, numerics) are valid right after
-    construction; `service_ms` / `self_probe_ok` are filled by warmup(). `kv_free_bytes` and
-    `open_sessions` are live. Every field is plain data (JSON via to_dict/from_dict)."""
+    Static facts (span, layer kinds, KV geometry, weight footprint, limits) are valid right
+    after construction, before load(), so placement can size a span on a candidate device
+    without loading it. `numerics_id` is final after load() (it names the artifact CID);
+    `service_ms` / `self_probe_ok` are filled by warmup(). `kv_free_bytes` and `open_sessions`
+    are live. Every field is plain data (JSON via to_dict/from_dict)."""
     device: DeviceInfo
     model: str
     lo: int
@@ -346,12 +387,18 @@ class Capability:
     layer_kinds: tuple[str, ...]          # per held layer, "global" | "swa"
     swa_window: int                       # w of the SWA layers (0 if the span holds none)
     hidden_size: int
-    wire_dtype: str                       # dtype of hidden/tap rows this stage emits
-    codecs_in: tuple[str, ...]            # hidden dtypes it accepts (head: token ids)
+    vocab_size: int
+    wire_dtype: str                       # dtype of hidden rows and tap rows this stage emits
+    codecs_in: tuple[str, ...]            # hidden dtypes it accepts (head: token-id dtypes)
+    logits_dtype: str                     # dtype of logits rows (tail)
+    kv_dtype: str                         # dtype of mirrored KV rows
+    kv_layout_id: str                     # a backup must report the same id (kv_layout_id())
     global_kv_bytes_per_pos: int          # all global layers of the span, one position
     swa_kv_bytes_per_pos: int             # all SWA layers of the span, one position
     kv_page_positions: int                # KV allocation granule in positions (1 = exact)
     kv_free_bytes: int
+    weight_bytes: int                     # resident weights of the span in this backend's format
+    load_peak_extra_bytes: int            # transient on top of weight_bytes while loading
     max_sessions: int
     max_ctx: int
     spec_window_max: int
@@ -361,7 +408,8 @@ class Capability:
     numerics_id: str
     numerics_mode: str
     chunk_invariant: bool                 # bytes independent of segment shapes (rebuild exact)
-    service_ms: tuple[tuple[int, float], ...] = ()   # (tokens per step, ms per step), measured
+    # (tokens per step, context position, ms per step), measured by warmup()
+    service_ms: tuple[tuple[int, int, float], ...] = ()
     self_probe_ok: bool | None = None     # warmup self-probe (repeat == first run, graph == eager)
     open_sessions: int = 0
 
@@ -374,10 +422,13 @@ class Capability:
             raise BadRequest("swa_window > 0 iff the span holds SWA layers")
         if self.tap_mode not in TAP_MODES or self.numerics_mode not in NUMERICS_MODES:
             raise BadRequest("bad tap_mode or numerics_mode")
-        if self.wire_dtype not in STORAGE or any(c not in STORAGE for c in self.codecs_in):
-            raise BadRequest("wire_dtype / codecs_in must be Rows dtypes")
-        if self.kv_page_positions < 1 or not self.numerics_id:
-            raise BadRequest("kv_page_positions >= 1 and a numerics_id are required")
+        dts = (self.wire_dtype, self.logits_dtype, self.kv_dtype, *self.codecs_in)
+        if any(d not in STORAGE for d in dts):
+            raise BadRequest("wire/logits/kv dtypes and codecs_in must be Rows dtypes")
+        if self.kv_page_positions < 1 or not self.numerics_id or not self.kv_layout_id:
+            raise BadRequest("kv_page_positions >= 1, a numerics_id and a kv_layout_id are required")
+        if min(self.weight_bytes, self.load_peak_extra_bytes, self.vocab_size, self.hidden_size) < 0:
+            raise BadRequest("sizes must be non-negative")
 
     @property
     def n_swa(self) -> int:
@@ -389,10 +440,14 @@ class Capability:
         return max(self.swa_window - 1, 0) * self.n_swa
 
     @property
-    def layer_ms(self) -> tuple[tuple[int, float], ...]:
-        """Measured per-layer cost: service_ms spread over the held layers, per bucket."""
+    def layer_ms(self) -> tuple[tuple[int, int, float], ...]:
+        """Measured per-layer cost: service_ms spread over the held layers, per (tokens, ctx)."""
         n = self.hi - self.lo
-        return tuple((b, ms / n) for b, ms in self.service_ms)
+        return tuple((b, c, ms / n) for b, c, ms in self.service_ms)
+
+    @property
+    def weight_bytes_per_layer(self) -> float:
+        return self.weight_bytes / (self.hi - self.lo)
 
     def session_kv_bytes(self, ctx: int, spec_window: int) -> int:
         """KV one session reserves at open(max_pos=ctx, spec_window): global rows for every
@@ -416,7 +471,7 @@ class Capability:
                 v = {g.name: (list(getattr(v, g.name)) if isinstance(getattr(v, g.name), tuple)
                               else getattr(v, g.name)) for g in fields(v)}
             elif f.name == "service_ms":
-                v = [[b, ms] for b, ms in v]
+                v = [[b, c, ms] for b, c, ms in v]
             elif isinstance(v, tuple):
                 v = list(v)
             out[f.name] = v
@@ -431,7 +486,7 @@ class Capability:
         d["device"] = DeviceInfo(**dev)
         for k in ("layer_kinds", "codecs_in", "tap_layers_held"):
             d[k] = tuple(d[k])
-        d["service_ms"] = tuple((int(b), float(ms)) for b, ms in d["service_ms"])
+        d["service_ms"] = tuple((int(b), int(c), float(ms)) for b, c, ms in d["service_ms"])
         return cls(**d)
 
 
@@ -452,8 +507,11 @@ class StageSpec:
     """What a runtime is asked to serve. `device` is an opaque backend selector
     ("cuda:0", "cuda:0,1" for a multi-GPU stage, "metal", "" = backend default).
     `max_sessions` is the hard session-table size: the node server caps NEW leases at S_max and
-    uses the rest as takeover headroom (C21), so size it >= 2 * S_max. `kv_budget_bytes` caps the
-    KV pool (0 = backend decides from free device memory)."""
+    uses the rest as takeover headroom (C21), so size it >= 2 * S_max where the backend can (a
+    max_sessions=1 backend, MLX today, serves as a primary only). `kv_budget_bytes` caps the KV
+    pool (0 = backend decides from free device memory); per-step transient workspace (e.g. a
+    prefill chunk's n + w - 1 SWA rows) is the backend's own, reserved at warmup, never per
+    session. `kv_dtype` "" = backend default; describe() reports what it chose."""
     model: str
     lo: int
     hi: int
@@ -467,6 +525,7 @@ class StageSpec:
     numerics: str = "invariant"
     device: str = ""
     kv_budget_bytes: int = 0
+    kv_dtype: str = ""
 
     def __post_init__(self):
         if not 0 <= self.lo < self.hi:
@@ -510,15 +569,35 @@ class SessionInfo:
 # ── compute ───────────────────────────────────────────────────────────────────────────────────
 
 @dataclass(frozen=True)
+class Sampling:
+    """How the tail draws truth tokens (ARCHITECTURE-v2 G1). temperature == 0 is greedy (argmax,
+    lowest id on ties). Otherwise the draw at absolute position p is a function of (logits row
+    p, these parameters, seed, p) ONLY: a counter RNG keyed by (seed, p), never by the row's
+    place in its segment or step, so draws are replayable and independent of batching and
+    chunking. top_k 0 = no cut; top_p 1.0 = no cut."""
+    seed: int = 0
+    temperature: float = 0.0
+    top_k: int = 0
+    top_p: float = 1.0
+
+    def __post_init__(self):
+        if self.temperature < 0 or self.top_k < 0 or not 0 < self.top_p <= 1:
+            raise BadRequest("temperature >= 0, top_k >= 0, 0 < top_p <= 1")
+
+
+@dataclass(frozen=True)
 class Segment:
     """One session's rows in a step.
 
     x: head stage -> token ids ("i32"/"i64", [n]); any other stage -> hidden rows [n, H] in one
     of describe().codecs_in. Inputs are per segment so one step can mix codecs (an fp8 prefill
     sub-chunk next to a bf16 decode row).
-    tap_in: the fc_partial accumulator from upstream ([n, H]); None means zeros.
-    kind: decode (n == 1) | verify | prefill | rebuild (only after rebuild_from; no logits).
-    logits: tail only.  taps: capture drafter taps for these rows."""
+    tap_in: the fc_partial accumulator from upstream ([n, H], wire dtype); None means zeros.
+    Only with taps=True in fc_partial mode.
+    kind: decode (n == 1) | verify | prefill | rebuild (only after rebuild_from; no logits or
+    tokens; taps as requested).
+    logits / tokens: tail only, "none" | "last" | "all". tokens are drawn on the device with
+    `sampling` (None = greedy), so a verify step returns n int32s instead of n x vocab floats."""
     sid: int
     start_pos: int
     n: int
@@ -527,6 +606,8 @@ class Segment:
     tap_in: Rows | None = None
     logits: str = "none"
     taps: bool = True
+    tokens: str = "none"
+    sampling: Sampling | None = None
 
     @property
     def codec_in(self) -> str:
@@ -547,9 +628,10 @@ class StepIn:
 class SegOut:
     sid: int
     hidden: Rows                  # [n, H] residual stream after the span's last layer (pre-final-norm)
-    logits: Rows | None = None    # tail: [1, V] ("last") or [n, V] ("all")
+    logits: Rows | None = None    # tail: [1, V] ("last") or [n, V] ("all"), logits_dtype
     taps: Mapping[int, Rows] = field(default_factory=dict)   # raw mode: layer -> [n, H]
     tap_acc: Rows | None = None   # fc_partial mode: tap_in + sum over held taps of W_fc,l . tap_l
+    tokens: Rows | None = None    # tail: i32 [1] ("last") or [n] ("all")
 
 
 @dataclass(frozen=True)
@@ -557,7 +639,8 @@ class StepOut:
     outs: tuple[SegOut, ...]      # same order as StepIn.segs
 
 
-def rebuild_start(layer_kinds: Iterable[str], window: int, F: int, upto: int) -> int:
+def rebuild_start(layer_kinds: Iterable[str], window: int, F: int, upto: int,
+                  exact_from: int | None = None) -> int:
     """First position a takeover must recompute (ARCHITECTURE-v2 §4.1 / C13, corrected rule).
 
         a = min(F - (w-1)*n_swa,  min over global layers l of  upto - (w-1)*i_l),  clamped at 0
@@ -566,19 +649,34 @@ def rebuild_start(layer_kinds: Iterable[str], window: int, F: int, upto: int) ->
     exact inputs; each SWA layer's output is exact only (w-1) rows later, a global layer adds
     no shift because it reads the exact mirrored rows below `upto`. So the top SWA layer's rows
     [F-w+1, F) come out exact, and every global row written (p >= upto) has an exact input.
-    Requires global layers to READ mirrored rows for p < upto and never overwrite them."""
+    Requires global layers to READ mirrored rows for p < upto and never overwrite them.
+
+    exact_from: also make the rebuild's OUTPUT rows exact from this position on (a tail whose
+    drafter must be rebuilt needs ~3*127 exact last-hidden rows for MTP-3, 1024 for DFlash):
+    a <= exact_from - (w-1)*n_swa. See rebuild_exact_from."""
     kinds = list(layer_kinds)
     if not 0 <= upto <= F:
         raise BadRequest(f"need 0 <= upto ({upto}) <= F ({F})")
+    if exact_from is not None and not 0 <= exact_from <= F:
+        raise BadRequest(f"need 0 <= exact_from ({exact_from}) <= F ({F})")
     w1 = max(window - 1, 0)
-    a = F - w1 * sum(k == "swa" for k in kinds)
+    n_swa = sum(k == "swa" for k in kinds)
+    a = F - w1 * n_swa
     below = 0
     for k in kinds:
         if k == "swa":
             below += 1
         else:
             a = min(a, upto - w1 * below)
+    if exact_from is not None:
+        a = min(a, exact_from - w1 * n_swa)
     return max(0, a)
+
+
+def rebuild_exact_from(layer_kinds: Iterable[str], window: int, a: int) -> int:
+    """First position whose rebuild OUTPUT rows (hidden, and taps) equal the fault-free ones:
+    every SWA layer adds (w-1) rows of partial window above a. 0 if the rebuild starts at 0."""
+    return 0 if a == 0 else a + max(window - 1, 0) * sum(k == "swa" for k in layer_kinds)
 
 
 @runtime_checkable
@@ -589,46 +687,66 @@ class StageRuntime(Protocol):
     def load(self, src: WeightSource) -> LoadReport:
         """Materialize exactly the span's tensors; LoadRefused on any missing/malformed one."""
 
-    def warmup(self, buckets: tuple[int, ...] = (1, 8, 32)) -> Capability:
+    def warmup(self, buckets: tuple[int, ...] = (1, 8, 32), contexts: tuple[int, ...] = (0,)) -> Capability:
         """Compile/capture what the backend needs, run the self-probe (a repeat step is byte-
-        equal to the first; on CUDA also graph == eager), measure service_ms per bucket, then
-        return describe(). Leaves no session behind."""
+        equal to the first; on CUDA also graph == eager), measure service_ms for every (bucket,
+        context) pair, then return describe(). Leaves no session behind. May reserve per-step
+        workspace, which lowers kv_free_bytes."""
 
     def describe(self) -> Capability: ...
 
     def open(self, sid: int, max_pos: int, spec_window: int) -> None:
-        """Reserve KV for max_pos global rows + (w-1+spec_window) SWA rows. KVFull if the pool
-        or the session table cannot hold it (or max_pos > max_ctx); WTooDeep if spec_window >
-        spec_window_max; SessionExists if sid is open."""
+        """Reserve KV for max_pos global rows + (w-1+spec_window) SWA rows (what
+        describe().session_kv_bytes says). KVFull if the pool or the session table cannot hold
+        it (or max_pos > max_ctx); WTooDeep if spec_window > spec_window_max; SessionExists if
+        sid is open. sids are arbitrary u64 values."""
 
     def close(self, sid: int) -> None:
-        """Drop the session and release its KV. Closing an unknown sid is a no-op."""
+        """Drop the session (also mid-rebuild) and release its KV. Unknown sid: no-op."""
 
     def length(self, sid: int) -> int: ...
 
     def info(self, sid: int) -> SessionInfo: ...
 
     def truncate(self, sid: int, pos: int) -> None:
-        """length := pos. RollbackPastCommit if pos < committed, PositionGap if pos > length."""
+        """length := pos. RollbackPastCommit if pos < committed, PositionGap if pos > length.
+        During a rebuild every truncate is refused (committed == F > length)."""
 
     def commit(self, sid: int, pos: int) -> None:
-        """Rows < pos are final. Monotone (a lower pos is a no-op); may run ahead of length."""
+        """Rows < pos are final: they are never rolled back and SWA history below
+        pos - (w-1) may be reclaimed. Monotone (a lower pos is a no-op); may run ahead of
+        length (prompt rows are final before they are computed); BadRequest past max_pos.
+        commit is the ROLLBACK FLOOR: a caller that may still need to rewind (entry
+        re-adoption from the gateway's last checkpoint, §4.3) must not commit past that point."""
 
     def export_state(self, sid: int, lo_pos: int, hi_pos: int,
                      kinds: tuple[str, ...] = ("global",)) -> KVBlob:
-        """Global-attention KV rows [lo_pos, hi_pos). hi_pos <= min(committed, length): rows at
-        or past the frontier are speculative and never mirrored. Only kinds=("global",)."""
+        """Global-attention KV rows [lo_pos, hi_pos) in the canonical layout (KV_LAYOUT_VERSION).
+        hi_pos <= min(committed, length): rows at or past the frontier are speculative and never
+        mirrored. Only kinds=("global",). Refused mid-takeover (imported or rebuilding)."""
 
     def import_state(self, sid: int, blob: KVBlob, upto: int) -> None:
         """Install mirrored global rows [blob.lo_pos, upto) into a FRESH session (length 0).
-        Chunks must be contiguous from 0; blob.lo_pos <= upto <= blob.hi_pos. SWA rows stay
-        unmaterialized; the next call must be rebuild_from."""
+        blob.layout_id must equal describe().kv_layout_id (another numerics class is fine).
+        Chunks must be contiguous from 0; blob.lo_pos <= upto <= blob.hi_pos (upto = g_eff may
+        cut a blob short). SWA rows stay unmaterialized; the next call must be rebuild_from."""
 
-    def rebuild_from(self, sid: int, F: int) -> int:
-        """Start a takeover rebuild of a fresh/imported session up to frontier F. Returns a
-        (<= rebuild_start(...)); afterwards length == a, committed == F, and only `rebuild`
-        segments covering [a, F) in order are accepted until length == F."""
+    def rebuild_from(self, sid: int, F: int, exact_from: int | None = None) -> int:
+        """Start a takeover rebuild of a fresh or imported session up to frontier F. Returns
+        exactly a = rebuild_start(layer_kinds, w, F, imported_upto, exact_from) (auditors
+        recompute it); afterwards length == a, committed == F, and only `rebuild` segments
+        continuing at length, up to F, are accepted until length == F. Their output rows at
+        p >= rebuild_exact_from(...) equal the fault-free ones (bit-equal under chunk
+        invariance); earlier rows are defined but meaningless."""
+
+    def embed(self, ids: Rows) -> Rows:
+        """Head only: token ids -> layer-lo input rows [n, H] in wire_dtype (drafters and the
+        v1 ModelRuntime facade use it; step() embeds on its own)."""
+
+    def project(self, hidden: Rows) -> Rows:
+        """Tail only: final norm + lm_head over given pre-final-norm rows -> logits [n, V] in
+        logits_dtype (MTP/DFlash drafters reuse the target's head through it)."""
 
     def step(self, x: StepIn) -> StepOut:
         """Run every segment. The whole step is validated before any state changes: a refused
-        step leaves every session exactly as it was."""
+        step leaves every session exactly as it was, and the error's .sid names the segment."""

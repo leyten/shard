@@ -1,51 +1,65 @@
 """ToyRuntime passes the StageRuntime conformance suite; wrong runtimes do not (BUILD-PLAN F3).
 
 Two parts:
-  1. tests/runtime_conformance.py's CHECKS on ToyRuntime in both numeric modes:
-     "chunk_invariant" (integer, schedule-free bytes: the rebuild must be bit-equal to the
-     fault-free state) and "adversarial" (bytes depend on each segment's (start_pos, n), like
-     real float kernels: everything must still hold except chunk invariance, and the rebuild
-     falls back to replay-equality).
+  1. tests/runtime_conformance.py's CHECKS on ToyRuntime in three geometries (w == W, w > W,
+     W >> w, so a swapped window cannot hide) and both numeric modes: "chunk_invariant"
+     (integer, schedule-free bytes: the rebuild must be bit-equal to the fault-free state) and
+     "adversarial" (bytes depend on each segment's (start_pos, n), like real float kernels:
+     everything must still hold except chunk invariance, and takeovers are judged against
+     the independent ToyReference instead).
   2. Anti-vacuity: mutant runtimes, each one realistic bug on top of the toy, must FAIL the
-     checks listed for them. A suite a wrong runtime can pass proves nothing.
+     checks designed to catch them, in both modes. A suite a wrong runtime can pass proves
+     nothing. The later mutants are the ones an adversarial review first got past the suite.
 """
+import dataclasses
+
 import numpy as np
 import pytest
 
-from runtime_conformance import (CHECKS, MAX_CTX, REBUILD_PATTERNS, W_SPEC, Skip, _find,
-                                 _seg, run_suite)
-from shard.runtime.api import Rows, StageSpec, StepIn, rebuild_start
-from shard.runtime.toy import P, ToyRuntime, ToyWeights, reference_forward
+from runtime_conformance import (CHECKS, REBUILD_PATTERNS, Skip, _find, _seg, run_suite)
+from shard.runtime.api import (ID_DTYPES, BadRequest, KVBlob, Rows, SegOut, StageSpec, StepIn,
+                               rebuild_start)
+from shard.runtime.toy import P, ToyReference, ToyRuntime, ToyWeights, toy_draw
 
 PATTERN = "SSSSSGSGSSGG"      # holds every gate span: SSG, SGS, SSSSSG, SGSGS (+ GSS, SSS, GG)
-WINDOW = 4
 TAPS = (0, 4, 7, 11)          # DFlash-like: first layer, spread, and the last layer (on the tail)
 HIDDEN, VOCAB = 4, 16
+GEOMS = {"w4W4": (4, 4), "w6W3": (6, 3), "w3W16": (3, 16)}   # (SWA window w, spec window W)
 
 
 class ToyFactory:
     """RuntimeFactory for ToyRuntime (or a subclass of it: the mutants)."""
     layer_kinds = tuple("swa" if c == "S" else "global" for c in PATTERN)
-    window = WINDOW
     taps = TAPS
+    numerics_mode = "invariant"
+    max_ctx = 512
 
-    def __init__(self, mode="chunk_invariant", cls=ToyRuntime):
-        self.mode, self.cls = mode, cls
-        self.name = f"{cls.__name__}[{mode}]"
+    def __init__(self, mode="chunk_invariant", cls=ToyRuntime, geom="w4W4"):
+        self.mode, self.cls, self.geom = mode, cls, geom
+        self.window, self.W = GEOMS[geom]
+        self.chunk_invariant = mode == "chunk_invariant"
+        self.name = f"{cls.__name__}[{mode},{geom}]"
         self.weights = ToyWeights(PATTERN, hidden=HIDDEN, vocab=VOCAB, taps=TAPS)
 
-    def _build(self, lo, hi, is_head, is_tail, tap_mode="raw", spec_window=W_SPEC,
-               max_sessions=8, max_ctx=MAX_CTX, kv_budget_bytes=0):
-        spec = StageSpec("toy", lo, hi, is_head=is_head, is_tail=is_tail, taps=TAPS,
-                         tap_mode=tap_mode, max_sessions=max_sessions, max_ctx=max_ctx,
-                         spec_window=spec_window, kv_budget_bytes=kv_budget_bytes)
-        return self.cls(spec, pattern=PATTERN, window=WINDOW, hidden=HIDDEN, vocab=VOCAB,
-                        mode=self.mode)
+    def _spec(self, lo, hi, is_head, is_tail, tap_mode="raw", spec_window=None, max_sessions=8,
+              max_ctx=None, kv_budget_bytes=0):
+        return StageSpec("toy", lo, hi, is_head=is_head, is_tail=is_tail, taps=TAPS,
+                         tap_mode=tap_mode, max_sessions=max_sessions,
+                         max_ctx=max_ctx or self.max_ctx, spec_window=spec_window or self.W,
+                         kv_budget_bytes=kv_budget_bytes)
+
+    def _build(self, lo, hi, is_head, is_tail, **kw):
+        return self.cls(self._spec(lo, hi, is_head, is_tail, **kw), pattern=PATTERN,
+                        window=self.window, hidden=HIDDEN, vocab=VOCAB, mode=self.mode)
 
     def make(self, lo, hi, *, is_head=False, is_tail=False, **kw):
         rt = self._build(lo, hi, is_head, is_tail, **kw)
         rt.load(self.weights)
         return rt
+
+    def reference(self, lo, hi, *, is_head=False, is_tail=False, tap_mode="raw"):
+        return ToyReference(self.weights, self._spec(lo, hi, is_head, is_tail, tap_mode=tap_mode),
+                            pattern=PATTERN, window=self.window, mode=self.mode)
 
     def hidden(self, n, seed):
         rng = np.random.default_rng(seed)
@@ -70,19 +84,15 @@ class ToyFactory:
     def close_enough(self, a, b, what):
         return a == b
 
-    def oracle(self, lo, hi, *, is_head, is_tail, x, schedule):
-        return reference_forward(self.weights, PATTERN, WINDOW, lo, hi, is_head=is_head,
-                                 is_tail=is_tail, x=x, schedule=schedule, mode=self.mode, taps=TAPS)
-
     def make_broken(self, lo, hi):
         rt = self._build(lo, hi, lo == 0, hi == len(PATTERN))
         rt.load(self.weights.without(f"layers.{lo}.b"))
 
 
-FACTORIES = [ToyFactory("chunk_invariant"), ToyFactory("adversarial")]
+FACTORIES = [ToyFactory(mode, geom=g) for g in GEOMS for mode in ("chunk_invariant", "adversarial")]
 
 
-@pytest.mark.parametrize("factory", FACTORIES, ids=lambda f: f.mode)
+@pytest.mark.parametrize("factory", FACTORIES, ids=lambda f: f"{f.mode}-{f.geom}")
 @pytest.mark.parametrize("check", CHECKS, ids=lambda c: c.__name__)
 def test_toy_conforms(check, factory):
     try:
@@ -104,32 +114,35 @@ def test_rebuild_cases_are_not_trivial():
     """The rebuild check must exercise partial SWA windows (0 < a) and global layers above SWA
     layers reading mirrored rows below g (a < g): otherwise 'bit-equal' is vacuous."""
     kinds = lambda pat: ["swa" if c == "S" else "global" for c in pat]   # noqa: E731
-    F = 50
-    assert 0 < rebuild_start(kinds("SSSSSG"), WINDOW, F, F - 5) < F - 5 - 3
-    assert rebuild_start(kinds("SGSGS"), WINDOW, F, F - 1) == F - 3 * (WINDOW - 1)      # F term binds
-    assert rebuild_start(kinds("SGSGS"), WINDOW, F, F - 10) == F - 10 - 2 * (WINDOW - 1)  # upper G binds
-    assert rebuild_start(kinds("SSS"), WINDOW, F, 0) == F - 3 * (WINDOW - 1)
+    F, w = 50, 4
+    assert 0 < rebuild_start(kinds("SSSSSG"), w, F, F - 5) < F - 5 - 3
+    assert rebuild_start(kinds("SGSGS"), w, F, F - 1) == F - 3 * (w - 1)      # F term binds
+    assert rebuild_start(kinds("SGSGS"), w, F, F - 10) == F - 10 - 2 * (w - 1)  # upper G binds
+    assert rebuild_start(kinds("SSS"), w, F, 0) == F - 3 * (w - 1)
+    assert rebuild_start(kinds("SSS"), w, F, 0, exact_from=F - 20) == F - 20 - 3 * (w - 1)
 
 
 def test_adversarial_mode_really_depends_on_shape():
     """In adversarial mode, chunking the same rows differently changes bytes (so the suite's
-    adversarial pass shows it never leans on chunk invariance), while the oracle agrees for a
-    given schedule."""
-    f = FACTORIES[1]
+    adversarial pass shows it never leans on chunk invariance), while the reference agrees for
+    a given schedule."""
+    f = ToyFactory("adversarial")
     x = f.ids(12, 1)
     outs = []
     for sched in ([(0, 12)], [(0, 5), (5, 7)]):
-        rt = f.make(0, len(PATTERN), is_head=True, is_tail=True)
-        rt.open(1, MAX_CTX, W_SPEC)
-        rt.commit(1, 12)
-        o = [rt.step(StepIn((_seg(1, s, x.slice(s, s + n)),))).outs[0] for s, n in sched]
-        outs.append(Rows.concat([q.hidden for q in o]))
-        ref = f.oracle(0, len(PATTERN), is_head=True, is_tail=True, x=x, schedule=sched)
-        assert outs[-1] == ref["hidden"]
+        got = []
+        for rt in (f.make(0, len(PATTERN), is_head=True, is_tail=True),
+                   f.reference(0, len(PATTERN), is_head=True, is_tail=True)):
+            rt.open(1, 64, 4)
+            rt.commit(1, 12)
+            got.append(Rows.concat([rt.step(StepIn((_seg(1, s, x.slice(s, s + n)),))).outs[0].hidden
+                                    for s, n in sched]))
+        assert got[0] == got[1]
+        outs.append(got[0])
     assert outs[0] != outs[1]
 
 
-# ── mutants: each one realistic bug; each must fail the checks listed for it ──────────────────
+# ── mutants: each one realistic bug; each must fail the checks designed to catch it ──────────
 
 class MirrorOverwrite(ToyRuntime):
     """The rebuild rewrites global rows below the mirror frontier from partial-window inputs
@@ -196,10 +209,10 @@ class TapOffByOne(ToyRuntime):
 class FirstDraftRebuildRule(ToyRuntime):
     """Rebuild starts at the first-draft a = min(upto, F - (w-1)*n_swa), ignoring the SWA
     layers below each global layer (it keeps mirrored rows, unlike MirrorOverwrite)."""
-    def rebuild_from(self, sid, F):
+    def rebuild_from(self, sid, F, exact_from=None):
         s = self._get(sid)
         upto = s.upto
-        a = super().rebuild_from(sid, F)
+        a = super().rebuild_from(sid, F, exact_from)
         if any(k == "global" for k in self.kinds):
             late = max(0, min(upto, F - (self.window - 1) * sum(k == "swa" for k in self.kinds)))
             if late > a:
@@ -208,26 +221,151 @@ class FirstDraftRebuildRule(ToyRuntime):
         return a
 
 
-# The checks each mutant is DESIGNED to trip (it may trip more).
+class NoopRebuild(ToyRuntime):
+    """Rebuild segments only advance the length: SWA windows and global rows past g stay empty."""
+    _strict = False
+
+    def _run(self, s, seg, ctx):
+        if seg.kind != "rebuild":
+            return super()._run(s, seg, ctx)
+        s.length = seg.start_pos + seg.n
+        if s.length >= s.rebuild_hi:
+            s.rebuild_hi = None
+        return SegOut(seg.sid, Rows("i32", np.zeros((seg.n, self.H), np.int32)))
+
+
+def _xor(blob):
+    return KVBlob(blob.lo_pos, blob.hi_pos, blob.layers,
+                  tuple(Rows("i32", r.data ^ np.int32(0x55)) for r in blob.rows), blob.layout_id, blob.numerics_id)
+
+
+class BlobRowsMasked(ToyRuntime):
+    """Export scrambles the rows and import unscrambles them: round trips through the same
+    runtime pass, but the KV receipt leaves and a cross-backend takeover are wrong."""
+    def export_state(self, sid, lo_pos, hi_pos, kinds=("global",)):
+        return _xor(super().export_state(sid, lo_pos, hi_pos, kinds))
+
+    def import_state(self, sid, blob, upto):
+        return super().import_state(sid, _xor(blob), upto)
+
+
+class SpecCheckUsesWindow(ToyRuntime):
+    """Bounds speculation by the SWA window w instead of the spec window W."""
+    _strict = False
+
+    def _validate(self, seg):
+        s = self._get(seg.sid)
+        W, s.W = s.W, self.window
+        try:
+            super()._validate(seg)
+        finally:
+            s.W = W
+
+
+class RebuildUsesW(ToyRuntime):
+    """The rebuild rule counts (W - 1) rows per SWA layer instead of (w - 1)."""
+    def rebuild_from(self, sid, F, exact_from=None):
+        w, self.window = self.window, self._get(sid).W
+        try:
+            return super().rebuild_from(sid, F, exact_from)
+        finally:
+            self.window = w
+
+
+class SidSlotAlias(ToyRuntime):
+    """KV lives in table slot sid % max_sessions, so two open sids can share their KV."""
+    _strict = False
+
+    def open(self, sid, max_pos, spec_window):
+        super().open(sid, max_pos, spec_window)
+        me = self._sess[sid]
+        for other, s in self._sess.items():
+            if (other != sid and other % self.spec.max_sessions == sid % self.spec.max_sessions
+                    and (s.max_pos, s.W) == (max_pos, spec_window)):
+                me.glob, me.swa, me.tag = s.glob, s.swa, s.tag
+                break
+
+
+class LogitsLastIsFirst(ToyRuntime):
+    """logits/tokens "last" return the FIRST row of the segment."""
+    def _last_rows(self, x, mode):
+        return x[:1] if mode == "last" else x
+
+
+class BatchCoupledOverBudget(ToyRuntime):
+    """Rows depend on the step size only above 40 tokens (a large-batch kernel path)."""
+    def _row_term(self, ctx, seg, li, r, x):
+        return super()._row_term(ctx, seg, li, r, x) + (ctx.total_tokens if ctx.total_tokens > 40 else 0)
+
+
+class ClaimsFast(BatchCoupledOverBudget):
+    """Hides its batch coupling by reporting numerics_mode='fast' (self-exemption)."""
+    def describe(self):
+        return dataclasses.replace(super().describe(), numerics_mode="fast")
+
+
+class RowCoupledLarge(ToyRuntime):
+    """Couples rows only in segments of 11+ rows (a large-chunk kernel path)."""
+    def _row_term(self, ctx, seg, li, r, x):
+        return super()._row_term(ctx, seg, li, r, x) + (int(x.sum() % 1009) if seg.n >= 11 else 0)
+
+
+class SamplerKeyedByRow(ToyRuntime):
+    """Keys the sampling RNG by the row's index in its segment instead of its position."""
+    def _draw(self, logits_row, sampling, p, r):
+        return toy_draw(logits_row, sampling, r)
+
+
+class PrefillSkipsRollbackCheck(ToyRuntime):
+    """Prefill segments may rewind below the committed frontier (final rows get rewritten)."""
+    def _validate(self, seg):
+        s = self._get(seg.sid)
+        c = s.committed
+        if seg.kind == "prefill" and seg.start_pos < s.length:
+            s.committed = min(c, seg.start_pos)
+        try:
+            super()._validate(seg)
+        finally:
+            s.committed = c
+
+
+class NoTokenRangeCheck(ToyRuntime):
+    """Checks id dtype and shape but not range: -1 reads the last row, V fails mid-step."""
+    def _check_ids(self, x, n, sid):
+        if not isinstance(x, Rows) or x.dtype not in ID_DTYPES or x.data.ndim != 1 or x.n != n:
+            raise BadRequest("token ids must be Rows i32/i64 [n]", sid=sid)
+
+
+# mutant -> (geometry, the checks DESIGNED to catch it; each must fail in both numeric modes)
 MUTANTS = {
-    MirrorOverwrite: {"check_rebuild"},
-    IgnoresTruncate: {"check_frontier"},
-    BatchCoupled: {"check_batch_invariance", "check_mixed_kinds", "check_replay"},
-    WindowOffByOne: {"check_oracle", "check_swa_retention"},
-    LeaksRejectedRows: {"check_frontier", "check_swa_retention", "check_row_independence"},
-    SwaNoSlack: {"check_swa_retention"},
-    RowCoupled: {"check_row_independence"},
-    TapOffByOne: {"check_taps_raw", "check_oracle"},
-    FirstDraftRebuildRule: {"check_rebuild"},
+    MirrorOverwrite: ("w4W4", {"check_rebuild", "check_export_import"}),
+    IgnoresTruncate: ("w4W4", {"check_frontier"}),
+    BatchCoupled: ("w4W4", {"check_batch_invariance", "check_mixed_kinds", "check_replay"}),
+    WindowOffByOne: ("w4W4", {"check_reference", "check_swa_retention"}),
+    LeaksRejectedRows: ("w4W4", {"check_frontier", "check_swa_retention", "check_row_independence"}),
+    SwaNoSlack: ("w4W4", {"check_swa_retention"}),
+    RowCoupled: ("w4W4", {"check_row_independence"}),
+    TapOffByOne: ("w4W4", {"check_taps_raw", "check_reference"}),
+    FirstDraftRebuildRule: ("w4W4", {"check_rebuild"}),
+    NoopRebuild: ("w4W4", {"check_rebuild", "check_mixed_kinds"}),
+    BlobRowsMasked: ("w4W4", {"check_export_import", "check_reference", "check_rebuild"}),
+    SpecCheckUsesWindow: ("w6W3", {"check_frontier", "check_validation_atomic"}),
+    RebuildUsesW: ("w6W3", {"check_rebuild"}),
+    SidSlotAlias: ("w4W4", {"check_replay", "check_mixed_kinds"}),
+    LogitsLastIsFirst: ("w4W4", {"check_tokens", "check_mixed_kinds"}),
+    BatchCoupledOverBudget: ("w4W4", {"check_batch_invariance"}),
+    ClaimsFast: ("w4W4", {"check_describe", "check_batch_invariance"}),
+    RowCoupledLarge: ("w4W4", {"check_row_independence"}),
+    SamplerKeyedByRow: ("w4W4", {"check_tokens", "check_reference"}),
+    PrefillSkipsRollbackCheck: ("w4W4", {"check_validation_atomic"}),
+    NoTokenRangeCheck: ("w4W4", {"check_validation_atomic"}),
 }
 
 
 @pytest.mark.parametrize("mode", ["chunk_invariant", "adversarial"])
 @pytest.mark.parametrize("mutant", list(MUTANTS), ids=lambda m: m.__name__)
 def test_mutant_is_caught(mutant, mode):
-    res = run_suite(ToyFactory(mode, cls=mutant))
-    failed = {k for k, v in res.items() if v.startswith("FAIL")}
-    assert failed, f"{mutant.__name__} passes the whole suite in {mode} mode: {res}"
-    if mode == "chunk_invariant":
-        missing = MUTANTS[mutant] - failed
-        assert not missing, f"{mutant.__name__} escaped {sorted(missing)}: {res}"
+    geom, designed = MUTANTS[mutant]
+    res = run_suite(ToyFactory(mode, cls=mutant, geom=geom), [c for c in CHECKS if c.__name__ in designed])
+    escaped = {k: v for k, v in res.items() if not v.startswith("FAIL")}
+    assert not escaped, f"{mutant.__name__} ({mode}, {geom}) escaped {escaped}"

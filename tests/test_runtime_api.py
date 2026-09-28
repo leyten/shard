@@ -10,9 +10,9 @@ import sys
 import numpy as np
 import pytest
 
-from shard.runtime.api import (BadRequest, Capability, DeviceInfo, KVBlob, Rows, StageRuntime,
-                               StageSpec, WeightSource, kv_layout_id, make_numerics_id,
-                               rebuild_start)
+from shard.runtime.api import (BadRequest, Capability, DeviceInfo, KVBlob, Rows, Sampling,
+                               StageRuntime, StageSpec, WeightSource, kv_layout_id,
+                               make_numerics_id, rebuild_exact_from, rebuild_start)
 from shard.runtime.toy import ToyRuntime, ToyWeights
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
@@ -83,15 +83,27 @@ FLEET = {
 def _cap(dev, n_layers, weight_bytes_per_layer=3 * GiB):
     kinds = tuple("global" if i % 4 == 3 else "swa" for i in range(n_layers))
     n_g = kinds.count("global")
+    wb = n_layers * weight_bytes_per_layer
     return Capability(
         device=dev, model="mimo-v2.6-flash", lo=10, hi=10 + n_layers, is_head=False, is_tail=False,
-        layer_kinds=kinds, swa_window=128, hidden_size=4096, wire_dtype="bf16", codecs_in=("bf16", "fp8_e4m3"),
+        layer_kinds=kinds, swa_window=128, hidden_size=4096, vocab_size=152064, wire_dtype="bf16",
+        codecs_in=("bf16", "fp8_e4m3"), logits_dtype="f32", kv_dtype="bf16",
+        kv_layout_id=kv_layout_id("mimo-v2.6-flash", [10 + i for i, k in enumerate(kinds) if k == "global"],
+                                  "bf16", (4, 192, 128)),
         global_kv_bytes_per_pos=n_g * 4 * (192 + 128) * 2, swa_kv_bytes_per_pos=(n_layers - n_g) * 8 * (192 + 128) * 2,
-        kv_page_positions=64, kv_free_bytes=max(0, dev.free_mem_bytes - n_layers * weight_bytes_per_layer - 2 * GiB),
+        kv_page_positions=64, kv_free_bytes=max(0, dev.free_mem_bytes - wb - 2 * GiB),
+        weight_bytes=wb, load_peak_extra_bytes=GiB // 2,
         max_sessions=256, max_ctx=65536, spec_window_max=64, max_tokens_per_step=2048,
         tap_layers_held=(), tap_mode="fc_partial",
         numerics_id=make_numerics_id(backend=dev.backend, arch_class=dev.arch_class, mode="invariant"),
-        numerics_mode="invariant", chunk_invariant=False, service_ms=((1, 4.0), (16, 6.5)))
+        numerics_mode="invariant", chunk_invariant=False,
+        service_ms=((1, 0, 4.0), (16, 0, 6.5), (16, 32768, 9.0)))
+
+
+def _layers_that_fit(dev, cap, ctx, sessions):
+    """What placement computes before assigning a span: every input comes from the records."""
+    per_layer = cap.weight_bytes_per_layer + sessions * cap.session_kv_bytes(ctx, 64) / (cap.hi - cap.lo)
+    return int((dev.free_mem_bytes - cap.load_peak_extra_bytes) // per_layer)
 
 
 def test_one_code_path_reasons_about_a_mixed_fleet():
@@ -104,7 +116,7 @@ def test_one_code_path_reasons_about_a_mixed_fleet():
         keys = keys or set(d) | set(d["device"])
         assert set(d) | set(d["device"]) == keys, f"{name}: the record's shape depends on the backend"
         assert c.sessions_at(32768, 64) >= 1, name
-        assert c.layer_ms == tuple((b, ms / (c.hi - c.lo)) for b, ms in c.service_ms)
+        assert c.layer_ms == tuple((b, x, ms / (c.hi - c.lo)) for b, x, ms in c.service_ms)
     fmt = {k: FLEET[k].format_support("mxfp4") for k in FLEET}
     assert fmt == {"rtx3090": "emulated", "rtx4090": "emulated", "rtx5090": "hw", "pro6000": "hw",
                    "spark": "hw", "m2pro": "emulated", "7900xtx": None}
@@ -112,6 +124,10 @@ def test_one_code_path_reasons_about_a_mixed_fleet():
     assert [k for k, d in FLEET.items() if d.unified_memory] == ["spark", "m2pro"]
     same_span = {k: _cap(FLEET[k], 6).sessions_at(32768, 64) for k in ("rtx3090", "rtx5090", "pro6000", "spark")}
     assert same_span["rtx3090"] < same_span["rtx5090"] <= same_span["pro6000"] <= same_span["spark"]
+    fit = {k: _layers_that_fit(FLEET[k], caps[k], 32768, 8) for k in FLEET}
+    assert fit["m2pro"] < fit["rtx3090"] <= fit["rtx5090"] < fit["pro6000"] < fit["spark"], fit
+    assert all(v >= 1 for v in fit.values()), fit                  # every device class gets a role
+    assert len({c.kv_layout_id for c in caps.values() if c.layer_kinds == caps["rtx3090"].layer_kinds}) == 1
     assert caps["rtx3090"].rebuild_positions == 127 * caps["rtx3090"].n_swa
 
 
@@ -149,12 +165,24 @@ def test_rows_types_and_byte_equality():
     assert q.row_bytes(1) == bytes([1, 1]) + np.float32(2.0).tobytes()          # §7.1 wire row
     with pytest.raises(BadRequest):
         Rows("i32", np.zeros((2, 2, 2), np.int32))
+    Rows("f16", np.zeros((2, 2), np.float16))                          # MLX fp16 KV
+    with pytest.raises(BadRequest):
+        Rows("fp8_e4m3fnuz", np.zeros((2, 2), np.uint8))            # AMD fp8 also per-row scaled
+
+
+def test_sampling_and_error_attribution():
+    with pytest.raises(BadRequest):
+        Sampling(temperature=-1.0)
+    with pytest.raises(BadRequest):
+        Sampling(top_p=0.0)
+    e = BadRequest("x", sid=7)
+    assert e.sid == 7 and isinstance(e, ValueError) and BadRequest("y").sid is None
 
 
 def test_kvblob_wire_roundtrip_and_refusals():
     rows = (Rows("bf16", np.arange(8, dtype=np.uint16).reshape(4, 2)),
             Rows("bf16", np.arange(8, 16, dtype=np.uint16).reshape(4, 2)))
-    b = KVBlob(3, 7, (5, 9), rows, kv_layout_id("m", (5, 9), "bf16", 2), "nid")
+    b = KVBlob(3, 7, (5, 9), rows, kv_layout_id("m", (5, 9), "bf16", (1, 1, 1)), "nid")
     assert KVBlob.from_bytes(b.to_bytes()) == b
     assert b.pos_bytes(4) == rows[0].row_bytes(1) + rows[1].row_bytes(1)
     raw = b.to_bytes()
@@ -165,7 +193,10 @@ def test_kvblob_wire_roundtrip_and_refusals():
         KVBlob(3, 7, (9, 5), rows, "l", "n")                        # layers must ascend
     with pytest.raises(BadRequest):
         KVBlob(3, 8, (5, 9), rows, "l", "n")                        # row count != range
-    assert kv_layout_id("m", (5, 9), "bf16", 2) != kv_layout_id("m", (5, 9), "bf16", 4)
+    base = kv_layout_id("m", (5, 9), "bf16", (4, 192, 128))
+    assert base != kv_layout_id("m", (5, 9), "bf16", (8, 96, 128))     # same width, other heads
+    assert base != kv_layout_id("m", (5, 9), "fp8_e4m3", (4, 192, 128))
+    assert base != kv_layout_id("m", (5, 10), "bf16", (4, 192, 128))
 
 
 def test_numerics_id_names_every_input():
@@ -251,6 +282,11 @@ def test_rebuild_start_edges():
     assert rebuild_start([S, G], 128, 100, 100) == 0                  # clamped
     with pytest.raises(BadRequest):
         rebuild_start([S, G], 128, 100, 101)                          # upto past F
+    with pytest.raises(BadRequest):
+        rebuild_start([S, G], 128, 100, 50, exact_from=101)
+    a = rebuild_start([S, S, S], 128, 2000, 0, exact_from=2000 - 381)  # MTP-3: ~381 exact last-hidden rows
+    assert a == 2000 - 381 - 3 * 127 and rebuild_exact_from([S, S, S], 128, a) == 2000 - 381
+    assert rebuild_exact_from([S, G], 128, 0) == 0
 
 
 # ── compatibility ─────────────────────────────────────────────────────────────────────────────
@@ -284,3 +320,12 @@ def test_toy_satisfies_the_protocols():
     rt = ToyRuntime(StageSpec("toy", 0, 2), pattern="SG", window=2)
     assert isinstance(rt, StageRuntime)
     assert isinstance(ToyWeights("SG"), WeightSource)
+
+
+def test_describe_before_load_sizes_the_span():
+    """Placement sizes a span on a candidate device from describe() BEFORE loading it."""
+    spec = StageSpec("toy", 1, 4, is_tail=True, taps=(2,), tap_mode="fc_partial")
+    rt = ToyRuntime(spec, pattern="SGSG", window=2)
+    before = rt.describe()
+    rep = rt.load(ToyWeights("SGSG", taps=(2,)))
+    assert before.weight_bytes == rep.n_bytes and before.kv_layout_id == rt.describe().kv_layout_id
