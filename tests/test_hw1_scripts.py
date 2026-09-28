@@ -163,7 +163,12 @@ def test_curve_grid_skips_and_graphed_flag(tmp_path):
     assert g_small and all(r["graphed"] for r in g_small)          # captured
     assert g_big and not any(r["graphed"] for r in g_big)          # over _manual_ok -> ran eager, SAYS so
     assert {r["params"]["moe"] for r in timed} == {"perstream", "batched"}
-    assert any(r["op"] == "decode_b_mixed" for r in d["records"])
+    mixed = [r for r in d["records"] if r["op"] == "decode_b_mixed"]
+    assert mixed and all(r["skipped"] for r in mixed)
+    m25_curve.main(["--mode", "curve", "--ctxs", "32", "--bs", "1", "--ss", "1", "--moe", "batched", "--graphed", "0",
+                    "--layers", "1", "--out", str(out), "--stub"] + FAST, stage=fake_stage(batch=16))
+    mixed = [r for r in load(out)["records"] if r["op"] == "decode_b_mixed"]
+    assert mixed and all("clip" in r["skipped"] for r in mixed)      # maxlen 160: never a clipped 'mixed' number
 
 
 def test_tau_prefill_kv(tmp_path):

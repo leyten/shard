@@ -29,6 +29,7 @@ import hw1_common as C  # noqa: E402
 REPO = os.path.abspath(os.path.join(os.path.dirname(__file__), "..", ".."))
 ANCHOR = {(16384, 4): (42.0, 26.0), (16384, 8): (71.0, 41.0)}     # (ctx,B) -> (per-stream, batched) ms
 ANCHOR_TOL = 0.20
+MIXED_MIN_MAXLEN = 16384                                           # mixed-context variant needs the tail room
 
 
 def load_stage():
@@ -156,7 +157,8 @@ def curve(res, S, layers, ctxs, bs, ss, moes, graphed_modes, warmup, iters, mixe
     cap = S.M25_KV_MAXLEN - 10
     for B in mixed:
         prm = {"ctx": "lognormal_med3k", "B": B, "s": 9, "moe": "batched", "graphed_req": False, "layers": nL}
-        why = _fits(S, B, 0, 9)
+        why = _fits(S, B, 0, 9) or (None if cap >= MIXED_MIN_MAXLEN else
+                                     f"M25_KV_MAXLEN {S.M25_KV_MAXLEN} < {MIXED_MIN_MAXLEN}: would clip the lognormal tail")
         if why:
             res.record("A1", "decode_b_mixed", prm, skipped=why)
             continue
