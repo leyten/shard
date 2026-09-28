@@ -16,7 +16,8 @@ from shard.runtime.api import (BadRequest, Capability, DeviceInfo, KVBlob, Rows,
 from shard.runtime.toy import ToyRuntime, ToyWeights
 
 ROOT = pathlib.Path(__file__).resolve().parent.parent
-PORTABLE = [*sorted((ROOT / "shard" / "runtime").glob("*.py")), ROOT / "tests" / "runtime_conformance.py"]
+PORTABLE = [*sorted((ROOT / "shard" / "runtime").glob("*.py")),
+            *sorted((ROOT / "shard" / "runtime" / "adapters").glob("*.py")), ROOT / "tests" / "runtime_conformance.py"]
 
 
 # ── device neutrality ─────────────────────────────────────────────────────────────────────────
