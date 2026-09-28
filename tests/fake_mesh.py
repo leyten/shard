@@ -434,7 +434,7 @@ class FakeMesh:
                  window: int = WINDOW, hidden: int = HIDDEN, vocab: int = VOCAB,
                  mode: str = "chunk_invariant", legs_ms=None, deadline: float = 2.0,
                  cost_scale: float = 1.0, max_ctx: int = 512, s_max: int = 16, weights_seed: int = 0,
-                 stuck_after: float = 60.0, trace: bool = False):
+                 stuck_after: float = 60.0, trace: bool = False, drafters=None):
         self.clock = VirtualClock(stuck_after=stuck_after) if clock == "virtual" else RealClock()
         self.clock.adopt("test")
         self.D, self.pattern, self.window, self.mode = D, pattern, window, mode
@@ -444,6 +444,7 @@ class FakeMesh:
         self.weights = ToyWeights(pattern, hidden=hidden, vocab=vocab, seed=weights_seed)
         self.spans = assign_spans(len(pattern), self.devices)
         self.deadline, self.cost_scale, self.max_ctx, self.s_max = deadline, cost_scale, max_ctx, s_max
+        self.drafters = dict(drafters or {})       # tail drafter plugins (node.py: `drafters`)
         self.faults = Faults()
         self.peers = [f"hop{i}" for i in range(D)]
         self._lock = threading.Lock()
@@ -490,7 +491,8 @@ class FakeMesh:
         node = FakeNode(self.runtime(i, weights), self.peers[i], resolve=self._resolve,
                         clock=self.clock, s_max=self.s_max,
                         links_factory=partial(FaultyLinks, faults=self.faults),
-                        trace=self._on_trace if self.trace_log is not None else None)
+                        trace=self._on_trace if self.trace_log is not None else None,
+                        drafters=self.drafters)
         addr = node.start()
         with self._lock:
             self._addr[self.peers[i]] = addr
@@ -508,7 +510,8 @@ class FakeMesh:
         self.clock.disown()
 
     # ── sessions ──────────────────────────────────────────────────────────────────────────
-    def open(self, sid: int, *, max_pos: int = 256, W: int = 8, expect_ok: bool = True) -> dict:
+    def open(self, sid: int, *, max_pos: int = 256, W: int = 8, expect_ok: bool = True,
+             drafter: str | None = None) -> dict:
         """lease_open on every hop; wait for every ack (or the deadline)."""
         h = hexsid(sid)
         for k in [k for k in self.entry.acks if k[0] == h]:
@@ -523,7 +526,7 @@ class FakeMesh:
             if role != "mid":
                 kw["salt"] = "5a" * 32
             if tail:
-                kw.update(seed=h, ekey="e1" * 32)
+                kw.update(seed=h, ekey="e1" * 32, drafter=drafter)
             self.entry.links.send(peer, frame.control("lease_open", **kw))
         end = self.clock.now() + self.deadline
         self.entry.pump_until(lambda: all((h, p) in self.entry.acks for p in self.peers), end)
