@@ -57,11 +57,28 @@ def settle_unpinned(receipts, layer_count, *, expected_nonce=None, check_chain=F
     return {"ok": True, "pinned": False, "layer_count": layer_count, "stages": _stages(receipts)}
 
 
+def settle_v2(req: dict) -> dict:
+    """Mesh jobs (shard-receipt/2): verify the entry's path log and the hops' checkpoints against
+    the orchestrator's leases (fail closed), then split `pool` over the attested work
+    (shard.settle2). Weights ride as decimal strings: they exceed 2^53 (a JS Number)."""
+    from .settle2 import REBUILD_CAP, settle_v2 as _settle_v2
+    out = _settle_v2(req["path_log"], req["checkpoints"], req["pool"], leases=req["leases"],
+                     entry_pubkey=req["entry_pubkey"], nonce=req["expected_nonce"], job_id=req["job_id"],
+                     manifest_cid=req["manifest_cid"], layer_kinds=req["layer_kinds"],
+                     window=req["window"], pay=req.get("pay"),
+                     cap=tuple(req.get("rebuild_cap", REBUILD_CAP)))
+    out["weights"] = {k: str(v) for k, v in out["weights"].items()}
+    return out
+
+
 def _main() -> int:
     """`python3 -m shard.verify` — JSON in ({receipts, layer_count, mode?, expected_nonce?,
     check_chain?, assignments?}), JSON out ({ok, pinned, stages} on success; {ok:false, error} on
     a rejected set). mode "payment" (the default) REQUIRES assignments — missing/empty is a config
-    bug (exit 2), not a verdict; mode "unpinned" routes to settle_unpinned and ignores them."""
+    bug (exit 2), not a verdict; mode "unpinned" routes to settle_unpinned and ignores them.
+    mode "v2" is a mesh job: {path_log, checkpoints, leases, entry_pubkey, expected_nonce, job_id,
+    manifest_cid, layer_kinds, window, pool, pay?, rebuild_cap?} -> settle_v2's {ok, work,
+    weights, payouts, ...}."""
     try:
         req = json.load(sys.stdin)
     except Exception as e:  # noqa: BLE001
@@ -72,7 +89,9 @@ def _main() -> int:
         json.dump({"ok": False, "error": "payment settlement requires assignments"}, sys.stdout)
         return 2
     try:
-        if mode == "unpinned":
+        if mode == "v2":
+            out = settle_v2(req)
+        elif mode == "unpinned":
             out = settle_unpinned(req["receipts"], req["layer_count"],
                                   expected_nonce=req.get("expected_nonce"),
                                   check_chain=bool(req.get("check_chain", False)))
