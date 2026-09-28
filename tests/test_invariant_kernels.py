@@ -20,7 +20,7 @@ import pytest
 import torch
 
 if not torch.cuda.is_available():
-    os.environ["TRITON_INTERPRET"] = "1"            # must precede the first triton.jit decoration
+    os.environ["TRITON_INTERPRET"] = "1"            # tests/conftest.py sets it first in a suite run
 triton = pytest.importorskip("triton")
 
 from shard.formats.quant import dequant_mxfp4  # noqa: E402
