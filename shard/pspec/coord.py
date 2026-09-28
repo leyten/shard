@@ -310,6 +310,13 @@ class Session:
         with self.st.lock:
             return len(self.st.outstanding) if self.stop else self.st.pending
 
+    def cancel(self):
+        """Stop generating now (a client cancel): nothing more is streamed, every queued frame is
+        dropped before the wire, and the replies still owed are drained, never judged. The tokens
+        committed so far stay a prefix of the uncancelled stream. Idempotent."""
+        self.stop = True
+        self.fence()
+
     def fence(self):
         """Bump the sep: every queued frame of the current speculation is dropped before the wire."""
         with self.st.lock:
@@ -508,3 +515,66 @@ def run(link, session, timeout=600.0):
         raise RuntimeError(f"pspec: the frame sender died: {type(sender.err).__name__}: "
                            f"{sender.err}") from sender.err
     return session.result()
+
+
+def run_many(link, sessions, timeout=600.0, on_reply=None):
+    """Drive many Sessions over ONE Link and ONE FrameSender to completion (the S3 entry loop).
+    -> {sid: session.result()}.
+
+    Replies are demultiplexed on `sid`; each session sees its own replies in the order the link
+    returns them, which is all `Session.on_reply` needs (the per-session FIFO holds end to end:
+    one sender, and every hop keeps a FIFO per session). A reply for no session here, or for a
+    session that owes nothing, is a protocol error. `on_reply(session, reply)` (optional) runs
+    before each reply is consumed: the seam a caller uses to cancel a session (`cancel()`) or
+    advance its ack. A session is done when it stopped and owes nothing; one that owes nothing
+    before stopping is a bug and raises, as in `run`."""
+    by_sid = {}
+    for s in sessions:
+        if s.sid in by_sid:
+            raise ValueError(f"pspec: two sessions share sid {s.sid}")
+        by_sid[s.sid] = s
+    sender = FrameSender(link)
+    sender.start()
+
+    def died():
+        return RuntimeError(f"pspec: the frame sender died: {type(sender.err).__name__}: "
+                            f"{sender.err}")
+
+    try:
+        for s in sessions:
+            sender.put(s.st, s.prefill())
+        live = set(by_sid)
+        while True:
+            if sender.err is not None:
+                raise died() from sender.err
+            for sid in list(live):
+                s = by_sid[sid]
+                if s.owed() == 0:
+                    if not s.stop:
+                        raise RuntimeError(
+                            f"pspec: session {sid}: nothing in flight at position {len(s.ids) - 1} "
+                            f"with {len(s.out)} of {s.max_new} tokens generated")
+                    live.discard(sid)
+            if not live:
+                break
+            try:
+                rep = link.recv(timeout)
+            except Exception:
+                if sender.err is not None:
+                    raise died() from sender.err
+                raise
+            s = by_sid.get(rep.get("sid"))
+            if s is None or rep["sid"] not in live:
+                raise RuntimeError(f"pspec: a reply for session {rep.get('sid')!r}, which has "
+                                   f"nothing on the wire here")
+            if on_reply is not None:
+                on_reply(s, rep)
+            for fr in s.on_reply(rep):
+                sender.put(s.st, fr)
+    finally:
+        for s in sessions:
+            s.fence()
+        sender.stop()
+    if sender.err is not None:
+        raise died() from sender.err
+    return {sid: s.result() for sid, s in by_sid.items()}
