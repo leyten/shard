@@ -68,7 +68,9 @@ from __future__ import annotations
 
 import math
 import re
+from bisect import bisect_left, insort
 from dataclasses import dataclass
+from operator import itemgetter
 from typing import Iterable, Mapping
 
 from ..probe import SPEC_V0
@@ -657,8 +659,10 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
     rtt: {a: {b: one-way ms}} with the entry named `entry`; a missing pair costs policy.leg_ms.
 
     A hop starts where the previous one ended (anywhere inside its holder's span) and ends at the
-    holder's span end or where another holder's span starts, so a slow or loaded holder can hand
-    over to a faster one at the first place it could (Petals cut only at span ends). The search is
+    holder's span end, or where the span of a holder with a lower loaded per-layer cost
+    (layer_ms * qf(rho)) starts, so a slow or busy holder hands over to a faster or idler one at
+    the first place it could (Petals cut only at span ends; with equal costs nothing changes and
+    the state space stays one state per holder). The search is
     a DAG over (holder, cut) states ordered by position, keeping per state the cheapest labels that
     are not dominated k times (a label is dominated by a cheaper one whose subnet set it contains,
     so the distinct-subnet filter can never be starved by pruning). Hop cost =
@@ -686,25 +690,41 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
         return (h["rho"] < policy.rho_max and h["sessions"] < policy.s_max and h["kv_free"] >= kv_tokens
                 and h["layer_ms"] is not None)
 
+    def full_key(c):                  # c = (cost, hops, parent label | None, holder, p, q)
+        par = c[2]
+        return ((par[2] if par else ()) + (c[3]["id"],), (par[3] if par else ()) + (-c[4],))
+
     def prune(cands):
-        cands.sort(key=lambda e: (e[0], len(e[1]), [x["id"] for x, _, _ in e[1]], [-p for _, p, _ in e[1]]))
-        kept, seqs = [], set()
-        for c in cands:
-            seq = tuple(x["id"] for x, _, _ in c[1])
-            if seq in seqs or sum(1 for a in kept if a[2] <= c[2]) >= k:
-                continue
-            kept.append(c)
-            seqs.add(seq)
-            if len(kept) >= max(4 * k, 16):
-                break
+        """Scan candidates in (cost, hops, ids, later cuts first) order; keep a label unless its
+        holder sequence is already kept or k kept labels with subset subnets dominate it. Labels
+        are materialised only when scanned: (cost, hops, ids, -starts, path, subnets)."""
+        cands.sort(key=itemgetter(0, 1))
+        kept, seqs, i, cap = [], set(), 0, max(4 * k, 16)
+        while i < len(cands) and len(kept) < cap:
+            j = i + 1
+            while j < len(cands) and cands[j][0] == cands[i][0] and cands[j][1] == cands[i][1]:
+                j += 1
+            run = sorted(cands[i:j], key=full_key) if j - i > 1 else cands[i:j]
+            for c in run:
+                seq, neg = full_key(c)
+                subs = (c[2][5] if c[2] else frozenset()) | {c[3]["subnet"]}
+                if seq in seqs or sum(1 for a in kept if a[5] <= subs) >= k:
+                    continue
+                kept.append((c[0], c[1], seq, neg, (c[2][4] if c[2] else ()) + ((c[3], c[4], c[5]),), subs))
+                seqs.add(seq)
+                if len(kept) >= cap:
+                    break
+            i = j
         return kept
 
     def search(roles):
         prim = {h["id"]: h for h in hs if h["role"] in roles and ok_primary(h)}
-        starts = sorted({h["span"][0] for h in prim.values()})
+        per = {hid: h["layer_ms"] * _qf(h["rho"]) for hid, h in prim.items()}     # loaded ms per layer
         states = sorted((q, hid) for hid, h in prim.items()
-                        for q in {h["span"][1]} | {s for s in starts if h["span"][0] < s < h["span"][1]})
-        by_end, out = {}, []
+                        for q in {h["span"][1]} | {g["span"][0] for gid, g in prim.items()
+                                                   if h["span"][0] < g["span"][0] < h["span"][1]
+                                                   and per[gid] < per[hid]})
+        by_end, ends, out = {}, [], []
         for q, hid in states:
             h = prim[hid]
             lo = h["span"][0]
@@ -712,21 +732,23 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
             qf = _qf(h["rho"])
             cands = []
             if lo == 0 and leg(entry, hid) < math.inf:
-                cands.append((leg(entry, hid) + ((q - 0) * h["layer_ms"] * qf + unrel), ((h, 0, q),),
-                              frozenset((h["subnet"],))))
-            for p in sorted(e for e in by_end if lo <= e < q):
+                cands.append((leg(entry, hid) + ((q - 0) * h["layer_ms"] * qf + unrel), 1, None, h, 0, q))
+            for p in ends[bisect_left(ends, lo):bisect_left(ends, q)]:
                 for gid, glabels in by_end[p]:
                     lg = leg(gid, hid)
                     if gid == hid or lg == math.inf:
                         continue
-                    for c, path, subs in glabels:
-                        if h["subnet"] not in subs:
-                            cands.append((c + lg + ((q - p) * h["layer_ms"] * qf + unrel), path + ((h, p, q),),
-                                          subs | {h["subnet"]}))
+                    hop = (q - p) * h["layer_ms"] * qf + unrel
+                    for lab in glabels:
+                        if h["subnet"] not in lab[5]:
+                            cands.append((lab[0] + lg + hop, lab[1] + 1, lab, h, p, q))
             kept = prune(cands)
-            by_end.setdefault(q, []).append((hid, kept))
+            if q not in by_end:
+                by_end[q] = []
+                insort(ends, q)
+            by_end[q].append((hid, kept))
             if q == n and leg(hid, entry) < math.inf:
-                out += [(c + leg(hid, entry) + profile.tail_ms, path) for c, path, _ in kept]
+                out += [(lab[0] + leg(hid, entry) + profile.tail_ms, lab[4]) for lab in kept]
         return out
 
     found, degraded = search(("stage",)), False

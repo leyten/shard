@@ -114,9 +114,7 @@
    "expect": [
     {"degraded":false,"failover":"mirror","hops":[{"backup":"C","hi":27,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
-    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"A","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999}
    ],
    "holders": [
     {"id":"A","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,27],"subnet":"same","uplink_mbps":200.0},
@@ -170,8 +168,8 @@
    "expect": [
     {"degraded":false,"failover":"replay","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":27,"id":"P1","lo":6,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":21,"id":"P1","lo":0,"role":"head"},{"backup":"G8","hi":22,"id":"G1","lo":21,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":22,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":12,"id":"G2","lo":6,"role":"mid"},{"backup":null,"hi":27,"id":"P1","lo":12,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":7326.608695652173,"step_ms":131.64999999999998}
    ],
    "holders": [
     {"id":"G0","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,6],"subnet":"s-G0","uplink_mbps":200.0},
@@ -196,7 +194,7 @@
    "expect": [
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":27,"id":"P1","lo":6,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":16,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":22,"id":"G1","lo":16,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":22,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
    ],
    "holders": [
     {"id":"G0","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,6],"subnet":"s-G0","uplink_mbps":200.0},
@@ -285,9 +283,7 @@
    "expect": [
     {"degraded":false,"failover":"mirror","hops":[{"backup":"C","hi":27,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
-    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"D","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999}
    ],
    "holders": [
     {"id":"A","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,27],"subnet":"s-A","uplink_mbps":200.0},
