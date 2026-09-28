@@ -26,10 +26,17 @@ passing: a frame still on a socket, in a queue or being computed can never be ti
 waiting is virtual. What virtual time does NOT model is real slowness: compute costs zero
 virtual time unless a runtime sleeps its modelled cost (tests/fake_mesh.py SimRuntime does).
 
-An accounting bug (an uncounted wake-up, a lost message that was never released) shows up as a
-frozen clock, never as a silent hang: a wait of an actor adopted with `raise_on_stuck` raises
-`Stuck` with a dump of busy actors, timers and live streams after `stuck_after` real seconds
-without progress.
+An accounting bug (an uncounted wake-up, a lost message that was never released) or a livelock
+(two peers answering each other forever, so load never reaches 0) shows up as a frozen clock,
+never as a silent hang: a wait of an actor adopted with `raise_on_stuck` raises `Stuck` with a
+dump of busy actors, timers and live streams once virtual time has not moved for `stuck_after`
+real seconds.
+
+Where faults land. A timer fires only at quiescence, so a fault injected "at virtual time t"
+lands when every frame is on a delayed leg, inside a node's modelled compute, or queued: a
+protocol-level instant. It never lands inside a syscall (mid-write, mid-dial, between a read
+and its hand-off). Those races need the real clock (tests/test_fake_mesh.py runs a real-clock
+storm for them).
 """
 from __future__ import annotations
 
@@ -175,7 +182,6 @@ class _Acct:
             if not self.is_dead:
                 self.n_sent += 1
                 c._load += 1
-                c._progress += 1
 
     def took(self) -> None:
         """The reader holds one whole message (the calling reader actor is busy)."""
@@ -185,7 +191,6 @@ class _Acct:
             if not self.is_dead and self.n_took < self.n_sent:
                 self.n_took += 1
                 c._load -= 1
-                c._progress += 1
 
     def dead(self) -> None:
         """The stream is gone: whatever was sent and not taken never arrives."""
@@ -196,7 +201,6 @@ class _Acct:
             self.is_dead = True
             c._load -= self.n_sent - self.n_took
             c._accts.pop(self.id, None)
-            c._progress += 1
             if c._load == 0:
                 c._advance()
 
@@ -216,7 +220,6 @@ class _VMailbox:
             if self._closed:
                 return False
             self._q.append(item)
-            c._progress += 1
             w = self._waiter
             if w is not None:
                 c._set(w, True)
@@ -249,7 +252,6 @@ class _VMailbox:
         c = self._c
         with c._lock:
             self._closed = True
-            c._progress += 1
             w = self._waiter
             if w is not None:
                 c._set(w, True)
@@ -274,7 +276,6 @@ class VirtualClock:
         self._tls = threading.local()
         self._actors: dict[int, _Actor] = {}
         self._accts: dict[int, _Acct] = {}
-        self._progress = 0
         self.stuck_after = stuck_after
         self.advances = 0                 # how many times time jumped (stats)
 
@@ -308,13 +309,11 @@ class VirtualClock:
         a = _Actor(name, self._lock, raises)
         self._actors[id(a)] = a
         self._load += 1
-        self._progress += 1
         return a
 
     def _close_actor(self, a: _Actor) -> None:
         a.timer = None
         self._actors.pop(id(a), None)
-        self._progress += 1
         if a.busy:
             a.busy = False
             self._load -= 1
@@ -394,7 +393,6 @@ class VirtualClock:
             return
         a.busy = busy
         self._load += 1 if busy else -1
-        self._progress += 1
         if self._load == 0:
             self._advance()
 
@@ -414,7 +412,6 @@ class VirtualClock:
                 if t > self._now:
                     self._now = t
                     self.advances += 1
-                self._progress += 1
                 for a in fired:
                     a.cv.notify()
 
@@ -425,11 +422,11 @@ class VirtualClock:
             a.timer, a.fired = seq, False
             heapq.heappush(self._timers, (deadline, seq, a))
         self._set(a, False)
-        seen, since = self._progress, time.monotonic()
+        seen, since = self._now, time.monotonic()
         while not (a.fired or done()):
             a.cv.wait(0.5)
-            if self._progress != seen:
-                seen, since = self._progress, time.monotonic()
+            if self._now != seen:
+                seen, since = self._now, time.monotonic()
             elif a.raises and time.monotonic() - since > self.stuck_after:
                 a.timer, a.fired = None, False
                 self._set(a, True)

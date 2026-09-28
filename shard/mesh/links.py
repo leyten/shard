@@ -7,7 +7,8 @@ shape and M4 swaps the transport, not the node:
 
 * Streams are one-way. A dialer only writes, an acceptor only reads. Replies travel on a
   stream the replier dials. Each message is one shard-frame/2 body in the unchanged
-  shard/transport framing (8-byte big-endian length, then the body), read with `frame.recv`.
+  shard/transport framing (8-byte big-endian length, then the body), encoded with
+  `frame.encode` and read with `frame.decode`. Nothing on this path imports torch.
 * A dialer opens a stream with a hello (a transport-framed JSON header `{"hello": PeerId,
   "acct": id}`). Loopback has no crypto, so the PeerId is self-declared; the sidecar verifies
   it in production. `acct` pairs the two ends' in-flight accounting under a VirtualClock.
@@ -52,6 +53,17 @@ def _read_exact(sock: socket.socket, n: int) -> bytes:
             raise ConnectionError("stream closed")
         buf += b
     return bytes(buf)
+
+
+def _recv_msg(sock: socket.socket) -> dict:
+    """One shard-frame/2 message: the transport framing, read without importing torch.
+    `frame.recv` reads the length through shard.transport, whose torch import stalls a node's
+    first receive by ~1.5 s and would make a Mac or any torch-less box install torch just to
+    read a frame. Same bounds: the length is refused past MAX_FRAME before any body byte."""
+    (n,) = struct.unpack("!Q", _read_exact(sock, 8))
+    if n > frame.MAX_FRAME:
+        raise frame.FrameError(f"frame length {n} exceeds MAX_FRAME ({frame.MAX_FRAME})")
+    return frame.decode(frame._read_body(sock, n))
 
 
 def _hello_bytes(me: str, acct: int) -> bytes:
@@ -248,8 +260,8 @@ class TcpLinks:
     def _drop_stream(self, o: _Outbox, abrupt: bool = True) -> None:
         s, a = o.sock, o.acct
         o.sock = o.acct = None
-        if a is not None:
-            a.dead()
+        if a is not None and abrupt:          # a FIN-closed stream's bytes still arrive: the
+            a.dead()                          # reader releases them when it reaches EOF
         if s is not None:
             _abort(s) if abrupt else _shut(s)
 
@@ -277,7 +289,7 @@ class TcpLinks:
             acct = self.clock.conn_lookup(cid)
             while True:
                 with self.clock.idle():
-                    msg = frame.recv(s)
+                    msg = _recv_msg(s)
                 acct.took()
                 if self._closed:
                     return

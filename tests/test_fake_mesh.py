@@ -94,12 +94,28 @@ def test_greedy_on_the_real_clock(mesh_factory, D):
 
 @pytest.mark.parametrize("D", [2, 5])
 def test_adversarial_numerics_same_schedule_same_bytes(mesh_factory, D):
-    """Bytes that depend on segment shapes (like float kernels) still match the direct loop:
-    the node forwards frames unsplit, so every hop runs the direct loop's shapes."""
+    """Bytes that depend on segment shapes (like float kernels) still match the direct loop
+    while every frame fits every hop's budget (prompts <= 12 tokens here): each hop then runs
+    the direct loop's shapes. The re-chunked case is the next test."""
     m = mesh_factory(D, mode="adversarial")
     for i in range(2):
         m.open(100 + i)
     _check_equal_direct(m, _prompts(2, 70 + D), 12)
+
+
+def test_adversarial_numerics_rechunked_frame_equals_the_replayed_schedule(mesh_factory):
+    """A 45-token prompt through a 32-token hop is computed in 2 steps there. Under
+    shape-dependent bytes that is NOT the unsplit direct loop; it IS the replay of the same
+    schedule. (The harness must be able to tell these apart, or adversarial mode proves nothing.)"""
+    m = mesh_factory(3, mode="adversarial")
+    m.open(100, max_pos=128)
+    prompt = [(7 * i + 3) % FM.VOCAB for i in range(45)]
+    got = m.generate(100, prompt, 8)
+    assert got != direct_greedy(m.weights, prompt, 8, mode="adversarial")[45:]
+    assert got == FM.replay_chain(m, prompt, 8)
+    cm = mesh_factory(3)                          # chunk-invariant: both references agree
+    cm.open(100, max_pos=128)
+    assert cm.generate(100, prompt, 8) == FM.replay_chain(cm, prompt, 8) == direct_greedy(cm.weights, prompt, 8)[45:]
 
 
 def test_a_frame_larger_than_a_hops_budget_runs_in_steps(mesh_factory):
@@ -197,28 +213,35 @@ def test_ignored_delays_are_caught(mesh_factory, monkeypatch):
 
 
 def test_leg_delays_are_honoured_on_the_wall_clock(mesh_factory):
-    """Real time: the median round trip grows by the injected leg delays, within ±10%."""
-    m = mesh_factory(3, clock="real", cost_scale=0.0)
+    """Real time: every hop's arrival and the reply grow by the injected delays of the legs
+    before them, within ±10% (median of 7 frames, zero-delay baseline subtracted)."""
+    m = mesh_factory(3, clock="real", cost_scale=0.0, trace=True)
     m.open(1)
     tok = reply_tokens(m.request(1, kind="P", pos=0, ids=[1, 2, 3]))[0]
     pos = 3
 
-    def median_rtt(k=7):
+    def offsets(k=7):
         nonlocal tok, pos
-        out = []
+        rows = []
         for _ in range(k):
-            t0 = time.monotonic()
-            tok = reply_tokens(m.request(1, kind="T", pos=pos, ids=[tok]))[0]
-            out.append(time.monotonic() - t0)
-            pos += 1
-        return sorted(out)[k // 2]
+            m.trace_log.clear()
+            seq = m.submit(1, kind="T", pos=pos, ids=[tok])
+            r = m.collect(1, seq)
+            t0 = m.sent_at(1, seq)
+            arrive = {peer: t for ev, peer, _, q, _, _, t in m.trace_log if ev == "in" and q == seq}
+            back = [t for _, x, t in m.entry.received if x["seq"] == seq][0]
+            rows.append([arrive[p] - t0 for p in m.peers] + [back - t0])
+            tok, pos = reply_tokens(r)[0], pos + 1
+        return [sorted(col)[k // 2] for col in zip(*rows)]
 
-    base = median_rtt()
+    base = offsets()
     legs = [20.0, 45.0, 30.0, 55.0]
     m.set_legs(legs)
-    with_delay = median_rtt()
-    added, want = with_delay - base, sum(legs) / 1000.0
-    assert abs(added - want) <= 0.10 * want, f"added {added * 1000:.1f} ms for {want * 1000:.0f} ms of legs"
+    got = offsets()
+    for i, (b, g) in enumerate(zip(base, got)):
+        want = sum(legs[:i + 1]) / 1000.0
+        assert abs((g - b) - want) <= 0.10 * want, \
+            f"arrival {i}: +{(g - b) * 1000:.1f} ms for {want * 1000:.0f} ms of legs"
 
 
 # ── fault injectors, one at a time ────────────────────────────────────────────────────────────
@@ -430,6 +453,107 @@ def test_lease_update_reroutes_with_a_new_rte(mesh_factory):
     assert reply_tokens(r) == [T[F + 1]] and r["rte"] == 2
 
 
+def test_partition_cuts_both_directions(mesh_factory):
+    m = mesh_factory(3)
+    m.open(1)
+    m.partition("hop1", "hop2")
+    for src, dst in (("hop1", "hop2"), ("hop2", "hop1")):
+        before = (m.links_of(src).stats["blocked"], m.bad_frames(dst))
+        m.malformed(src, dst, "garbage")          # anything written src -> dst must vanish
+        m.clock.settle()
+        m.clock.sleep(0.01)
+        assert m.links_of(src).stats["blocked"] == before[0] + 1, (src, dst)
+        assert m.bad_frames(dst) == before[1], (src, dst)
+    m.heal()
+    m.malformed("hop2", "hop1", "garbage")
+    m.clock.sleep(0.01)
+    assert m.bad_frames("hop1") == 1
+
+
+def test_a_malformed_frame_leaves_the_receivers_other_streams_alone(mesh_factory):
+    """hop2 reads two streams (from hop1 and from the entry): garbage on hop1's resets only
+    that one, so the entry's pooled stream to hop2 is not re-dialled."""
+    m = mesh_factory(3)
+    pos, tok = _decode_ready(m, 1)
+    m.open(2)                                     # the entry now has a stream to hop2
+    dials = m.entry.links.stats["redials"]
+    m.malformed("hop1", "hop2", "garbage")
+    m.clock.settle()
+    m.clock.sleep(0.01)
+    assert m.bad_frames("hop2") == 1 and m.nodes[2].links.stats["streams_reset"] == 1
+    m.close_session(2)                            # another message on the entry -> hop2 stream
+    m.clock.sleep(0.01)
+    assert m.entry.links.stats["redials"] == dials
+    assert m.nodes[2].snapshot().get("close_refused", 0) == 0 and 2 not in m.nodes[2]._leases
+    r = m.request(1, kind="T", pos=pos, ids=[tok])
+    assert reply_tokens(r) == [direct_greedy(m.weights, [1, 2, 3, 4], 3)[pos + 1]]
+
+
+def test_nodes_never_answer_an_ack(mesh_factory):
+    """Regression (skeptic): a lease whose ret is another node + one refused frame made the
+    two nodes ack each other forever (a livelock that also froze virtual time)."""
+    m = mesh_factory(2)
+    h = hexsid(7)
+    lo, hi = m.spans[0]
+    m.entry.links.send("hop0", frame.control(
+        "lease_open", sid=h, rte=1, lo=lo, hi=hi, role="head", pred=ENTRY, next="hop1", ret="hop1",
+        max_pos=64, W=4, cx="ids", salt="5a" * 32, nonce="00" * 8, lease=b"x"))
+    m.clock.settle()
+    m.clock.sleep(0.01)
+    m._seq[7] = 0
+    m.submit(7, kind="T", pos=5, ids=[1])         # a gap: hop0 acks the refusal to hop1
+    m.clock.sleep(0.5)
+    assert m.nodes[0].snapshot()["refused_gap"] == 1
+    assert m.nodes[1].snapshot().get("ctl_ack_ignored") == 1
+    assert m.nodes[0].snapshot().get("ctl_ack_ignored", 0) == 0
+
+
+def test_close_and_lease_update_only_from_the_leases_entry(mesh_factory):
+    m = mesh_factory(3)
+    pos, tok = _decode_ready(m, 1)
+    m.links_of("hop0").send("hop1", frame.control("close", sid=hexsid(1)))
+    m.links_of("hop0").send("hop2", frame.control("lease_update", sid=hexsid(1), rte=9,
+                                                   truncate_to=0, sig=b"s"))
+    m.clock.settle()
+    m.clock.sleep(0.01)
+    assert m.nodes[1].snapshot()["close_refused"] == 1
+    assert m.nodes[2].snapshot()["update_refused"] == 1
+    r = m.request(1, kind="T", pos=pos, ids=[tok])
+    assert reply_tokens(r) == [direct_greedy(m.weights, [1, 2, 3, 4], 3)[pos + 1]]
+
+
+def test_out_of_vocab_ids_are_refused_before_the_commit(mesh_factory):
+    m = mesh_factory(2)
+    pos, tok = _decode_ready(m, 1)
+    with pytest.raises(HopError) as ei:
+        m.request(1, kind="T", pos=pos, ids=[FM.VOCAB + 5], cpos=pos + 1)
+    assert ei.value.code == "bad"
+    assert m.nodes[0].rt.info(1).committed == pos - 1          # cpos did not move the floor
+    r = m.request(1, kind="T", pos=pos, ids=[tok])
+    assert reply_tokens(r) == [direct_greedy(m.weights, [1, 2, 3, 4], 3)[pos + 1]]
+
+
+def test_the_node_path_never_imports_torch():
+    """A Mac or any torch-less box must run a node: block torch and serve a 2-hop real mesh."""
+    import subprocess
+    import sys
+    import os
+    code = (
+        "import sys; sys.modules['torch'] = None\n"
+        "sys.path[:0] = [%r, %r]\n"
+        "import fake_mesh as FM\n"
+        "m = FM.FakeMesh(2, clock='real', cost_scale=0.0)\n"
+        "m.open(1)\n"
+        "got = m.generate(1, [1, 2, 3], 4)\n"
+        "assert got == FM.direct_greedy(m.weights, [1, 2, 3], 4)[3:], got\n"
+        "m.close()\n"
+        "assert 'torch' not in [k for k, v in sys.modules.items() if v is not None]\n"
+        "print('ok')\n") % (os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                             os.path.dirname(os.path.abspath(__file__)))
+    out = subprocess.run([sys.executable, "-c", code], capture_output=True, text=True, timeout=120)
+    assert out.returncode == 0 and out.stdout.strip() == "ok", out.stderr[-2000:]
+
+
 # ── the storm ─────────────────────────────────────────────────────────────────────────────────
 def test_thousand_faults_in_virtual_time(mesh_factory):
     """10^3 injected faults (kill / hang / partition / malformed, random hop or leg, before or
@@ -451,9 +575,12 @@ def test_thousand_faults_in_virtual_time(mesh_factory):
 
 
 def test_fault_storm_on_the_real_clock(mesh_factory):
-    m = mesh_factory(3, clock="real", deadline=0.3, cost_scale=0.0, legs_ms=[1.0] * 4)
-    rep = fault_storm(m, 16, seed=7)
+    """The syscall-level races virtual time cannot reach: faults land mid-write, mid-dial and
+    between a read and its hand-off, at wall-clock offsets."""
+    m = mesh_factory(4, clock="real", deadline=0.3, cost_scale=0.0, legs_ms=[1.0] * 5)
+    rep = fault_storm(m, 60, seed=7)
     assert rep["violations"] == [], rep["violations"]
+    assert all(sum(v.values()) >= 8 for v in rep["outcomes"].values()), rep["outcomes"]
 
 
 @pytest.mark.parametrize("clock", CLOCKS)
@@ -485,6 +612,23 @@ def test_noop_injectors_are_caught(mesh_factory, monkeypatch):
     rep = fault_storm(m, 12, seed=1)
     for kind in ("kill", "hang", "partition"):
         assert any(kind in v for v in rep["violations"]), (kind, rep["violations"])
+
+
+def test_a_spurious_loss_is_not_blamed_on_the_fault(mesh_factory, monkeypatch):
+    """Anti-vacuity (skeptic): a hop that silently drops some frames must show up as failures
+    the injected fault cannot explain, not be absorbed as the expected Deadline."""
+    real = FM.FakeNode._on_frame
+    rng = random.Random(3)
+
+    def lossy(self, peer, f, t):
+        if self.peer_id == "hop1" and rng.random() < 0.08:
+            return
+        real(self, peer, f, t)
+
+    monkeypatch.setattr(FM.FakeNode, "_on_frame", lossy)
+    m = mesh_factory(3, legs_ms=[2.0] * 4)
+    rep = fault_storm(m, 60, seed=4)
+    assert any("BEFORE the" in v for v in rep["violations"]), rep["violations"][:5]
 
 
 def test_a_hop_with_other_weights_breaks_equality(mesh_factory):

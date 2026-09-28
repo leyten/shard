@@ -172,3 +172,27 @@ def test_real_clock_mailbox():
     mb.close()
     with pytest.raises(Closed):
         mb.get()
+
+
+def test_a_livelock_is_stuck_too(vc):
+    """Two actors answering each other forever at one instant keep load above 0: time can
+    never move, and the waiter must hear about it (the node ack ping-pong the review found)."""
+    a, b = vc.mailbox("a"), vc.mailbox("b")
+    stop = threading.Event()
+
+    def pong(inbox, other):
+        while not stop.is_set():
+            try:
+                x = inbox.get(timeout=0.5)
+            except (Timeout, Closed):
+                return
+            other.put(x)
+
+    vc.spawn("ping", pong, a, b)
+    vc.spawn("pong", pong, b, a)
+    a.put(1)
+    with pytest.raises(Stuck):
+        vc.mailbox("main").get(timeout=1.0)
+    stop.set()
+    a.close()
+    b.close()

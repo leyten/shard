@@ -13,10 +13,13 @@ Per inbound frame f of session s (§4.2):
   3. fence: f.fen or f.sep < s.sep_seen -> forwarded header-only (the tail replies `fen`),
      nothing is computed. Otherwise s.sep_seen = f.sep.
   4. seek, judged against the frontier f.cpos will set: pos > length is a gap, pos below the
-     frontier a rollback, pos + n past frontier + W a window refusal. A refused frame changes
-     nothing (not even the frontier) and is reported loudly: `ack{seq, code}` to the lease's
-     `ret`. Otherwise commit(cpos) (rows < cpos are final); pos < length is an implicit
-     truncate.
+     frontier a rollback, pos + n past frontier + W a window refusal. Head token ids are
+     bounded by the vocabulary here too. A frame refused by these checks changes nothing (not
+     even the frontier) and is reported loudly: `ack{seq, code}` to the lease's `ret`.
+     Otherwise commit(cpos) (rows < cpos are final); pos < length is an implicit truncate.
+     Content the runtime alone can judge (e.g. hidden values it rejects) is refused after
+     the commit: cpos is the entry's statement about committed tokens, not about this
+     frame's payload, so the frontier it set stands.
   5. batch: when the loop is free it runs ONE runtime step holding at most one segment per
      session under the runtime's token budget (round-robin across sessions). A frame larger
      than the budget runs alone as consecutive steps and is forwarded whole.
@@ -26,9 +29,12 @@ Per inbound frame f of session s (§4.2):
 If the successor is unreachable after a re-dial, the frame is lost and the node sends
 `ack{seq, next_down}` to `ret`. A malformed inbound message resets that stream only.
 
-Control (§5.3): lease_open (admission: S_max, span and role, codecs, then the runtime's own KV /
-W refusals; answered with `ack` to the sender), lease_update (rte bump, re-pointing,
-truncate_to; acked), close. Every other command is counted as unsupported (M1 fills `_CONTROL`).
+Control (§5.3): lease_open (admission: S_max, load rho < 0.85, span and role, codecs, then the
+runtime's own KV / W refusals; answered with `ack` to the sender), lease_update (rte bump,
+re-pointing, truncate_to; acked, idempotent on a retransmission) and close, both accepted only
+from the lease's `ret` (the entry) until M2 signs updates. Every other command is counted and
+ignored (M1 fills `_CONTROL`); an `ack` is never answered, so two nodes cannot ack each other
+forever.
 
 Many sessions from day one. S_max (default 16) caps NEW leases and is itself capped at half the
 runtime's session table, keeping the other half as takeover headroom (C21).
@@ -64,6 +70,7 @@ from .clock import Closed, RealClock, Timeout
 from .links import TcpLinks
 
 _ROLE = {(True, False): "head", (False, False): "mid", (False, True): "tail", (True, True): "solo"}
+RHO_ADMIT = 0.85          # §4.2: no new lease while the hop's load is at or above this
 
 
 def _code(e: Exception) -> str:
@@ -229,8 +236,10 @@ class NodeServer:
     def _on_control(self, peer: str, m: dict) -> None:
         name = self._CONTROL.get(m["cmd"])
         if name is None:
-            self.count("unsupported_ctl")
-            if m.get("sid") is not None and m.get("rte") is not None:
+            self.count(f"ctl_{m['cmd']}_ignored")
+            # Only a lease_open-shaped request earns an answer; an `ack` (or anything a peer
+            # sends as a report) is never answered, or two nodes could ack each other forever.
+            if m["cmd"] == "takeover":
                 self._ack(peer, m["sid"], m["rte"], "unsupported")
             return
         getattr(self, name)(peer, m)
@@ -246,7 +255,7 @@ class NodeServer:
     def _admit(self, sid: int, m: dict) -> str:
         if sid in self._leases:
             return "exists"
-        if len(self._leases) >= self.s_max:
+        if len(self._leases) >= self.s_max or self._rho() >= RHO_ADMIT:
             return "busy"
         if (m["lo"], m["hi"]) != (self.cap.lo, self.cap.hi) or m["role"] != self.role:
             return "span"
@@ -283,10 +292,13 @@ class NodeServer:
     def _lease_update(self, peer: str, m: dict) -> None:
         sid = int(m["sid"], 16)
         L = self._leases.get(sid)
-        if L is None:
-            self.count("update_no_lease")
+        if L is None or peer != L.ret:        # v0 authority: the lease's entry (M2: signature)
+            self.count("update_refused")
             return
-        if m["rte"] <= L.rte or not self._verify_update(m):
+        if m["rte"] == L.rte:                 # a retransmission: already applied
+            self._ack(peer, m["sid"], m["rte"], "ok")
+            return
+        if m["rte"] < L.rte or not self._verify_update(m):
             self._ack(peer, m["sid"], m["rte"], "bad")
             return
         F = m["truncate_to"]
@@ -305,7 +317,12 @@ class NodeServer:
         self._ack(peer, m["sid"], m["rte"], "ok")
 
     def _close(self, peer: str, m: dict) -> None:
-        self._drop_session(int(m["sid"], 16))
+        sid = int(m["sid"], 16)
+        L = self._leases.get(sid)
+        if L is None or peer != L.ret:        # only the lease's entry may end it
+            self.count("close_refused")
+            return
+        self._drop_session(sid)
 
     def _drop_session(self, sid: int) -> None:
         self._leases.pop(sid, None)
@@ -392,7 +409,8 @@ class NodeServer:
             raise _Refuse("unsupported")
         if x is None:
             x = self._rows_in(f)
-        kind = "prefill" if f["kind"] == "P" else ("decode" if n == 1 else "verify")
+        # the SEG kind is the FRAME's (a chunk of a verify frame is still a verify segment)
+        kind = "prefill" if f["kind"] == "P" else ("decode" if f["n"] == 1 else "verify")
         tokens = "none"
         if L.role in ("tail", "solo") and (f["kind"] != "P" or f["last"]):
             tokens = f["lg"]
@@ -452,7 +470,11 @@ class NodeServer:
 
     def _run_big(self, sid: int) -> None:
         """A frame larger than the token budget: validate the whole frame first, then run it
-        as consecutive steps (no step can then refuse) and forward it whole."""
+        as consecutive steps and forward it whole. The seek checks cannot fail mid-frame; a
+        content refusal or backend error in a later chunk leaves the session half-advanced,
+        so the session is closed and reported as a fault (§4.1: "undefined, fail over").
+        Under shape-dependent numerics the bytes then depend on this hop's budget: they
+        replay from the recorded schedule, they do not equal an unsplit run (§0.6)."""
         f, _ = self._pop(sid)
         L = self._leases[sid]
         n = f["n"]
@@ -572,7 +594,10 @@ class NodeServer:
         if cx == "ids":
             if not self.cap.is_head:
                 raise _Refuse("bad")
-            return Rows("i32", np.frombuffer(x.data, dtype="<i4").astype(np.int32))
+            ids = np.frombuffer(x.data, dtype="<i4").astype(np.int32)
+            if len(ids) and int(ids.max()) >= self.cap.vocab_size:
+                raise _Refuse("bad")          # refused before cpos is committed
+            return Rows("i32", ids)
         if self.cap.is_head:
             raise _Refuse("bad")
         if cx == "bf16" and "bf16" in codecs and x.shape == (n, H):

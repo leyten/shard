@@ -21,8 +21,15 @@ frame whose last row is position p must carry oracle_token(T, p).
 
 TIME. clock="virtual" (shard.mesh.clock.VirtualClock) or "real". In virtual time a 2 s deadline
 costs nothing, yet it can only expire once nothing in the mesh can progress without time passing,
-leg delays are exact, and compute takes exactly the modelled cost. Real mode runs the same code on
-the wall clock (delays via real waits, no accounting).
+leg delays are exact, and compute takes exactly the modelled cost. The flip side: a fault
+scheduled "mid-flight" in virtual time lands at a quiescent instant (a frame on a delayed leg,
+inside a node's modelled compute, or queued), never inside a syscall. Real mode runs the same code
+on the wall clock (delays via real waits, no accounting); the real-clock storm is what lands
+faults mid-write, mid-dial and between a read and its hand-off.
+
+SHAPE-DEPENDENT NUMERICS (mode="adversarial", like float kernels). A hop that re-chunks a frame
+over its token budget changes the bytes, so the mesh then equals `replay_chain` (the same
+schedule replayed hop by hop), not `direct_greedy`.
 
 FAULTS. Each must surface as an observable failure at the entry, never as a harness hang:
   kill(i)          crash: streams reset, runtime state gone. Next frame: LinkDown (head) or
@@ -378,6 +385,39 @@ def direct_greedy(weights: ToyWeights, prompt, n_new: int, *, pattern=PATTERN, w
     return list(prompt) + toks
 
 
+def replay_chain(mesh: "FakeMesh", prompt, n_new: int) -> list[int]:
+    """The mesh's schedule replayed WITHOUT the mesh: one runtime per hop span, each fed every
+    frame the way the node server runs it (a frame over the hop's token budget in budget-sized
+    steps). Under shape-dependent numerics a re-chunking hop changes the bytes, so this, not
+    direct_greedy, is what the mesh must equal: "replay of the recorded schedule reproduces
+    the bytes" (ARCHITECTURE-v2 §0.6). Returns the continuation."""
+    P = len(prompt)
+    rts = []
+    for i in range(mesh.D):
+        rt = mesh.runtime(i)._rt                          # the bare ToyRuntime, no modelled cost
+        rt.open(1, max_pos=P + n_new + 1, spec_window=8)
+        rts.append(rt)
+
+    def run(pos, ids, cpos, kind):
+        x, n = Rows("i32", np.array(ids, dtype=np.int32)), len(ids)
+        for i, rt in enumerate(rts):
+            rt.commit(1, cpos)
+            b, outs = mesh.devices[i].budget, []
+            for lo in range(0, n, b):
+                hi = min(n, lo + b)
+                last = i == mesh.D - 1 and hi == n
+                seg = Segment(1, pos + lo, hi - lo, x.slice(lo, hi), tokens="last" if last else "none",
+                              kind="prefill" if kind == "P" else ("decode" if n == 1 else "verify"))
+                outs.append(rt.step(StepIn((seg,))).outs[0])
+            x = Rows.concat([o.hidden for o in outs])
+        return int(outs[-1].tokens.data[-1])
+
+    toks = [run(0, prompt, P - 1, "P")]
+    for k in range(n_new - 1):
+        toks.append(run(P + k, [toks[-1]], P + k, "T"))
+    return toks
+
+
 def reply_tokens(r: dict) -> list[int]:
     return [int(v) for v in r["toks"].numpy()]
 
@@ -613,10 +653,13 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
     """n_faults trials. Each opens a fresh session, runs greedy requests, injects ONE fault
     (kind, target, request index, before or mid-flight at a random offset), and checks:
       * every reply ever received (late ones included) carries the oracle's token;
+      * no failure is blamed on a fault that had not fired yet (a spurious loss is a violation);
       * the fault surfaces as the failure its kind must produce, at the right place and time:
         kill -> LinkDown(dead head) / HopError(next_down) from the dead hop's predecessor
         (before the request: always, and faster than the deadline), or Deadline if the frame
-        died inside the node; hang / partition -> Deadline at exactly sent + deadline;
+        died inside the node; hang / partition -> Deadline at exactly sent + deadline, with
+        evidence (the partitioned leg blocked a message; the hung node received the frame and
+        computed at most the step it was in);
         malformed -> the receiver's bad_frames += 1, the receiver stays up, at most one Deadline;
       * after recovery (restart / resume / heal) the mesh serves again: the lost position
         re-fed on the same session succeeds (hang, partition, malformed), and every next trial
@@ -660,11 +703,16 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
         during = rng.random() < 0.5
         offset = rng.uniform(0.0, mesh.rtt(len(prompt) if at_step == 0 else 1))
         base_bad = mesh.bad_frames(leg[1]) if kind == "malformed" else 0
+        blocked0 = sum(mesh.links_of(p).stats["blocked"] for p in leg)
+        inj: dict = {}                        # when the fault really fired, and evidence
 
         def inject():
+            inj["t"] = mesh.clock.now()
             if kind == "kill":
                 mesh.kill(hop)
             elif kind == "hang":
+                node = mesh.nodes[hop]
+                inj["hang0"] = (node.links.stats["received"], node.snapshot().get("steps", 0))
                 mesh.hang(hop)
             elif kind == "partition":
                 mesh.partition(*leg)
@@ -674,6 +722,7 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
         codes = mesh.open(sid, expect_ok=False)
         if any(c != "ok" for c in codes.values()):
             bad(trial, f"mesh not recovered: lease_open {codes}")
+            mesh.close_session(sid)
             continue
 
         def req(step):
@@ -712,7 +761,10 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
             f":{failure.code}" if isinstance(failure, HopError) else "")
         outcomes[kind][name] = outcomes[kind].get(name, 0) + 1
         t_sent = mesh.sent_at(sid, fail_seq) if fail_seq is not None else None
-        if kind == "kill":
+        if failure is not None and ("t" not in inj or failure.t < inj["t"]):
+            bad(trial, f"{name} at request {fail_step} BEFORE the {kind} fired "
+                       f"(planned at request {at_step}): a failure the fault cannot explain")
+        elif kind == "kill":
             dead = mesh.peers[hop]
             pred = ENTRY if hop == 0 else mesh.peers[hop - 1]
             if failure is None:
@@ -732,6 +784,14 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
                 bad(trial, f"{kind} ({hop if kind == 'hang' else leg}) surfaced as {name}")
             elif abs(failure.t - (t_sent + mesh.deadline)) > 1e-9 and mesh.clock.virtual:
                 bad(trial, f"{kind}: Deadline at {failure.t - t_sent:.9f}s, not {mesh.deadline}s")
+            if kind == "partition" and sum(mesh.links_of(p).stats["blocked"] for p in leg) == blocked0:
+                bad(trial, f"partition {leg}: no message was ever blocked on it")
+            if kind == "hang" and "hang0" in inj:
+                node = mesh.nodes[hop]
+                got_in = node.links.stats["received"] - inj["hang0"][0]
+                ran = node.snapshot().get("steps", 0) - inj["hang0"][1]
+                if got_in < 1 or ran > 1:  # the frame reached it, it computed nothing new
+                    bad(trial, f"hang of {node.peer_id}: received {got_in}, computed {ran} steps")
         else:
             if failure is not None and not isinstance(failure, Deadline):
                 bad(trial, f"malformed {how} on {leg} surfaced as {name}")
