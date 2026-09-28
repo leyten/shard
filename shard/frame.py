@@ -92,6 +92,12 @@ DECISIONS WHERE §5 IS SILENT OR AMBIGUOUS (each consistent with the §7 receipt
   decrypt `eid` (ekey), sample (seed) or sign its checkpoints (nonce), all of which §7 needs.
 - `lease_update.sig` signs `signing_bytes(msg)`: the canonical body with `sig` left out.
   `backup = ""` clears the backup (for example when it died). Absent means unchanged.
+- `ack` (hop → entry) is not in §5.3, which has no admission reply and no refusal message. Without
+  one an entry cannot know that every hop installed its lease before the first frame, and §4.2's
+  "refuse loudly" (a position gap) has no wire form. `ack{sid, rte, seq?, code}` answers
+  `lease_open` / `lease_update` to the sender (`seq` absent), and reports a refused or undeliverable
+  frame to the lease's `ret` (`seq` = the frame's). `code` is one of `ACK_CODES`; `ok` is the
+  only success.
 - `recv` reads the body into one buffer that grows geometrically with the bytes that have
   arrived. A peer that claims a large frame and then stalls pins at most 2× what it sent
   (`transport.recv_msg` preallocates the full claim). The price is about one extra memory pass
@@ -117,6 +123,13 @@ MAX_HOPS = 255            # ld / dt entries
 MAX_BLK = 64              # tail drafter block length K
 EID_SLACK = 64            # eid ≤ 4·n + this (AEAD nonce + tag)
 U16, U32 = 0xFFFF, 0xFFFFFFFF
+# ack codes. Admission (lease_open): busy (S_max), kv_full, w_too_deep, exists, span (layer range
+# or role is not what the hop serves), bad (malformed or unverifiable), unsupported (a feature
+# this node version lacks). Frames: gap (pos past the session length), rollback (below the
+# committed frontier), window (past frontier + W), fault (backend error: the session is closed),
+# next_down (the successor is unreachable: the frame is lost).
+ACK_CODES = ("ok", "busy", "kv_full", "w_too_deep", "exists", "span", "bad", "unsupported",
+             "gap", "rollback", "window", "fault", "next_down")
 
 
 class FrameError(ConnectionError):
@@ -403,6 +416,7 @@ _CONTROL = {
     "log_rows": [_SID, _PLO, _PHI, ("cx", _CODEC, _REQ, None),
                  ("ct", _enum("none", "bf16"), "none", None), ("seg", _seg, _REQ, None)] + _PAYLOAD,
     "stats": [("rec", _bytes(1, 65536), _REQ, "b")],
+    "ack": [_SID, _RTE, ("seq", U32_, None, None), ("code", _enum(*ACK_CODES), _REQ, None)],
 }
 _CONTROL = {cmd: _head3("c") + [("cmd", _const(cmd), _REQ, None)] + f for cmd, f in _CONTROL.items()}
 MAX_BLOBS = max(sum(1 for f in s if f[3]) for s in [_FRAME, _REPLY, *_CONTROL.values()])
