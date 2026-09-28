@@ -91,6 +91,17 @@ def test_mxfp4_every_value_is_bf16_exact_and_leading_dims_work():
         assert torch.equal(w[e], dequant_mxfp4(packed[e], scale[e]))
 
 
+def test_mxfp4_accepts_deepseek_v4_storage_dtypes():
+    """V4 ships the same bytes as I8 codes + F8_E8M0 scales: reinterpreted, never converted."""
+    g = torch.Generator().manual_seed(3)
+    packed = torch.randint(0, 256, (4, 32), dtype=torch.uint8, generator=g)
+    scale = torch.randint(100, 150, (4, 2), dtype=torch.uint8, generator=g)
+    ref = dequant_mxfp4(packed, scale)
+    assert torch.equal(dequant_mxfp4(packed.view(torch.int8), scale), ref)
+    if hasattr(torch, "float8_e8m0fnu"):
+        assert torch.equal(dequant_mxfp4(packed.view(torch.int8), scale.view(torch.float8_e8m0fnu)), ref)
+
+
 def test_mxfp4_shape_mismatch_refused():
     with pytest.raises(ValueError, match="shapes"):
         dequant_mxfp4(torch.zeros(2, 32, dtype=torch.uint8), torch.zeros(2, 3, dtype=torch.uint8))

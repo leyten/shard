@@ -5,6 +5,8 @@ MXFP4 (OCP Microscaling v1.0, as MiMo-V2 / gpt-oss / Kimi-K3 routed experts ship
   codes   e2m1, bit 3 = sign: {0, .5, 1, 1.5, 2, 3, 4, 6} and their negatives (0x8 = -0.0).
   scale   U8 E8M0 [..., N, K/32]: one shared exponent per 32 consecutive elements along K,
           value 2^(s-127); 0xFF is NaN.
+  Storage dtypes differ, bytes do not: DeepSeek-V4 stores the packed codes as I8 and the scales as
+  F8_E8M0 (torch.float8_e8m0fnu); both are reinterpreted as uint8, never converted.
   Evidence: bit-identical to transformers' gpt-oss decoder (`integrations.mxfp4.
   convert_moe_packed_tensors`) on real MiMo-V2.6-Flash layer-1 experts 0/131/255 x gate/up/down
   (scratchpad oracle, 2026-09-28); the same OCP layout vLLM 0.30.0's Mxfp4MoEMethod consumes and
@@ -57,6 +59,8 @@ def e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
     """E8M0 shared scales -> fp32 2^(s-127). Built from the fp32 bit pattern (s << 23; s = 0 is the
     subnormal 2^-127), so it is exact for every code and independent of any exp2 implementation.
     0xFF (NaN) is refused. Note: torch.set_flush_denormal(True) would flush s = 0 to zero."""
+    if scale.dtype == getattr(torch, "float8_e8m0fnu", None):
+        scale = scale.view(torch.uint8)
     if scale.dtype != torch.uint8:
         raise ValueError(f"E8M0 scale must be uint8, got {scale.dtype}")
     if (scale == 255).any():
@@ -69,6 +73,8 @@ def e8m0_to_fp32(scale: torch.Tensor) -> torch.Tensor:
 def dequant_mxfp4(packed: torch.Tensor, scale: torch.Tensor) -> torch.Tensor:
     """MXFP4 -> fp32 [..., N, K]. packed U8 [..., N, K/2] (low nibble first), scale U8 E8M0
     [..., N, K/32]. Every value is exactly bf16-representable (see the module docstring)."""
+    if packed.dtype == torch.int8:
+        packed = packed.view(torch.uint8)
     if packed.dtype != torch.uint8:
         raise ValueError(f"MXFP4 packed tensor must be uint8, got {packed.dtype}")
     *lead, kh = packed.shape
