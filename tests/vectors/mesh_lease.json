@@ -1,0 +1,378 @@
+{
+ "about": "Shared mesh test vectors: tests/vectors/mesh_{placement,paths,lease,directory}.json.",
+ "claims": ["cell","exp","from","hi","iat","iss","job","kv","lid","lo","model","role","rte","sid","to","typ"],
+ "domain": "shard-lease/1\n",
+ "gate": [
+  {
+   "me": "PeerB",
+   "name": "redial ok, stale rte refused, supersede, close",
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "skew": 30,
+   "steps": [
+    {"expect":{"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":2000,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"},
+    {"expect":{"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":2001,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"},
+    {"expect":{"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566fe","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":4,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":2002,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZSIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6NCwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.wLaVrvf0d5chzOqhs_a27lPAhKXakCQg2zJ65v8LxwI_-3WHD1s7KD8e3W84dnr7tgKUIeNnXn8oq6eMNCrfCg"},
+    {"expect":{"error":"stale_rte"},"now":2003,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"},
+    {"expect":null,"now":2004,"op":"supersede","rte":5,"sid":"0123456789abcdef"},
+    {"expect":{"error":"stale_rte"},"now":2005,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZSIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6NCwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.wLaVrvf0d5chzOqhs_a27lPAhKXakCQg2zJ65v8LxwI_-3WHD1s7KD8e3W84dnr7tgKUIeNnXn8oq6eMNCrfCg"},
+    {"expect":{"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566fd","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":5,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":2006,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZCIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6NSwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.4WdGmz-7eDdDIFhaZA5SlN1ZKNWJ7U5zTabELs40HZiTHe1Zvq3aDeIVcKsDzTFSiL4B0EnYMcuxBxncBfQiBw"},
+    {"expect":null,"now":2007,"op":"close","sid":"0123456789abcdef"},
+    {"expect":{"error":"closed"},"now":2008,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZCIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6NSwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.4WdGmz-7eDdDIFhaZA5SlN1ZKNWJ7U5zTabELs40HZiTHe1Zvq3aDeIVcKsDzTFSiL4B0EnYMcuxBxncBfQiBw"},
+    {"expect":{"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"fedcba9876543210","to":"PeerB","typ":"shard-lease/1"}},"now":2009,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiZmVkY2JhOTg3NjU0MzIxMCIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.oxBJiZWsokPBb9482tvyy2aieR3vqcxFHC-XfOmD7zyPhC1r2IwY7SCmItYDgiM4UEytxDbx2kgvNAjqxuC_Cw"}
+   ]
+  },
+  {
+   "me": "PeerB",
+   "name": "prune waits for every older token",
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "skew": 30,
+   "steps": [
+    {"expect":{"ok":{"cell":"eu-1","exp":1200,"from":"PeerA","hi":16,"iat":1100,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566bb","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":2,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":1150,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6MTIwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjExMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZiYiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Miwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.2NvtZkHco8CU39u7nIna26SZ7RLLUo4T7PvY07TctAWfZ8E_K1tBrtq2o1GXdHG3LX9iFilUATBp9Mz_6MUlAg"},
+    {"expect":null,"now":1300,"op":"prune"},
+    {"expect":{"error":"stale_rte"},"now":1300,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6ODc0MDAsImZyb20iOiJQZWVyQSIsImhpIjoxNiwiaWF0IjoxMDAwLCJpc3MiOiJrUER2QWFnb2sxYXJoTWtqZnA0cEN1OUx5cTVtODJ5RXFNdHhWRmxrdk9jPSIsImpvYiI6ImpvYi0xIiwia3YiOjQwOTYsImxpZCI6IjAwMTEyMjMzNDQ1NTY2YWEiLCJsbyI6OCwibW9kZWwiOiJYaWFvbWlNaU1vL01pTW8tVjIuNi1GbGFzaCIsInJvbGUiOiJtaWQiLCJydGUiOjEsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.tVgPjc5m0qzSODjPzqhHG70dGvyYJtyHLnRplbRfGTe-z2uxc70YED8ymqXeX2D_O5eYXdBtkFY9QoXMriABBQ"},
+    {"expect":null,"now":87531,"op":"prune"},
+    {"expect":{"ok":{"cell":"eu-1","exp":90100,"from":"PeerA","hi":16,"iat":90000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566aa","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":1,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},"now":90050,"op":"admit","sender":"PeerA","token":"eyJjZWxsIjoiZXUtMSIsImV4cCI6OTAxMDAsImZyb20iOiJQZWVyQSIsImhpIjoxNiwiaWF0Ijo5MDAwMCwiaXNzIjoia1BEdkFhZ29rMWFyaE1ramZwNHBDdTlMeXE1bTgyeUVxTXR4VkZsa3ZPYz0iLCJqb2IiOiJqb2ItMSIsImt2Ijo0MDk2LCJsaWQiOiIwMDExMjIzMzQ0NTU2NmFhIiwibG8iOjgsIm1vZGVsIjoiWGlhb21pTWlNby9NaU1vLVYyLjYtRmxhc2giLCJyb2xlIjoibWlkIiwicnRlIjoxLCJzaWQiOiIwMTIzNDU2Nzg5YWJjZGVmIiwidG8iOiJQZWVyQiIsInR5cCI6InNoYXJkLWxlYXNlLzEifQ.9MmlMg793AgmNl0RFwizjZ-SV23xNyzLrhLxLFW_bHzYTe_sbU_dBjHdHs7s0QS1H93g3cAARXkaH569lyq_CQ"}
+   ]
+  }
+ ],
+ "issue": [
+  {
+   "claims": {"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"},
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "claims": {"cell":"eu-1","exp":4600,"from":"Entry1","hi":16,"iat":1000,"job":"job-1","kv":4096,"lid":"00112233445566ff","lo":0,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"head","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"},
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IkVudHJ5MSIsImhpIjoxNiwiaWF0IjoxMDAwLCJpc3MiOiJrUER2QWFnb2sxYXJoTWtqZnA0cEN1OUx5cTVtODJ5RXFNdHhWRmxrdk9jPSIsImpvYiI6ImpvYi0xIiwia3YiOjQwOTYsImxpZCI6IjAwMTEyMjMzNDQ1NTY2ZmYiLCJsbyI6MCwibW9kZWwiOiJYaWFvbWlNaU1vL01pTW8tVjIuNi1GbGFzaCIsInJvbGUiOiJoZWFkIiwicnRlIjozLCJzaWQiOiIwMTIzNDU2Nzg5YWJjZGVmIiwidG8iOiJQZWVyQiIsInR5cCI6InNoYXJkLWxlYXNlLzEifQ.5qpwaKKVlRROaQ2KA6mCgHCbowAweaXvKOMp3mdw0fH43CiAw3CD14bqJEsAtGZAJGUQbIp7MIWNwdCfy6OyDw"
+  },
+  {
+   "claims": {"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"backup","rte":3,"sid":"0123456789abcdef","to":"PeerZ","typ":"shard-lease/1"},
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6ImJhY2t1cCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlcloiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.hgDwdJpaeOGscsqm4UPfYsdL-OwOJmKYI8EpM3z6DkIJXFPhceM1YHjVgSxRL8ql50CLidAxTDP66XMauRx9Dw"
+  },
+  {
+   "claims": {"cell":"eu-1","exp":4600,"from":"PeerA","hi":48,"iat":1000,"job":"job-1","kv":0,"lid":"00112233445566ff","lo":0,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"solo","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"},
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjQ4LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6MCwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjowLCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6InNvbG8iLCJydGUiOjMsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.Q3nm1LJI-zWGk9bpm7buKgWy5qHbu7DROU4Yp_Leny7ca2exDt_nTD_HobM5lqquJxG_cPUlb8o9Nvuerdq5AA"
+  }
+ ],
+ "key": {
+  "note": "PUBLIC test key; never a production key",
+  "pub_b64": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+  "seed_hex": "a6ac300618a7b7c29294ddf8fadb631830389e7a01f64d68ed8cc6a2cdedc1ab"
+ },
+ "kind": "lease",
+ "max_token": 4096,
+ "max_ttl_s": 86400,
+ "schema": "shard-mesh-vectors/1",
+ "verify": [
+  {
+   "audience": "PeerB",
+   "expect": {"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},
+   "name": "valid",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},
+   "name": "valid as bytes-equivalent string at the last valid second",
+   "now": 4599,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"ok":{"cell":"eu-1","exp":4600,"from":"PeerA","hi":16,"iat":1000,"iss":"kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=","job":"job-1","kv":4096,"lid":"00112233445566ff","lo":8,"model":"XiaomiMiMo/MiMo-V2.6-Flash","role":"mid","rte":3,"sid":"0123456789abcdef","to":"PeerB","typ":"shard-lease/1"}},
+   "name": "skew: 30 s before iat",
+   "now": 970,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "rte changed, signature kept",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6NCwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerC",
+   "expect": {"error":"signature"},
+   "name": "to changed, signature kept",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckMiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "kv changed, signature kept",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6MTA0ODU3NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "exp extended, signature kept",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6OTk5OTksImZyb20iOiJQZWVyQSIsImhpIjoxNiwiaWF0IjoxMDAwLCJpc3MiOiJrUER2QWFnb2sxYXJoTWtqZnA0cEN1OUx5cTVtODJ5RXFNdHhWRmxrdk9jPSIsImpvYiI6ImpvYi0xIiwia3YiOjQwOTYsImxpZCI6IjAwMTEyMjMzNDQ1NTY2ZmYiLCJsbyI6OCwibW9kZWwiOiJYaWFvbWlNaU1vL01pTW8tVjIuNi1GbGFzaCIsInJvbGUiOiJtaWQiLCJydGUiOjMsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "role changed, signature kept",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6InRhaWwiLCJydGUiOjMsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "signed by another key",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6IkpOSU1vTWRGUG5adVBtUzQ1WFQ4SU9mZ05qVlhHUzFJMUlqQzNLKzBNMWc9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.KnX_d9gO40HFj0jxxgjjQYu4f1s0CeKEPi2aYrYYQr3lGNklbqVS0cK6q-Q0Zxl6joBD9xGYdk_5CTfLpAG8AA"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"signature"},
+   "name": "signed without the domain tag",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.Sa5GzpwV0cAJveRe8-v6NAeQN0yuNkN3uh9rh-mFEfi-GDmvsg1cVYy_Z5suecuF-qjcpgc7Ogd9X86zJADkBA"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"issuer"},
+   "name": "iss is another key, signed by the pinned key",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6IkpOSU1vTWRGUG5adVBtUzQ1WFQ4SU9mZ05qVlhHUzFJMUlqQzNLKzBNMWc9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.ZTZGIr4n82eA-wS_3T3IS651tob8tV7fv5vqDPtXcRaRF1R1o5JdAdf61Brm_vfCuld9L2U-p5P35MdJ57eSBQ"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "unknown claim",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIiwienoiOjF9.jdp7Q5g6fAfaehPha8Q_vSUqtsrlE7A3n4_32qPYR0-vkemWnOMo18IsJ3UQe5B63vFvwXZxH-BmkuiasVjlCQ"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "missing claim",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJsaWQiOiIwMDExMjIzMzQ0NTU2NmZmIiwibG8iOjgsIm1vZGVsIjoiWGlhb21pTWlNby9NaU1vLVYyLjYtRmxhc2giLCJyb2xlIjoibWlkIiwicnRlIjozLCJzaWQiOiIwMTIzNDU2Nzg5YWJjZGVmIiwidG8iOiJQZWVyQiIsInR5cCI6InNoYXJkLWxlYXNlLzEifQ.z_j9lqcaiwqWS7S8GujlQUj-PEbjQIpSC8hm4mQJsKwK2p5O7LggHS1aT5fkZy57vQwHoGyAEhYmTsLqBAGoDQ"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "float rte",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6My4wLCJzaWQiOiIwMTIzNDU2Nzg5YWJjZGVmIiwidG8iOiJQZWVyQiIsInR5cCI6InNoYXJkLWxlYXNlLzEifQ.pH0vcPA9u9t6cIdQ0-On_d0tGRsrSINZt9qDdQ0wXWg55lxHdZi1Q71wQBVCiCbXJGG2f2dfFVnCXUB0IgY2BA"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "bool rte",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6dHJ1ZSwic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.f8AW2Z049JRkOTTwm24Zr-te7G_CPfklDcjTO7CHvL6-DMzJSTbxjeFGGxsvx6S4h_5XsM2VHOOqDDMHKR46DQ"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "duplicate key",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIiwicnRlIjo5fQ.2nnmFVVGEe5ANNhtUW4nE8qe0_cb5BiCnDr1gr-DANAz_W0yRkQqXoewMmjGYJ5AroP0eiadE_ZPqlXOBKQoBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "NaN",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6TmFOLCJsaWQiOiIwMDExMjIzMzQ0NTU2NmZmIiwibG8iOjgsIm1vZGVsIjoiWGlhb21pTWlNby9NaU1vLVYyLjYtRmxhc2giLCJyb2xlIjoibWlkIiwicnRlIjozLCJzaWQiOiIwMTIzNDU2Nzg5YWJjZGVmIiwidG8iOiJQZWVyQiIsInR5cCI6InNoYXJkLWxlYXNlLzEifQ.n7Z2MQ8BY7oeh1wx-3R8Ecf-NGlwfNwEVvxFhvCLvWhW80Vp-dMm6519bwcls3igKzuLfF7JnCAJPewGBqEcBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "uppercase sid",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OUFCQ0RFRiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.M163xusoD4PN6wJjHk47OM2uREptBuccZDF28AyW8aObRK9HIcjYoSn3iy2XKon6wPaf5kWraWkymLWyomAzCA"
+  },
+  {
+   "audience": "PeerA",
+   "expect": {"error":"schema"},
+   "name": "self edge",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckEiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.VgOj5PMPg90lHxP4VWkSD4XlWvEKUf4Z2G27XMyTbSXrSN6UTmZcojAFLjt_M8aR3EqqcaflR-CaF-1aZJbqDg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"schema"},
+   "name": "empty layer range",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjoxNiwibW9kZWwiOiJYaWFvbWlNaU1vL01pTW8tVjIuNi1GbGFzaCIsInJvbGUiOiJtaWQiLCJydGUiOjMsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.98u_G2Xwn-8dmHxFCwRf5xEEZ3HBEVKV2MNXD_oSZRygdyl8atVtBLKDx0lVHsnl3FtQauYA77wBLyp7zlH5DA"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"ttl"},
+   "name": "ttl over 24 h",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6ODc0MDEsImZyb20iOiJQZWVyQSIsImhpIjoxNiwiaWF0IjoxMDAwLCJpc3MiOiJrUER2QWFnb2sxYXJoTWtqZnA0cEN1OUx5cTVtODJ5RXFNdHhWRmxrdk9jPSIsImpvYiI6ImpvYi0xIiwia3YiOjQwOTYsImxpZCI6IjAwMTEyMjMzNDQ1NTY2ZmYiLCJsbyI6OCwibW9kZWwiOiJYaWFvbWlNaU1vL01pTW8tVjIuNi1GbGFzaCIsInJvbGUiOiJtaWQiLCJydGUiOjMsInNpZCI6IjAxMjM0NTY3ODlhYmNkZWYiLCJ0byI6IlBlZXJCIiwidHlwIjoic2hhcmQtbGVhc2UvMSJ9.pQ6IAAdCbKCtsfbg52Y0kxrAfNuQm7x3HPKbgfcTuD2lGLj2UzIz8E77LOho3wtYXkiDdWF0nLrJdKdAGPgKCA"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "non-canonical base64 (unused bits set)",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBh"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "padding",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg="
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "three parts",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg.x"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "not base64url",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR+XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "empty",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": ""
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"format"},
+   "name": "oversize",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"
+  },
+  {
+   "audience": "PeerC",
+   "expect": {"error":"audience"},
+   "name": "wrong audience",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"sender"},
+   "name": "wrong sender (a stolen token)",
+   "now": 2000,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "Mallory",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"expired"},
+   "name": "expired",
+   "now": 4600,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  },
+  {
+   "audience": "PeerB",
+   "expect": {"error":"not_yet_valid"},
+   "name": "not yet valid",
+   "now": 969,
+   "pub": "kPDvAagok1arhMkjfp4pCu9Lyq5m82yEqMtxVFlkvOc=",
+   "sender": "PeerA",
+   "skew": 30,
+   "token": "eyJjZWxsIjoiZXUtMSIsImV4cCI6NDYwMCwiZnJvbSI6IlBlZXJBIiwiaGkiOjE2LCJpYXQiOjEwMDAsImlzcyI6ImtQRHZBYWdvazFhcmhNa2pmcDRwQ3U5THlxNW04MnlFcU10eFZGbGt2T2M9Iiwiam9iIjoiam9iLTEiLCJrdiI6NDA5NiwibGlkIjoiMDAxMTIyMzM0NDU1NjZmZiIsImxvIjo4LCJtb2RlbCI6IlhpYW9taU1pTW8vTWlNby1WMi42LUZsYXNoIiwicm9sZSI6Im1pZCIsInJ0ZSI6Mywic2lkIjoiMDEyMzQ1Njc4OWFiY2RlZiIsInRvIjoiUGVlckIiLCJ0eXAiOiJzaGFyZC1sZWFzZS8xIn0.0Nv3uM0JkiwfZYf2l3GgCNF5v1EX85vzP4Lpjche4InwDIhe5cf9UpNFoEStZmxJ0eLE9rSUY7QItoMWZR-XBg"
+  }
+ ],
+ "wire": "b64url(canonical claims JSON) '.' b64url(Ed25519(key, DOMAIN || payload)), no padding"
+}
