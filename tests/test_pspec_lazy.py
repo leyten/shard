@@ -51,6 +51,19 @@ def test_lazy_licence_sound_at_every_floor(policy, accept, W, floor, k):
         assert host.skipped == 0, "a chunk burst is one frame: nothing to hint"
 
 
+@pytest.mark.parametrize("floor", [1, 2])
+@pytest.mark.parametrize("W", [2, 3, K + 1])
+@pytest.mark.parametrize("off", range(1, 14))
+def test_lazy_licence_sound_with_eos_anywhere(off, W, floor):
+    """EOS committed at any depth of a run: the stop drains every later reply, skipped or not."""
+    eos = (T[P + off],)
+    for k in (1, 2, K):
+        host = TailDrafterHost(BlocksDrafter(tail_blocks(T, k, ACCEPT["random"]), k))
+        r, *_ = run_pspec(T, P, 45, W=W, floor=floor, policy="pertoken", host=host, lazy=True,
+                          eos=eos)
+        assert r["tokens"] == toy_greedy(T, P, 45, eos=eos)
+
+
 def test_lazy_licence_saves_drafts():
     """The licence is not vacuous: at floor 1 with runs in flight it skips most drafts."""
     eager = TailDrafterHost(BlocksDrafter(tail_blocks(T, K), K))
