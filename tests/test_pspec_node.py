@@ -370,6 +370,32 @@ def test_coordinator_over_the_mesh_is_lossless(mesh_factory, D, policy, tail):
     assert snap.get("faults", 0) == 0 and not any(k.startswith("refused") for k in snap)
 
 
+@pytest.mark.parametrize("D,floor,W", [(3, 3, 8), (5, 2, 6), (7, 4, 8)])
+def test_deep_pipelines_with_topups_are_lossless(mesh_factory, D, floor, W):
+    """Per-token frames with a refill floor > 1 keep up to W positions in flight, so every cancel
+    leaves a tail of stale frames on the wire: the tail judges them off-path (acc False), the
+    coordinator discards them by sep, and the committed stream is still the greedy one."""
+    box, rng = {}, random.Random(D)
+    m = mesh_factory(D, clock="real", cost_scale=0.0,
+                     legs_ms=[rng.uniform(0.0, 3.0) for _ in range(D + 1)],
+                     drafters={"toy": tail_drafter(box, 5, _miss(0.7, D))})
+    tot = {"stale_replies": 0, "topups": 0}
+    for sid in (1, 2, 3):
+        prompt = [rng.randrange(FM.VOCAB) for _ in range(6)]
+        T = direct_greedy(m.weights, prompt, 40)
+        box["T"] = T
+        m.open(sid, max_pos=6 + 30 - 1, W=W, drafter="toy")
+        s = coord.Session(prompt, 30, sid=hexsid(sid), rte=1, W=W, policy="pertoken", floor=floor,
+                          seal=bytes)
+        r = coord.run(MeshLink(m), s, timeout=20.0)
+        assert r["tokens"] == T[6:36], sid
+        for k in tot:
+            tot[k] += r[k]
+    snap = m.nodes[-1].snapshot()
+    assert tot["stale_replies"] > 0 and tot["topups"] > 0, tot
+    assert snap["judged_off"] == tot["stale_replies"]       # each stale reply judged off-path
+
+
 def test_coordinator_over_the_mesh_with_eos(mesh_factory):
     box = {}
     m = mesh_factory(3, clock="real", cost_scale=0.0, drafters={"toy": tail_drafter(box, 3, _miss(0.7, 1))})
