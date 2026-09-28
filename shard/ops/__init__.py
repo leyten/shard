@@ -28,3 +28,19 @@ decode/verify sizes, design-runtime §6 R1). MiMo-Flash layer, 5090-class card:
     Not in the decode gate but it is TTFT: the Q-tiled variant is TODO (invariant by the same masked-tile
     no-op argument).
 """
+
+
+def numerics_parts(device=None) -> dict:
+    """Everything that decides the receipt-grade bytes, for numerics_id: the kernel pins plus the
+    toolchain (Triton/ptxas codegen decides FMA contraction, ex2.approx, division) and the EXACT compute
+    capability (not an arch family). Same parts => same compiled kernels => same bytes (the HW2 probe
+    checks the last step on each device)."""
+    import torch
+    import triton
+
+    from . import invariant_attn, invariant_moe
+    cuda = torch.cuda.is_available()
+    return dict(moe=invariant_moe.NUMERICS_PIN, attn=invariant_attn.NUMERICS_PIN, triton=triton.__version__,
+                torch=torch.__version__, cuda=torch.version.cuda,
+                capability=list(torch.cuda.get_device_capability(device)) if cuda else None,
+                backend="cuda" if cuda else ("interpreter" if invariant_moe.INTERPRET else "none"))

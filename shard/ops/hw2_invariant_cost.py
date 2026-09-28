@@ -27,9 +27,9 @@ import torch
 
 FLASH = dict(H=4096, I=2048, E=256, top_k=8, hq=64, hkv_global=4, hkv_swa=8, window=128,
              decode=[1, 4, 8, 16, 32, 64], verify=[(1, 8), (4, 8), (8, 8)], prefill=[512],
-             ctx=[4096, 32768], reps=20, probe_moe=(2, 17, 64, 1), probe_attn=(3, 9, 40))
+             ctx=[4096, 32768], reps=20, probe_moe=(2, 17, 64, 1), probe_attn=(3, 9, 40), probe_slots=16)
 SMOKE = dict(H=256, I=128, E=16, top_k=4, hq=16, hkv_global=1, hkv_swa=2, window=128,
-             decode=[1], verify=[(1, 2)], prefill=[], ctx=[80], reps=1, probe_moe=(3,), probe_attn=(3,))
+             decode=[1], verify=[(1, 2)], prefill=[], ctx=[80], reps=1, probe_moe=(3,), probe_attn=(3,), probe_slots=2)
 RATIO_GATE = 1.5
 
 
@@ -130,6 +130,13 @@ def probe_invariance(cfg, dev, w13, s13, w2, s2, g) -> dict:
     pid, pw = _route(1, cfg, dev, g)
     base = im.moe_experts_forward(px, pid, pw, w13, s13, w2, s2)[0]
     moe_ok = []
+    for j in range(cfg["probe_slots"]):                  # every row slot of the expert's BLOCK_M tile
+        x = torch.randn(im.BLOCK_M, cfg["H"], generator=g).to(torch.bfloat16).to(dev)
+        ids = pid.repeat(im.BLOCK_M, 1)
+        w = pw.repeat(im.BLOCK_M, 1)
+        x[j] = px[0]
+        out = im.moe_experts_forward(x, ids, w, w13, s13, w2, s2)
+        moe_ok.append(bool(torch.equal(out[j].view(torch.int16), base.view(torch.int16))))
     for n in cfg["probe_moe"]:
         x = torch.randn(n, cfg["H"], generator=g).to(torch.bfloat16).to(dev)
         ids, w = _route(n, cfg, dev, g)
@@ -149,11 +156,28 @@ def probe_invariance(cfg, dev, w13, s13, w2, s2, g) -> dict:
             q = torch.randn(n, cfg["hq"], 192, generator=g).to(torch.bfloat16).to(dev)
             seq = torch.randint(0, 4, (n,), generator=g).int().to(dev)
             pos = torch.randint(0, ctx, (n,), generator=g).int().to(dev)
-            q[n - 1], seq[n - 1], pos[n - 1] = pq[0], 0, ctx - 1
+            j = int(torch.randint(0, n, (1,), generator=g))          # probe at a random row
+            q[j], seq[j], pos[j] = pq[0], 0, ctx - 1
             out = ia.paged_diffkv_attention(q, kc, vc, bt, seq, pos, window, sk)
-            attn_ok.append(bool(torch.equal(out[n - 1].view(torch.int16), ref.view(torch.int16))))
+            attn_ok.append(bool(torch.equal(out[j].view(torch.int16), ref.view(torch.int16))))
     return dict(moe_probe_byte_identical=moe_ok, attn_probe_byte_identical=attn_ok,
-                all_ok=all(moe_ok) and all(attn_ok))
+                all_ok=all(moe_ok) and all(attn_ok), compiled_variants=compiled_variants())
+
+
+def compiled_variants() -> dict | None:
+    """Compiled kernels per Triton function after all the mixed batches above. Receipt-grade expects ONE
+    per kernel per config (batch-dependent args are do_not_specialize); more means a batch shape got its
+    own never-probed binary. None under the interpreter (nothing compiles)."""
+    from . import invariant_attn as ia
+    from . import invariant_moe as im
+    out = {}
+    for name, fn in (("moe_gemm", im._mxfp4_grouped_gemm_kernel), ("attn_split", ia._attn_split_kernel),
+                     ("attn_merge", ia._attn_merge_kernel)):
+        caches = getattr(fn, "device_caches", None)
+        if caches is None:
+            return None
+        out[name] = sum(len(c[0]) for c in caches.values())
+    return out
 
 
 def summarize(res: dict, meaningful: bool = True) -> dict:
@@ -184,13 +208,12 @@ def main(argv=None) -> dict:
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if dev == "cpu" and not a.smoke:
         raise SystemExit("no GPU: run with --smoke (and TRITON_INTERPRET=1)")
-    from . import invariant_attn as ia
-    from . import invariant_moe as im
+    from . import numerics_parts
     res = measure(cfg, dev)
     res["meta"] = dict(device=torch.cuda.get_device_name() if dev == "cuda" else "cpu-interpreter",
                        capability=list(torch.cuda.get_device_capability()) if dev == "cuda" else None,
                        smoke=a.smoke, timings_meaningful=dev == "cuda" and not a.smoke,
-                       pins=[im.NUMERICS_PIN, ia.NUMERICS_PIN], fast_backends=fast_backends(),
+                       numerics=numerics_parts(), fast_backends=fast_backends(),
                        torch=torch.__version__)
     res["summary"] = summarize(res, res["meta"]["timings_meaningful"])
     if a.out:

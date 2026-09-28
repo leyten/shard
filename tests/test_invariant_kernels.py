@@ -27,6 +27,8 @@ from shard.formats.quant import dequant_mxfp4  # noqa: E402
 from shard.ops import invariant_attn as ia  # noqa: E402
 from shard.ops import invariant_moe as im  # noqa: E402
 
+import triton.language as tl  # noqa: E402
+
 FULL = os.environ.get("SHARD_R4_FULL") == "1"
 DEV = "cuda" if torch.cuda.is_available() else "cpu"
 BF = torch.bfloat16
@@ -197,6 +199,60 @@ def test_moe_probe_rows_byte_identical_across_mixes(mix, moe_baseline):
     for i, r in rows:
         assert torch.equal(out[r].view(torch.int16), moe_baseline[i].view(torch.int16)), \
             f"mix {mix[0]}: probe {i} at row {r} changed bytes"
+
+
+def test_moe_probe_every_m_tile_slot(moe_baseline):
+    """The probe lands in every row slot of its expert's BLOCK_M tile (neighbours routed to the same
+    experts, probe moved from slot 0 to BLOCK_M-1): bytes never move."""
+    g = _gen(31)
+    for j in (range(im.BLOCK_M) if FULL else (0, 7, im.BLOCK_M - 1)):
+        x = torch.randn(im.BLOCK_M, H, generator=g).to(BF)
+        ids = PROBE_IDS[0].repeat(im.BLOCK_M, 1)
+        w = torch.rand(im.BLOCK_M, TOP_K, generator=g) + 0.1
+        x[j], w[j] = PROBE_X[0], PROBE_W[0]
+        out = run_moe(x, ids, w)
+        assert torch.equal(out[j].view(torch.int16), moe_baseline[0].view(torch.int16)), f"slot {j}"
+
+
+def test_moe_guards():
+    """Out-of-range expert ids are refused (their rows would never be written); T=0 is empty; scale codes
+    that decode to overflow or subnormal weights are refused at load."""
+    w13, s13, w2, s2 = EXPERTS
+    x = torch.randn(2, H).to(BF)
+    with pytest.raises(ValueError):
+        im.moe_experts_forward(x, torch.tensor([[0, 1, 2, E]]).repeat(2, 1), torch.ones(2, TOP_K),
+                               w13, s13, w2, s2)
+    assert im.moe_experts_forward(x[:0], torch.zeros(0, TOP_K, dtype=torch.long), torch.zeros(0, TOP_K),
+                                  w13, s13, w2, s2).shape == (0, H)
+    im.validate_expert_scales(s13)
+    for bad in (0, 2, 253, 255):
+        with pytest.raises(ValueError):
+            im.validate_expert_scales(torch.full((2, 2), bad, dtype=torch.uint8))
+
+
+@triton.jit
+def _rne_kernel(x_ptr, o_ptr, n, BLOCK: tl.constexpr):
+    offs = tl.arange(0, BLOCK)
+    m = offs < n
+    tl.store(o_ptr + offs, im.f32_to_bf16_rne(tl.load(x_ptr + offs, mask=m)), mask=m)
+
+
+def test_rne_helper_matches_torch_and_keeps_nan():
+    """f32_to_bf16_rne == torch's RNE cast for finite values/inf (incl. ties, negatives, subnormals,
+    overflow), and every NaN pattern -- including NVIDIA's canonical 0x7FFFFFFF, which a bare carry would
+    turn into -0.0 -- stays NaN."""
+    g = _gen(3)
+    bits = torch.cat([torch.randint(-2**31, 2**31 - 1, (4000,), generator=g, dtype=torch.int64),
+                      torch.tensor([0x7FFFFFFF, 0xFFFFFFFF - 2**32, 0x7FC00000, 0xFFC00000 - 2**32, 0x7F800001,
+                                    0x7F800000, 0xFF800000 - 2**32, 0x7F7FFFFF, 0x00008000, 0x00018000,
+                                    0x3F808000, 0x3F818000, 0x00000001, 0x80000000 - 2**32])])
+    x = bits.to(torch.int32).view(torch.float32)
+    out = torch.empty(x.numel(), dtype=BF)
+    _rne_kernel[(1,)](x.to(DEV), out_dev := out.to(DEV), x.numel(), BLOCK=triton.next_power_of_2(x.numel()))
+    out = out_dev.cpu()
+    nan = torch.isnan(x)
+    assert torch.isnan(out[nan]).all()
+    assert torch.equal(out[~nan].view(torch.int16), x[~nan].to(BF).view(torch.int16))
 
 
 def test_moe_row_independence_under_finite_perturbation(moe_baseline):

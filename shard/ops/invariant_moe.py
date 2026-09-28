@@ -45,6 +45,25 @@ NUM_WARPS, NUM_STAGES = 4, 2
 # products exact in fp32; fp32 accumulate) -- the same math the bf16 MMA does, so it tests the TILING
 # and ORDER contract; the on-GPU bytes of the bf16 MMA are the HW2 probe's job (hw2_invariant_cost.py).
 INTERPRET = os.environ.get("TRITON_INTERPRET", "0") not in ("", "0")
+
+
+def _fix_interpreter_scalar_index():
+    """Triton 3.6's interpreter implements tensor.__index__ as int(ndarray); NumPy >= 2.4 refuses that for
+    the 1-element arrays scalars live in, so `range(n)` with a runtime n crashes. CPU-interpreter only."""
+    from triton.runtime import interpreter as ti
+    if getattr(ti, "_shard_index_fix", False):
+        return
+    orig = ti._patch_lang_tensor
+
+    def patched(tensor, scope):
+        orig(tensor, scope)
+        scope.set_attr(tensor, "__index__", lambda self: int(self.handle.data.reshape(-1)[0]))
+    ti._patch_lang_tensor = patched
+    ti._shard_index_fix = True
+
+
+if INTERPRET:
+    _fix_interpreter_scalar_index()
 NUMERICS_PIN = f"mxfp4-w4a16-grouped/v1/bm{BLOCK_M}-bn{BLOCK_N}-bk{BLOCK_K}-sk1-w{NUM_WARPS}-s{NUM_STAGES}"
 
 
@@ -61,15 +80,16 @@ def _e2m1_to_f32(code):
 
 @triton.jit
 def f32_to_bf16_rne(x):
-    """fp32 -> bf16, round-to-nearest-even, by integer bit arithmetic (finite inputs). Identical on
+    """fp32 -> bf16, round-to-nearest-even, by integer bit arithmetic; NaN -> canonical 0x7FC0. Identical on
     every backend; Triton 3.6's interpreter implements `.to(tl.bfloat16)` as TRUNCATION (verified),
     so the explicit form is what makes CPU-interpreted bytes mean anything."""
     b = x.to(tl.uint32, bitcast=True)
-    b = b + 0x7FFF + ((b >> 16) & 1)
-    return (b >> 16).to(tl.uint16).to(tl.bfloat16, bitcast=True)
+    r = (b + 0x7FFF + ((b >> 16) & 1)) >> 16
+    r = tl.where(x != x, 0x7FC0, r)                     # NaN stays NaN (the carry would turn 0x7FFFFFFF into -0)
+    return r.to(tl.uint16).to(tl.bfloat16, bitcast=True)
 
 
-@triton.jit
+@triton.jit(do_not_specialize=["num_rows"])        # one compiled kernel for every batch size
 def _mxfp4_grouped_gemm_kernel(
     a_ptr, w_ptr, s_ptr, out_ptr, sorted_ids_ptr, expert_ids_ptr,
     N, K, num_rows,
@@ -83,11 +103,12 @@ def _mxfp4_grouped_gemm_kernel(
     pid_m = tl.program_id(0)
     pid_n = tl.program_id(1)
     pid_k = tl.program_id(2)
-    e = tl.load(expert_ids_ptr + pid_m)
+    e = tl.load(expert_ids_ptr + pid_m).to(tl.int64)             # e*stride_we > 2^31 on Pro (384 experts)
     offs_m = pid_m * BLOCK_M + tl.arange(0, BLOCK_M)
     ids = tl.load(sorted_ids_ptr + offs_m)
     row_ok = ids < num_rows
-    a_rows = tl.where(row_ok, ids // A_DIV, 0)
+    a_rows = tl.where(row_ok, ids // A_DIV, 0).to(tl.int64)
+    ids = ids.to(tl.int64)
     offs_n = pid_n * BLOCK_N + tl.arange(0, BLOCK_N)
     n_ok = offs_n < N
     half = tl.arange(0, BLOCK_K // 2)
@@ -121,25 +142,36 @@ def _mxfp4_grouped_gemm_kernel(
         tl.store(out_ptr + out_off, f32_to_bf16_rne(acc).to(tl.float32), mask=omask)
 
 
+def validate_expert_scales(scale: torch.Tensor) -> None:
+    """Load-time guard (not per call): E8M0 codes must keep every decoded weight a NORMAL finite bf16.
+    >= 253 overflows (the oracle refuses it too); <= 2 gives subnormal weights, where FTZ behaviour
+    differs across backends (the Triton interpreter flushes bf16 subnormals; GPUs may not)."""
+    lo, hi = int(scale.min()), int(scale.max())
+    if lo < 3 or hi > 252:
+        raise ValueError(f"E8M0 scale codes [{lo}, {hi}] outside the receipt-grade range [3, 252]")
+
+
 def align_by_expert(topk_ids: torch.Tensor, n_experts: int, block_m: int = BLOCK_M):
     """moe_align_block_size equivalent (host-side, deterministic). Flat row r = token*top_k + slot.
     Returns (sorted_ids [n_blocks*block_m] padded with the sentinel T*top_k, expert_ids [n_blocks]).
     Row order within an expert is ascending r; it does not affect any row's bytes (rows independent)."""
     flat = topk_ids.reshape(-1).to(torch.int64)
     sentinel = flat.numel()
+    if sentinel and (int(flat.min()) < 0 or int(flat.max()) >= n_experts):
+        raise ValueError(f"expert id outside [0, {n_experts})")      # such rows would never be written
     ids, experts = [], []
     for ex in range(n_experts):
         rows = torch.nonzero(flat == ex).flatten()
         if rows.numel() == 0:
             continue
         nb = -(-rows.numel() // block_m)
-        pad = torch.full((nb * block_m - rows.numel(),), sentinel, dtype=torch.int64)
+        pad = torch.full((nb * block_m - rows.numel(),), sentinel, dtype=torch.int64, device=flat.device)
         ids.append(torch.cat([rows, pad]))
         experts += [ex] * nb
     dev = topk_ids.device
     if not ids:
         return torch.empty(0, dtype=torch.int32, device=dev), torch.empty(0, dtype=torch.int32, device=dev)
-    return (torch.cat(ids).to(torch.int32).to(dev), torch.tensor(experts, dtype=torch.int32, device=dev))
+    return torch.cat(ids).to(torch.int32), torch.tensor(experts, dtype=torch.int32, device=dev)
 
 
 def mxfp4_grouped_gemm(a: torch.Tensor, w_packed: torch.Tensor, w_scale: torch.Tensor,
@@ -193,6 +225,8 @@ def moe_experts_forward(x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.T
     x bf16 [T, H]; topk_ids [T, k] (distinct per token); topk_w fp32 [T, k];
     w13 = gate rows then up rows: U8 [E, 2I, H/2] / [E, 2I, H/32]; w2 U8 [E, H, I/2] / [E, H, I/32]."""
     T, top_k = topk_ids.shape
+    if T == 0:
+        return x.new_empty(0, w2_packed.shape[1])
     inter = w13_packed.shape[1] // 2
     sk = naive_split_k(T) if naive else 1
     gu = mxfp4_grouped_gemm(x, w13_packed, w13_scale, topk_ids, a_div=top_k, split_k=sk)   # [T*k, 2I]
@@ -201,7 +235,7 @@ def moe_experts_forward(x: torch.Tensor, topk_ids: torch.Tensor, topk_w: torch.T
     h = (torch.nn.functional.silu(g) * u).to(torch.bfloat16).contiguous()
     y = mxfp4_grouped_gemm(h, w2_packed, w2_scale, topk_ids, a_div=1, split_k=sk)          # [T*k, H]
     y = y.view(T, top_k, -1)
-    order = torch.argsort(topk_ids, dim=1)                       # ascending expert id per token
+    order = torch.argsort(topk_ids, dim=1, stable=True)          # ascending expert id per token
     acc = torch.zeros(T, y.shape[-1], dtype=torch.float32, device=x.device)
     for j in range(top_k):                                       # elementwise, fixed order
         sl = order[:, j]
