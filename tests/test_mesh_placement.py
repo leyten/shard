@@ -373,6 +373,17 @@ def test_96gb_and_24gb_mix_every_card_holds_and_fat_nodes_shorten_the_chain():
     assert len(paths[0]["hops"]) == 2 and len(paths) > 1  # 24 GB cards add alternative chains
 
 
+def test_fat_nodes_carry_sessions_even_when_only_small_chains_are_mirror_backed():
+    """2 x 96 GB + 9 x 24 GB: the 24 GB chain is mirror-backed by the fat cards, the fat 2-hop path
+    only by replay over the small cards. Mirror-first ranking would park the fat cards as backups
+    at 23 tok/s; the 1.3x slack keeps them carrying sessions at 43 tok/s."""
+    c = _fleet([("P1", "pro6000-96g"), ("P2", "pro6000-96g")] + [(f"G{i}", "3090") for i in range(9)])
+    paths = candidate_paths(_views(c), FLASH, POL, k=10)
+    assert [h["id"] for h in paths[0]["hops"]] == ["P1", "P2"] and paths[0]["failover"] == "replay"
+    chain = [p for p in paths if p["failover"] == "mirror"]
+    assert chain and all(p["rank_ms"] > POL.backed_slack * paths[0]["rank_ms"] for p in chain)
+
+
 def test_a_fleet_of_only_24gb_cards_serves_backed_paths():
     c = _fleet([(f"G{i}", "3090" if i % 2 else "4090") for i in range(18)])
     (p, *_) = candidate_paths(_views(c), FLASH, POL)

@@ -218,13 +218,15 @@ class Policy:
     s_max: int = 16
     rho_max: float = 0.85
     unreliability_ms: float = 50.0
+    backed_slack: float = 1.3        # design-mesh §4.1: a path > 1.3x the best alternative is degraded
     small_models: tuple[SmallModel, ...] = ()
 
     def __post_init__(self):
         if self.k_min < 1 or self.plan_sessions < 0 or self.plan_ctx < 1 or self.spec_window < 0:
             raise ValueError("k_min >= 1, plan_sessions >= 0, plan_ctx >= 1, spec_window >= 0")
-        if not (self.leg_ms >= 0 and self.bar_tok_s > 0 and 0 < self.rho_max < 1 and self.s_max >= 1):
-            raise ValueError("leg_ms >= 0, bar_tok_s > 0, 0 < rho_max < 1, s_max >= 1")
+        if not (self.leg_ms >= 0 and self.bar_tok_s > 0 and 0 < self.rho_max < 1 and self.s_max >= 1
+                and self.backed_slack >= 1):
+            raise ValueError("leg_ms >= 0, bar_tok_s > 0, 0 < rho_max < 1, s_max >= 1, backed_slack >= 1")
 
     def to_dict(self) -> dict:
         d = {k: getattr(self, k) for k in self.__dataclass_fields__ if k != "small_models"}
@@ -634,10 +636,13 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
     leg and profile.tail_ms. Hard filters: primaries need rho < rho_max, sessions < s_max and
     kv_free >= kv_tokens; subnets on a path are distinct; a backup is never on its own path and
     must hold the whole hop with kv_free >= kv_tokens. Stage holders only; if they form no complete
-    path, backup-role holders may carry hops and the path is `degraded`. Ranking: failover class
-    (_FAILOVER: mirror, replay, none), then rank_ms = prefill_ms + (max_new / g) * step_ms
-    (prefill_ms from topology.predict_prefill_ms, None and 0 when prompt_tokens == 0), then fewer
-    hops, then ids."""
+    path, backup-role holders may carry hops and the path is `degraded`. Ranking by
+    rank_ms = prefill_ms + (max_new / g) * step_ms (prefill_ms from topology.predict_prefill_ms,
+    None and 0 when prompt_tokens == 0): paths within policy.backed_slack x the best rank_ms come
+    first, ordered by failover class (_FAILOVER: mirror, replay, none), then rank_ms, then fewer
+    hops, then ids; slower paths follow in the same order. The slack keeps a fat 2-hop path whose
+    hops nobody mirrors ahead of a 9-hop mirror-backed chain of small cards (which would otherwise
+    turn the fat devices into idle backups), while equal-cost paths still prefer mirrors."""
     n, rtt = profile.n_layers, rtt or {}
     hs = sorted((dict(h) for h in holders), key=lambda h: h["id"])
     leg = lambda a, b: float(rtt.get(a, {}).get(b, policy.leg_ms))          # noqa: E731
@@ -701,8 +706,9 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
                     "replay" if all(_covered(h["lo"], h["hi"], others) for h in hops) else "none")
         paths.append({"hops": hops, "step_ms": step, "prefill_ms": prefill, "rank_ms": rank,
                       "failover": failover, "degraded": degraded})
-    paths.sort(key=lambda p: (_FAILOVER.index(p["failover"]), _q9(p["rank_ms"]), len(p["hops"]),
-                              [h["id"] for h in p["hops"]]))
+    best = min((p["rank_ms"] for p in paths), default=0.0)
+    paths.sort(key=lambda p: (p["rank_ms"] > policy.backed_slack * best, _FAILOVER.index(p["failover"]),
+                              _q9(p["rank_ms"]), len(p["hops"]), [h["id"] for h in p["hops"]]))
     return paths[:k]
 
 
