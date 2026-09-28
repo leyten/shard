@@ -144,7 +144,11 @@ def namespace(names) -> dict:
         # (a ViT's own final norm is not the tail's), then any the checkpoint does carry,
         # and only if it carries none (a tied model has no lm_head tensor) the conventional
         # name under the DERIVED stack. Sorting keeps the pick independent of key order.
+        # Among those inside, a DIRECT child of the stack's module beats a deeper one: in a
+        # top-level namespace (DeepSeek-V4's `layers.N.` / `norm` / `mtp.0.norm`) everything is
+        # "inside", and sorting alone would hand the tail the MTP block's norm.
         found = sorted(edges[key])
         inside = [c for c in found if c.startswith(f"{under}." if under else "")]
-        ns[key] = (inside or found or [default.lstrip(".")])[0]
+        direct = [c for c in inside if (c.rsplit(".", 1)[0] if "." in c else "") == under]
+        ns[key] = (direct or inside or found or [default.lstrip(".")])[0]
     return ns
