@@ -103,11 +103,19 @@ Filter: 1 GPU, verified, rentable, `cuda_max_good >= 13.0`. Prices are $/h (dph_
 
 That is about 2× the old single-box $4-8, and still well inside the balance.
 
-## Known limits (from the self-review; the numbers carry labels, they are not hidden)
+## Known limits (from the self-review and a skeptic pass; the numbers carry labels, they are not hidden)
 
-- B2 at B > 1 loops per sequence (`batched_kernel: false`). The batched attention kernel is R5's job.
-  B2 at B > 1 is an upper bound.
+- B2 at B > 1 loops per sequence (`batched_kernel: false`). Each sequence has its own KV, so L2 does
+  not flatter it. The batched attention kernel is R5's job, so B2 at B > 1 is an upper bound.
 - The D op chain has no RoPE and is not the vendor layer. It isolates kernel and format numerics per
   family. The full-layer cross-family check waits for R2 (mimo_ref promoted).
-- kfac compares a MiMo eager op-sum (+10% glue) with an M2.5 eager stage per layer at B=1, s=9. Both
-  sides are eager. Graph gains on MiMo are unknown until HW2.
+- kfac divides the MiMo op-sum (+10% glue, per-op cuda events) by the same A2 s=9 per-layer time that
+  pipespec_sim scales. That basis is graphed when A2 ran graphed. The MiMo side is unfused, so kfac
+  leans high, which is the conservative direction.
+- K5/K6 get a verdict only from a **calibration-grade** run: Marlin experts, flashinfer on both
+  attention kinds, and real golden inputs. Anything else records the value with `pass: null`.
+- K5 keeps the pre-registered definition, with prefill attention starting at 0. `replay_tok_s_*_prefix8k`
+  re-times the global layers at an 8k prefix, which is the honest number for long sessions.
+- M2.5 A0-A2 route on random hidden states, the same as the anchor, so they stay comparable. K2 sits
+  near its threshold and depends on how many distinct experts get hit. MiMo B1 records that count;
+  the M2.5 side does not yet.
