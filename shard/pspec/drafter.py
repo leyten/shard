@@ -22,10 +22,16 @@ FUSED TAPS (TapSpec). DFlash's `fc` is linear with no bias, so fc(concat(h_l0..h
 sum_i W_i . h_li with W_i the i-th column block of fc.weight. The stage owning layer l_i adds
 W_i . h_li into a running [n, H] accumulator that rides the frame's `tap` lane: one H-vector per
 position instead of k taps. Two properties matter for receipts (the wire bytes are hashed):
-  * ORDER-FIXED: contributions are added in path order = ascending layer order, one add per stage.
+  * ORDER-FIXED: contributions are added in path order = ascending layer order, with ONE bf16
+    rounding per tap LAYER (not per stage). That is what makes the bytes independent of placement:
+    a stage holding two tap layers must round after each, never sum them in f32 and round once.
   * ROW-LOCAL: each row's bytes are a function of that row's inputs alone. `partial` computes a
     fixed-order per-row reduction (no BLAS gemm, whose blocking depends on the batch), so the
     accumulator of a row is bitwise independent of which frame, batch or chunk carried it.
+    This holds for THIS reference only: a stock GPU gemm changes a row's bits with the batch
+    (review: torch f32 gemm, batch 1 vs 64, 3928/4096 elements differ). A device stage must use a
+    batch-invariant kernel for W_l . h under numerics "invariant", or the tap lane cannot be
+    hashed bit-exactly by receipts (D2/D3).
 The wire dtype is bf16 (shard.frame `tap`); `bf16_round` is the exact round-to-nearest-even the
 wire applies between hops.
 
@@ -115,7 +121,10 @@ def attend(q, K, V, sink, scale):
 @dataclass(frozen=True)
 class TapSpec:
     """Target layers a drafter taps and how they fuse. `layers` are absolute target layer ids
-    (tap L = the OUTPUT of layer L, pre-final-norm, runtime.api convention) in fc column order;
+    (tap L = the OUTPUT of layer L, pre-final-norm, runtime.api convention) in fc column order.
+    OPEN FOR D2: MiMo DFlash's tap 47 is the target's LAST layer, and HF's `hidden_states[-1]`
+    (dflash.py's `hidden_states[l + 1]`) is usually the post-final-norm state; if so the tail
+    contributes W_47 . norm(h_47), which it can (it holds the final norm);
     `hidden` is H. mode "fc_partial": the stage holding layer l adds W_l . h_l into the frame's
     running accumulator; "raw": taps travel as-is (the concat reference)."""
     layers: tuple[int, ...]
