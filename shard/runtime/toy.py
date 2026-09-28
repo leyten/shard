@@ -265,43 +265,47 @@ class ToyRuntime:
             self_probe_ok=self._probe, open_sessions=len(self._sess))
 
     def warmup(self, buckets=(1, 8, 32), contexts=(0,), sessions=(1,)) -> Capability:
-        """Time one step per shape (s sessions x b tokens at context c) on scratch sessions
-        (never registered, never charged to the KV pool) after an untimed prefix of c rows
-        each, and self-probe: the repeat run must be byte-equal."""
+        """Time step() for every shape (s sessions x b tokens at context c) on scratch sessions
+        (private negative sids, never charged to the KV pool, removed afterwards) after an
+        untimed prefix of c rows each, and self-probe: the repeat run must be byte-equal."""
         self._loaded()
         service, probe = [], True
         for n_s in sessions:
             for ctx in contexts:
                 for b in buckets:
-                    b = int(b)
+                    b, n_s, ctx = int(b), int(n_s), int(ctx)
                     if b < 1 or n_s * b > self.max_tokens_per_step or ctx + b > self.spec.max_ctx:
                         continue
                     runs, best = [], float("inf")
                     for _ in range(2):
-                        scratch = []
-                        for _ in range(int(n_s)):
+                        sids = [-1 - i for i in range(n_s)]     # real sids are u64 >= 0
+                        for sid in sids:
                             s = self._new_sess(ctx + b, 1, 0)
                             s.committed = ctx + b
-                            for p0 in range(0, ctx, self.max_tokens_per_step):
-                                n0 = min(self.max_tokens_per_step, ctx - p0)
-                                self._run(s, self._probe_seg(p0, n0), _StepCtx(n0, 1))
-                            scratch.append(s)
-                        seg = self._probe_seg(ctx, b)
-                        t0 = time.perf_counter()
-                        outs = [self._run(s, seg, _StepCtx(n_s * b, int(n_s))) for s in scratch]
-                        best = min(best, time.perf_counter() - t0)
-                        runs.append(outs[0])
+                            self._sess[sid] = s
+                        try:
+                            for sid in sids:
+                                for p0 in range(0, ctx, self.max_tokens_per_step):
+                                    n0 = min(self.max_tokens_per_step, ctx - p0)
+                                    self.step(StepIn((self._probe_seg(sid, p0, n0),)))
+                            t0 = time.perf_counter()
+                            outs = self.step(StepIn(tuple(self._probe_seg(sid, ctx, b) for sid in sids))).outs
+                            best = min(best, time.perf_counter() - t0)
+                            runs.append(outs[0])
+                        finally:
+                            for sid in sids:
+                                self._sess.pop(sid, None)
                     probe &= runs[0].hidden == runs[1].hidden and runs[0].logits == runs[1].logits
-                    service.append((int(n_s), b, int(ctx), best * 1000.0))
+                    service.append((n_s, b, ctx, best * 1000.0))
         self._service, self._probe = tuple(service), bool(probe)
         return self.describe()
 
-    def _probe_seg(self, start: int, n: int) -> Segment:
+    def _probe_seg(self, sid: int, start: int, n: int) -> Segment:
         if self.spec.is_head:
             x = Rows("i32", (np.arange(start, start + n) % self.V).astype(np.int32))
         else:
             x = Rows("i32", (np.arange(start * self.H, (start + n) * self.H) % P).astype(np.int32).reshape(n, self.H))
-        return Segment(-1, start, n, x, kind="prefill", logits="last" if self.spec.is_tail else "none")
+        return Segment(sid, start, n, x, kind="prefill", logits="last" if self.spec.is_tail else "none")
 
     # ── sessions ───────────────────────────────────────────────────────────────────────────
     def _swa_capacity(self, W: int) -> int:

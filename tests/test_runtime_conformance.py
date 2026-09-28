@@ -420,6 +420,67 @@ class FloorWithoutEarlyStart(ToyRuntime):
         return a
 
 
+class ExactFromOverridesFloor(ToyRuntime):
+    """With both exact_from and a floor, starts the rebuild from exact_from alone."""
+    def rebuild_from(self, sid, F, exact_from=None, floor=None):
+        if exact_from is None or floor is None:
+            return super().rebuild_from(sid, F, exact_from, floor)
+        a = super().rebuild_from(sid, F, exact_from)
+        self._get(sid).committed = floor
+        return a
+
+
+class FloorDepthCappedAt3(ToyRuntime):
+    """Honours at most 3 rows of rollback floor below F."""
+    def rebuild_from(self, sid, F, exact_from=None, floor=None):
+        a = super().rebuild_from(sid, F, exact_from, floor)
+        if floor is not None:
+            self._get(sid).committed = max(floor, F - 3)
+        return a
+
+
+class ExportPastFrontier(ToyRuntime):
+    """Mirrors rows up to the length, speculative or not (e.g. past a takeover's floor)."""
+    def export_state(self, sid, lo_pos, hi_pos, kinds=("global",)):
+        s = self._get(sid)
+        c = s.committed
+        s.committed = max(c, min(hi_pos, s.length))
+        try:
+            return super().export_state(sid, lo_pos, hi_pos, kinds)
+        finally:
+            s.committed = c
+
+
+class CostTrueOnlyAtProbe(ToyRuntime):
+    """Reports the (1 session, 32 tokens, context 0) cost honestly and every other shape 100x cheap."""
+    def warmup(self, buckets=(1, 8, 32), contexts=(0,), sessions=(1,)):
+        super().warmup(buckets, contexts, sessions)
+        self._service = tuple((n, b, c, ms if (n, b, c) == (1, 32, 0) else ms / 100) for n, b, c, ms in self._service)
+        return self.describe()
+
+
+class SamplerPosMod256(ToyRuntime):
+    """Keys the sampling RNG by an 8-bit position."""
+    def _draw(self, logits_row, sampling, p, r):
+        return toy_draw(logits_row, sampling, p & 0xFF)
+
+
+class SeedTrunc32(ToyRuntime):
+    """Keys the sampling RNG by the low 32 bits of the seed."""
+    def _draw(self, logits_row, sampling, p, r):
+        if sampling is not None:
+            sampling = dataclasses.replace(sampling, seed=sampling.seed & 0xFFFFFFFF)
+        return toy_draw(logits_row, sampling, p)
+
+
+class TopKDroppedWithTopP(ToyRuntime):
+    """Ignores top_k whenever top_p < 1."""
+    def _draw(self, logits_row, sampling, p, r):
+        if sampling is not None and sampling.top_p < 1:
+            sampling = dataclasses.replace(sampling, top_k=0)
+        return toy_draw(logits_row, sampling, p)
+
+
 # mutant -> (geometry, the checks DESIGNED to catch it; each must fail in both numeric modes)
 MUTANTS = {
     MirrorOverwrite: ("w4W4", {"check_rebuild", "check_export_import"}),
@@ -451,6 +512,13 @@ MUTANTS = {
     FakeServiceMs: ("w4W4", {"check_describe"}),
     IgnoresRebuildFloor: ("w4W4", {"check_rebuild"}),
     FloorWithoutEarlyStart: ("w4W4", {"check_rebuild"}),
+    ExactFromOverridesFloor: ("w4W4", {"check_rebuild"}),
+    FloorDepthCappedAt3: ("w4W4", {"check_rebuild"}),
+    ExportPastFrontier: ("w4W4", {"check_rebuild", "check_frontier", "check_export_import"}),
+    CostTrueOnlyAtProbe: ("w4W4", {"check_describe"}),
+    SamplerPosMod256: ("w4W4", {"check_long_context"}),
+    SeedTrunc32: ("w4W4", {"check_tokens"}),
+    TopKDroppedWithTopP: ("w4W4", {"check_tokens", "check_long_context"}),
 }
 
 

@@ -410,7 +410,9 @@ class Capability:
     numerics_id: str
     numerics_mode: str
     chunk_invariant: bool                 # bytes independent of segment shapes (rebuild exact)
-    # (sessions in the step, tokens per session, context position, ms per step), from warmup()
+    # (sessions in the step, tokens per session, context position, ms per step), from warmup():
+    # the wall-clock of step() as its caller sees it (host copies included), because that is
+    # what the batcher and the router pay; not device-only kernel time.
     service_ms: tuple[tuple[int, int, int, float], ...] = ()
     self_probe_ok: bool | None = None     # warmup self-probe (repeat == first run, graph == eager)
     open_sessions: int = 0

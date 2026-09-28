@@ -56,6 +56,7 @@ PREFILL_CHUNK = 16
 # (a slot table, a 32-bit key); both are open together wherever SIDS[:3] are.
 SIDS = (0, 9, (1 << 33) + 9, (1 << 64) - 1)
 SAMPLE = Sampling(seed=1234, temperature=1.0, top_k=4)
+SAMPLE_LONG = Sampling(seed=(1 << 40) + 11, temperature=1.0, top_k=5, top_p=0.8)
 
 
 class Skip(Exception):
@@ -293,6 +294,25 @@ def _cat(outs, attr):
     return None if any(p is None for p in parts) else Rows.concat(parts)
 
 
+def _time_step(f, rt, head, tail, n_s, b, c) -> float:
+    """Best-of-3 caller-visible wall time (ms) of one step of n_s sessions x b tokens at context c."""
+    best = float("inf")
+    for rep in range(3):
+        sids = [200 + 10 * rep + i for i in range(n_s)]
+        x = _inp(f, head, c + b, 6)
+        for sid in sids:
+            _open(rt, sid, f)
+            rt.commit(sid, c + b)
+            _play(rt, sid, _prefill_ops(x, 0, c))
+        segs = tuple(_seg(sid, c, x.slice(c, c + b), "prefill", logits="last" if tail else "none") for sid in sids)
+        t0 = time.perf_counter()
+        rt.step(StepIn(segs))
+        best = min(best, (time.perf_counter() - t0) * 1000)
+        for sid in sids:
+            rt.close(sid)
+    return best
+
+
 def _as_float(r: Rows) -> np.ndarray:
     if r.dtype == "bf16":
         return (r.data.astype(np.uint32) << np.uint32(16)).view(np.float32)
@@ -342,7 +362,8 @@ def check_describe(f):
         if "global" in cap.layer_kinds:
             blob = rt.export_state(sid, 0, 3)
             assert blob.layout_id == cap.kv_layout_id and all(r.dtype == cap.kv_dtype for r in blob.rows)
-            assert cap.global_kv_bytes_per_pos >= len(blob.pos_bytes(0)), \
+            payload = sum(r.data[0].nbytes for r in blob.rows)        # fp8 per-row scales excluded
+            assert cap.global_kv_bytes_per_pos >= payload, \
                 "describe() reports fewer global KV bytes per position than one exported position holds"
         rt.close(sid)
         wcap = rt.warmup(buckets=(1, 4, 32), contexts=(0, 8), sessions=(1, 3))
@@ -352,17 +373,11 @@ def check_describe(f):
         assert all(ms > 0 for *_, ms in wcap.service_ms)
         assert wcap.self_probe_ok is True and wcap.open_sessions == 0
         assert wcap.numerics_id == cap.numerics_id
-        claimed = dict(((n, b, c), ms) for n, b, c, ms in wcap.service_ms)[(1, 32, 0)]
-        best = float("inf")
-        for i in range(3):                               # the curve must be a real measurement
-            _open(rt, 100 + i, f)
-            rt.commit(100 + i, 32)
-            seg = _seg(100 + i, 0, _inp(f, head, 32, 6), logits="last" if tail else "none")
-            t0 = time.perf_counter()
-            _one(rt, seg)
-            best = min(best, (time.perf_counter() - t0) * 1000)
-            rt.close(100 + i)
-        assert best / 10 <= claimed <= best * 10, f"service_ms says {claimed:.3f} ms, a real step takes {best:.3f} ms"
+        claimed = {(n, b, c): ms for n, b, c, ms in wcap.service_ms}
+        for shape in ((1, 32, 0), (1, 4, 8), (3, 4, 8)):  # the curve must be a real measurement
+            best = _time_step(f, rt, head, tail, *shape)
+            assert best / 5 <= claimed[shape] <= best * 5, \
+                f"service_ms{shape} says {claimed[shape]:.3f} ms, a real step takes {best:.3f} ms"
     unloaded = getattr(f, "make_unloaded", None)
     if unloaded:                                         # placement sizes spans before loading
         lo, hi, head, tail = _role(f, "tail")
@@ -1035,7 +1050,7 @@ def _blob_prefix(blob: KVBlob, g: int) -> KVBlob:
     return KVBlob(0, g, blob.layers, tuple(r.slice(0, g) for r in blob.rows), blob.layout_id, blob.numerics_id)
 
 
-def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail, floor=None):
+def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail, floor=None, validate=True):
     """Import [0, g), rebuild [a, F) in `chunk`-row segments, then (with a floor) rewind to the
     floor as a re-adopting entry would, and continue 3 W-rounds from the rollback floor."""
     _open(r, sid, f)
@@ -1051,6 +1066,8 @@ def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail, floor=N
         p += n
     lo_exact = max(rebuild_exact_from(kinds, f.window, a), exact_from or 0)
     exact = {p + i: (o, i) for p, n, o in rb for i in range(n) if p + i >= lo_exact}
+    if validate and fl < F:                              # rows at or past the floor are not final
+        _raises(BadRequest, r.export_state, sid, 0, F)
     kv = r.export_state(sid, 0, fl) if blob is not None else None
     gm = min(g, fl)
     mirror_ok = blob is None or gm == 0 or r.export_state(sid, 0, gm) == _blob_prefix(blob, gm)
@@ -1088,7 +1105,9 @@ def check_rebuild(f):
         gs = sorted({g for g in (F, F - 1, F - w1 - 2, F - 3 * w1 - 5, w1 + 1, 0) if 0 <= g <= F}) if has_g else [0]
         fl_cfg = max(F - min(f.W, 3), 0)
         cfgs = ([(g, None, None) for g in gs] + [(gs[-1], max(0, F - 3 * w1 - 2), None)]
-                + [(g, None, fl_cfg) for g in (gs[-1], gs[len(gs) // 2])])
+                + [(g, None, fl_cfg) for g in (gs[-1], gs[len(gs) // 2])]
+                + [(gs[-1], F - 1, fl_cfg), (gs[len(gs) // 2], None, max(F - f.W, 0))])  # exact_from above
+                                                                  # the floor; a floor at full depth
         for g, ex, fl in cfgs:
             where = f"span {pat} [{lo},{hi}) F={F} g={g} exact_from={ex} floor={fl}"
             blob = _blob_prefix(full, g) if has_g else None
@@ -1099,7 +1118,8 @@ def check_rebuild(f):
             ref = _ref(f, lo, hi, head, tail)
             # Behaviour first: a wrong rebuild must show up as wrong state, not only as a formula.
             if ref is not None:
-                ra, rexact, rkv, _, rcont = _backup(ref, sid, f, blob, g, F, true, 5, ex, kinds, tail, fl)
+                ra, rexact, rkv, _, rcont = _backup(ref, sid, f, blob, g, F, true, 5, ex, kinds, tail, fl,
+                                                     validate=False)
                 a, exact, kv, _, cont = runs[0]
                 _match_ref(f, cont, rcont, f"continuation after rebuild ({where})")
                 _match_ref(f, exact, rexact, f"rebuild outputs from rebuild_exact_from on ({where})")
@@ -1178,23 +1198,28 @@ def check_rebuild_protocol(f):
 
 
 def check_long_context(f):
-    """A speculative history that crosses position 300 (past every small page table) matches
-    the reference row for row, and so does its exported KV."""
-    lo, hi, head, tail = _role(f, "mid")
+    """A speculative history as long as the factory's max_ctx allows (past position 300 at
+    least: beyond every small page table) matches the reference row for row, including tail
+    tokens sampled with a 64-bit seed and top_k + top_p, and so does its exported KV."""
     if f.max_ctx < 360:
         raise Skip("factory max_ctx < 360")
-    ref = _ref(f, lo, hi, head, tail)
-    if ref is None:
-        raise Skip("factory has no reference runtime")
-    ops, true, c = _spec_script(f, head, seed=201, prefix=300, rounds=8, W=f.W)
-    got = {}
-    for name, r in (("rt", _mk(f, lo, hi, head, tail)), ("ref", ref)):
-        _open(r, SIDS[2], f)
-        outs = _play(r, SIDS[2], ops) + _continue(r, SIDS[2], true, c, f.W)
-        got[name] = (_rows_of(outs), r.export_state(SIDS[2], 0, c) if "global" in f.layer_kinds[lo:hi] else None)
-    _match_ref(f, got["rt"][0], got["ref"][0], "long context")
-    if got["rt"][1] is not None:
-        assert _blob_close(f, got["rt"][1], got["ref"][1]), "long-context KV != reference"
+    prefix = max(300, f.max_ctx - 12 * f.W - 8)
+    for lo, hi, head, tail in (_role(f, "mid"), _role(f, "tail")):
+        ref = _ref(f, lo, hi, head, tail)
+        if ref is None:
+            raise Skip("factory has no reference runtime")
+        kw = dict(logits="last", tokens="all", sampling=SAMPLE_LONG) if tail else {}
+        ops, true, c = _spec_script(f, head, seed=201, prefix=prefix, rounds=8, W=f.W)
+        got = {}
+        for name, r in (("rt", _mk(f, lo, hi, head, tail)), ("ref", ref)):
+            _open(r, SIDS[2], f)
+            outs = _play(r, SIDS[2], ops, **kw) + _continue(r, SIDS[2], true, c, f.W, **kw)
+            got[name] = (_rows_of(outs), [o.logits for _, _, o in outs],
+                         r.export_state(SIDS[2], 0, c) if "global" in f.layer_kinds[lo:hi] else None)
+        _match_ref(f, got["rt"][0], got["ref"][0], f"long context [{lo},{hi})")
+        assert all(a is b or f.close_enough(a, b, "reference") for a, b in zip(got["rt"][1], got["ref"][1]))
+        if got["rt"][2] is not None:
+            assert _blob_close(f, got["rt"][2], got["ref"][2]), "long-context KV != reference"
 
 
 def check_close_isolation(f):
@@ -1254,7 +1279,9 @@ def check_tokens(f):
     ref = _ref(f, lo, hi, head, tail)
     if ref is not None:
         configs = (SAMPLE, Sampling(seed=7, temperature=1.0, top_k=0),
-                   Sampling(seed=8, temperature=0.7, top_k=0, top_p=0.5), Sampling(seed=9, temperature=1.3, top_k=3))
+                   Sampling(seed=8, temperature=0.7, top_k=0, top_p=0.5), Sampling(seed=9, temperature=1.3, top_k=3),
+                   Sampling(seed=(1 << 40) + 5, temperature=0.9, top_k=6, top_p=0.5),
+                   Sampling(seed=(1 << 32) + 7, temperature=1.0, top_k=0))
         for i, sp in enumerate(configs):
             r = _ref(f, lo, hi, head, tail)
             _open(r, 1, f)
