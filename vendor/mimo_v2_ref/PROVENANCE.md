@@ -38,8 +38,9 @@ subset is vendored, as a file that needs nothing but torch:
 On 2026-09-28 the subset was run against the FULL unmodified file (transformers 5.12.1, masks from
 transformers' `create_causal_mask` / `create_sliding_window_causal_mask`) with identical weights and
 inputs: **bit-identical** outputs in fp32 and bf16 for a global dense, an SWA MoE and a global MoE
-layer of the tiny test model. The full file itself was run on the real Flash layers 0, 1 and 5 in the
-scratch oracle work (`scratchpad/v2/mimo/`, parity numbers in the R2 receipt).
+layer of the tiny test model. The full file itself was run on the real Flash layers 0 and 1 in the
+scratch oracle work (`scratchpad/v2/mimo/`); real layer 5 goes through this subset in
+`tests/test_mimo_real.py`.
 
 ## Known vendor-file defect this does NOT inherit silently
 

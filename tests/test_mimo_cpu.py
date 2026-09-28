@@ -180,6 +180,111 @@ def test_runtime_equals_oracle_and_decode_equals_prefill(tiny):
         assert got == Rows("bf16", want.view(torch.int16).numpy().view(np.uint16)), sched
 
 
+def test_routing_matches_the_vendor_gate_on_many_tokens(tiny):
+    """Routing sets on 3000 decisions per run (vs 48 in the layer tests), fp32 router math on
+    identical inputs: must be identical. A router bias rounded to bf16 (the landmine the formats
+    guard names: ulp 0.0156 at 2.0) flips some of them, so this catches it in the shared math too."""
+    cfg = MimoConfig.from_hf(tiny.config)
+    c = types.SimpleNamespace(**tiny.config)
+    x = torch.randn(500, cfg.hidden, generator=torch.Generator().manual_seed(7)).to(torch.bfloat16)
+    flips = 0
+    for i in [j for j, s in enumerate(cfg.layers) if s.is_moe][:3]:
+        L = MimoLayer.load(cfg, i, tiny.ckpt)
+        gate = vm.MiMoV2MoEGate(c).eval()
+        gate.weight = torch.nn.Parameter(torch.from_numpy(tiny.ckpt.logical[i]["router"]), requires_grad=False)
+        gate.e_score_correction_bias = torch.nn.Parameter(torch.from_numpy(tiny.ckpt.logical[i]["router_bias"]),
+                                                          requires_grad=False)
+        vidx, vw = gate(x[None])
+        ours = [L.route(x[r:r + 1]) for r in range(x.shape[0])]
+        assert [set(r.tolist()) for r in vidx] == [set(o[1][0].tolist()) for o in ours]
+        for r, (_, idx, wt) in enumerate(ours):         # same weights too, in the vendor's order
+            order = [idx[0].tolist().index(e) for e in vidx[r].tolist()]
+            assert torch.allclose(wt[0, order], vw[r], rtol=0, atol=1e-6)     # fp32 sum order only
+        rounded = MimoLayer(cfg, cfg.layers[i], {**L.w, "router_bias": L.w["router_bias"].to(torch.bfloat16).float()},
+                            L.experts)
+        flips += sum(set(rounded.route(x[r:r + 1])[1][0].tolist()) != set(vidx[r].tolist()) for r in range(x.shape[0]))
+    assert flips > 0, "a bf16-rounded router bias must be visible here"
+
+
+def test_bytes_do_not_depend_on_the_ambient_thread_count(tiny):
+    """Every compute call runs under the runtime's pinned intra-op thread count (part of the
+    numerics_id), whatever the process has set, and the process setting is restored."""
+    ids = tiny.ids(40, 5)
+    old = torch.get_num_threads()
+    outs = []
+    try:
+        for ambient in (1, 8):
+            torch.set_num_threads(ambient)
+            rt = tiny.make(0, 8, is_head=True, is_tail=True)
+            rt.open(1, 64, tiny.W)
+            rt.commit(1, 40)
+            o = rt.step(StepIn((Segment(1, 0, 40, ids, kind="prefill", logits="all"),))).outs[0]
+            assert torch.get_num_threads() == ambient
+            outs.append((o.hidden, o.logits, rt.describe().numerics_id))
+    finally:
+        torch.set_num_threads(old)
+    assert outs[0] == outs[1]
+    four = CpuRuntime(StageSpec("mimo-tiny", 0, 8, is_head=True, is_tail=True), tiny.config, threads=4)
+    four.load(tiny.ckpt)
+    assert four.describe().numerics_id != outs[0][2]
+
+
+def test_ids_bind_the_config_and_the_loaded_bytes(tiny):
+    """numerics_id and kv_layout_id change with anything that changes what a byte means: a config
+    value (the v pre-scale), or one weight byte behind identical names and headers; KV from a
+    stage with another config is refused on import."""
+    base = tiny.make(0, 2, is_head=True)
+    alt_cfg = {**tiny.config, "attention_value_scale": 0.5}
+    alt = CpuRuntime(StageSpec("mimo-tiny", 0, 2, is_head=True), alt_cfg)
+    alt.load(tiny.ckpt)
+    assert alt.describe().numerics_id != base.describe().numerics_id
+    assert alt.describe().kv_layout_id != base.describe().kv_layout_id
+    base.open(1, 64, tiny.W)
+    base.commit(1, 5)
+    base.step(StepIn((Segment(1, 0, 5, tiny.ids(5, 1), kind="prefill"),)))
+    alt.open(1, 64, tiny.W)
+    with pytest.raises(BadRequest, match="layout"):
+        alt.import_state(1, base.export_state(1, 0, 5), 5)
+    name = "model.layers.1.self_attn.o_proj.weight"
+    w = tiny.ckpt.read(name)
+    w[0, 0] ^= 1                                                   # one mantissa bit
+    other = CpuRuntime(StageSpec("mimo-tiny", 0, 2, is_head=True), tiny.config)
+    other.load(tiny.ckpt.replaced(name, w, "BF16"))
+    assert other.describe().numerics_id != base.describe().numerics_id
+
+
+def test_truncate_is_refused_mid_rebuild(tiny):
+    """With a < floor <= length < F, a truncate would cut a rebuild short: refused until length == F."""
+    rt = tiny.make(1, 5)
+    rt.open(1, 128, tiny.W)
+    a = rt.rebuild_from(1, 40, floor=38)
+    rt.step(StepIn((Segment(1, a, 39 - a, tiny.hidden(39 - a, 3), kind="rebuild"),)))
+    assert a < 38 <= rt.length(1) < 40
+    with pytest.raises(BadRequest, match="mid-takeover"):
+        rt.truncate(1, 38)
+    rt.step(StepIn((Segment(1, 39, 1, tiny.hidden(1, 4), kind="rebuild"),)))
+    rt.truncate(1, 38)
+
+
+def test_expert_scale_payload_refused_at_load(tiny):
+    """A NaN E8M0 scale or an overflowing MXFP4 block is refused by load(), not by the first step
+    that routes to it (which would already have written KV)."""
+    name = "model.layers.1.mlp.experts.3.down_proj.weight_scale"
+    sc = tiny.ckpt.read(name)
+    for bad in (255, 254):
+        s2 = sc.copy()
+        s2[0, 0] = bad
+        with pytest.raises(LoadRefused):
+            _rt(tiny, 1, 2).load(tiny.ckpt.replaced(name, s2, "U8"))
+
+
+def test_describe_counts_the_expert_cache(tiny):
+    cfg = MimoConfig.from_hf(tiny.config)
+    one = CpuRuntime(StageSpec("mimo-tiny", 1, 2), tiny.config, expert_cache=1).describe()
+    eight = CpuRuntime(StageSpec("mimo-tiny", 1, 2), tiny.config, expert_cache=8).describe()
+    assert eight.layer_weight_bytes[0] - one.layer_weight_bytes[0] == 7 * 3 * cfg.moe_intermediate * cfg.hidden * 2
+
+
 # ── 2. loader guards ─────────────────────────────────────────────────────────────────────────
 
 def _rt(f, lo, hi, **kw):

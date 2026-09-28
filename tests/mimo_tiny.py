@@ -229,7 +229,7 @@ class MimoReference:
                                     fc_taps=self.taps if fc else (), fc_order=order)
         self.glob = tuple(i for i in span if cfg.layers[i].kind == "global")
         geo = {(cfg.layers[i].n_kv, cfg.layers[i].qk_dim, cfg.layers[i].v_dim) for i in self.glob}
-        self.layout = kv_layout_id(spec.model, self.glob, "bf16", geo.pop() if geo else (0, 0, 0))
+        self.layout = kv_layout_id(f"{spec.model}#{cfg.fingerprint()}", self.glob, "bf16", geo.pop() if geo else (0, 0, 0))
         self.s = {}
 
     def open(self, sid, max_pos, spec_window):

@@ -27,7 +27,8 @@ class SafetensorsSource:
     """`names()` / `read(name)` / `dtype_of(name)` over a set of safetensors files.
 
     artifact_cid: pass the manifest's content id when there is one. The default is derived from the
-    headers only ("hdr-..."): it names the tensor LAYOUT, not the bytes, and says so."""
+    headers only ("hdr-..."): it names the tensor LAYOUT, not the bytes, and says so. (CpuRuntime
+    binds the bytes itself: its numerics_id carries a digest of every tensor the span read.)"""
 
     def __init__(self, paths, artifact_cid: str | None = None):
         self._where: dict[str, tuple[str, dict]] = {}
@@ -69,9 +70,10 @@ class SafetensorsSource:
         if st is None:
             raise FetchError(f"{name}: dtype {t['dtype']} has no numpy storage")
         count = int(np.prod(t["shape"])) if t["shape"] else 1
+        buf = bytearray(t["nbytes"])                 # writable: consumers wrap it without a copy
         with open(path, "rb") as f:
             f.seek(t["start"])
-            buf = f.read(t["nbytes"])
-        if len(buf) != t["nbytes"]:
+            got = f.readinto(buf)
+        if got != t["nbytes"]:
             raise FetchError(f"{name}: short read from {path}")
         return np.frombuffer(buf, dtype=st, count=count).reshape(t["shape"])

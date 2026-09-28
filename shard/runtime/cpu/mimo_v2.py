@@ -22,7 +22,10 @@ Canonical numerics ("canonical bf16", ARCHITECTURE-v2 §6), the definition:
 This implementation's own bytes: every op runs on ONE row ([1, D] tensors, a matrix-vector product
 per row, attention per query over exactly its visible keys, copied to one canonical layout first), so
 a row's bytes never depend on which rows share a call. That makes THIS backend batch-, chunk- and
-partition-invariant (a takeover rebuild is bit-equal to the fault-free run). It is how the CPU gets
+partition-invariant (a takeover rebuild is bit-equal to the fault-free run). The bytes DO depend on
+torch's intra-op thread count (measured: attention at >= 12 threads differs from <= 8 on real
+Flash layers), so every compute call runs under a pinned count (`intra_op_threads`) that is part of
+the numerics_id; the runtime's default is 1, the one count every host can honour. It is how the CPU gets
 invariance (MKL's batched GEMM is not row-invariant: measured), not a requirement on GPU kernels,
 which get batch/partition invariance from fixed tiles (R4) and do not promise chunk invariance.
 Weights are held as fp32 containers of bf16 values (experts stay packed, see ExpertStore).
@@ -30,6 +33,7 @@ act=torch.float32 runs the same code without the bf16 roundings (the tight vendo
 """
 from __future__ import annotations
 
+import contextlib
 from collections import OrderedDict
 
 import numpy as np
@@ -46,8 +50,11 @@ ST_NUMPY = {"BF16": np.uint16, "F32": np.float32, "F8_E4M3": np.uint8, "U8": np.
 _TORCH_VIEW = {"BF16": torch.bfloat16, "F8_E4M3": torch.float8_e4m3fn}
 
 
+DEFAULT_EXPERT_CACHE = 8
+
+
 class WeightError(ValueError):
-    """A checkpoint tensor is missing or has the wrong dtype/shape."""
+    """A checkpoint tensor is missing, malformed, or has the wrong dtype/shape."""
 
 
 def read_tensor(src, name: str, st_dtype: str, shape: tuple) -> torch.Tensor:
@@ -68,7 +75,7 @@ def read_tensor(src, name: str, st_dtype: str, shape: tuple) -> torch.Tensor:
         raise WeightError(f"{name} must stay float32 (router selection bias), got numpy {a.dtype}")
     if a.dtype != ST_NUMPY[st_dtype] or tuple(a.shape) != tuple(shape):
         raise WeightError(f"{name}: got {a.dtype}{list(a.shape)}, want {st_dtype}{list(shape)}")
-    t = torch.from_numpy(np.array(a, copy=True, order="C"))
+    t = torch.from_numpy(np.require(a, requirements=["C", "W"]))     # copies only a read-only view
     t = t.view(_TORCH_VIEW[st_dtype]) if st_dtype in _TORCH_VIEW else t
     try:
         return check_keep_fp32(name, t)
@@ -77,8 +84,37 @@ def read_tensor(src, name: str, st_dtype: str, shape: tuple) -> torch.Tensor:
 
 
 def _fp32(t: torch.Tensor) -> torch.Tensor:
-    """A private, contiguous fp32 copy (aligned like every other weight: BLAS paths depend on it)."""
-    return t.to(torch.float32).contiguous().clone()
+    """A private, contiguous fp32 tensor (freshly allocated, so aligned like every other weight:
+    BLAS paths depend on alignment). One copy: a conversion already allocates."""
+    x = t.to(torch.float32).contiguous()
+    return x.clone() if x.data_ptr() == t.data_ptr() else x
+
+
+@contextlib.contextmanager
+def intra_op_threads(n: int | None):
+    """Run the enclosed torch CPU ops with exactly n intra-op threads (None: leave it alone)."""
+    old = torch.get_num_threads()
+    if n is None or n == old:
+        yield
+        return
+    torch.set_num_threads(n)
+    try:
+        yield
+    finally:
+        torch.set_num_threads(old)
+
+
+def check_mx_scales(name: str, packed: torch.Tensor, scale: torch.Tensor) -> None:
+    """Load-time guard for an MXFP4 tensor: an E8M0 NaN (0xFF) or a block whose values overflow
+    (scale bytes >= 253 with a large code) is refused now, not at the first step that routes to it.
+    Normal checkpoints never come near: the scan is one byte compare unless a huge scale appears."""
+    if (scale == 255).any():
+        raise WeightError(f"{name}: E8M0 NaN scale (0xFF)")
+    if (scale >= 253).any():
+        try:
+            dequant_mxfp4(packed, scale)
+        except ValueError as e:
+            raise WeightError(f"{name}: {e}") from None
 
 
 # ── canonical ops (one row at a time; see the module docstring) ────────────────────────────────
@@ -143,9 +179,11 @@ def mlp(x: torch.Tensor, wg, wu, wd, act: torch.dtype) -> torch.Tensor:
 
 class ExpertStore:
     """The routed experts of one MoE layer, resident PACKED (MXFP4 bytes + E8M0 scales, what a GPU
-    keeps too) and dequantized exactly on first use; a small LRU holds the bf16 matrices."""
+    keeps too) and dequantized exactly on first use; an LRU of `max_cached` experts holds the bf16
+    matrices (3 * I * H * 2 bytes each: 50 MB on Flash, counted in resident_bytes). get() hands out
+    fp32 copies (one expert at a time per layer call: 100 MB transient on Flash)."""
 
-    def __init__(self, packed: dict, max_cached: int = 64):
+    def __init__(self, packed: dict, max_cached: int = DEFAULT_EXPERT_CACHE):
         self.packed = packed                  # e -> {proj: (packed u8, scale u8)}
         self.cache: OrderedDict[int, tuple] = OrderedDict()
         self.max_cached = max_cached
@@ -180,7 +218,7 @@ class MimoLayer:
         self.inv_freq = rope_inv_freq(spec.rope_dim, spec.rope_theta)
 
     @classmethod
-    def load(cls, cfg: MimoConfig, i: int, src, expert_cache: int = 64) -> "MimoLayer":
+    def load(cls, cfg: MimoConfig, i: int, src, expert_cache: int = DEFAULT_EXPERT_CACHE) -> "MimoLayer":
         s, plan = cfg.layers[i], layer_plan(cfg, i)
         t = {n: read_tensor(src, n, *ds) for n, ds in plan.items() if ".experts." not in n}
         p = layer_prefix(i)
@@ -209,13 +247,15 @@ class MimoLayer:
                 packed[e] = {proj: (read_tensor(src, q + proj + ".weight", *plan[q + proj + ".weight"]),
                                     read_tensor(src, q + proj + ".weight_scale", *plan[q + proj + ".weight_scale"]))
                              for proj in ("gate_proj", "up_proj", "down_proj")}
+                for proj, (pk, sc) in packed[e].items():
+                    check_mx_scales(q + proj, pk, sc)
             experts = ExpertStore(packed, expert_cache)
         return cls(cfg, s, w, experts)
 
     @staticmethod
-    def resident_bytes(cfg: MimoConfig, i: int) -> int:
-        """Bytes this layer holds on the CPU backend: fp32 containers for the dense tensors, experts
-        packed (the LRU of dequantized experts is workspace, reported via load_peak_extra)."""
+    def resident_bytes(cfg: MimoConfig, i: int, expert_cache: int = DEFAULT_EXPERT_CACHE) -> int:
+        """Bytes this layer holds on the CPU backend: fp32 containers for the dense tensors, the
+        experts packed, plus a full LRU of `expert_cache` dequantized (bf16) experts."""
         s, H = cfg.layers[i], cfg.hidden
         n = 2 * H + (s.n_q * s.qk_dim + s.n_kv * s.qk_dim + s.n_kv * s.v_dim) * H + H * s.n_q * s.v_dim
         n += s.n_q if s.has_sink else 0
@@ -223,7 +263,18 @@ class MimoLayer:
             return 4 * (n + 3 * cfg.intermediate * H)
         I, E = cfg.moe_intermediate, cfg.n_experts
         packed = E * (2 * I * (H // 2 + H // MX_BLOCK) + H * (I // 2 + I // MX_BLOCK))
-        return 4 * (n + E * H + E) + packed
+        return 4 * (n + E * H + E) + packed + min(expert_cache, E) * 3 * I * H * 2
+
+    @staticmethod
+    def load_peak_bytes(cfg: MimoConfig, i: int) -> int:
+        """Transient bytes on top of resident_bytes while loading (or stepping) this layer: FP8
+        dequant holds ~12 B per element of its largest matrix (codes, fp32 product, gathered scales,
+        the bf16 rounding); an MoE step holds one expert's fp32 copy."""
+        s, H = cfg.layers[i], cfg.hidden
+        big = (s.n_q * s.qk_dim + s.n_kv * (s.qk_dim + s.v_dim)) * H
+        if not s.is_moe:
+            big = max(big, cfg.intermediate * H)
+        return 12 * big + (12 * cfg.moe_intermediate * H if s.is_moe else 0)
 
     # The layer, split where a backend's KV state sits between the halves. Each call takes a
     # segment's rows and runs the canonical ops one row at a time; grouping rows only lets an
@@ -271,7 +322,7 @@ class MimoLayer:
         choice = scores + self.w["router_bias"]                         # the bias only picks experts
         idx = torch.topk(choice, self.cfg.top_k, dim=-1, sorted=True).indices
         wt = scores.gather(1, idx)
-        if self.cfg.norm_topk:
+        if self.cfg.norm_topk and self.cfg.top_k > 1:                  # the vendor's own condition
             wt = wt / (wt.sum(-1, keepdim=True) + 1e-20)
         return logits, idx, wt * self.cfg.routed_scale
 
@@ -382,19 +433,21 @@ class KVCache:
 
 class MimoOracle:
     """The CPU oracle (promoted scratch mimo_ref.MiMoRef): a set of decoder layers (+ embedding /
-    final norm) of ONE sequence, dense KV, optional per-op traces. Golden vectors are defined by it."""
+    final norm) of ONE sequence, dense KV, optional per-op traces. Golden vectors are defined by it,
+    in the class of the thread count they were made with (`threads`; None = the ambient count)."""
 
     def __init__(self, cfg: MimoConfig, layers: dict, dtype: torch.dtype = torch.bfloat16,
-                 edges: MimoEdges | None = None):
-        self.cfg, self.layers, self.dtype, self.edges = cfg, layers, dtype, edges
+                 edges: MimoEdges | None = None, threads: int | None = 1):
+        self.cfg, self.layers, self.dtype, self.edges, self.threads = cfg, layers, dtype, edges, threads
         self.specs = {i: cfg.layers[i] for i in layers}
 
     @classmethod
     def from_source(cls, config: dict, src, layers, dtype: torch.dtype = torch.bfloat16, *,
-                    head: bool = False, tail: bool = False, expert_cache: int = 64) -> "MimoOracle":
+                    head: bool = False, tail: bool = False, expert_cache: int = DEFAULT_EXPERT_CACHE,
+                    threads: int | None = 1) -> "MimoOracle":
         cfg = MimoConfig.from_hf(config)
         edges = MimoEdges.load(cfg, src, head=head, tail=tail) if head or tail else None
-        return cls(cfg, {i: MimoLayer.load(cfg, i, src, expert_cache) for i in layers}, dtype, edges)
+        return cls(cfg, {i: MimoLayer.load(cfg, i, src, expert_cache) for i in layers}, dtype, edges, threads)
 
     def new_cache(self) -> KVCache:
         return KVCache(self.specs, self.dtype)
@@ -403,7 +456,8 @@ class MimoOracle:
         return self.edges.embed(ids, self.dtype)
 
     def final_norm(self, h: torch.Tensor) -> torch.Tensor:
-        return torch.cat([rmsnorm(h[t:t + 1], self.edges.norm, self.cfg.eps, h.dtype) for t in range(h.shape[0])])
+        with intra_op_threads(self.threads):
+            return torch.cat([rmsnorm(h[t:t + 1], self.edges.norm, self.cfg.eps, h.dtype) for t in range(h.shape[0])])
 
     def forward(self, h: torch.Tensor, start_pos: int, cache: KVCache, layers=None,
                 traces: dict | None = None) -> torch.Tensor:
@@ -411,6 +465,10 @@ class MimoOracle:
         layer's cache length must equal start_pos (truncate first to roll back)."""
         if h.dtype != self.dtype or h.dim() != 2:
             raise ValueError(f"h must be [T, H] {self.dtype}")
+        with intra_op_threads(self.threads):
+            return self._forward(h, start_pos, cache, layers, traces)
+
+    def _forward(self, h, start_pos, cache, layers, traces):
         act = self.dtype
         for i in (sorted(self.layers) if layers is None else layers):
             L, s = self.layers[i], self.specs[i]

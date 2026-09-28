@@ -23,6 +23,9 @@ RoPE, another quantization) is refused, never guessed.
 """
 from __future__ import annotations
 
+import dataclasses
+import hashlib
+import json
 import math
 from dataclasses import dataclass
 
@@ -75,6 +78,13 @@ class MimoConfig:
     @property
     def kinds(self) -> tuple[str, ...]:
         return tuple(s.kind for s in self.layers)
+
+    def fingerprint(self) -> str:
+        """Identity of everything above that changes what a byte means (dims, window, RoPE, v-scale,
+        eps, routing): part of every numerics_id and kv_layout_id, so two stages that disagree on
+        the config can never claim bit-comparability or swap KV."""
+        blob = json.dumps(dataclasses.asdict(self), sort_keys=True, separators=(",", ":"))
+        return "mimo-" + hashlib.sha256(blob.encode()).hexdigest()[:24]
 
     @classmethod
     def from_hf(cls, c: dict) -> "MimoConfig":

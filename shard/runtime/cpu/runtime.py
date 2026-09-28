@@ -18,14 +18,17 @@ reference validates the bookkeeping every GPU/MLX backend must copy, not a simpl
 Numerics: canonical bf16, one row at a time, so batch-, chunk- and partition-invariant; describe()
 says chunk_invariant=True and a takeover rebuild is bit-equal to the fault-free state. The
 numerics_id pins what the bytes depend on here: torch version, BLAS, the CPU ISA torch dispatches
-to (MKL's summation order differs between AVX2 and AVX-512), the weights' artifact id, and the
-sampler. Tokens are drawn on the host: greedy = the lowest id among exactly-maximal fp32 logits;
+to (MKL's summation order differs between AVX2 and AVX-512), the intra-op thread count every
+compute call is pinned to (default 1: bytes change at >= 12 threads, measured), the model config's
+fingerprint, the sampler, and a digest of exactly the tensor bytes the span loaded. Tokens are
+drawn on the host: greedy = the lowest id among exactly-maximal fp32 logits;
 sampled = a float64 softmax over the top_k / top_p cut of logits / temperature, inverted with a
 splitmix64 counter keyed by (seed, absolute position) only.
 """
 from __future__ import annotations
 
 import dataclasses
+import hashlib
 import platform
 import re
 import time
@@ -41,7 +44,7 @@ from ..api import (ID_DTYPES, LOGITS_MODES, SEG_KINDS, BadRequest, Capability, K
                   StepOut, StepTooLarge, UnknownSession, WTooDeep, kv_layout_id, make_numerics_id,
                   rebuild_start)
 from ..toy import host_device
-from .mimo_v2 import MimoEdges, MimoLayer, WeightError
+from .mimo_v2 import DEFAULT_EXPERT_CACHE, MimoEdges, MimoLayer, WeightError, intra_op_threads
 
 ACT = torch.bfloat16
 KERNEL_PIN = "mimo_v2-cpu-ref/1"
@@ -108,6 +111,28 @@ def _blas() -> str:
     return m.group(1) if m else "unknown"
 
 
+class _Digest:
+    """A WeightSource proxy hashing exactly the tensors a load reads (name, dtype, shape, bytes):
+    the span's own content id, whatever the source claims about itself."""
+
+    def __init__(self, src):
+        self.src, self._h = src, {}
+        self.artifact_cid = src.artifact_cid
+        if hasattr(src, "dtype_of"):
+            self.dtype_of = src.dtype_of
+
+    def names(self):
+        return self.src.names()
+
+    def read(self, name):
+        a = np.ascontiguousarray(self.src.read(name))
+        self._h[name] = hashlib.sha256(f"{a.dtype.str}{a.shape}".encode() + a.data).hexdigest()
+        return a
+
+    def hexdigest(self) -> str:
+        return "span-" + hashlib.sha256("".join(f"{n}={d};" for n, d in sorted(self._h.items())).encode()).hexdigest()[:32]
+
+
 # ── sessions ──────────────────────────────────────────────────────────────────────────────────
 
 @dataclass
@@ -133,7 +158,7 @@ class CpuRuntime:
     _strict = True
 
     def __init__(self, spec: StageSpec, config: dict, *, max_tokens_per_step: int = 256,
-                 expert_cache: int = 64):
+                 expert_cache: int = DEFAULT_EXPERT_CACHE, threads: int = 1):
         try:
             self.cfg = cfg = MimoConfig.from_hf(config)
         except (UnsupportedConfig, KeyError, TypeError, ValueError) as e:
@@ -144,8 +169,9 @@ class CpuRuntime:
             raise BadRequest("the CPU reference computes canonical numerics only (numerics='invariant')")
         if spec.kv_dtype not in ("", "bf16"):
             raise BadRequest(f"the CPU reference keeps KV in bf16, not {spec.kv_dtype!r}")
-        if max_tokens_per_step < 1:
-            raise BadRequest("max_tokens_per_step >= 1")
+        if max_tokens_per_step < 1 or expert_cache < 1 or threads < 1:
+            raise BadRequest("max_tokens_per_step, expert_cache and threads must be >= 1")
+        self.threads = threads
         self.spec, self.window = spec, cfg.window
         self.max_tokens_per_step, self.expert_cache = max_tokens_per_step, expert_cache
         self.H, self.V = cfg.hidden, cfg.vocab
@@ -160,7 +186,9 @@ class CpuRuntime:
         if len(geo) > 1:
             raise BadRequest(f"global layers of one span must share a KV geometry, got {geo}")
         self._geo = geo.pop() if geo else (0, 0, 0)
-        self._layout = kv_layout_id(spec.model, self._glob, "bf16", self._geo)
+        # the config fingerprint rides in the model part: equal ids promise equal meaning of every
+        # byte, and V rows mean nothing without the v pre-scale they were written with
+        self._layout = kv_layout_id(f"{spec.model}#{cfg.fingerprint()}", self._glob, "bf16", self._geo)
         self._budget = spec.kv_budget_bytes or max(1, cpu_device().free_mem_bytes // 4)
         self._used = 0
         self._sess: dict[int, _Sess] = {}
@@ -174,7 +202,8 @@ class CpuRuntime:
         return make_numerics_id(
             backend="cpu", arch_class=f"cpu-{platform.machine() or 'unknown'}", mode="invariant",
             kernel_pins=(KERNEL_PIN, f"torch-{torch.__version__}", f"blas-{_blas()}",
-                         f"isa-{torch.backends.cpu.get_cpu_capability()}", SAMPLER_PIN),
+                         f"isa-{torch.backends.cpu.get_cpu_capability()}", f"threads-{self.threads}",
+                         SAMPLER_PIN, self.cfg.fingerprint()),
             quant="mimo_v2:mxfp4-exact+fp8b-bf16rne", artifact_cid=cid)
 
     # ── weights ─────────────────────────────────────────────────────────────────────────────
@@ -203,14 +232,15 @@ class CpuRuntime:
         if unknown:
             raise LoadRefused(f"{unknown[0]!r} ({len(unknown)} unknown) is not part of the MiMo-V2 "
                               "layer format this adapter implements")
+        dig = _Digest(src)
         try:
-            layers = {i: MimoLayer.load(self.cfg, i, src, self.expert_cache) for i in range(sp.lo, sp.hi)}
-            edges = MimoEdges.load(self.cfg, src, head=sp.is_head, tail=sp.is_tail,
+            layers = {i: MimoLayer.load(self.cfg, i, dig, self.expert_cache) for i in range(sp.lo, sp.hi)}
+            edges = MimoEdges.load(self.cfg, dig, head=sp.is_head, tail=sp.is_tail,
                                    fc_taps=self._taps if self._fc else (), fc_order=self._tap_order)
         except WeightError as e:
             raise LoadRefused(str(e)) from None
         self._layers, self._edges = layers, edges
-        self._nid = self._numerics_id(src.artifact_cid)
+        self._nid = self._numerics_id(f"{src.artifact_cid}/{dig.hexdigest()}")
         nbytes = sum(int(np.prod(shape)) * (4 if dt in ("F32",) else 2 if dt == "BF16" else 1)
                      for dt, shape in plan.values())
         return LoadReport(n_tensors=len(plan), n_bytes=nbytes, artifact_cid=src.artifact_cid)
@@ -226,9 +256,10 @@ class CpuRuntime:
 
     def describe(self) -> Capability:
         sp, cfg = self.spec, self.cfg
-        lw = tuple(MimoLayer.resident_bytes(cfg, i) for i in range(sp.lo, sp.hi))
-        big = max(max(s.n_q * s.qk_dim + s.n_kv * (s.qk_dim + s.v_dim), cfg.intermediate) * cfg.hidden
-                  for s in cfg.layers[sp.lo:sp.hi])
+        lw = tuple(MimoLayer.resident_bytes(cfg, i, self.expert_cache) for i in range(sp.lo, sp.hi))
+        peak = max(MimoLayer.load_peak_bytes(cfg, i) for i in range(sp.lo, sp.hi))
+        if sp.is_head or sp.is_tail:                  # a bf16 [V, H] read beside its fp32 copy
+            peak = max(peak, 2 * cfg.vocab * cfg.hidden)
         return Capability(
             device=cpu_device(), model=sp.model, lo=sp.lo, hi=sp.hi, is_head=sp.is_head,
             is_tail=sp.is_tail, layer_kinds=self.kinds,
@@ -240,7 +271,7 @@ class CpuRuntime:
             kv_free_bytes=self._budget - self._used, layer_weight_bytes=lw,
             edge_weight_bytes=MimoEdges.resident_bytes(cfg, head=sp.is_head, tail=sp.is_tail,
                                                        n_fc_held=len(self._taps) if self._fc else 0),
-            load_peak_extra_bytes=8 * big, max_sessions=sp.max_sessions, max_ctx=sp.max_ctx,
+            load_peak_extra_bytes=peak, max_sessions=sp.max_sessions, max_ctx=sp.max_ctx,
             spec_window_max=sp.spec_window, max_tokens_per_step=self.max_tokens_per_step,
             tap_layers_held=self._taps, tap_mode=sp.tap_mode, numerics_id=self._nid,
             numerics_mode="invariant", chunk_invariant=True, service_ms=self._service,
@@ -343,6 +374,8 @@ class CpuRuntime:
 
     def truncate(self, sid: int, pos: int) -> None:
         s = self._get(sid)
+        if s.imported or s.rebuild_hi is not None:
+            raise BadRequest("session is mid-takeover: no truncate until the rebuild reaches F", sid=sid)
         if pos > s.length:
             raise PositionGap(f"truncate to {pos} past length {s.length}", sid=sid)
         if pos < s.committed:
@@ -428,7 +461,8 @@ class CpuRuntime:
         if not self.spec.is_head:
             raise BadRequest("embed() is head-only")
         self._check_ids(ids, ids.n if isinstance(ids, Rows) else -1, None)
-        return to_rows(self._edges.embed(torch.from_numpy(ids.data.astype(np.int64)), ACT))
+        with intra_op_threads(self.threads):
+            return to_rows(self._edges.embed(torch.from_numpy(ids.data.astype(np.int64)), ACT))
 
     def project(self, hidden: Rows, *, tokens: bool = False, start_pos: int = 0,
                 sampling: Sampling | None = None) -> Rows:
@@ -437,7 +471,8 @@ class CpuRuntime:
             raise BadRequest("project() is tail-only")
         self._check_hidden(hidden, hidden.n if isinstance(hidden, Rows) else -1, None, "hidden")
         x = from_rows(hidden)
-        lg = torch.cat([self._edges.logits(x[r:r + 1], ACT) for r in range(x.shape[0])]).numpy()
+        with intra_op_threads(self.threads):
+            lg = torch.cat([self._edges.logits(x[r:r + 1], ACT) for r in range(x.shape[0])]).numpy()
         if not tokens:
             return Rows("f32", lg.astype(np.float32))
         return Rows("i32", np.array([draw(lg[i], sampling, start_pos + i) for i in range(lg.shape[0])],
@@ -456,7 +491,8 @@ class CpuRuntime:
         total = sum(seg.n for seg in segs)
         if total > self.max_tokens_per_step:
             raise StepTooLarge(f"{total} tokens > max_tokens_per_step {self.max_tokens_per_step}")
-        return StepOut(tuple(self._run(self._sess[seg.sid], seg) for seg in segs))
+        with intra_op_threads(self.threads):
+            return StepOut(tuple(self._run(self._sess[seg.sid], seg) for seg in segs))
 
     def _validate(self, seg: Segment) -> None:
         sid = seg.sid
