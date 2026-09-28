@@ -114,7 +114,9 @@
    "expect": [
     {"degraded":false,"failover":"mirror","hops":[{"backup":"C","hi":27,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
-    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999}
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"A","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
    ],
    "holders": [
     {"id":"A","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,27],"subnet":"same","uplink_mbps":200.0},
@@ -168,8 +170,8 @@
    "expect": [
     {"degraded":false,"failover":"replay","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":27,"id":"P1","lo":6,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":12,"id":"G2","lo":6,"role":"mid"},{"backup":null,"hi":27,"id":"P1","lo":12,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":7326.608695652173,"step_ms":131.64999999999998}
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":21,"id":"P1","lo":0,"role":"head"},{"backup":"G8","hi":22,"id":"G1","lo":21,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":22,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
    ],
    "holders": [
     {"id":"G0","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,6],"subnet":"s-G0","uplink_mbps":200.0},
@@ -194,7 +196,7 @@
    "expect": [
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
     {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":6,"id":"G0","lo":0,"role":"head"},{"backup":null,"hi":27,"id":"P1","lo":6,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
-    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":27,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":33,"id":"G3","lo":27,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":33,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":16,"id":"P1","lo":0,"role":"head"},{"backup":null,"hi":22,"id":"G1","lo":16,"role":"mid"},{"backup":null,"hi":48,"id":"P2","lo":22,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
    ],
    "holders": [
     {"id":"G0","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,6],"subnet":"s-G0","uplink_mbps":200.0},
@@ -235,6 +237,68 @@
    "policy": {"backed_slack":1.3,"bar_tok_s":20.0,"hole_repair_s":600.0,"k_min":2,"kmin_repair_s":1800.0,"leg_ms":13.0,"move_interval_s":600.0,"plan_ctx":32768,"plan_sessions":8,"rho_max":0.85,"s_max":16,"small_models":[],"spec_window":64,"unified_host_bytes":4294967296,"unreliability_ms":50.0},
    "profile": "XiaomiMiMo/MiMo-V2.6-Flash",
    "why": "the backup is never on its own path"
+  },
+  {
+   "args": {"k":3},
+   "expect": [
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":20,"id":"X","lo":0,"role":"head"},{"backup":null,"hi":48,"id":"Y","lo":20,"role":"tail"}],"prefill_ms":null,"rank_ms":7938.782608695652,"step_ms":142.64999999999998}
+   ],
+   "holders": [
+    {"id":"X","kv_free":262144,"layer_ms":3.0,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,40],"subnet":"X","uplink_mbps":100.0},
+    {"id":"Y","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[20,48],"subnet":"Y","uplink_mbps":100.0}
+   ],
+   "name": "a slow holder hands over where a faster span starts",
+   "policy": {"backed_slack":1.3,"bar_tok_s":20.0,"hole_repair_s":600.0,"k_min":2,"kmin_repair_s":1800.0,"leg_ms":13.0,"move_interval_s":600.0,"plan_ctx":32768,"plan_sessions":8,"rho_max":0.85,"s_max":16,"small_models":[],"spec_window":64,"unified_host_bytes":4294967296,"unreliability_ms":50.0},
+   "profile": "XiaomiMiMo/MiMo-V2.6-Flash",
+   "why": "hops may end at another holder's span start, not only at their own span end"
+  },
+  {
+   "args": {"k":3},
+   "expect": [
+    {"degraded":false,"failover":"none","hops":[{"backup":"C0","hi":20,"id":"Q","lo":0,"role":"head"},{"backup":null,"hi":40,"id":"G","lo":20,"role":"mid"},{"backup":null,"hi":48,"id":"Tl","lo":40,"role":"tail"}],"prefill_ms":null,"rank_ms":7549.217391304349,"step_ms":135.65}
+   ],
+   "holders": [
+    {"id":"C0","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C1","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C2","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C3","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C4","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C5","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C6","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C7","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C8","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C9","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C10","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C11","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"C12","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"S","uplink_mbps":100.0},
+    {"id":"Q","kv_free":262144,"layer_ms":2.0,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,20],"subnet":"T","uplink_mbps":100.0},
+    {"id":"G","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[20,40],"subnet":"U","uplink_mbps":100.0},
+    {"id":"Tl","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[40,48],"subnet":"S","uplink_mbps":100.0}
+   ],
+   "name": "label pruning cannot starve the subnet filter",
+   "policy": {"backed_slack":1.3,"bar_tok_s":20.0,"hole_repair_s":600.0,"k_min":2,"kmin_repair_s":1800.0,"leg_ms":13.0,"move_interval_s":600.0,"plan_ctx":32768,"plan_sessions":8,"rho_max":0.85,"s_max":16,"small_models":[],"spec_window":64,"unified_host_bytes":4294967296,"unreliability_ms":50.0},
+   "profile": "XiaomiMiMo/MiMo-V2.6-Flash",
+   "why": "13 cheap heads share the tail's subnet; the pricier head on another subnet must survive pruning"
+  },
+  {
+   "args": {"k":5,"rtt":{"A":{"B":-1.0},"B":{"A":-5.0}}},
+   "expect": [
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"C","hi":27,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
+    {"degraded":false,"failover":"mirror","hops":[{"backup":"A","hi":27,"id":"C","lo":0,"role":"head"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":5879.652173913044,"step_ms":105.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"D","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"D","hi":48,"id":"B","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999},
+    {"degraded":false,"failover":"none","hops":[{"backup":null,"hi":22,"id":"A","lo":0,"role":"head"},{"backup":"B","hi":27,"id":"C","lo":22,"role":"mid"},{"backup":"B","hi":48,"id":"D","lo":27,"role":"tail"}],"prefill_ms":null,"rank_ms":6603.130434782609,"step_ms":118.64999999999999}
+   ],
+   "holders": [
+    {"id":"A","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,27],"subnet":"s-A","uplink_mbps":200.0},
+    {"id":"B","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[22,48],"subnet":"s-B","uplink_mbps":200.0},
+    {"id":"C","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[0,27],"subnet":"s-C","uplink_mbps":200.0},
+    {"id":"D","kv_free":262144,"layer_ms":1.15,"reliability":1.0,"rho":0.0,"role":"stage","sessions":0,"span":[22,48],"subnet":"s-D","uplink_mbps":200.0}
+   ],
+   "name": "an unreachable pair is skipped",
+   "policy": {"backed_slack":1.3,"bar_tok_s":20.0,"hole_repair_s":600.0,"k_min":2,"kmin_repair_s":1800.0,"leg_ms":13.0,"move_interval_s":600.0,"plan_ctx":32768,"plan_sessions":8,"rho_max":0.85,"s_max":16,"small_models":[],"spec_window":64,"unified_host_bytes":4294967296,"unreliability_ms":50.0},
+   "profile": "XiaomiMiMo/MiMo-V2.6-Flash",
+   "why": "negative (and, in memory, non-finite) rtt entries are unreachable, never a crash"
   }
  ],
  "kind": "paths",
@@ -248,6 +312,7 @@
    "layer_bytes": [324000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000,3553000000,3553000000,3553000000,3553000000,3553000000,3548000000],
    "layer_kinds": ["global","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","global"],
    "layer_ms": 1.15,
+   "logits_ms": 2.3,
    "model": "XiaomiMiMo/MiMo-V2.6-Flash",
    "n_layers": 48,
    "reserve_bytes": 1879048192,
@@ -267,6 +332,7 @@
    "layer_bytes": [670000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000,8074000000],
    "layer_kinds": ["global","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","global","swa","swa","swa","swa","swa","swa","global"],
    "layer_ms": 1.15,
+   "logits_ms": 2.3,
    "model": "XiaomiMiMo/MiMo-V2.6-Pro",
    "n_layers": 70,
    "reserve_bytes": 1879048192,
@@ -286,6 +352,7 @@
    "layer_bytes": [3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000,3600000000],
    "layer_kinds": ["swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa","swa"],
    "layer_ms": 1.0,
+   "logits_ms": 0.0,
    "model": "sim/flash-48",
    "n_layers": 48,
    "reserve_bytes": 0,

@@ -28,7 +28,7 @@ from mesh_fleet import DEVICES, DISTILL_9B, node  # noqa: E402
 from shard.manifest import pub_b64  # noqa: E402
 from shard.mesh import lease as L  # noqa: E402
 from shard.mesh.directory import Directory, LeaseRefused  # noqa: E402
-from shard.mesh.placement import (MIMO_V26_FLASH, MIMO_V26_PRO, Cell, Fit, ModelProfile, Node, Policy,  # noqa: E402
+from shard.mesh.placement import (MIMO_V26_FLASH, MIMO_V26_PRO, Cell, Fit, Node, Policy,  # noqa: E402
                                   candidate_paths, classify)
 
 SCHEMA = "shard-mesh-vectors/1"
@@ -99,7 +99,7 @@ def exec_directory(d: Directory, op: str, a: dict):
     if op == "complete_move":
         return d.complete_move(a["id"], a["model"], a["now"])
     if op == "update":
-        return d.update(a["record"])
+        return d.update(a["record"], a["now"])
     if op == "report_failure":
         return d.report_failure(a["id"], a["model"], a["now"])
     if op == "snapshot":
@@ -111,8 +111,13 @@ def exec_directory(d: Directory, op: str, a: dict):
             return {"ok": d.lease(**a["args"])}
         except LeaseRefused as e:
             return {"error": e.code}
+    if op == "reroute":
+        try:
+            return {"ok": d.reroute(a["lease"], rte=a["rte"], hops=a["hops"], now=a["now"])}
+        except LeaseRefused as e:
+            return {"error": e.code}
     if op == "release":
-        return d.release(a["lease"])
+        return d.release(a["lease"], a["now"])
     raise ValueError(op)
 
 
@@ -126,11 +131,13 @@ def exec_gate(state: dict, op: str, a: dict):
     g = state["gate"]
     if op == "admit":
         try:
-            return {"ok": g.admit(a["token"], sender=a["sender"], now=a["now"])}
+            return {"ok": g.admit(a["token"], now=a["now"], bind=a["bind"])}
         except L.LeaseError as e:
             return {"error": e.code}
+    if op == "accepts":
+        return g.accepts(a["sid"], a["rte"], a["sender"], a["kind"])
     if op == "supersede":
-        return g.supersede(a["sid"], a["rte"], a["now"])
+        return g.supersede(a["sid"], a["rte"], a["now"], a.get("pred"))
     if op == "close":
         return g.close(a["sid"], a["now"])
     if op == "prune":
@@ -140,8 +147,7 @@ def exec_gate(state: dict, op: str, a: dict):
 
 def exec_verify(v: dict):
     try:
-        return {"ok": L.verify(v["token"], v["pub"], audience=v["audience"], sender=v["sender"], now=v["now"],
-                               skew=v["skew"])}
+        return {"ok": L.verify(v["token"], v["pub"], audience=v["audience"], now=v["now"], skew=v["skew"])}
     except L.LeaseError as e:
         return {"error": e.code}
 
@@ -159,7 +165,7 @@ class Rec:
 
 
 def _jsonable(x):
-    return json.loads(json.dumps(x))
+    return json.loads(json.dumps(x, allow_nan=False))
 
 
 # ── placement cases ───────────────────────────────────────────────────────────────────────────
@@ -170,6 +176,22 @@ def _pcase(name, why, profile, policy, build):
     build(r)
     case["steps"] = r.steps
     return case
+
+
+def slow_cpu_probe() -> dict:
+    """A describe() record measuring 4.5 ms per Flash layer on layers [1, 3): too slow to be a hop."""
+    from shard.runtime.api import Capability
+    dev = Node.from_dict(node("P", "cpu-256g")).device
+    lb = MIMO_V26_FLASH.layer_bytes[1:3]
+    return Capability(device=dev, model=FLASH, lo=1, hi=3, is_head=False, is_tail=False,
+                      layer_kinds=MIMO_V26_FLASH.layer_kinds[1:3], swa_window=128, hidden_size=4096,
+                      vocab_size=152576, wire_dtype="bf16", codecs_in=("bf16",), logits_dtype="f32",
+                      kv_dtype="bf16", kv_layout_id="kvl1-x", global_kv_bytes_per_pos=0,
+                      swa_kv_bytes_per_pos=10240, kv_page_positions=1, kv_free_bytes=1 << 30,
+                      layer_weight_bytes=tuple(lb), edge_weight_bytes=0, load_peak_extra_bytes=0, max_sessions=32,
+                      max_ctx=32768, spec_window_max=64, max_tokens_per_step=2048, tap_layers_held=(),
+                      tap_mode="raw", numerics_id="nid1-x", numerics_mode="invariant", chunk_invariant=False,
+                      service_ms=((1, 1, 0, 9.0),)).to_dict()
 
 
 def placement_cases():
@@ -293,6 +315,16 @@ def placement_cases():
         r("join", node=sim_node("n3", 24), now=900)
         r("repair", now=1800)
 
+    def cancel_move(r):
+        for i, (lo, hi) in enumerate([(0, 24), (0, 24), (24, 40), (24, 40), (40, 48)]):
+            r("join", node=sim_node(f"n{i}", hi - lo, span=[lo, hi]), now=0)
+        r("leave", id="n4", now=100)
+        mv = r("repair", now=700)
+        other = "n3" if mv[0]["id"] == "n2" else "n2"
+        r("leave", id=other, now=750)
+        r("complete_move", id=mv[0]["id"], now=800)
+        r("counts")
+
     def no_mover(r):
         r("join", node=sim_node("n1", 24, span=[0, 24]), now=0)
         r("join", node=sim_node("n2", 16, span=[24, 40]), now=0)
@@ -310,6 +342,8 @@ def placement_cases():
                "timer", SIM, SIM_POLICY, kmin_rejoin),
         _pcase("repair: no legal mover, no move", "nobody may drop a layer it alone holds", SIM, SIM_POLICY,
                no_mover),
+        _pcase("repair: completing a move never opens a hole", "the other holder of the mover's old span "
+               "died mid-download: the move is cancelled (false)", SIM, SIM_POLICY, cancel_move),
     ]
 
     def mixed_short(r):
@@ -327,6 +361,7 @@ def placement_cases():
     def all_classes(r):
         for i, kind in enumerate(sorted(DEVICES)):
             r("join", node=node(f"X{i}", kind), now=i)
+        r("join", node=node("SlowCpu", "cpu-256g", capability=slow_cpu_probe()), now=20)
         r("counts")
 
     def churn(r):
@@ -350,8 +385,10 @@ def placement_cases():
                "24 GB card completes a 4-hop path", FLASH, pol_dict(**CATALOG), mixed_short),
         _pcase("mixed: a fleet of only 24 GB cards", "two full copies, 9 hops (the tail card holds 5)", FLASH,
                pol_dict(**CATALOG), only24),
-        _pcase("mixed: every device class in one cell", "stages, a backup holder, whole-servers and a seeder",
-               FLASH, pol_dict(**CATALOG), all_classes),
+        _pcase("mixed: every device class in one cell", "stages, a measured-slow backup holder, "
+               "whole-servers", FLASH, pol_dict(**CATALOG), all_classes),
+        _pcase("mixed: 24 GB cells at 16 ms legs still hold the tail", "s_min is 6 but a 24 GB tail span holds "
+               "5: a shorter span may close a hole", FLASH, pol_dict(leg_ms=16.0, **CATALOG), only24),
         _pcase("mixed: deterministic churn", "joins, leaves and repairs of random device families; spans must "
                "match exactly", FLASH, pol_dict(**CATALOG), churn),
     ]
@@ -410,6 +447,21 @@ def paths_cases():
                "else can", [cpu], {"k": 3}),
         _qcase("a solo holder backed by a backup-role holder", "the backup is never on its own path",
                [cpu, dict(cpu, id="M", role="stage", layer_ms=1.15, subnet="M", reliability=1.0)], {"k": 3}),
+        _qcase("a slow holder hands over where a faster span starts", "hops may end at another holder's "
+               "span start, not only at their own span end",
+               [dict(cpu, id="X", span=[0, 40], role="stage", layer_ms=3.0, subnet="X", reliability=1.0),
+                dict(cpu, id="Y", span=[20, 48], role="stage", layer_ms=1.15, subnet="Y", reliability=1.0)],
+               {"k": 3}),
+        _qcase("label pruning cannot starve the subnet filter", "13 cheap heads share the tail's subnet; the "
+               "pricier head on another subnet must survive pruning",
+               [dict(cpu, id=f"C{i}", span=[0, 20], role="stage", layer_ms=1.15, subnet="S", reliability=1.0)
+                for i in range(13)] +
+               [dict(cpu, id="Q", span=[0, 20], role="stage", layer_ms=2.0, subnet="T", reliability=1.0),
+                dict(cpu, id="G", span=[20, 40], role="stage", layer_ms=1.15, subnet="U", reliability=1.0),
+                dict(cpu, id="Tl", span=[40, 48], role="stage", layer_ms=1.15, subnet="S", reliability=1.0)],
+               {"k": 3}),
+        _qcase("an unreachable pair is skipped", "negative (and, in memory, non-finite) rtt entries are "
+               "unreachable, never a crash", fat, {"k": 5, "rtt": {"A": {"B": -1.0}, "B": {"A": -5.0}}}),
     ]
 
 
@@ -468,14 +520,12 @@ def lease_doc():
         ("empty", "", {}),
         ("oversize", "A" * (L.MAX_TOKEN + 1), {}),
         ("wrong audience", good, {"audience": "PeerC"}),
-        ("wrong sender (a stolen token)", good, {"sender": "Mallory"}),
         ("expired", good, {"now": 4600}),
         ("not yet valid", good, {"now": 969}),
     ]
     verify = []
     for name, tok, over in tokens:
-        v = {"name": name, "token": tok, "pub": pub, "audience": "PeerB", "sender": "PeerA", "now": 2000,
-             "skew": 30, **over}
+        v = {"name": name, "token": tok, "pub": pub, "audience": "PeerB", "now": 2000, "skew": 30, **over}
         v["expect"] = _jsonable(exec_verify(v))
         verify.append(v)
     issue = [{"claims": {k: v for k, v in BASE_CLAIMS.items()}, "token": good}]
@@ -487,25 +537,46 @@ def lease_doc():
     def t(**over):
         return L.issue(KEY, {**BASE_CLAIMS, **over})
 
+    sid = BASE_CLAIMS["sid"]
+    bind = {k: BASE_CLAIMS[k] for k in L.BIND_KEYS}
+
+    def adm(r, token, now, **over):
+        return r("admit", token=token, now=now, bind={**bind, **over})
+
     gates = []
     for name, build in (
-        ("redial ok, stale rte refused, supersede, close", lambda r: [
-            r("admit", token=t(), sender="PeerA", now=2000),
-            r("admit", token=t(), sender="PeerA", now=2001),
-            r("admit", token=t(rte=4, lid="00112233445566fe"), sender="PeerA", now=2002),
-            r("admit", token=t(), sender="PeerA", now=2003),
-            r("supersede", sid=BASE_CLAIMS["sid"], rte=5, now=2004),
-            r("admit", token=t(rte=4, lid="00112233445566fe"), sender="PeerA", now=2005),
-            r("admit", token=t(rte=5, lid="00112233445566fd"), sender="PeerA", now=2006),
-            r("close", sid=BASE_CLAIMS["sid"], now=2007),
-            r("admit", token=t(rte=5, lid="00112233445566fd"), sender="PeerA", now=2008),
-            r("admit", token=t(sid="fedcba9876543210"), sender="PeerA", now=2009)]),
+        ("binding: the carrying message must claim what the token claims", lambda r: [
+            adm(r, t(), 2000, role="head"),
+            adm(r, t(), 2000, lo=9),
+            adm(r, t(), 2000, **{"from": "PeerX"}),
+            adm(r, t(), 2000, rte=4),
+            adm(r, t(role="backup", lid="00112233445566fc"), 2000),
+            adm(r, t(role="backup", lid="00112233445566fc"), 2000, role="backup"),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="mirror"),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame"),
+            adm(r, t(), 2001, rte=3),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame"),
+            r("accepts", sid=sid, rte=3, sender="PeerX", kind="frame")]),
+        ("redelivery ok, stale rte refused, supersede with a new pred, close", lambda r: [
+            adm(r, t(), 2000),
+            adm(r, t(), 2001),
+            adm(r, t(rte=4, lid="00112233445566fe"), 2002),
+            adm(r, t(), 2003),
+            r("supersede", sid=sid, rte=5, now=2004, pred="PeerZ"),
+            r("accepts", sid=sid, rte=5, sender="PeerZ", kind="frame"),
+            r("accepts", sid=sid, rte=5, sender="PeerA", kind="frame"),
+            adm(r, t(rte=4, lid="00112233445566fe"), 2005),
+            r("supersede", sid=sid, rte=6, now=2006),
+            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame"),
+            r("close", sid=sid, now=2007),
+            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame"),
+            adm(r, t(rte=7, lid="00112233445566fd"), 2008)]),
         ("prune waits for every older token", lambda r: [
-            r("admit", token=t(rte=2, lid="00112233445566bb", iat=1100, exp=1200), sender="PeerA", now=1150),
+            adm(r, t(rte=2, lid="00112233445566bb", iat=1100, exp=1200), 1150),
             r("prune", now=1300),
-            r("admit", token=t(rte=1, lid="00112233445566aa", exp=1000 + L.MAX_TTL_S), sender="PeerA", now=1300),
+            adm(r, t(rte=1, lid="00112233445566aa", exp=1000 + L.MAX_TTL_S), 1300),
             r("prune", now=1100 + L.MAX_TTL_S + 31),
-            r("admit", token=t(rte=1, lid="00112233445566aa", iat=90000, exp=90100), sender="PeerA", now=90050)]),
+            adm(r, t(rte=1, lid="00112233445566aa", iat=90000, exp=90100), 90050)]),
     ):
         rec = Rec(exec_gate, {"gate": L.LeaseGate(pub, "PeerB")})
         build(rec)
@@ -556,6 +627,9 @@ def directory_cases():
         r("lease", args=_lease_args({"hops": hops}))
         r("snapshot", cell="eu-1", model=FLASH)
 
+    def rec(hid, now, **kw):
+        return {"id": hid, "model": FLASH, "sessions": 0, "rho": 0.0, "kv_free": 262144, "sids": [], **kw}
+
     def refusals(r):
         twelve(r)
         (p, *_) = r("paths", cell="eu-1", model=FLASH, args={"k": 1})
@@ -566,38 +640,59 @@ def directory_cases():
         r("lease", args=_lease_args({"hops": bad(2, id="Ghost")}))                              # unknown_holder
         r("lease", args=_lease_args({"hops": bad(2, backup=hops[0]["backup"])}))                # backup_span
         r("lease", args=_lease_args(p, sid="NOT-HEX"))                                          # bad_request
-        r("update", record={"id": hops[2]["id"], "model": FLASH, "ts": 50, "sessions": 0, "rho": 0.9,
-                            "kv_free": 262144})
+        r("update", record=rec(hops[2]["id"], 50, rho=0.9), now=50)
         r("lease", args=_lease_args(p))                                                         # overloaded
-        r("update", record={"id": hops[2]["id"], "model": FLASH, "ts": 51, "sessions": 0, "rho": 0.0,
-                            "kv_free": 262144})
-        r("update", record={"id": hops[1]["backup"], "model": FLASH, "ts": 51, "sessions": 0, "rho": 0.0,
-                            "kv_free": 100})
+        r("update", record=rec(hops[2]["id"], 51), now=51)
+        r("update", record=rec(hops[1]["backup"], 51, kv_free=100), now=51)
         r("lease", args=_lease_args(p))                                                         # kv_full
-        r("update", record={"id": hops[1]["backup"], "model": FLASH, "ts": 52, "sessions": 0, "rho": 0.0,
-                            "kv_free": 262144})
+        r("update", record=rec(hops[1]["backup"], 52), now=52)
         r("report_failure", id=hops[3]["id"], model=FLASH, now=60)
         r("lease", args=_lease_args(p))                                                         # suspect
-        r("update", record={"id": hops[3]["id"], "model": FLASH, "ts": 61, "sessions": 0, "rho": 0.0,
-                            "kv_free": 262144})
+        r("update", record=rec(hops[3]["id"], 61), now=61)
         r("lease", args=_lease_args(p))                                                         # ok
-        r("lease", args=_lease_args(p))                                                         # duplicate_lease
+        r("lease", args=_lease_args(p, job="job-2"))                                            # sid_in_use
         r("snapshot", cell="eu-1", model=FLASH)
 
     def absorb(r):
         twelve(r)
         (p, *_) = r("paths", cell="eu-1", model=FLASH, args={"k": 1})
         le = r("lease", args=_lease_args(p, now=100))
-        h = p["hops"][0]["id"]
-        r("update", record={"id": h, "model": FLASH, "ts": 90, "sessions": 2, "rho": 0.1, "kv_free": 50000})
+        h, sid = p["hops"][0]["id"], "0123456789abcdef"
+        r("update", record=rec(h, 90, sessions=2, rho=0.1, kv_free=50000), now=90)
         r("snapshot", cell="eu-1", model=FLASH)
-        r("update", record={"id": h, "model": FLASH, "ts": 100, "sessions": 3, "rho": 0.3, "kv_free": 45904})
-        r("update", record={"id": h, "model": FLASH, "ts": 95, "sessions": 0, "rho": 0.0, "kv_free": 1})
+        r("update", record=rec(h, 101, sessions=3, rho=0.3, kv_free=45904, sids=[sid]), now=101)
         r("snapshot", cell="eu-1", model=FLASH)
-        r("release", lease=le["ok"]["lease"])
+        r("update", record=rec(h, 102, sessions=2, rho=0.2, kv_free=50000), now=102)
+        r("release", lease=le["ok"]["lease"], now=150)
         r("snapshot", cell="eu-1", model=FLASH)
-        r("lease", args=_lease_args(p, rte=1, now=200))
-        r("lease", args=_lease_args(p, sid="fedcba9876543210", now=200 + 3600))   # the first one expired
+        r("lease", args=_lease_args(p, now=200))                                  # sid_in_use: retired
+        r("lease", args=_lease_args(p, sid="2222222222222222", now=200))
+        r("lease", args=_lease_args(p, sid="fedcba9876543210", now=200 + 3600))   # the previous one expired
+        r("snapshot", cell="eu-1", model=FLASH)
+
+    def reroute(r):
+        twelve(r)
+        (p, *_) = r("paths", cell="eu-1", model=FLASH, args={"k": 1})
+        le = r("lease", args=_lease_args(p))
+        dead = p["hops"][2]
+        r("report_failure", id=dead["id"], model=FLASH, now=150)
+        hops = [dict(h) for h in p["hops"]]
+        hops[2] = {"id": dead["backup"], "lo": dead["lo"], "hi": dead["hi"], "backup": None}
+        r("reroute", lease=le["ok"]["lease"], rte=1, hops=hops, now=160)
+        r("snapshot", cell="eu-1", model=FLASH)
+        r("reroute", lease=le["ok"]["lease"], rte=1, hops=hops, now=170)           # stale_rte
+        hops2 = [dict(h) for h in hops]
+        hops2[2]["backup"] = dead["id"]                                            # the suspect as backup
+        r("reroute", lease=le["ok"]["lease"], rte=2, hops=hops2, now=170)          # suspect
+        r("reroute", lease="0" * 16, rte=5, hops=hops, now=170)                    # unknown_lease
+
+    def backup_once(r):
+        r("join", node=node("Mac", "mac-192g"), model=FLASH, now=0)
+        for i in range(6):
+            r("join", node=node(f"F{i}", "5090"), model=FLASH, now=0)
+        r("update", record=rec("Mac", 1, sessions=16, rho=0.2, kv_free=200000), now=1)
+        (p, *_) = r("paths", cell="eu-1", model=FLASH, args={"k": 1, "kv_tokens": 40000})
+        r("lease", args=_lease_args(p, kv_tokens=40000))
         r("snapshot", cell="eu-1", model=FLASH)
 
     def mixed(r):
@@ -627,9 +722,13 @@ def directory_cases():
                "KV, the next best path avoids the leased hops", bump),
         _dcase("backup on the path is refused, nothing changes", "ARCHITECTURE §4.4 hard filter", backup_on_path),
         _dcase("every refusal code, each atomic", "bad_path, unknown_holder, backup_span, bad_request, "
-               "overloaded, kv_full, suspect, then ok and duplicate_lease", refusals),
-        _dcase("record pushes absorb bumps by timestamp; release and expiry undo them", "Parallax-style bump "
-               "with 5 s pushes", absorb),
+               "overloaded, kv_full, suspect, then ok and sid_in_use", refusals),
+        _dcase("a record absorbs a bump once it lists the sid; release and expiry undo it; sids are single-use",
+               "Parallax-style bump with 5 s pushes stamped on receipt", absorb),
+        _dcase("reroute: a takeover gets tokens for changed edges only; survivors are not bumped twice",
+               "failover at rte+1 (C6); stale rte, suspects and unknown leases refused", reroute),
+        _dcase("a backup is charged KV once per session", "one Mac backs six 5090 hops at its session cap",
+               backup_once),
         _dcase("mixed fleet: roles, paths, tokens, a death and a sticky return", "Spark, 96 GB, 24 GB, 8 GB, "
                "a 192 GB Mac and a CPU box in one cell", mixed),
         _dcase("repair through the directory", "a hole is filled by the next arrival; no legal k_min mover",
@@ -655,7 +754,7 @@ def dump(doc) -> str:
         expand = (isinstance(x, dict) and depth <= 2) or (
             isinstance(x, list) and depth <= 3 and all(isinstance(v, dict) for v in x))
         if not expand or not x:
-            return json.dumps(x, sort_keys=True, separators=(",", ":"))
+            return json.dumps(x, sort_keys=True, separators=(",", ":"), allow_nan=False)
         pad = " " * (depth + 1)
         if isinstance(x, dict):
             items = [f"{pad}{json.dumps(k)}: {enc(x[k], depth + 1)}" for k in sorted(x)]

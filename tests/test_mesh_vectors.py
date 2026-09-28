@@ -100,11 +100,13 @@ def test_vectors_cover_the_m3_gate():
     names = " | ".join(ids("mesh_placement.json") + ids("mesh_paths.json") + ids("mesh_directory.json")).lower()
     for topic in ("join priority: holes", "k < k_min before", "disk-warm", "sticky", "repair: hole",
                   "repair: k < k_min", "bump", "backup on the path", "spark + 5090 + 3090", "only 24 gb",
-                  "every device class", "role table"):
+                  "every device class", "role table", "reroute", "charged kv once", "hands over"):
         assert topic in names, topic
     codes = {v["expect"].get("error") for v in load("mesh_lease.json")["verify"]}
-    assert codes >= {None, "signature", "schema", "issuer", "audience", "sender", "expired", "not_yet_valid",
-                     "format", "ttl"}
+    assert codes >= {None, "signature", "schema", "issuer", "audience", "expired", "not_yet_valid", "format", "ttl"}
+    gate_codes = {st["expect"].get("error") for g in load("mesh_lease.json")["gate"] for st in g["steps"]
+                  if isinstance(st["expect"], dict)}
+    assert gate_codes >= {None, "binding", "stale_rte", "closed"}
 
 
 def test_vectors_are_current():
