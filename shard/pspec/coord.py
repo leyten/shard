@@ -539,9 +539,11 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
     advance its ack. A session is done when it stopped and owes nothing; one that owes nothing
     before stopping is a bug and raises, as in `run`.
 
-    ISOLATION. A `SessionFailed` from the link fails THAT session only: it is cancelled (its
-    queued frames never ship), later replies for it are dropped, and its result carries
-    ok=False and the reason; the caller closes its lease. Any other link error ends the loop."""
+    ISOLATION. A `SessionFailed` from the link, or any error judging one session's reply (a
+    bad echo, an `acc` disagreement, a hook error), fails THAT session only: it is cancelled
+    (its queued frames never ship), later replies for it are dropped, and its result carries
+    ok=False and the reason; the caller closes its lease. Any other link error (a dead link, a
+    timeout: nothing to attribute it to) ends the loop."""
     by_sid = {}
     for s in sessions:
         if s.sid in by_sid:
@@ -558,6 +560,12 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
         for s in sessions:
             sender.put(s.st, s.prefill())
         live, failed = set(by_sid), {}
+
+        def fail(sid, why):
+            failed[sid] = why
+            by_sid[sid].cancel()
+            live.discard(sid)
+
         while True:
             if sender.err is not None:
                 raise died() from sender.err
@@ -575,9 +583,7 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
                 rep = link.recv(timeout)
             except SessionFailed as e:
                 if e.sid in live:
-                    failed[e.sid] = e.why
-                    by_sid[e.sid].cancel()
-                    live.discard(e.sid)
+                    fail(e.sid, e.why)
                 elif e.sid not in by_sid:
                     raise
                 continue
@@ -591,9 +597,14 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
             if s is None or rep["sid"] not in live:
                 raise RuntimeError(f"pspec: a reply for session {rep.get('sid')!r}, which has "
                                    f"nothing on the wire here")
-            if on_reply is not None:
-                on_reply(s, rep)
-            for fr in s.on_reply(rep):
+            try:
+                if on_reply is not None:
+                    on_reply(s, rep)
+                frames = s.on_reply(rep)
+            except Exception as e:                           # noqa: BLE001 - this session only
+                fail(s.sid, f"{type(e).__name__}: {e}")
+                continue
+            for fr in frames:
                 sender.put(s.st, fr)
     finally:
         for s in sessions:

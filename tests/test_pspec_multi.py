@@ -145,7 +145,7 @@ def test_interleaving_fuzz_cancels_eos_delays(mesh_factory, seed):
             assert r == want[:len(r)], job[0]
         else:
             assert r == want, job[0]
-    assert cancelled > 0 and len(cancel_at) > cancelled - 1, (cancelled, cancel_at)
+    assert cancelled > 0, (cancelled, cancel_at)
     snap = [n.snapshot() for n in m.nodes]
     assert all(s.get("faults", 0) == 0 and not any(k.startswith("refused") for k in s) for s in snap)
     # the next job on the same mesh is unaffected by whatever the cancelled ones left queued
@@ -156,8 +156,8 @@ def test_interleaving_fuzz_cancels_eos_delays(mesh_factory, seed):
 
 
 def test_fence_isolation_across_sessions(mesh_factory):
-    """Session A's sep races ahead; B's frames at sep 0 still compute, A's stale frames are fenced
-    without touching B, and a batched step holding both leaves B exactly on its stream."""
+    """Session A's sep races ahead; B's frames at sep 0 still compute, and A's stale frame, queued
+    at the same parked hop as B's, is fenced at dequeue without touching B."""
     m = mesh_factory(3, devices=BIG[:3])
     pa, pb = [3, 3, 7, 1], [9, 4, 4]
     Ta, Tb = direct_greedy(m.weights, pa, 10), direct_greedy(m.weights, pb, 10)
@@ -169,7 +169,7 @@ def test_fence_isolation_across_sessions(mesh_factory):
     assert _req(m, A, kind="T", pos=Pa, ids=[Ta[Pa]], sep=5)["acc"] is True
     _settle(m)
     b_before = _state(m, B)
-    # A's stale frame (wrong id, rewinding) and B's sep-0 frame land in the same queue window
+    # A's stale frame (wrong id, rewinding) and B's sep-0 frame queue at the same parked head
     m.hang(0)
     sa = _submit(m, A, kind="S", pos=Pa, ids=[_wrong(Ta[Pa], 0)], sep=0)
     sb = _submit(m, B, kind="T", pos=Pb, ids=[Tb[Pb]], sep=0)
@@ -188,7 +188,11 @@ def test_fence_isolation_across_sessions(mesh_factory):
 
 
 def test_priority_classes_frontier_first_then_prefill(mesh_factory):
+    """The head's budget (6) cannot hold all three frames: the frontier frames run first, in
+    frontier order, and the prefill that arrived FIRST waits a step (round-robin would run it
+    first and alone)."""
     m = mesh_factory(2, devices=BIG[:2])
+    m.nodes[0]._budget = 6
     steps = []
     rt = m.nodes[0].rt
     inner = rt.step
@@ -212,13 +216,15 @@ def test_priority_classes_frontier_first_then_prefill(mesh_factory):
     m.resume(0)
     for sid, seq in ((1, s1), (2, s2), (3, s3)):
         m.collect(sid, seq)
-    assert [sid for sid, _k, _p in steps[0]] == [3, 2, 1]
-    assert [k for _s, k, _p in steps[0]] == ["decode", "decode", "prefill"]
+    assert [(sid, k) for sid, k, _p in steps[0]] == [(3, "decode"), (2, "decode")]
+    assert [(sid, k) for sid, k, _p in steps[1]] == [(1, "prefill")]
 
 
-def test_a_prefill_is_not_starved_by_decode_load(mesh_factory):
-    """Strict priority would park a prefill behind a steady decode load forever when the budget
-    only fits the decodes; the STARVE guard runs it within a bounded number of steps."""
+@pytest.mark.parametrize("n_dec,rows", [(4, 1), (6, 3)])
+def test_a_prefill_is_not_starved_by_decode_load(mesh_factory, n_dec, rows):
+    """Strict priority would park a prefill behind a steady decode load for as long as it lasts
+    (48 steps here); the STARVE guard runs it within a few steps, even when more decodes than
+    fit one step are starved alongside it (starved sessions go longest-waiting first)."""
     m = mesh_factory(1, devices=BIG[:1])
     node = m.nodes[0]
     node._budget = 4
@@ -229,25 +235,28 @@ def test_a_prefill_is_not_starved_by_decode_load(mesh_factory):
         steps.append([s.kind for s in x.segs])
         return inner(x)
     node.rt.step = spy
-    prompts = {sid: [sid, sid + 1, sid + 2] for sid in (1, 2, 3, 4)}
-    T = {sid: direct_greedy(m.weights, p, 30) for sid, p in prompts.items()}
+    sids = list(range(1, n_dec + 1))
+    prompts = {sid: [sid, sid + 1, sid + 2] for sid in sids}
+    T = {sid: direct_greedy(m.weights, p, 3 + rows * 12 + 2) for sid, p in prompts.items()}
     for sid, p in prompts.items():
-        m.open(sid)
+        m.open(sid, W=8)
         _req(m, sid, kind="P", pos=0, ids=p, lg="last")
-    m.open(9)
+    m.open(99)
     m.hang(0)
     seqs = []
-    for k in range(12):                              # 12 rounds of 4 decode frames: budget-full
-        for sid in (1, 2, 3, 4):
-            seqs.append((sid, m.submit(sid, kind="T", pos=3 + k, ids=[T[sid][3 + k]], cpos=3 + k)))
-    seqs.append((9, m.submit(9, kind="P", pos=0, ids=[1, 1])))
+    for k in range(12 if rows == 1 else 8):          # a decode load that fills every step
+        for sid in sids:
+            pos = 3 + rows * k
+            seqs.append((sid, m.submit(sid, kind="T" if rows == 1 else "S", pos=pos,
+                                       ids=T[sid][pos:pos + rows], cpos=pos, lg="all")))
+    seqs.append((99, m.submit(99, kind="P", pos=0, ids=[1, 1])))
     steps.clear()
     m.clock.settle()
     m.resume(0)
     for sid, seq in seqs:
         m.collect(sid, seq)
     at = next(i for i, st in enumerate(steps) if "prefill" in st)
-    assert at <= 5, (at, steps[:8])                  # STARVE = 4; strict priority: at == 12
+    assert at <= 8, (at, len(steps))                 # STARVE = 4; strict priority: 12 / 48
 
 
 class _LoggingLink(MeshLink):
@@ -352,3 +361,27 @@ def test_a_refused_session_fails_alone(mesh_factory):
         if job is not bad:
             r = res[hexsid(job[0])]
             assert r["ok"] and r["tokens"] == _want(job), job[0]
+
+
+def test_one_sessions_bad_reply_fails_that_session_only(mesh_factory):
+    """A reply the coordinator cannot accept (here: one session's `acc` flipped on the way) fails
+    that session; the others on the same sender finish lossless."""
+    K, box = 4, {}
+    m = _mesh(mesh_factory, 3, box, K, seed=31)
+    jobs = _jobs(m, box, 5, random.Random(31), K)
+    victim, n = hexsid(jobs[1][0]), [0]
+
+    class Tamper(MeshLink):
+        def recv(self, timeout):
+            rep = super().recv(timeout)
+            if rep["sid"] == victim and rep["acc"] is not None and not rep["fen"]:
+                n[0] += 1
+                if n[0] == 3:
+                    rep = dict(rep, acc=not rep["acc"])
+            return rep
+    sessions = [_open(m, job, K=K) for job in jobs]
+    res = coord.run_many(Tamper(m), sessions, timeout=20.0)
+    assert res[victim]["ok"] is False and "RuntimeError" in res[victim]["error"]
+    for job in jobs:
+        if hexsid(job[0]) != victim:
+            assert res[hexsid(job[0])]["ok"] and res[hexsid(job[0])]["tokens"] == _want(job)

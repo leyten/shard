@@ -415,8 +415,9 @@ class NodeServer:
         Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through.
         Then the §4.2 priority classes over each session's head frame: rebuild feeds, then
         TRUTH/SPEC frontier-first (smallest pos - cpos), then PREFILL; ties in round-robin
-        order. A session passed over STARVE steps in a row goes first (a prefill, or a frame
-        over the budget, is never starved by a steady decode load)."""
+        order. A session passed over STARVE steps in a row goes first, longest-waiting first
+        whatever its class (a prefill, or a frame over the budget, is never starved by a steady
+        decode load, however many decodes are waiting too)."""
         ready = []
         for i, sid in enumerate(list(self._rr)):
             q = self._fifo.get(sid)
@@ -434,8 +435,9 @@ class NodeServer:
             if q:
                 f = q[0][0]
                 cls = 0 if f["kind"] == "R" else (2 if f["kind"] == "P" else 1)
-                starved = self._skips.get(sid, 0) >= self.STARVE
-                ready.append(((not starved, cls, f["pos"] - f["cpos"], i), sid, f["n"]))
+                w = self._skips.get(sid, 0)
+                age = -w if w >= self.STARVE else 0
+                ready.append(((age == 0, age, cls, f["pos"] - f["cpos"], i), sid, f["n"]))
         ready.sort()
         chosen, total = [], 0
         for _key, sid, n in ready:
