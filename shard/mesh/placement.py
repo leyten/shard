@@ -112,6 +112,7 @@ class ModelProfile:
     layer_ms: float
     active_bytes_per_layer: int
     tail_ms: float
+    logits_ms: float
     g: float
     lane: int
     wire_bytes_per_pos: int
@@ -133,8 +134,8 @@ class ModelProfile:
             raise ValueError("shared_edge_bytes is counted in both head_bytes and tail_bytes")
         if any(f not in FORMATS for f in self.weight_formats):
             raise ValueError(f"weight formats must be in {FORMATS}")
-        if not (self.layer_ms > 0 and self.tail_ms >= 0 and self.g > 0 and self.lane >= 1):
-            raise ValueError("layer_ms > 0, tail_ms >= 0, g > 0, lane >= 1")
+        if not (self.layer_ms > 0 and 0 <= self.logits_ms <= self.tail_ms and self.g > 0 and self.lane >= 1):
+            raise ValueError("layer_ms > 0, 0 <= logits_ms <= tail_ms, g > 0, lane >= 1")
 
     def to_dict(self) -> dict:
         return {"model": self.model, "n_layers": self.n_layers, "layer_bytes": list(self.layer_bytes),
@@ -143,7 +144,7 @@ class ModelProfile:
                 "tail_bytes": self.tail_bytes, "shared_edge_bytes": self.shared_edge_bytes,
                 "reserve_bytes": self.reserve_bytes, "weight_formats": list(self.weight_formats),
                 "layer_ms": self.layer_ms, "active_bytes_per_layer": self.active_bytes_per_layer,
-                "tail_ms": self.tail_ms, "g": self.g, "lane": self.lane,
+                "tail_ms": self.tail_ms, "logits_ms": self.logits_ms, "g": self.g, "lane": self.lane,
                 "wire_bytes_per_pos": self.wire_bytes_per_pos}
 
     @classmethod
@@ -162,7 +163,7 @@ def _mimo(model, n, globals_, layer0, moe_global, moe_swa, kv_global, embed, tai
         model=model, n_layers=n, layer_bytes=lb, layer_kinds=kinds, swa_window=128,
         kv_bytes_per_pos=(kv_global, 5120), head_bytes=embed, tail_bytes=embed + tail_extra + embed,
         shared_edge_bytes=embed, reserve_bytes=1_879_048_192, weight_formats=("mxfp4", "fp8_e4m3", "bf16"),
-        layer_ms=1.15, active_bytes_per_layer=active, tail_ms=11.45, g=4.6, lane=lane,
+        layer_ms=1.15, active_bytes_per_layer=active, tail_ms=11.45, logits_ms=2.3, g=4.6, lane=lane,
         wire_bytes_per_pos=wire)
 
 
@@ -172,9 +173,10 @@ def _mimo(model, n, globals_, layer0, moe_global, moe_swa, kv_global, embed, tai
 # copy (MTP consumes emb(x_{p+1}); design-runtime §5 extras, ARCHITECTURE C11). KV per layer per
 # position bf16: global 4 KV heads x (192+128) x 2 = 2560 B, SWA 8 heads = 5120 B. reserve 1.75 GiB
 # (design-runtime §5 fit method). layer_ms 1.15 / tail_ms 11.45 / g 4.6 are the MEAS V4 hop-law
-# terms (design-mesh §1); with MTP-3 in chunk mode g is lower (ARCHITECTURE C23) - re-derive g
-# after HW1. active_bytes_per_layer (EST): 8 of 256 MXFP4 experts (3 x 2048 x 4096 x 4.25 bit)
-# + attention 0.128 GB + router = ~0.237 GB read per decode step.
+# terms (design-mesh §1; tail_ms = draft 9.16 + head/logits ~2.3 = logits_ms); with MTP-3 in chunk
+# mode g is lower (ARCHITECTURE C23) - re-derive g after HW1. active_bytes_per_layer (EST): 8 of
+# 256 MXFP4 experts (3 x 2048 x 4096 x 4.25 bit) + attention 0.128 GB + router = ~0.237 GB read
+# per decode step.
 MIMO_V26_FLASH = _mimo("XiaomiMiMo/MiMo-V2.6-Flash", 48, {0, 5, 11, 17, 23, 29, 35, 41, 47},
                        324_000_000, 3_548_000_000, 3_553_000_000, 2560, 1_249_902_592,
                        8_192 + 1_190_000_000, 237_000_000, lane=4, wire=8192)
@@ -247,19 +249,21 @@ class Policy:
 @dataclass(frozen=True)
 class Probe:
     """What placement keeps of a probe describe() for one model: the measured resident bytes of
-    the probe span and the measured decode ms per layer (None if warmup did not run)."""
+    the probe span and the measured wall-clock ms of one decode step over the whole span (None if
+    warmup did not run). A tail probe's step includes the logits (warmup asks for them)."""
     model: str
     lo: int
     hi: int
     layer_weight_bytes: tuple[int, ...]
-    layer_ms: float | None
+    step_ms: float | None
+    is_tail: bool = False
 
     @classmethod
     def from_capability(cls, cap: Capability) -> "Probe":
-        shapes = cap.layer_ms
+        shapes = cap.service_ms
         decode = sorted((c, ms) for s, b, c, ms in shapes if s == 1 and b == 1)
         ms = decode[0][1] if decode else (min(shapes, key=lambda e: (e[0] * e[1], e[2]))[3] if shapes else None)
-        return cls(cap.model, cap.lo, cap.hi, tuple(cap.layer_weight_bytes), ms)
+        return cls(cap.model, cap.lo, cap.hi, tuple(cap.layer_weight_bytes), ms, cap.is_tail)
 
 
 @dataclass(frozen=True)
@@ -306,12 +310,15 @@ def _probe_for(node: Node, profile: ModelProfile) -> Probe | None:
 
 
 def footprint_scale(node: Node, profile: ModelProfile) -> float:
-    """Measured resident bytes / profile bytes over the probe span (1.0 without a probe)."""
+    """How much heavier this backend keeps a layer than the profile: the largest measured /
+    profile ratio over the probe's representative layers (at least half the profile's heaviest
+    layer, so a dense layer 0 cannot hide an MoE packing penalty). 1.0 without such a probe."""
     p = _probe_for(node, profile)
-    if p is None:
+    if p is None or len(p.layer_weight_bytes) != p.hi - p.lo:
         return 1.0
-    ref = sum(profile.layer_bytes[p.lo:p.hi])
-    return sum(p.layer_weight_bytes) / ref if ref else 1.0
+    big = max(profile.layer_bytes) / 2
+    ratios = [m / r for m, r in zip(p.layer_weight_bytes, profile.layer_bytes[p.lo:p.hi]) if r >= big]
+    return max(ratios, default=1.0)
 
 
 def layer_cost_ms(node: Node, profile: ModelProfile) -> float:
@@ -319,8 +326,10 @@ def layer_cost_ms(node: Node, profile: ModelProfile) -> float:
     The bandwidth bound only bounds accelerators: a CPU verifying a block is compute-bound, so
     an unmeasured CPU backend (like unknown bandwidth) costs inf until its probe measures it."""
     p = _probe_for(node, profile)
-    if p is not None and p.layer_ms is not None:
-        return float(p.layer_ms)
+    if p is not None and p.step_ms is not None:
+        per = (p.step_ms - (profile.logits_ms if p.is_tail else 0.0)) / (p.hi - p.lo)
+        if per > 0:                                  # a tail probe's logits are tail_ms's, not the layers'
+            return float(per)
     bw = node.device.mem_bw_bytes_s
     if not bw > 0 or node.device.backend == "cpu":
         return math.inf
@@ -412,7 +421,7 @@ def classify(node: Node, profile: ModelProfile, policy: Policy) -> Verdict:
     quals = {"whole-server": bool(small), "verifier": fit >= 1, "seeder": True}
     if s_min is not None and fit >= s_min:
         role = "stage"
-    elif s_base is not None and fit >= s_base:
+    elif s_base is not None and fit >= s_base and math.isfinite(t):
         role = "backup"
     else:
         role = next(r for r in ("whole-server", "verifier", "seeder") if quals[r])
@@ -520,6 +529,16 @@ class Cell:
     def _choose(self, spans, t, cnt, cap, disk):
         return max(spans, key=lambda s: self.span_key(s, t, cnt, cap, disk))
 
+    def _spans_for(self, node: Node, v: Verdict, cnt: list[int]) -> list[tuple[int, int]]:
+        """A stage takes spans of at least s_min layers, except that a shorter maximal span may
+        close a hole (a 24 GB card whose tail span is one layer under s_min still holds the tail
+        rather than leave it a permanent hole; the path pays for it in rank_ms)."""
+        fit = Fit(node, self.profile, self.policy)
+        if v.role != "stage":
+            return fit.spans()
+        long = fit.spans(v.s_min)
+        return long + [s for s in fit.spans() if s not in long and any(cnt[i] == 0 for i in range(*s))]
+
     # -- events --------------------------------------------------------------------------------
     def join(self, node: Node, now: float) -> Decision:
         if node.id in self.holdings or node.id in self.others:
@@ -530,13 +549,13 @@ class Cell:
             return Decision(node.id, v.role, None, 0, "role", v)
         fit = Fit(node, self.profile, self.policy)
         min_len = v.s_min if v.role == "stage" else 1
-        spans = fit.spans(min_len)
         cnt, cap = self.counts(), self.capacity()
+        spans = self._spans_for(node, v, cnt)
         disk = node.on_disk(self.profile.model)
         best = self._choose(spans, v.layer_ms, cnt, cap, disk)
         span, reason = best, "join"
         old = self.persisted.get(node.id) or node.span
-        if old is not None and fit.fits(*old) and old[1] - old[0] >= min_len:
+        if old is not None and fit.fits(*old) and (old[1] - old[0] >= min_len or tuple(old) in spans):
             hole_move = (self.span_key(best, v.layer_ms, cnt, cap, disk)[0] > 0
                          and all(cnt[i] >= self.policy.k_min for i in range(*old)))
             span, reason = (best, "hole") if hole_move else (tuple(old), "sticky")
@@ -561,7 +580,7 @@ class Cell:
             return []
         cnt = self.counts()
         targets = {i for i in range(n) if cnt[i] == 0 and now - self._hole_since[i] >= pol.hole_repair_s}
-        reason, floor = "hole", pol.k_min
+        reason, floor = "hole", max(pol.k_min, 2)       # the mover leaves >= 1 holder behind
         if not targets:
             targets = {i for i in range(n)
                        if 0 < cnt[i] < pol.k_min and now - self._under_since[i] >= pol.kmin_repair_s}
@@ -574,12 +593,11 @@ class Cell:
             h = self.holdings[hid]
             if any(cnt[i] < floor for i in range(*h.span)):
                 continue
-            min_len = h.verdict.s_min if h.verdict.role == "stage" else 1
-            spans = [s for s in Fit(h.node, self.profile, pol).spans(min_len)
+            cnt_wo, cap_wo = self.counts(exclude=hid), self.capacity(exclude=hid)
+            spans = [s for s in self._spans_for(h.node, h.verdict, cnt_wo)
                      if s != h.span and any(s[0] <= i < s[1] for i in targets)]
             if not spans:
                 continue
-            cnt_wo, cap_wo = self.counts(exclude=hid), self.capacity(exclude=hid)
             disk = h.node.on_disk(self.profile.model)
             best = self._choose(spans, h.verdict.layer_ms, cnt_wo, cap_wo, disk)
             if reason == "k_min":
@@ -596,14 +614,22 @@ class Cell:
         self._last_move = now
         return [Move(hid, h.span, best, dl, reason)]
 
-    def complete_move(self, node_id: str, now: float) -> None:
-        """The mover reports its new span warm: switch (its old sessions drained first)."""
+    def complete_move(self, node_id: str, now: float) -> bool:
+        """The mover reports its new span warm: switch (its old sessions drained first). If a
+        death during the download left the mover the only holder of a layer it would drop, the
+        move is cancelled instead (False): the node keeps serving, the new span stays on its disk."""
         h = self.holdings[node_id]
         if h.target is None:
             raise ValueError(f"{node_id} has no move in flight")
+        others = self.counts(exclude=node_id)
+        if any(others[i] == 0 for i in range(*h.span) if not h.target[0] <= i < h.target[1]):
+            h.target = None
+            self._refresh(now)
+            return False
         h.span, h.target = h.target, None
         self.persisted[node_id] = h.span
         self._refresh(now)
+        return True
 
     def cancel_move(self, node_id: str) -> None:
         h = self.holdings.get(node_id)
@@ -630,52 +656,77 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
                "rho", "sessions", "kv_free", "uplink_mbps"}]  (live, bumps included)
     rtt: {a: {b: one-way ms}} with the entry named `entry`; a missing pair costs policy.leg_ms.
 
-    A hop starts anywhere inside its holder's span and runs to the span's end (Petals'
-    construction), so the search is a DAG over holders ordered by span end. Hop cost =
+    A hop starts where the previous one ended (anywhere inside its holder's span) and ends at the
+    holder's span end or where another holder's span starts, so a slow or loaded holder can hand
+    over to a faster one at the first place it could (Petals cut only at span ends). The search is
+    a DAG over (holder, cut) states ordered by position, keeping per state the cheapest labels that
+    are not dominated k times (a label is dominated by a cheaper one whose subnet set it contains,
+    so the distinct-subnet filter can never be starved by pruning). Hop cost =
     leg + (q - p) * t * qf(rho) + unreliability_ms * (1 - reliability); step_ms adds the return
-    leg and profile.tail_ms. Hard filters: primaries need rho < rho_max, sessions < s_max and
-    kv_free >= kv_tokens; subnets on a path are distinct; a backup is never on its own path and
-    must hold the whole hop with kv_free >= kv_tokens. Stage holders only; if they form no complete
-    path, backup-role holders may carry hops and the path is `degraded`. Ranking by
+    leg and profile.tail_ms; a non-finite or negative rtt is an unreachable pair. Hard filters:
+    primaries need rho < rho_max, sessions < s_max and kv_free >= kv_tokens; subnets on a path are
+    distinct; a backup is never on its own path and must hold the whole hop with
+    kv_free >= kv_tokens. Stage holders only; if they form no complete path, backup-role holders
+    may carry hops and the path is `degraded`. Ranking by
     rank_ms = prefill_ms + (max_new / g) * step_ms (prefill_ms from topology.predict_prefill_ms,
     None and 0 when prompt_tokens == 0): paths within policy.backed_slack x the best rank_ms come
     first, ordered by failover class (_FAILOVER: mirror, replay, none), then rank_ms, then fewer
     hops, then ids; slower paths follow in the same order. The slack keeps a fat 2-hop path whose
     hops nobody mirrors ahead of a 9-hop mirror-backed chain of small cards (which would otherwise
-    turn the fat devices into idle backups), while equal-cost paths still prefer mirrors."""
+    turn the fat devices into idle backups), while equal-cost paths still prefer mirrors. Among
+    equal-cost cut variants of one holder sequence the later cuts win."""
     n, rtt = profile.n_layers, rtt or {}
     hs = sorted((dict(h) for h in holders), key=lambda h: h["id"])
-    leg = lambda a, b: float(rtt.get(a, {}).get(b, policy.leg_ms))          # noqa: E731
+
+    def leg(a, b):
+        v = float(rtt.get(a, {}).get(b, policy.leg_ms))
+        return v if 0 <= v < math.inf else math.inf
 
     def ok_primary(h):
         return (h["rho"] < policy.rho_max and h["sessions"] < policy.s_max and h["kv_free"] >= kv_tokens
                 and h["layer_ms"] is not None)
 
+    def prune(cands):
+        cands.sort(key=lambda e: (e[0], len(e[1]), [x["id"] for x, _, _ in e[1]], [-p for _, p, _ in e[1]]))
+        kept, seqs = [], set()
+        for c in cands:
+            seq = tuple(x["id"] for x, _, _ in c[1])
+            if seq in seqs or sum(1 for a in kept if a[2] <= c[2]) >= k:
+                continue
+            kept.append(c)
+            seqs.add(seq)
+            if len(kept) >= max(4 * k, 16):
+                break
+        return kept
+
     def search(roles):
-        prim = sorted((h for h in hs if h["role"] in roles and ok_primary(h)),
-                      key=lambda h: (h["span"][1], h["span"][0], h["id"]))
-        K, labels = max(4 * k, 8), {}
-        for h in prim:
-            lo, hi = h["span"]
-            hop = lambda p: ((hi - p) * h["layer_ms"] * _qf(h["rho"])            # noqa: E731
-                             + policy.unreliability_ms * (1.0 - h["reliability"]))
+        prim = {h["id"]: h for h in hs if h["role"] in roles and ok_primary(h)}
+        starts = sorted({h["span"][0] for h in prim.values()})
+        states = sorted((q, hid) for hid, h in prim.items()
+                        for q in {h["span"][1]} | {s for s in starts if h["span"][0] < s < h["span"][1]})
+        by_end, out = {}, []
+        for q, hid in states:
+            h = prim[hid]
+            lo = h["span"][0]
+            unrel = policy.unreliability_ms * (1.0 - h["reliability"])
+            qf = _qf(h["rho"])
             cands = []
-            if lo == 0:
-                cands.append((leg(entry, h["id"]) + hop(0), ((h, 0, hi),)))
-            for g in prim:
-                ghi = g["span"][1]
-                if g is h or not lo <= ghi < hi:
-                    continue
-                for c, path in labels.get(g["id"], ()):
-                    if any(x["subnet"] == h["subnet"] for x, _, _ in path):
+            if lo == 0 and leg(entry, hid) < math.inf:
+                cands.append((leg(entry, hid) + ((q - 0) * h["layer_ms"] * qf + unrel), ((h, 0, q),),
+                              frozenset((h["subnet"],))))
+            for p in sorted(e for e in by_end if lo <= e < q):
+                for gid, glabels in by_end[p]:
+                    lg = leg(gid, hid)
+                    if gid == hid or lg == math.inf:
                         continue
-                    cands.append((c + leg(g["id"], h["id"]) + hop(ghi), path + ((h, ghi, hi),)))
-            cands.sort(key=lambda e: (e[0], len(e[1]), [x["id"] for x, _, _ in e[1]]))
-            labels[h["id"]] = cands[:K]
-        out = []
-        for h in prim:
-            if h["span"][1] == n:
-                out += [(c + leg(h["id"], entry) + profile.tail_ms, path) for c, path in labels.get(h["id"], ())]
+                    for c, path, subs in glabels:
+                        if h["subnet"] not in subs:
+                            cands.append((c + lg + ((q - p) * h["layer_ms"] * qf + unrel), path + ((h, p, q),),
+                                          subs | {h["subnet"]}))
+            kept = prune(cands)
+            by_end.setdefault(q, []).append((hid, kept))
+            if q == n and leg(hid, entry) < math.inf:
+                out += [(c + leg(hid, entry) + profile.tail_ms, path) for c, path, _ in kept]
         return out
 
     found, degraded = search(("stage",)), False

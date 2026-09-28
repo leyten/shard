@@ -80,7 +80,8 @@ def test_unified_memory_pays_for_host_state():
 
 def _cap(model, lo, hi, layer_bytes, service_ms=()):
     return Capability(device=Node.from_dict(node("X", "4090")).device, model=model, lo=lo, hi=hi,
-                      is_head=False, is_tail=False, layer_kinds=FLASH.layer_kinds[lo:hi], swa_window=128,
+                      is_head=False, is_tail=False, layer_kinds=FLASH.layer_kinds[lo:hi],
+                      swa_window=128 if "swa" in FLASH.layer_kinds[lo:hi] else 0,
                       hidden_size=4096, vocab_size=152576, wire_dtype="bf16", codecs_in=("bf16",),
                       logits_dtype="f32", kv_dtype="bf16", kv_layout_id="kvl1-x", global_kv_bytes_per_pos=0,
                       swa_kv_bytes_per_pos=5120, kv_page_positions=1, kv_free_bytes=GiB,
@@ -116,7 +117,7 @@ def test_probe_from_a_real_describe_record():
     from shard.runtime.toy import ToyRuntime
     cap = ToyRuntime(StageSpec("toy", 0, 2), pattern="GS", window=2).describe()
     p = P.Probe.from_capability(Capability.from_dict(cap.to_dict()))    # JSON round trip, as pushed
-    assert (p.model, p.lo, p.hi, len(p.layer_weight_bytes), p.layer_ms) == ("toy", 0, 2, 2, None)
+    assert (p.model, p.lo, p.hi, len(p.layer_weight_bytes), p.step_ms, p.is_tail) == ("toy", 0, 2, 2, None, False)
     n = Node.from_dict({**node("T", "5090"), "capability": cap.to_dict()})
     assert n.probe == p and P.footprint_scale(n, FLASH) == 1.0          # another model's probe
 
@@ -127,7 +128,7 @@ ROLE_TABLE_FLASH_H13 = {
     "4060-8g": "whole-server", "3060-12g": "whole-server", "4060ti-16g": "whole-server",
     "3090": "stage", "4090": "stage", "7900xtx": "whole-server", "5090": "stage", "a6000-48g": "stage",
     "pro6000-96g": "stage", "spark-128g": "stage", "mac-64g": "stage", "mac-192g": "stage",
-    "mac-512g": "stage", "cpu-256g": "backup"}
+    "mac-512g": "stage", "cpu-256g": "whole-server"}     # an unmeasured CPU holds nothing yet
 
 
 def test_role_table_flash_default_cell():
@@ -158,13 +159,17 @@ def test_stage_min_layers_is_the_hop_law():
     assert stage_min_layers(float("inf"), FLASH, Policy()) is None
 
 
-def test_big_but_slow_is_a_backup_holder_until_measured_fast():
-    cpu = N("C", "cpu-256g")
-    v = classify(cpu, FLASH, POL)
-    assert v.role == "backup" and v.fit_layers == 48 and v.s_min is None
-    fast = Node.from_dict(node("C", "cpu-256g", capability=_cap(FLASH.model, 1, 3, FLASH.layer_bytes[1:3],
-                                                                 [(1, 1, 0, 2 * 2.0)])))
-    assert classify(fast, FLASH, POL).role == "stage"      # measured 2 ms/layer x 48 = one-hop path
+def cpu_measured(ms_per_layer):
+    return Node.from_dict(node("C", "cpu-256g", capability=_cap(FLASH.model, 1, 3, FLASH.layer_bytes[1:3],
+                                                                 [(1, 1, 0, 2 * ms_per_layer)])))
+
+
+def test_big_but_slow_is_a_backup_holder_only_once_measured():
+    v = classify(N("C", "cpu-256g"), FLASH, POL)
+    assert v.role == "whole-server" and v.fit_layers == 48 and v.s_min is None   # unmeasured: no span
+    slow = classify(cpu_measured(4.5), FLASH, POL)
+    assert (slow.role, slow.s_min) == ("backup", None)     # holds 48 layers, too slow to be a hop
+    assert classify(cpu_measured(2.0), FLASH, POL).role == "stage"   # 2 ms/layer x 48 = one-hop path
 
 
 def test_device_names_are_irrelevant_only_numbers_matter():
@@ -378,7 +383,7 @@ def test_fat_nodes_carry_sessions_even_when_only_small_chains_are_mirror_backed(
     only by replay over the small cards. Mirror-first ranking would park the fat cards as backups
     at 23 tok/s; the 1.3x slack keeps them carrying sessions at 43 tok/s."""
     c = _fleet([("P1", "pro6000-96g"), ("P2", "pro6000-96g")] + [(f"G{i}", "3090") for i in range(9)])
-    paths = candidate_paths(_views(c), FLASH, POL, k=10)
+    paths = candidate_paths(_views(c), FLASH, POL, k=40)
     assert [h["id"] for h in paths[0]["hops"]] == ["P1", "P2"] and paths[0]["failover"] == "replay"
     chain = [p for p in paths if p["failover"] == "mirror"]
     assert chain and all(p["rank_ms"] > POL.backed_slack * paths[0]["rank_ms"] for p in chain)
@@ -400,9 +405,10 @@ def test_14_5090s_reproduce_the_hop_law_6_hop_path():
 
 def test_every_device_class_gets_a_role_in_one_mixed_cell():
     c = _fleet([(f"X{i}", k) for i, k in enumerate(sorted(DEVICES))])
-    roles = {x.node.device.device_name: x.verdict.role for x in c.holdings.values()}
+    c.join(cpu_measured(4.5), 1.0)                         # a measured-slow CPU box: a backup holder
+    roles = {x.node.id + x.node.device.device_name: x.verdict.role for x in c.holdings.values()}
     roles.update({k: v.role for k, v in c.others.items()})
-    assert len(roles) == len(DEVICES) and all(r in P.ROLES for r in roles.values())
+    assert len(roles) == len(DEVICES) + 1 and all(r in P.ROLES for r in roles.values())
     assert {r for r in roles.values()} >= {"stage", "backup", "whole-server"}
 
 
@@ -489,3 +495,90 @@ def test_measured_rtt_overrides_the_cell_leg():
     a, b = p0["hops"][0]["id"], p0["hops"][1]["id"]
     p1 = candidate_paths(v, FLASH, POL, rtt={a: {b: 90.0}})[0]
     assert (p1["hops"][0]["id"], p1["hops"][1]["id"]) != (a, b)
+
+
+# ── adversarial-review regressions ────────────────────────────────────────────────────────────
+
+def test_completing_a_move_never_opens_a_hole():
+    c = _hole_cell(hole_repair_s=0.0)
+    (m,) = c.repair(700.0)
+    assert m.frm == (24, 40) and m.to[1] == 48
+    other = "n4" if m.id == "n3" else "n3"
+    c.leave(other, 750.0)                                  # the other holder of [24, 40) dies mid-download
+    assert c.complete_move(m.id, 800.0) is False           # cancelled: the mover keeps [24, 40) warm
+    assert c.holdings[m.id].span == (24, 40) and c.holdings[m.id].target is None
+    assert all(v >= 1 for v in c.counts()[:40])
+
+
+@pytest.mark.parametrize("leg", [16.0, 18.0])
+def test_24gb_cells_hold_the_tail_even_when_it_is_one_layer_under_s_min(leg):
+    pol = Policy(leg_ms=leg, small_models=CATALOG)
+    c = _fleet([(f"G{i}", "3090") for i in range(16)], pol)
+    assert classify(N("G", "3090"), FLASH, pol).s_min == 6 and spans_by_edge(N("G", "3090"), pol=pol)[2] == 5
+    assert c.holes() == []
+    (p, *_) = candidate_paths(_views(c), FLASH, pol)
+    assert p["hops"][-1]["hi"] == 48
+
+
+def _cap_tail(lo, hi, step_ms):
+    d = _cap(FLASH.model, lo, hi, FLASH.layer_bytes[lo:hi], [(1, 1, 0, step_ms)])
+    d["is_tail"] = hi == 48
+    return d
+
+
+def test_a_tail_probe_does_not_charge_the_logits_to_the_layers():
+    ms = 6 * 1.15 + FLASH.logits_ms                        # six layers + lm_head, as warmup measures a tail
+    tail = Node.from_dict(node("T", "5090", capability=_cap_tail(42, 48, ms)))
+    assert P.layer_cost_ms(tail, FLASH) == pytest.approx(1.15)
+    assert classify(tail, FLASH, POL).role == "stage"
+
+
+def test_the_footprint_comes_from_moe_sized_probe_layers():
+    dense_only = Node.from_dict(node("A", "4090", capability=_cap(FLASH.model, 0, 1, [FLASH.layer_bytes[0]])))
+    assert P.footprint_scale(dense_only, FLASH) == 1.0    # layer 0 says nothing about MoE packing
+    mixed = [FLASH.layer_bytes[0], int(FLASH.layer_bytes[1] * 2.4)]
+    both = Node.from_dict(node("A", "4090", capability=_cap(FLASH.model, 0, 2, mixed)))
+    assert P.footprint_scale(both, FLASH) == pytest.approx(2.4, rel=1e-6)   # not diluted by layer 0
+
+
+def test_a_zero_or_negative_measurement_falls_back_to_the_estimate():
+    n = Node.from_dict(node("A", "5090", capability=_cap(FLASH.model, 1, 3, FLASH.layer_bytes[1:3],
+                                                          [(1, 1, 0, 0.0)])))
+    assert P.layer_cost_ms(n, FLASH) == P.layer_cost_ms(N("A", "5090"), FLASH)
+    Cell(FLASH, POL).join(n, 0.0)                          # no ZeroDivisionError
+
+
+def test_a_slow_holder_hands_over_where_a_faster_span_starts():
+    x = {"id": "X", "span": [0, 40], "role": "stage", "layer_ms": 3.0, "subnet": "X", "reliability": 1.0,
+         "rho": 0.0, "sessions": 0, "kv_free": 10 ** 6, "uplink_mbps": 100.0}
+    y = dict(x, id="Y", span=[20, 48], layer_ms=1.15, subnet="Y")
+    (p, *_) = candidate_paths([x, y], FLASH, POL)
+    assert [(h["id"], h["lo"], h["hi"]) for h in p["hops"]] == [("X", 0, 20), ("Y", 20, 48)]
+    assert p["step_ms"] == pytest.approx(3 * 13.0 + 20 * 3.0 + 28 * 1.15 + FLASH.tail_ms)
+
+
+def test_pruning_cannot_starve_the_subnet_filter():
+    base = {"role": "stage", "layer_ms": 1.15, "reliability": 1.0, "rho": 0.0, "sessions": 0,
+            "kv_free": 10 ** 6, "uplink_mbps": 100.0}
+    cheap = [dict(base, id=f"C{i}", span=[0, 20], subnet="S") for i in range(13)]
+    pricey = dict(base, id="Q", span=[0, 20], subnet="T", layer_ms=2.0)
+    mid = dict(base, id="G", span=[20, 40], subnet="U")
+    tail = dict(base, id="Tl", span=[40, 48], subnet="S")
+    for k in (1, 3):
+        (p, *_) = candidate_paths(cheap + [pricey, mid, tail], FLASH, POL, k=k)
+        assert [h["id"] for h in p["hops"]] == ["Q", "G", "Tl"]
+
+
+def test_an_unreachable_rtt_is_skipped_not_a_crash():
+    c = _fleet([("A", "pro6000-96g"), ("B", "pro6000-96g"), ("C", "pro6000-96g")])
+    v = _views(c)
+    ps = candidate_paths(v, FLASH, POL, rtt={"A": {"B": float("inf")}, "B": {"A": -1.0}}, k=10)
+    assert ps and all((a["id"], b["id"]) not in (("A", "B"), ("B", "A"))
+                      for p in ps for a, b in zip(p["hops"], p["hops"][1:]))
+
+
+def test_hole_repair_with_k_min_1_never_bounces_the_only_holder():
+    c = sim_cell(k_min=1, hole_repair_s=0.0, move_interval_s=0.0)
+    seat(c, 1, 0, 24)
+    seat(c, 2, 24, 40)                                     # [40, 48) a hole; everyone is alone on its span
+    assert c.repair(10.0) == []

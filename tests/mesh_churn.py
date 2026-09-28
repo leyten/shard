@@ -24,7 +24,7 @@ CLASSES = [("16GB", 3, 0.22), ("24GB", 5, 0.33), ("32GB", 8, 0.28), ("48GB", 12,
 SIM_PROFILE = ModelProfile(
     model="sim/flash-48", n_layers=L, layer_bytes=(LAYER,) * L, layer_kinds=("swa",) * L,
     swa_window=128, kv_bytes_per_pos=(0, 0), head_bytes=0, tail_bytes=0, shared_edge_bytes=0,
-    reserve_bytes=0, weight_formats=("bf16",), layer_ms=1.0, active_bytes_per_layer=0, tail_ms=0.0,
+    reserve_bytes=0, weight_formats=("bf16",), layer_ms=1.0, active_bytes_per_layer=0, tail_ms=0.0, logits_ms=0.0,
     g=4.6, lane=4, wire_bytes_per_pos=0)
 
 # placement_sim.out (3 seeds, 20 days, 8 h node life): (cov>=1, cov>=2) per (mean nodes, policy).
