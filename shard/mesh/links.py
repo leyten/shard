@@ -260,8 +260,10 @@ class TcpLinks:
     def _drop_stream(self, o: _Outbox, abrupt: bool = True) -> None:
         s, a = o.sock, o.acct
         o.sock = o.acct = None
-        if a is not None and abrupt:          # a FIN-closed stream's bytes still arrive: the
-            a.dead()                          # reader releases them when it reaches EOF
+        # A FIN-closed stream's bytes still arrive, and its reader releases them at EOF. A
+        # stream no reader ever claimed (it died mid-hello) is released here.
+        if a is not None and (abrupt or not getattr(a, "claimed", True)):
+            a.dead()
         if s is not None:
             _abort(s) if abrupt else _shut(s)
 

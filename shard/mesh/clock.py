@@ -159,21 +159,23 @@ class RealClock:
 # ── virtual time ──────────────────────────────────────────────────────────────────────────────
 
 class _Actor:
-    __slots__ = ("name", "busy", "timer", "fired", "raises", "cv", "where")
+    __slots__ = ("name", "busy", "timer", "fired", "raises", "cv", "where", "seen", "since")
 
     def __init__(self, name: str, lock, raises: bool):
         self.name, self.busy, self.timer, self.fired = name, True, None, False
         self.raises, self.cv, self.where = raises, threading.Condition(lock), ""
+        self.seen, self.since = None, 0.0     # the virtual instant this actor last waited at
 
 
 class _Acct:
     """In-flight accounting of one TCP stream, shared by its two in-process ends."""
-    __slots__ = ("clock", "id", "label", "n_sent", "n_took", "is_dead")
+    __slots__ = ("clock", "id", "label", "n_sent", "n_took", "is_dead", "claimed")
 
     def __init__(self, clock: "VirtualClock", cid: int, label: str):
         self.clock, self.id, self.label = clock, cid, label
         self.n_sent = self.n_took = 0
         self.is_dead = False
+        self.claimed = False                  # a reader looked this stream up
 
     def sent(self) -> None:
         """Before writing one message: it is in flight until taken or the stream dies."""
@@ -382,6 +384,8 @@ class VirtualClock:
     def conn_lookup(self, cid) -> _Acct:
         with self._lock:
             a = self._accts.get(cid) if isinstance(cid, int) else None
+            if a is not None:
+                a.claimed = True
             if a is None:                     # unknown or already dead: counts nothing
                 a = _Acct(self, 0, "dead")
                 a.is_dead = True
@@ -422,12 +426,16 @@ class VirtualClock:
             a.timer, a.fired = seq, False
             heapq.heappush(self._timers, (deadline, seq, a))
         self._set(a, False)
-        seen, since = self._now, time.monotonic()
+        # Stuck = this actor keeps waiting while virtual time stays at one instant for
+        # stuck_after real seconds, summed over its waits (a livelock that keeps waking it
+        # must not restart the window).
+        if a.seen != self._now:
+            a.seen, a.since = self._now, time.monotonic()
         while not (a.fired or done()):
             a.cv.wait(0.5)
-            if self._now != seen:
-                seen, since = self._now, time.monotonic()
-            elif a.raises and time.monotonic() - since > self.stuck_after:
+            if self._now != a.seen:
+                a.seen, a.since = self._now, time.monotonic()
+            elif a.raises and time.monotonic() - a.since > self.stuck_after:
                 a.timer, a.fired = None, False
                 self._set(a, True)
                 raise Stuck(self._dump(a))

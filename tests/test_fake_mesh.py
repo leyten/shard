@@ -559,7 +559,7 @@ def test_thousand_faults_in_virtual_time(mesh_factory):
     """10^3 injected faults (kill / hang / partition / malformed, random hop or leg, before or
     mid-flight) on a 5-hop mixed fleet with leg delays: every one surfaces as its expected
     failure, every reply ever received matches the oracle, the mesh always recovers, < 5 min."""
-    m = mesh_factory(5, legs_ms=[4.0, 9.0, 2.0, 15.0, 6.0, 3.0])
+    m = mesh_factory(5, legs_ms=[4.0, 9.0, 2.0, 15.0, 6.0, 3.0], trace=True)
     t0 = time.monotonic()
     rep = fault_storm(m, 1000, seed=2026)
     wall = time.monotonic() - t0
@@ -577,7 +577,7 @@ def test_thousand_faults_in_virtual_time(mesh_factory):
 def test_fault_storm_on_the_real_clock(mesh_factory):
     """The syscall-level races virtual time cannot reach: faults land mid-write, mid-dial and
     between a read and its hand-off, at wall-clock offsets."""
-    m = mesh_factory(4, clock="real", deadline=0.3, cost_scale=0.0, legs_ms=[1.0] * 5)
+    m = mesh_factory(4, clock="real", deadline=0.3, cost_scale=0.0, legs_ms=[1.0] * 5, trace=True)
     rep = fault_storm(m, 60, seed=7)
     assert rep["violations"] == [], rep["violations"]
     assert all(sum(v.values()) >= 8 for v in rep["outcomes"].values()), rep["outcomes"]
@@ -588,7 +588,7 @@ def test_kills_and_restarts_leak_no_threads(clock):
     """Every crashed node's threads exit, so 10^3 kills cannot exhaust the process."""
     import threading
     base = threading.active_count()
-    m = FakeMesh(4, clock=clock, legs_ms=[2.0] * 5, stuck_after=30.0,
+    m = FakeMesh(4, clock=clock, legs_ms=[2.0] * 5, stuck_after=30.0, trace=True,
                  **({"deadline": 0.3, "cost_scale": 0.0} if clock == "real" else {}))
     try:
         rep = fault_storm(m, 24, seed=5)
@@ -608,7 +608,7 @@ def test_noop_injectors_are_caught(mesh_factory, monkeypatch):
     monkeypatch.setattr(FakeMesh, "kill", lambda self, i: None)
     monkeypatch.setattr(FakeMesh, "hang", lambda self, i: None)
     monkeypatch.setattr(FakeMesh, "partition", lambda self, a, b: None)
-    m = mesh_factory(3, legs_ms=[2.0] * 4)
+    m = mesh_factory(3, legs_ms=[2.0] * 4, trace=True)
     rep = fault_storm(m, 12, seed=1)
     for kind in ("kill", "hang", "partition"):
         assert any(kind in v for v in rep["violations"]), (kind, rep["violations"])
@@ -626,9 +626,10 @@ def test_a_spurious_loss_is_not_blamed_on_the_fault(mesh_factory, monkeypatch):
         real(self, peer, f, t)
 
     monkeypatch.setattr(FM.FakeNode, "_on_frame", lossy)
-    m = mesh_factory(3, legs_ms=[2.0] * 4)
+    m = mesh_factory(3, legs_ms=[2.0] * 4, trace=True)
     rep = fault_storm(m, 60, seed=4)
     assert any("BEFORE the" in v for v in rep["violations"]), rep["violations"][:5]
+    assert any("was lost, but not between" in v for v in rep["violations"]), rep["violations"][:5]
 
 
 def test_a_hop_with_other_weights_breaks_equality(mesh_factory):

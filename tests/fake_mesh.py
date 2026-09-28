@@ -658,13 +658,16 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
         kill -> LinkDown(dead head) / HopError(next_down) from the dead hop's predecessor
         (before the request: always, and faster than the deadline), or Deadline if the frame
         died inside the node; hang / partition -> Deadline at exactly sent + deadline, with
-        evidence (the partitioned leg blocked a message; the hung node received the frame and
-        computed at most the step it was in);
+        evidence (the partitioned leg blocked a message; the hung node computed at most the step
+        it was in; and for every Deadline, the lost frame entered the faulted leg or node and
+        never came out the far side);
         malformed -> the receiver's bad_frames += 1, the receiver stays up, at most one Deadline;
       * after recovery (restart / resume / heal) the mesh serves again: the lost position
         re-fed on the same session succeeds (hang, partition, malformed), and every next trial
         opens its lease on every hop (kill).
     Returns {"trials", "outcomes": {kind: {outcome: count}}, "violations": [...]}."""
+    if mesh.trace_log is None:
+        raise ValueError("fault_storm needs FakeMesh(trace=True): Deadlines are proven from traces")
     rng = random.Random(seed)
     prompts = [[rng.randrange(VOCAB) for _ in range(rng.randrange(3, 9))] for _ in range(n_prompts)]
     Ts = [direct_greedy(mesh.weights, p, n_new + 2, pattern=mesh.pattern, window=mesh.window,
@@ -703,6 +706,7 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
         during = rng.random() < 0.5
         offset = rng.uniform(0.0, mesh.rtt(len(prompt) if at_step == 0 else 1))
         base_bad = mesh.bad_frames(leg[1]) if kind == "malformed" else 0
+        mesh.trace_log.clear()
         blocked0 = sum(mesh.links_of(p).stats["blocked"] for p in leg)
         inj: dict = {}                        # when the fault really fired, and evidence
 
@@ -712,7 +716,7 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
                 mesh.kill(hop)
             elif kind == "hang":
                 node = mesh.nodes[hop]
-                inj["hang0"] = (node.links.stats["received"], node.snapshot().get("steps", 0))
+                inj["hang0"] = (None, node.snapshot().get("steps", 0))
                 mesh.hang(hop)
             elif kind == "partition":
                 mesh.partition(*leg)
@@ -787,14 +791,34 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
             if kind == "partition" and sum(mesh.links_of(p).stats["blocked"] for p in leg) == blocked0:
                 bad(trial, f"partition {leg}: no message was ever blocked on it")
             if kind == "hang" and "hang0" in inj:
-                node = mesh.nodes[hop]
-                got_in = node.links.stats["received"] - inj["hang0"][0]
-                ran = node.snapshot().get("steps", 0) - inj["hang0"][1]
-                if got_in < 1 or ran > 1:  # the frame reached it, it computed nothing new
-                    bad(trial, f"hang of {node.peer_id}: received {got_in}, computed {ran} steps")
+                # hung: at most the step it was in finishes (the lost frame may have arrived
+                # before the hang, so arrival is proven by custody below, not by a counter)
+                ran = mesh.nodes[hop].snapshot().get("steps", 0) - inj["hang0"][1]
+                if ran > 1:
+                    bad(trial, f"hang of {mesh.peers[hop]}: computed {ran} steps while hung")
         else:
             if failure is not None and not isinstance(failure, Deadline):
                 bad(trial, f"malformed {how} on {leg} surfaced as {name}")
+        if isinstance(failure, Deadline) and "t" in inj:
+            # Custody evidence: the lost frame (or its reply) entered the faulted leg or node
+            # and never came out the far side. A loss anywhere else is not this fault's.
+            if kind in ("kill", "hang"):
+                src = ENTRY if hop == 0 else mesh.peers[hop - 1]
+                dst = ENTRY if hop == mesh.D - 1 else mesh.peers[hop + 1]
+            else:
+                src, dst = leg
+            h = hexsid(sid)
+
+            def traced(ev, peer):
+                return any(e[0] == ev and e[1] == peer and e[2] == h and e[3] == fail_seq
+                           for e in list(mesh.trace_log))
+
+            left = src == ENTRY or traced("out", src) or traced("reply", src)
+            reached = (any(r["sid"] == h and r["seq"] == fail_seq for _, r, _ in mesh.entry.received)
+                       if dst == ENTRY else traced("in", dst))
+            if not left or reached:
+                bad(trial, f"{kind}: request {fail_seq} was lost, but not between {src} and {dst} "
+                           f"(left {src}: {left}, reached {dst}: {reached})")
 
         # recovery, then prove the mesh serves again
         if kind == "kill":
@@ -825,6 +849,15 @@ def fault_storm(mesh: FakeMesh, n_faults: int, *, seed: int = 0, n_prompts: int 
                 bad(trial, f"re-feed after {kind} recovery failed: {e!r}")
             if rsid != sid:
                 mesh.close_session(rsid)
+        if kind == "hang" and isinstance(failure, Deadline) and fail_step > 0:
+            # A hang delays, it never loses: the resumed node finishes the stuck request, and
+            # its late reply lands before the re-feed's (same FIFO path). Else it was lost.
+            # (A lost prefill is recovered on a fresh session after closing this one, so its
+            # late frame meets closed leases downstream: no late reply is owed there.)
+            h = hexsid(sid)
+            mesh.clock.settle()
+            if not any(r["sid"] == h and r["seq"] == fail_seq for _, r, _ in mesh.entry.received):
+                bad(trial, f"hang of {mesh.peers[hop]}: request {fail_seq} never answered after resume")
         if kind == "malformed":
             mesh.clock.settle()
             got = mesh.bad_frames(leg[1]) - base_bad

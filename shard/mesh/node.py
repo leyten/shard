@@ -255,14 +255,14 @@ class NodeServer:
     def _admit(self, sid: int, m: dict) -> str:
         if sid in self._leases:
             return "exists"
-        if len(self._leases) >= self.s_max or self._rho() >= RHO_ADMIT:
-            return "busy"
         if (m["lo"], m["hi"]) != (self.cap.lo, self.cap.hi) or m["role"] != self.role:
             return "span"
         if m["ct"] != "none" or m["drafter"] is not None:
             return "unsupported"
         if m["cx"] not in self._in_codecs:
             return "unsupported"
+        if len(self._leases) >= self.s_max or self._rho() >= RHO_ADMIT:
+            return "busy"
         if not self._verify_lease(m):
             return "bad"
         return "ok"
@@ -293,7 +293,8 @@ class NodeServer:
         sid = int(m["sid"], 16)
         L = self._leases.get(sid)
         if L is None or peer != L.ret:        # v0 authority: the lease's entry (M2: signature)
-            self.count("update_refused")
+            self.count("update_refused")      # answered, so a re-adopting entry learns fast
+            self._ack(peer, m["sid"], m["rte"], "bad")
             return
         if m["rte"] == L.rte:                 # a retransmission: already applied
             self._ack(peer, m["sid"], m["rte"], "ok")
@@ -321,6 +322,8 @@ class NodeServer:
         L = self._leases.get(sid)
         if L is None or peer != L.ret:        # only the lease's entry may end it
             self.count("close_refused")
+            if L is not None:
+                self._ack(peer, m["sid"], L.rte, "bad")
             return
         self._drop_session(sid)
 
