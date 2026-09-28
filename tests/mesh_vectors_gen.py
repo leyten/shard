@@ -113,7 +113,8 @@ def exec_directory(d: Directory, op: str, a: dict):
             return {"error": e.code}
     if op == "reroute":
         try:
-            return {"ok": d.reroute(a["lease"], rte=a["rte"], hops=a["hops"], now=a["now"])}
+            return {"ok": d.reroute(a["lease"], rte=a["rte"], hops=a["hops"], now=a["now"],
+                                    renew=a.get("renew", False))}
         except LeaseRefused as e:
             return {"error": e.code}
     if op == "release":
@@ -135,7 +136,7 @@ def exec_gate(state: dict, op: str, a: dict):
         except L.LeaseError as e:
             return {"error": e.code}
     if op == "accepts":
-        return g.accepts(a["sid"], a["rte"], a["sender"], a["kind"])
+        return g.accepts(a["sid"], a["rte"], a["sender"], a["kind"], a["now"])
     if op == "supersede":
         return g.supersede(a["sid"], a["rte"], a["now"], a.get("pred"))
     if op == "close":
@@ -468,8 +469,8 @@ def paths_cases():
 # ── lease cases ───────────────────────────────────────────────────────────────────────────────
 
 BASE_CLAIMS = {"typ": L.TYP, "lid": "00112233445566ff", "job": "job-1", "sid": "0123456789abcdef", "rte": 3,
-               "model": FLASH, "cell": "eu-1", "role": "mid", "from": "PeerA", "to": "PeerB", "lo": 8,
-               "hi": 16, "kv": 4096, "iat": 1000, "exp": 4600}
+               "model": FLASH, "cell": "eu-1", "role": "mid", "from": "PeerA", "to": "PeerB", "next": "PeerC",
+               "ret": "Entry", "lo": 8, "hi": 16, "kv": 4096, "iat": 1000, "exp": 4600}
 
 
 def lease_doc():
@@ -529,8 +530,8 @@ def lease_doc():
         v["expect"] = _jsonable(exec_verify(v))
         verify.append(v)
     issue = [{"claims": {k: v for k, v in BASE_CLAIMS.items()}, "token": good}]
-    for over in ({"role": "head", "from": "Entry1", "lo": 0}, {"role": "backup", "to": "PeerZ"},
-                 {"role": "solo", "lo": 0, "hi": 48, "kv": 0}):
+    for over in ({"role": "head", "from": "Entry1", "lo": 0}, {"role": "backup", "to": "PeerZ", "next": "", "ret": ""},
+                 {"role": "solo", "lo": 0, "hi": 48, "kv": 0, "next": ""}):
         c = {**BASE_CLAIMS, **over}
         issue.append({"claims": c, "token": L.issue(KEY, c)})
 
@@ -543,34 +544,45 @@ def lease_doc():
     def adm(r, token, now, **over):
         return r("admit", token=token, now=now, bind={**bind, **over})
 
+    bk = {"role": "backup", "next": "", "ret": ""}
     gates = []
     for name, build in (
         ("binding: the carrying message must claim what the token claims", lambda r: [
             adm(r, t(), 2000, role="head"),
             adm(r, t(), 2000, lo=9),
             adm(r, t(), 2000, **{"from": "PeerX"}),
+            adm(r, t(), 2000, next="PeerX"),
+            adm(r, t(), 2000, ret="Other"),
             adm(r, t(), 2000, rte=4),
-            adm(r, t(role="backup", lid="00112233445566fc"), 2000),
-            adm(r, t(role="backup", lid="00112233445566fc"), 2000, role="backup"),
-            r("accepts", sid=sid, rte=3, sender="PeerA", kind="mirror"),
-            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame"),
+            adm(r, t(lid="00112233445566fc", **bk), 2000),
+            adm(r, t(lid="00112233445566fc", **bk), 2000, **bk),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="mirror", now=2000),
+            r("accepts", sid=sid, rte=4, sender="PeerA", kind="mirror", now=2000),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame", now=2000),
             adm(r, t(), 2001, rte=3),
-            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame"),
-            r("accepts", sid=sid, rte=3, sender="PeerX", kind="frame")]),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame", now=2001),
+            r("accepts", sid=sid, rte=3, sender="PeerX", kind="frame", now=2001),
+            r("accepts", sid=sid, rte=3, sender="PeerA", kind="frame", now=4600)]),
         ("redelivery ok, stale rte refused, supersede with a new pred, close", lambda r: [
             adm(r, t(), 2000),
             adm(r, t(), 2001),
             adm(r, t(rte=4, lid="00112233445566fe"), 2002),
             adm(r, t(), 2003),
             r("supersede", sid=sid, rte=5, now=2004, pred="PeerZ"),
-            r("accepts", sid=sid, rte=5, sender="PeerZ", kind="frame"),
-            r("accepts", sid=sid, rte=5, sender="PeerA", kind="frame"),
+            r("accepts", sid=sid, rte=5, sender="PeerZ", kind="frame", now=2004),
+            r("accepts", sid=sid, rte=5, sender="PeerA", kind="frame", now=2004),
             adm(r, t(rte=4, lid="00112233445566fe"), 2005),
             r("supersede", sid=sid, rte=6, now=2006),
-            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame"),
+            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame", now=2006),
             r("close", sid=sid, now=2007),
-            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame"),
+            r("accepts", sid=sid, rte=6, sender="PeerZ", kind="frame", now=2007),
             adm(r, t(rte=7, lid="00112233445566fd"), 2008)]),
+        ("a newer token keeps the other mirror edges", lambda r: [
+            *[adm(r, t(lid=f"{i:016x}", lo=8 * i, hi=8 * i + 8, **{"from": f"P{i}"}, **bk), 2000,
+                  lo=8 * i, hi=8 * i + 8, **{"from": f"P{i}"}, **bk) for i in range(3)],
+            adm(r, t(lid="00000000000000aa", rte=4, lo=8, hi=16, **{"from": "Q1"}, **bk), 2001,
+                lo=8, hi=16, **{"from": "Q1"}, **bk),
+            *[r("accepts", sid=sid, rte=4, sender=x, kind="mirror", now=2002) for x in ("P0", "P1", "P2", "Q1")]]),
         ("prune waits for every older token", lambda r: [
             adm(r, t(rte=2, lid="00112233445566bb", iat=1100, exp=1200), 1150),
             r("prune", now=1300),
@@ -685,6 +697,11 @@ def directory_cases():
         hops2[2]["backup"] = dead["id"]                                            # the suspect as backup
         r("reroute", lease=le["ok"]["lease"], rte=2, hops=hops2, now=170)          # suspect
         r("reroute", lease="0" * 16, rte=5, hops=hops, now=170)                    # unknown_lease
+        floaty = [dict(h) for h in hops]
+        floaty[0]["hi"] = floaty[1]["lo"] = floaty[1]["lo"] + 0.5              # non-integral in every language
+        r("reroute", lease=le["ok"]["lease"], rte=2, hops=floaty, now=180)         # bad_path, atomic
+        r("reroute", lease=le["ok"]["lease"], rte=2, hops=hops, now=3000, renew=True)
+        r("snapshot", cell="eu-1", model=FLASH)
 
     def backup_once(r):
         r("join", node=node("Mac", "mac-192g"), model=FLASH, now=0)
