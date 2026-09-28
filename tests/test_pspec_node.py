@@ -30,9 +30,9 @@ from shard.pspec import coord
 
 
 # ── the coordinator's seat on the mesh ────────────────────────────────────────────────────────
-class HopRefusal(ConnectionError):
-    def __init__(self, peer, code, seq):
-        super().__init__(f"{peer} refused frame seq {seq}: {code}")
+class HopRefusal(coord.SessionFailed):
+    def __init__(self, sid, peer, code, seq):
+        super().__init__(sid, f"{peer} refused frame seq {seq}: {code}")
         self.peer, self.code, self.seq = peer, code, seq
 
 
@@ -41,7 +41,8 @@ class MeshLink:
     Replies come from the tail, refusals (`ack` with a seq) from ANY hop, each on its own one-way
     stream into the entry's inbox, which is why this is not coord.SocketLink (one return socket
     cannot carry a mid hop's refusal). A refusal or an undeliverable frame raises ConnectionError
-    naming the hop; lease acks (no seq) are skipped. `tamper(reply) -> reply` corrupts replies."""
+    naming the hop (coord.SessionFailed: run_many fails that session only); lease acks (no seq)
+    are skipped. `tamper(reply) -> reply` corrupts replies."""
 
     def __init__(self, mesh, tamper=None):
         self.m, self.tamper = mesh, tamper
@@ -66,11 +67,12 @@ class MeshLink:
                     self.replies.append(msg)
                     return self.tamper(msg) if self.tamper is not None else msg
                 if msg["op"] == "c" and msg["cmd"] == "ack" and msg["seq"] is not None:
-                    raise HopRefusal(peer, msg["code"], msg["seq"])
+                    raise HopRefusal(msg["sid"], peer, msg["code"], msg["seq"])
                 continue
             _, peer, meta, _t = ev
             if meta.get("op") == "f":
-                raise ConnectionError(f"mesh: frame seq {meta.get('seq')} undeliverable to {peer}")
+                raise coord.SessionFailed(meta["sid"], f"frame seq {meta.get('seq')} "
+                                                       f"undeliverable to {peer}")
 
 
 def _wrong(t, d):

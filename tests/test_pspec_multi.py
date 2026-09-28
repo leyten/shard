@@ -323,3 +323,30 @@ def test_adversarial_shape_mode_equals_the_replayed_schedule(mesh_factory):
         differs += res[h]["tokens"] != _want(job)
     assert max(n.snapshot().get("max_batch", 0) for n in m.nodes) > 1
     assert differs > 0              # the mode is really shape-dependent (else this is vacuous)
+
+
+def test_a_refused_session_fails_alone(mesh_factory):
+    """One session leased a row short of what it uses: a hop refuses it mid-run (window). That
+    session fails with the hop's reason; every other session on the same sender and the same
+    hops finishes lossless."""
+    K, box = 4, {}
+    m = _mesh(mesh_factory, 3, box, K, seed=21)
+    jobs = _jobs(m, box, 6, random.Random(21), K)
+    jobs[2] = bad = jobs[2][:6] + ((),) + jobs[2][7:]           # no EOS: it must reach the end
+    sessions = []
+    for job in jobs:
+        s = _open(m, job, K=K)
+        if job is bad:                                # re-lease it two rows short on every hop
+            m.close_session(job[0])
+            _settle(m)
+            m.open(job[0], max_pos=len(job[1]) + job[2] - 3, W=job[5],
+                   drafter="toy" if job[4] else None)
+        sessions.append(s)
+    res = coord.run_many(MeshLink(m), sessions, timeout=20.0)
+    rb = res[hexsid(bad[0])]
+    assert rb["ok"] is False and "window" in rb["error"], rb
+    assert rb["tokens"] == _want(bad)[:len(rb["tokens"])]
+    for job in jobs:
+        if job is not bad:
+            r = res[hexsid(job[0])]
+            assert r["ok"] and r["tokens"] == _want(job), job[0]

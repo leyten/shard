@@ -86,6 +86,16 @@ class Link(Protocol):
     def recv(self, timeout: float) -> dict: ...
 
 
+class SessionFailed(ConnectionError):
+    """Raised by a Link's `recv` when the network refused or lost ONE session's frame (a hop's
+    `ack{seq, code}`, an undeliverable frame): `run_many` fails that session and goes on with
+    the others; `run` (one session) lets it propagate like any dead link."""
+
+    def __init__(self, sid, why):
+        super().__init__(f"pspec: session {sid}: {why}")
+        self.sid, self.why = sid, why
+
+
 class SocketLink:
     """Link over two sockets: frames to the head (`pipe`), replies from the tail (`ret`). This is
     the adapter for the node server and the fake mesh: both terminate the entry's streams on
@@ -527,7 +537,11 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
     session that owes nothing, is a protocol error. `on_reply(session, reply)` (optional) runs
     before each reply is consumed: the seam a caller uses to cancel a session (`cancel()`) or
     advance its ack. A session is done when it stopped and owes nothing; one that owes nothing
-    before stopping is a bug and raises, as in `run`."""
+    before stopping is a bug and raises, as in `run`.
+
+    ISOLATION. A `SessionFailed` from the link fails THAT session only: it is cancelled (its
+    queued frames never ship), later replies for it are dropped, and its result carries
+    ok=False and the reason; the caller closes its lease. Any other link error ends the loop."""
     by_sid = {}
     for s in sessions:
         if s.sid in by_sid:
@@ -543,7 +557,7 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
     try:
         for s in sessions:
             sender.put(s.st, s.prefill())
-        live = set(by_sid)
+        live, failed = set(by_sid), {}
         while True:
             if sender.err is not None:
                 raise died() from sender.err
@@ -559,10 +573,20 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
                 break
             try:
                 rep = link.recv(timeout)
+            except SessionFailed as e:
+                if e.sid in live:
+                    failed[e.sid] = e.why
+                    by_sid[e.sid].cancel()
+                    live.discard(e.sid)
+                elif e.sid not in by_sid:
+                    raise
+                continue
             except Exception:
                 if sender.err is not None:
                     raise died() from sender.err
                 raise
+            if rep.get("sid") in failed:                     # a failed session's late reply
+                continue
             s = by_sid.get(rep.get("sid"))
             if s is None or rep["sid"] not in live:
                 raise RuntimeError(f"pspec: a reply for session {rep.get('sid')!r}, which has "
@@ -577,4 +601,7 @@ def run_many(link, sessions, timeout=600.0, on_reply=None):
         sender.stop()
     if sender.err is not None:
         raise died() from sender.err
-    return {sid: s.result() for sid, s in by_sid.items()}
+    out = {sid: s.result() for sid, s in by_sid.items()}
+    for sid, why in failed.items():
+        out[sid].update(ok=False, error=why)
+    return out
