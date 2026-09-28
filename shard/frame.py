@@ -70,6 +70,10 @@ DECISIONS WHERE §5 IS SILENT OR AMBIGUOUS (each consistent with the §7 receipt
 - `cx = ids` implies `ct = none`: the tap lane starts at the head (no layers precede it).
 - `toks` length ∈ {0, 1, n}, matching `lg` = none/last/all. Token ids are ≥ 0 (a negative id is a
   device-side assert on CUDA embedding). The runtime still bounds ids by the vocabulary.
+- `lz` (reply): the tail's drafter skipped this reply's block under the lazy licence (`hint.lic` /
+  `dnxt`). It needs `acc` true and no `blk`. A reply with neither `blk` nor `lz` means the drafter
+  ran and had nothing to propose (an empty block, which `blk` cannot carry). The entry raises if
+  it ever needs the block of an `lz` reply (an unsound licence), see pspec.coord.
 - `acc` is tri-state: absent / true / false. `dt` rows are integer microseconds
   `[span_us, comp_us]`, not float ms, because floats have no canonical JSON form across languages.
 - `lease_open.role` adds `solo` (head and tail in one hop): per the device-agnostic principle, a
@@ -372,6 +376,7 @@ _REPLY = _head3("r") + [
     ("n", U16_, _REQ, None),
     ("acc", _bool, None, None),
     ("fen", _bool, False, None),
+    ("lz", _bool, False, None),         # the tail skipped drafting under the lazy licence
     ("ld", _u8list, (), None),
     ("dt", _dt, (), None),
     ("toks", _tensor("i32"), None, "t"),
@@ -512,8 +517,8 @@ def _check_reply(m):
     n = m["n"]
     _span(m["pos"], n)
     if m["fen"]:
-        if any(m[k] is not None for k in ("toks", "blk", "acc")):
-            raise ValueError("a fenced reply carries no toks/blk/acc")
+        if any(m[k] is not None for k in ("toks", "blk", "acc")) or m["lz"]:
+            raise ValueError("a fenced reply carries no toks/blk/acc/lz")
     else:
         t = m["toks"]
         if t is None or len(t.shape) != 1 or t.shape[0] not in (0, 1, n):
@@ -524,6 +529,8 @@ def _check_reply(m):
         if len(b.shape) != 1 or not 1 <= b.shape[0] <= MAX_BLK:
             raise ValueError(f"blk: want i32[1..{MAX_BLK}], got {b!r}")
         _ids_nonneg(b, "blk")
+    if m["lz"] and (b is not None or m["acc"] is not True):
+        raise ValueError("lz (drafting skipped under the licence) needs acc=true and no blk")
 
 
 def _check_control(m):
