@@ -1,11 +1,21 @@
 """shard-lease/1: orchestrator-signed lease tokens and the node-side admission gate.
 
-A lease token authorizes ONE stream edge of ONE session: `from` may dial `to` and have its frames
-(or, for a backup, its KV mirror) accepted for session `sid` at route epoch `rte`, for layers
-[lo, hi), with `kv` tokens of KV reserved, until `exp` (ARCHITECTURE-v2 §4.6: sidecar admission by
-a lease token {job, sid, rte, from, to, exp} instead of a static -allow list; frame.py carries it
-as the opaque `lease` blob of lease_open, <= 4096 bytes). The orchestrator is the only signer at
-launch (the directory); node-signed leases come with the DHT directory (design-mesh M6).
+A lease token authorizes ONE stream edge of ONE session: node `to` serves session `sid` at route
+epoch `rte` for layers [lo, hi) with `kv` tokens of KV reserved, and accepts that session's frames
+(roles head/mid/tail/solo) or KV mirror (role backup) from the PeerId `from` only, until `exp`
+(ARCHITECTURE-v2 §4.6 lease-token admission instead of a static -allow list; C20 predecessor
+binding). The orchestrator is the only signer at launch (the directory); node-signed leases come
+with the DHT directory (design-mesh M6).
+
+FLOW. The entry delivers each hop its token inside lease_open / takeover (frame.py's opaque
+`lease` blob, <= 4096 bytes); a backup's token rides with its mirror_open. The node checks the
+signature, that it is the audience, and that the message's own fields (sid, rte, lo, hi, role,
+pred / primary) equal the signed claims (`binding_of`), then admits `from` for that session. It
+never matters who carried the token: what the token grants is bound to `to` and `from`, and the
+sidecar tags every inbound stream with the verified remote PeerId, so frames from anyone but
+`from` are dropped (`LeaseGate.accepts`). A path change bumps the route epoch: surviving hops
+learn it from the entry-signed lease_update (C6, `LeaseGate.supersede`), replacement edges get new
+orchestrator tokens (`Directory.reroute`).
 
 WIRE FORM. `b64url(payload) "." b64url(sig)`, no padding, where payload is the canonical claims
 JSON (sorted keys, no whitespace, ASCII only) and sig = Ed25519(orchestrator key,
@@ -20,18 +30,19 @@ WHAT VERIFY REJECTS (each with a stable error code, shared with the TypeScript i
                 (ints only, no floats or bools; ids restricted to token-safe charsets)
   issuer        `iss` is not the pinned key (belt and braces: the signature already binds it)
   audience      `to` is not the verifying node
-  sender        `from` is not the authenticated PeerId of the dialer (a stolen token is useless:
-                the sidecar tags inbound streams with the verified remote PeerId)
   not_yet_valid now < iat - skew
   expired       now >= exp
   ttl           exp - iat > MAX_TTL_S or exp <= iat
 
-REPLAY (LeaseGate, node side). Re-presenting a live token is legitimate: a pooled stream that
-resets is re-dialled with the same token (ARCHITECTURE C20). What a token must never do is
-resurrect a session the node has moved past, so the gate additionally rejects
+REPLAY (LeaseGate, node side). Re-delivering a live token (a retried lease_open) is idempotent.
+What a token must never do is resurrect a session the node has moved past or grant more than its
+message claims, so admission additionally rejects
+  binding       the carrying message's fields differ from the signed claims (a head token in a
+                mid lease_open, a backup token as a primary, another span or route epoch)
   stale_rte     rte below the highest route epoch seen for the sid (a lease_update or a newer
                 token superseded it)
-  closed        the sid was closed on this node (until every token for it has expired)
+  closed        the sid was closed on this node (sids are single-use: the directory never
+                re-leases one within MAX_TTL_S)
 """
 from __future__ import annotations
 
@@ -139,7 +150,7 @@ def _no_const(s):
     raise LeaseError("schema", f"non-finite number {s}")
 
 
-def verify(token, orch_pub: str, *, audience: str, sender: str, now: int, skew: int = 30) -> dict:
+def verify(token, orch_pub: str, *, audience: str, now: int, skew: int = 30) -> dict:
     """Fail closed: return the claims, or raise LeaseError with the first failing check's code."""
     if isinstance(token, (bytes, bytearray, memoryview)):
         try:
@@ -165,8 +176,6 @@ def verify(token, orch_pub: str, *, audience: str, sender: str, now: int, skew: 
         raise LeaseError("issuer", "iss is not the pinned orchestrator key")
     if claims["to"] != audience:
         raise LeaseError("audience", f"token is for {claims['to']}, not {audience}")
-    if claims["from"] != sender:
-        raise LeaseError("sender", f"token admits {claims['from']}, not {sender}")
     if not 0 < claims["exp"] - claims["iat"] <= MAX_TTL_S:
         raise LeaseError("ttl", "lifetime out of bounds")
     if now < claims["iat"] - skew:
@@ -176,23 +185,52 @@ def verify(token, orch_pub: str, *, audience: str, sender: str, now: int, skew: 
     return claims
 
 
+BIND_KEYS = ("sid", "lo", "hi", "role", "from")
+
+
+def binding_of(msg) -> dict:
+    """The claims a decoded shard-frame/2 control message asserts about its token: lease_open and
+    takeover bind sid, rte, span, role and pred; mirror_open binds sid, span and its primary (the
+    mirror source) under role backup. admit() requires the token to carry exactly these."""
+    cmd = msg["cmd"]
+    if cmd in ("lease_open", "takeover"):
+        return {"sid": msg["sid"], "rte": msg["rte"], "lo": msg["lo"], "hi": msg["hi"], "role": msg["role"],
+                "from": msg["pred"]}
+    if cmd == "mirror_open":
+        return {"sid": msg["sid"], "lo": msg["lo"], "hi": msg["hi"], "role": "backup", "from": msg["primary"]}
+    raise ValueError(f"{cmd} carries no lease")
+
+
+def _kind(role: str) -> str:
+    return "mirror" if role == "backup" else "frame"
+
+
 @dataclass
 class _SidState:
     rte: int = 0
+    edges: dict = field(default_factory=lambda: {"frame": set(), "mirror": set()})
     horizon: int = 0          # no token this state guards against can be valid after this
     closed: bool = False
 
 
 @dataclass
 class LeaseGate:
-    """A node's admission state (module docstring REPLAY). One per node identity."""
+    """A node's admission state (module docstring FLOW and REPLAY). One per node identity."""
     orch_pub: str
     me: str
     skew: int = 30
     _sids: dict = field(default_factory=dict)
 
-    def admit(self, token, *, sender: str, now: int) -> dict:
-        c = verify(token, self.orch_pub, audience=self.me, sender=sender, now=now, skew=self.skew)
+    def admit(self, token, *, now: int, bind) -> dict:
+        """Verify a delivered token and bind it to its carrying message (binding_of). Returns the
+        claims; afterwards accepts(sid, rte, claims['from'], kind) holds."""
+        missing = [k for k in BIND_KEYS if k not in bind]
+        if missing:
+            raise ValueError(f"bind must name {BIND_KEYS}, missing {missing}")
+        c = verify(token, self.orch_pub, audience=self.me, now=now, skew=self.skew)
+        for k, v in bind.items():
+            if c.get(k) != v:
+                raise LeaseError("binding", f"message {k}={v!r}, token {k}={c.get(k)!r}")
         st = self._sids.get(c["sid"])
         if st is not None:
             if st.closed:
@@ -201,14 +239,28 @@ class LeaseGate:
                 raise LeaseError("stale_rte", f"rte {c['rte']} < {st.rte}")
         else:
             st = self._sids[c["sid"]] = _SidState()
-        st.rte = max(st.rte, c["rte"])
+        if c["rte"] > st.rte:
+            st.rte, st.edges = c["rte"], {"frame": set(), "mirror": set()}
+        st.edges[_kind(c["role"])].add(c["from"])
         st.horizon = max(st.horizon, c["iat"] + MAX_TTL_S)   # older tokens were issued before iat
         return c
 
-    def supersede(self, sid: str, rte: int, now: int) -> None:
-        """An entry-signed lease_update moved the session to route epoch `rte`."""
+    def accepts(self, sid: str, rte: int, sender: str, kind: str = "frame") -> bool:
+        """May `sender` (the verified PeerId of an inbound stream) deliver this session's frames
+        (kind "frame") or KV mirror (kind "mirror") at route epoch `rte`?"""
+        st = self._sids.get(sid)
+        return st is not None and not st.closed and rte == st.rte and sender in st.edges[kind]
+
+    def supersede(self, sid: str, rte: int, now: int, pred: str | None = None) -> None:
+        """An entry-signed lease_update moved the session to route epoch `rte` (C6): the admitted
+        edges carry over, the frame predecessor becomes `pred` when the update names one. Older
+        route epochs are refused from now on."""
         st = self._sids.setdefault(sid, _SidState())
-        st.rte, st.horizon = max(st.rte, rte), max(st.horizon, now + MAX_TTL_S)
+        if rte > st.rte:
+            st.rte = rte
+            if pred is not None:
+                st.edges["frame"] = {pred}
+        st.horizon = max(st.horizon, now + MAX_TTL_S)
 
     def close(self, sid: str, now: int) -> None:
         st = self._sids.setdefault(sid, _SidState())

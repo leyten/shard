@@ -58,12 +58,12 @@ def test_backup_on_the_path_is_refused_and_nothing_changes():
 
 
 @pytest.mark.parametrize("breakit,want", [
-    (lambda d, p: d.update({"id": p["hops"][2]["id"], "model": M, "ts": 50, "sessions": 0, "rho": 0.86,
-                            "kv_free": 10 ** 6}), "overloaded"),
-    (lambda d, p: d.update({"id": p["hops"][2]["id"], "model": M, "ts": 50, "sessions": 16, "rho": 0.1,
-                            "kv_free": 10 ** 6}), "overloaded"),
-    (lambda d, p: d.update({"id": p["hops"][1]["backup"], "model": M, "ts": 50, "sessions": 0, "rho": 0.0,
-                            "kv_free": 100}), "kv_full"),
+    (lambda d, p: d.update({"id": p["hops"][2]["id"], "model": M, "sessions": 0, "rho": 0.86,
+                            "kv_free": 10 ** 6}, 50), "overloaded"),
+    (lambda d, p: d.update({"id": p["hops"][2]["id"], "model": M, "sessions": 16, "rho": 0.1,
+                            "kv_free": 10 ** 6}, 50), "overloaded"),
+    (lambda d, p: d.update({"id": p["hops"][1]["backup"], "model": M, "sessions": 0, "rho": 0.0,
+                            "kv_free": 100}, 50), "kv_full"),
     (lambda d, p: p["hops"][1].update(hi=p["hops"][1]["hi"] + 1), "bad_path"),
     (lambda d, p: p["hops"].pop(), "bad_path"),
     (lambda d, p: p["hops"][1].update(lo=p["hops"][1]["lo"] - 1) or p["hops"][0].update(hi=p["hops"][0]["hi"] - 1),
@@ -83,24 +83,39 @@ def test_every_refusal_is_atomic(breakit, want):
     assert e.value.code == want and d.snapshot("eu-1", M) == snap
 
 
-def test_subnet_collision_duplicate_hop_and_duplicate_lease():
+def test_subnet_collision_duplicate_hop_and_single_use_sids():
     d = fleet([("A", "pro6000-96g"), ("B", "pro6000-96g")])
     p = d.paths("eu-1", M)[0]
-    lease(d, p)
+    le = lease(d, p)
+    for job in ("job-1", "job-2"):
+        with pytest.raises(LeaseRefused) as e:
+            lease(d, p, job=job, rte=1)
+        assert e.value.code == "sid_in_use"                  # a live sid, in any job
+    d.release(le["lease"], 200)
     with pytest.raises(LeaseRefused) as e:
-        lease(d, p)
-    assert e.value.code == "duplicate_lease"                 # a re-lease must bump rte
-    assert lease(d, p, rte=1)["lease"]
+        lease(d, p, now=300)
+    assert e.value.code == "sid_in_use"                      # a released sid stays retired
+    assert lease(d, p, now=200 + L.MAX_TTL_S)["lease"]      # ... until no gate can remember it
     d2 = fleet([("A", "pro6000-96g", ), ("B", "pro6000-96g")])
-    d2.cells[("eu-1", M)].holdings["B"].node = d2.cells[("eu-1", M)].holdings["A"].node.__class__(
-        **{**d2.cells[("eu-1", M)].holdings["B"].node.__dict__, "subnet": "s-A"})
+    h = d2.cells[("eu-1", M)].holdings
+    h["B"].node = h["A"].node.__class__(**{**h["B"].node.__dict__, "subnet": "s-A"})
     with pytest.raises(LeaseRefused) as e:
         lease(d2, p)
     assert e.value.code == "subnet_collision"
     hops = [dict(p["hops"][0], hi=10), dict(p["hops"][0], lo=10, hi=20), dict(p["hops"][1], lo=20)]
     with pytest.raises(LeaseRefused) as e:
-        lease(d, {"hops": hops}, rte=2)
+        lease(d, {"hops": hops}, sid="1111111111111111")
     assert e.value.code == "duplicate_hop"
+
+
+def gate_admits(d, t, now=100):
+    """What the hop does with a token its lease_open carried: verify, bind to the message, admit."""
+    g = L.LeaseGate(d.pubkey, t["to"])
+    c = L.verify(t["token"], d.pubkey, audience=t["to"], now=now)
+    bind = {k: c[k] for k in L.BIND_KEYS}
+    assert bind["from"] == t["from"] and bind["role"] == t["role"]
+    g.admit(t["token"], now=now, bind=bind)
+    return g, c
 
 
 def test_every_token_admits_exactly_its_edge_at_its_node():
@@ -113,30 +128,42 @@ def test_every_token_admits_exactly_its_edge_at_its_node():
     assert [t["from"] for t in prim] == ["Entry1"] + [h["id"] for h in hops[:-1]]
     assert [t["role"] for t in prim] == ["head"] + ["mid"] * (len(hops) - 2) + ["tail"]
     for t in toks:
-        gate = L.LeaseGate(d.pubkey, t["to"])
-        c = gate.admit(t["token"], sender=t["from"], now=100)
+        g, c = gate_admits(d, t)
         assert (c["sid"], c["rte"], c["kv"], c["exp"]) == (SID, 0, 4096, 100 + d.lease_ttl_s)
+        kind = "mirror" if t["role"] == "backup" else "frame"
+        assert g.accepts(SID, 0, t["from"], kind) and not g.accepts(SID, 0, "Mallory", kind)
         with pytest.raises(L.LeaseError):
-            L.LeaseGate(d.pubkey, t["to"]).admit(t["token"], sender="Mallory", now=100)
-        with pytest.raises(L.LeaseError):
-            L.LeaseGate(d.pubkey, "Mallory").admit(t["token"], sender=t["from"], now=100)
+            L.LeaseGate(d.pubkey, "Mallory").admit(t["token"], now=100, bind={k: c[k] for k in L.BIND_KEYS})
     for t in (x for x in toks if x["role"] == "backup"):
         hop = next(h for h in hops if h["backup"] == t["to"])
         assert t["from"] == hop["id"]                        # the mirror stream: primary -> backup
 
 
-def test_record_pushes_absorb_bumps_by_timestamp():
+def test_record_pushes_absorb_a_bump_once_the_node_lists_the_session():
     d = twelve()
     p = d.paths("eu-1", M)[0]
     lease(d, p, now=100)
     h = p["hops"][0]["id"]
     view = lambda: next(v for v in d.snapshot("eu-1", M) if v["id"] == h)   # noqa: E731
-    d.update({"id": h, "model": M, "ts": 90, "sessions": 2, "rho": 0.1, "kv_free": 50_000})
+    d.update({"id": h, "model": M, "sessions": 2, "rho": 0.1, "kv_free": 50_000, "sids": []}, 90)
     assert (view()["sessions"], view()["kv_free"]) == (3, 50_000 - 4096)     # the bump stays on top
-    d.update({"id": h, "model": M, "ts": 100, "sessions": 3, "rho": 0.3, "kv_free": 45_904})
+    d.update({"id": h, "model": M, "sessions": 3, "rho": 0.3, "kv_free": 45_904, "sids": [SID]}, 101)
     assert (view()["sessions"], view()["rho"], view()["kv_free"]) == (3, 0.3, 45_904)   # absorbed
-    d.update({"id": h, "model": M, "ts": 95, "sessions": 0, "rho": 0.0, "kv_free": 1})
-    assert view()["sessions"] == 3                            # an out-of-order push is ignored
+    d.update({"id": h, "model": M, "sessions": 2, "rho": 0.2, "kv_free": 50_000, "sids": []}, 102)
+    assert view()["sessions"] == 2                            # the session closed: nothing comes back
+
+
+def test_node_clocks_do_not_matter():
+    """Records carry no node timestamp: a node stamping ms (or 30 s slow) cannot freeze its
+    record, keep itself suspect, or lose/duplicate bumps."""
+    d = twelve()
+    p = d.paths("eu-1", M)[0]
+    h = p["hops"][0]["id"]
+    d.report_failure(h, M, 50)
+    d.update({"id": h, "model": M, "sessions": 0, "rho": 0.0, "kv_free": 10 ** 6, "ts": 1.7e12}, 51)
+    d.update({"id": h, "model": M, "sessions": 1, "rho": 0.1, "kv_free": 10 ** 6, "ts": 0}, 52)
+    v = next(v for v in d.snapshot("eu-1", M) if v["id"] == h)
+    assert (v["sessions"], v["suspect"]) == (1, False)
 
 
 def test_release_and_expiry_undo_the_bump():
@@ -144,13 +171,51 @@ def test_release_and_expiry_undo_the_bump():
     p = d.paths("eu-1", M)[0]
     snap = d.snapshot("eu-1", M)
     le = lease(d, p)
-    d.release(le["lease"])
+    d.release(le["lease"], 150)
     assert d.snapshot("eu-1", M) == snap
-    lease(d, p, rte=1, now=100)
+    lease(d, p, sid="2222222222222222", now=200)
     q = d.paths("eu-1", M)[0]
-    lease(d, q, sid="fedcba9876543210", now=100 + d.lease_ttl_s)   # the first lease has expired
+    lease(d, q, sid="fedcba9876543210", now=200 + d.lease_ttl_s)   # the previous lease has expired
     ids = {h["id"] for h in p["hops"]} - {h["id"] for h in q["hops"]}
-    assert all(v["sessions"] == 0 for v in d.snapshot("eu-1", M) if v["id"] in ids)
+    assert ids and all(v["sessions"] == 0 for v in d.snapshot("eu-1", M) if v["id"] in ids)
+
+
+def test_reroute_replaces_a_dead_hop_without_double_counting_survivors():
+    d = twelve()
+    p = d.paths("eu-1", M)[0]
+    le = lease(d, p)
+    dead = p["hops"][2]
+    d.report_failure(dead["id"], M, 150)
+    hops = [dict(h) for h in p["hops"]]
+    hops[2] = {"id": dead["backup"], "lo": dead["lo"], "hi": dead["hi"], "backup": None}   # tier-1 takeover
+    r = d.reroute(le["lease"], rte=1, hops=hops, now=160)
+    changed = {(t["role"], t["from"], t["to"]) for t in r["tokens"]}
+    assert changed == {("mid", hops[1]["id"], hops[2]["id"]), ("mid", hops[2]["id"], hops[3]["id"])}
+    view = {v["id"]: v for v in d.snapshot("eu-1", M)}
+    assert view[dead["id"]]["sessions"] == 0 and view[hops[2]["id"]]["sessions"] == 1
+    assert all(view[h["id"]]["sessions"] == 1 for h in hops)  # survivors still count the session once
+    for t in r["tokens"]:
+        g, c = gate_admits(d, t, now=160)
+        assert c["rte"] == 1
+    with pytest.raises(LeaseRefused) as e:
+        d.reroute(le["lease"], rte=1, hops=hops, now=170)
+    assert e.value.code == "stale_rte"
+
+
+def test_a_backup_is_charged_once_per_session_not_once_per_hop():
+    d = fleet([("Mac", "mac-192g")] + [(f"F{i}", "5090") for i in range(6)])
+    d.update({"id": "Mac", "model": M, "sessions": 16, "rho": 0.2, "kv_free": 200_000, "sids": []}, 1)
+    (p, *_) = d.paths("eu-1", M, kv_tokens=40_000)
+    assert {h["backup"] for h in p["hops"]} == {"Mac"} and len(p["hops"]) == 6
+    lease(d, p, kv_tokens=40_000)
+    assert next(v for v in d.snapshot("eu-1", M) if v["id"] == "Mac")["kv_free"] == 160_000
+
+
+def test_a_device_holding_a_span_serves_one_model():
+    from shard.mesh.placement import MIMO_V26_PRO
+    d = fleet([("A", "pro6000-96g")])
+    with pytest.raises(ValueError):
+        d.join(node("A", "pro6000-96g"), MIMO_V26_PRO.model, 1)
 
 
 def test_report_failure_only_steers_routing():
@@ -161,7 +226,7 @@ def test_report_failure_only_steers_routing():
     d.report_failure(bad, M, 50)
     assert all(bad not in [h["id"] for h in q["hops"]] for q in d.paths("eu-1", M, k=10))
     assert d.cells[("eu-1", M)].holdings[bad].span == span    # placement untouched
-    d.update({"id": bad, "model": M, "ts": 51, "sessions": 0, "rho": 0.0, "kv_free": 10 ** 6})
+    d.update({"id": bad, "model": M, "sessions": 0, "rho": 0.0, "kv_free": 10 ** 6}, 51)
     assert any(bad in [h["id"] for h in q["hops"]] for q in d.paths("eu-1", M, k=10))
 
 
@@ -197,4 +262,4 @@ def test_mixed_fleet_end_to_end():
     p = d.paths("eu-1", M)[0]
     le = lease(d, p)
     for t in le["tokens"]:
-        assert L.LeaseGate(d.pubkey, t["to"]).admit(t["token"], sender=t["from"], now=100)
+        gate_admits(d, t)

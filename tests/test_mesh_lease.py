@@ -22,7 +22,7 @@ def tok(**over):
 
 
 def ok(token, **kw):
-    args = {"audience": "PeerB", "sender": "PeerA", "now": 2_000, **kw}
+    args = {"audience": "PeerB", "now": 2_000, **kw}
     return L.verify(token, PUB, **args)
 
 
@@ -44,13 +44,47 @@ def test_round_trip_and_bounds():
     assert ok(t.encode()) == c                             # the frame carries it as bytes
 
 
-def test_rides_lease_open_as_the_opaque_token_blob():
-    t = tok(role="head").encode()
+def lease_open(token, **over):
     msg = {"v": 2, "op": "c", "cmd": "lease_open", "sid": CLAIMS["sid"], "rte": 3, "lo": 8, "hi": 16,
-           "role": "mid", "pred": "PeerA", "next": "PeerC", "ret": "Entry", "max_pos": 32768, "W": 8, "cx": "bf16",
-           "nonce": "00" * 8, "lease": t}
-    back = frame.decode(b"".join(bytes(p) for p in frame.encode(msg)))
-    assert bytes(back["lease"]) == t and ok(bytes(back["lease"]))["role"] == "head"
+           "role": "mid", "pred": "PeerA", "next": "PeerC", "ret": "Entry", "max_pos": 32768, "W": 8,
+           "cx": "bf16", "nonce": "00" * 8, "lease": token.encode()}
+    msg.update(over)
+    return frame.decode(b"".join(bytes(p) for p in frame.encode(msg)))
+
+
+def test_rides_lease_open_and_binds_to_its_fields():
+    back = lease_open(tok())
+    g = L.LeaseGate(PUB, "PeerB")
+    c = g.admit(bytes(back["lease"]), now=2_000, bind=L.binding_of(back))
+    assert c["role"] == "mid" and g.accepts(CLAIMS["sid"], 3, "PeerA")
+    assert not g.accepts(CLAIMS["sid"], 3, "PeerX") and not g.accepts(CLAIMS["sid"], 2, "PeerA")
+    assert not g.accepts(CLAIMS["sid"], 3, "PeerA", kind="mirror")
+
+
+@pytest.mark.parametrize("over", [{"role": "head", "pred": "Entry", "salt": "00" * 32}, {"lo": 9}, {"hi": 15},
+                                  {"rte": 4},
+                                  {"pred": "PeerX"}, {"sid": "f" * 16}])
+def test_a_token_is_refused_in_a_message_that_claims_something_else(over):
+    back = lease_open(tok(), **over)
+    with pytest.raises(L.LeaseError) as e:
+        L.LeaseGate(PUB, "PeerB").admit(bytes(back["lease"]), now=2_000, bind=L.binding_of(back))
+    assert e.value.code == "binding"
+
+
+def test_a_backup_token_is_only_a_mirror_edge():
+    t = tok(role="backup", lid="00112233445566fc")
+    g = L.LeaseGate(PUB, "PeerB")
+    with pytest.raises(L.LeaseError) as e:                  # not as a primary lease_open
+        g.admit(t, now=2_000, bind=L.binding_of(lease_open(t)))
+    assert e.value.code == "binding"
+    mo = {"cmd": "mirror_open", "sid": CLAIMS["sid"], "primary": "PeerA", "lo": 8, "hi": 16, "max_pos": 32768}
+    g.admit(t, now=2_000, bind=L.binding_of(mo))
+    assert g.accepts(CLAIMS["sid"], 3, "PeerA", kind="mirror") and not g.accepts(CLAIMS["sid"], 3, "PeerA")
+
+
+def test_admit_demands_a_binding():
+    with pytest.raises(ValueError):
+        L.LeaseGate(PUB, "PeerB").admit(tok(), now=2_000, bind={"sid": CLAIMS["sid"]})
 
 
 @pytest.mark.parametrize("field,val", [("rte", 4), ("lo", 7), ("hi", 48), ("to", "PeerC"), ("from", "PeerX"),
@@ -130,10 +164,9 @@ def test_noncanonical_base64_is_rejected():
     assert code(f"{p64}.{alt}") == "format"
 
 
-def test_audience_sender_and_time():
+def test_audience_and_time():
     t = tok()
     assert code(t, audience="PeerC") == "audience"
-    assert code(t, sender="PeerC") == "sender"              # a stolen token is useless to the thief
     assert code(t, now=4_600) == "expired"
     assert ok(t, now=4_599)["rte"] == 3
     assert code(t, now=969) == "not_yet_valid"
@@ -143,24 +176,33 @@ def test_audience_sender_and_time():
     assert e.value.code == "ttl"
 
 
-def test_gate_accepts_redials_and_refuses_stale_or_closed_sessions():
+BIND = {k: CLAIMS[k] for k in L.BIND_KEYS}
+
+
+def admit(g, token, now):
+    return g.admit(token, now=now, bind=BIND)
+
+
+def test_gate_redelivery_is_idempotent_stale_and_closed_sessions_are_refused():
     g = L.LeaseGate(PUB, "PeerB")
     t3, t4 = tok(), tok(rte=4, lid="00112233445566fe")
-    assert g.admit(t3, sender="PeerA", now=2_000)["rte"] == 3
-    assert g.admit(t3, sender="PeerA", now=2_001)          # a reset stream re-dials with its token
-    assert g.admit(t4, sender="PeerA", now=2_002)["rte"] == 4
+    assert admit(g, t3, 2_000)["rte"] == 3
+    assert admit(g, t3, 2_001)                             # a retried lease_open
+    assert admit(g, t4, 2_002)["rte"] == 4 and not g.accepts(CLAIMS["sid"], 3, "PeerA")
     with pytest.raises(L.LeaseError) as e:
-        g.admit(t3, sender="PeerA", now=2_003)
+        admit(g, t3, 2_003)
     assert e.value.code == "stale_rte"
-    g.supersede(CLAIMS["sid"], 5, now=2_004)
+    g.supersede(CLAIMS["sid"], 5, now=2_004, pred="PeerZ")  # entry-signed lease_update: new predecessor
+    assert g.accepts(CLAIMS["sid"], 5, "PeerZ") and not g.accepts(CLAIMS["sid"], 5, "PeerA")
     with pytest.raises(L.LeaseError) as e:
-        g.admit(t4, sender="PeerA", now=2_005)
+        admit(g, t4, 2_005)
     assert e.value.code == "stale_rte"
-    t5 = tok(rte=5, lid="00112233445566fd")
-    assert g.admit(t5, sender="PeerA", now=2_006)
+    g.supersede(CLAIMS["sid"], 6, now=2_006)                # no pred named: the edge carries over
+    assert g.accepts(CLAIMS["sid"], 6, "PeerZ")
     g.close(CLAIMS["sid"], now=2_007)
+    assert not g.accepts(CLAIMS["sid"], 6, "PeerZ")
     with pytest.raises(L.LeaseError) as e:
-        g.admit(t5, sender="PeerA", now=2_008)
+        admit(g, tok(rte=7, lid="00112233445566fd"), 2_008)
     assert e.value.code == "closed"
 
 
@@ -168,10 +210,10 @@ def test_gate_prunes_only_when_nothing_it_guards_can_verify():
     g = L.LeaseGate(PUB, "PeerB")
     long_old = tok(rte=1, lid="00112233445566aa", exp=CLAIMS["iat"] + L.MAX_TTL_S)
     short_new = tok(rte=2, lid="00112233445566bb", iat=1_100, exp=1_200)
-    g.admit(short_new, sender="PeerA", now=1_150)
+    admit(g, short_new, 1_150)
     g.prune(now=1_300)                                      # short_new expired, long_old has not
     with pytest.raises(L.LeaseError) as e:
-        g.admit(long_old, sender="PeerA", now=1_300)
+        admit(g, long_old, 1_300)
     assert e.value.code == "stale_rte"
     g.prune(now=1_100 + L.MAX_TTL_S + 31)
     assert g._sids == {}
