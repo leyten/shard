@@ -32,14 +32,17 @@ LAYOUT OF A DECODE FRAME (MiMo-Flash, H = 4096, bf16, n = 1): 8 (length) + 4 (he
 JSON header + 8 per blob + the 8192 B row. Overhead on top of the row:
 - 243 B for a bare frame (223 B JSON);
 - 354 B mid-path with 7 `ld` bytes and an `eid` (plus its ciphertext);
-- 431 B with every number at its maximum width and a hint.
+- 411 B with every number at its maximum width and a hint.
 
 `tests/test_frame.py::test_byte_budget` pins these bounds for each message type.
 
 DECISIONS WHERE §5 IS SILENT OR AMBIGUOUS (each consistent with the §7 receipts):
 - Wire row (§7.1) = `x[i] ‖ xs[i] ‖ tap[i]`, the exact received/sent blob bytes (`wire_row`).
   `eid` and the header are excluded, so an OUT leaf computed from the sent message equals the IN
-  leaf computed from the received one.
+  leaf computed from the received one. §7.1's table writes `x‖tap‖xs`, but its defining sentence
+  says x, then xs, then tap, and that sentence wins. A row's length is fixed by (codec, H), which
+  the SEG log and the manifest pin, so the concatenation is unambiguous. Decoded views are
+  read-only, so no consumer can edit the bytes before hashing them.
 - Signed or opaque payloads (`lease` token, `ck` checkpoint, `kv` blob, `sig`, `stats` record,
   `eid`) ride as raw u8 blobs and are never re-serialised. Their bytes are what was signed. Their
   schemas belong to their owners (P1, M3, the runtime).
@@ -47,14 +50,24 @@ DECISIONS WHERE §5 IS SILENT OR AMBIGUOUS (each consistent with the §7 receipt
   strings. A u64 as a JSON number is unsafe past 2^53 in other languages. JSON numbers are ≤ u32.
 - `pos + n ≤ 2^32 − 1`, so the tail's OUT leaf index p+1 (§7.1) fits u32. `-1 ≤ cpos ≤ pos + n`.
   `seq`, `sep` and `rte` never wrap: a session ends first.
-- `hint = {dnxt?, lic?}`: `dnxt` = the token id already streamed after this frame (v1 `dnxt`),
-  `lic` = v1 `dprev`, the licence to reuse the block returned one position back
-  (v4_dspark_draft.wants_block).
+- `hint = {lic}` only: `lic` = v1 `dprev`, the licence to reuse the block returned one position
+  back (v4_dspark_draft.wants_block). §5.1 also puts `dnxt` in clear. `dnxt` is the token id
+  already streamed after this frame, i.e. plaintext output on every hop, which breaks §0.8 (ids
+  visible to head and tail only). So `dnxt` rides inside the `eid` plaintext instead.
+- `eid` plaintext = int32le ids of the rows, then optionally `dnxt` (int32le). The AEAD belongs to
+  the lease's `ekey`, not to this module. Bounds:
+  - every frame that holds exactly its own n rows, including the entry→head prefill chunk:
+    `eid` ≤ 4·(n+1) + 64 B;
+  - a hidden-state prefill piece: the head cannot split ciphertext, so `eid` rides only `sub = 0`
+    and covers the whole injected chunk (≤ 4·(65535+1) + 64 B). The tail then holds every prompt
+    id before the later sub-chunks arrive.
+
+  These bounds are size sanity, not a secrecy boundary. Mid hops forward `eid` opaque and cannot
+  check it, just as they cannot check the bits of `x`.
 - `sub`/`last` are prefill-only. Any other kind must leave them at 0/true (omitted).
 - `fen` frames are header-only: no `x`/`xs`/`tap`/`eid`. Fenced replies keep sid/rte/seq/sep
   (§5.2) and carry no `toks`/`acc`/`blk`.
 - `cx = ids` implies `ct = none`: the tap lane starts at the head (no layers precede it).
-- `eid` ≤ 4·n + 64 bytes (ids + AEAD nonce/tag slack), so it cannot become a side channel.
 - `toks` length ∈ {0, 1, n}, matching `lg` = none/last/all. Token ids are ≥ 0 (a negative id is a
   device-side assert on CUDA embedding). The runtime still bounds ids by the vocabulary.
 - `acc` is tri-state: absent / true / false. `dt` rows are integer microseconds
@@ -70,7 +83,21 @@ DECISIONS WHERE §5 IS SILENT OR AMBIGUOUS (each consistent with the §7 receipt
 - `log_rows` holds one codec per message, with the same payload fields as a frame, so the
   rebuilding hop can check its IN leaves with `wire_row`. `seg` = [[start_pos, n, codec, kind]]
   (§7.1 SEG). A range that changes codec is served as several messages.
+  `seg` is checked for structure only. Ordering and coverage are P1's: segments may legitimately
+  overlap under last-write-wins. A per-token range too long for one header is paged by the
+  fetcher.
+- `takeover` carries the full `lease_open` field set (role, W, codecs, drafter and the role-gated
+  secrets) plus `F` and `g_entry`. §5.3 lists only `sid, rte', F, g_entry, pred, next, ret,
+  lease`. With that list, a backup taking over a head or tail could not compute H_tok (salt),
+  decrypt `eid` (ekey), sample (seed) or sign its checkpoints (nonce), all of which §7 needs.
 - `lease_update.sig` signs `signing_bytes(msg)`: the canonical body with `sig` left out.
+  `backup = ""` clears the backup (for example when it died). Absent means unchanged.
+- `recv` reads the body into one buffer that grows geometrically with the bytes that have
+  arrived. A peer that claims a large frame and then stalls pins at most 2× what it sent
+  (`transport.recv_msg` preallocates the full claim). The price is about one extra memory pass
+  over a large body: 16 MiB reads in ~17 ms instead of ~5 ms on loopback. On a real link that pass
+  overlaps with bytes still arriving. The `M25_MAX_FRAME` env var is read once at import, as in
+  transport.
 """
 import json
 import os
@@ -89,7 +116,7 @@ MAX_HIDDEN = 0xFFFF
 MAX_HOPS = 255            # ld / dt entries
 MAX_BLK = 64              # tail drafter block length K
 EID_SLACK = 64            # eid ≤ 4·n + this (AEAD nonce + tag)
-U16, U32, I31 = 0xFFFF, 0xFFFFFFFF, 0x7FFFFFFF
+U16, U32 = 0xFFFF, 0xFFFFFFFF
 
 
 class FrameError(ConnectionError):
@@ -110,6 +137,17 @@ _DT = {
 _BY_WIRE = {w: k for k, (w, _, _) in _DT.items()}
 
 
+_PLAIN = re.compile(r"[<@=]?[bBhHiIlLqQnNefd?]")   # plain numeric formats; no '>'/'!', no structs
+
+
+def _flat(data) -> memoryview:
+    """any C-contiguous, native/little-endian buffer -> flat byte memoryview (no copy)"""
+    mv = memoryview(data)
+    if not mv.c_contiguous or not _PLAIN.fullmatch(mv.format):
+        raise ValueError(f"payload buffers must be C-contiguous plain little-endian, got {mv.format!r}")
+    return mv if mv.ndim == 1 and mv.format == "B" else mv.cast("B")
+
+
 class Tensor:
     """dtype tag + shape + raw little-endian bytes. `data` is a flat memoryview (zero-copy over the
     received frame on decode). Every supported device family is little-endian."""
@@ -124,9 +162,7 @@ class Tensor:
             if type(d) is not int or d < 0:
                 raise ValueError(f"bad tensor dim {d!r}")
             numel *= d
-        mv = memoryview(data)
-        if mv.ndim != 1 or mv.format != "B":
-            mv = mv.cast("B")
+        mv = _flat(data)
         if numel * _DT[dtype][1] != len(mv):
             raise ValueError(f"{dtype}{list(shape)} needs {numel * _DT[dtype][1]} bytes, got {len(mv)}")
         self.dtype, self.shape, self.data = dtype, shape, mv
@@ -213,7 +249,7 @@ def _const(c):
     return chk
 
 
-_U8, U16_, U32_, _TOK = _int(0, 255), _int(0, U16), _int(0, U32), _int(0, I31)
+_U8, U16_, U32_ = _int(0, 255), _int(0, U16), _int(0, U32)
 _CPOS = _int(-1, U32)                                   # -1 = none
 
 
@@ -235,13 +271,10 @@ def _dt(v):
 
 
 def _hint(v):
-    if type(v) is not dict or not set(v) <= {"dnxt", "lic"}:
-        raise ValueError(f"hint must be {{dnxt?, lic?}}, got {str(v)[:60]}")
-    dnxt, lic = v.get("dnxt"), v.get("lic", False)
-    if dnxt is not None:
-        _TOK(dnxt)
-    _bool(lic)
-    return None if dnxt is None and not lic else {"dnxt": dnxt, "lic": lic}
+    """{lic}. A plaintext `dnxt` is refused: it is an output token id (it rides in `eid`)."""
+    if type(v) is not dict or not set(v) <= {"lic"}:
+        raise ValueError(f"hint must be {{lic}} (dnxt rides encrypted in eid), got {str(v)[:60]}")
+    return {"lic": True} if _bool(v.get("lic", False)) else None
 
 
 _CODEC = _enum("ids", "bf16", "fp8")
@@ -274,9 +307,7 @@ def _bytes(lo, hi):
     def chk(v):
         if not isinstance(v, (bytes, bytearray, memoryview)):
             raise ValueError(f"want bytes, got {type(v).__name__}")
-        mv = memoryview(v)
-        if mv.ndim != 1 or mv.format != "B":
-            mv = mv.cast("B")
+        mv = _flat(v)
         if not lo <= len(mv) <= hi:
             raise ValueError(f"want {lo}..{hi} bytes, got {len(mv)}")
         return mv
@@ -341,19 +372,23 @@ _PLO, _PHI = ("pos_lo", U32_, _REQ, None), ("pos_hi", U32_, _REQ, None)
 _PAYLOAD = [("x", _tensor("i32", "bf16", "fp8"), None, "t"), ("xs", _tensor("f32"), None, "t"),
             ("tap", _tensor("bf16"), None, "t")]
 
+# a hop's lease: lease_open, and takeover (which leases a backup into the dead hop's place)
+_LEASE = [_SID, _RTE, _LO, _HI,
+          ("role", _enum("head", "mid", "tail", "solo"), _REQ, None),
+          ("pred", _PEER, _REQ, None), ("next", _PEER, None, None),
+          ("ret", _PEER, _REQ, None), ("backup", _PEER, None, None),
+          ("max_pos", U32_, _REQ, None), ("W", U16_, _REQ, None),
+          ("cx", _CODEC, _REQ, None), ("ct", _enum("none", "bf16"), "none", None),
+          ("drafter", _NAME, None, None), ("seed", _HEX64, None, None),
+          ("salt", _HEX32B, None, None), ("ekey", _HEX32B, None, None),
+          ("nonce", _NONCE, _REQ, None)]
+_TOKEN = ("lease", _bytes(1, 4096), _REQ, "b")
+
 _CONTROL = {
-    "lease_open": [_SID, _RTE, _LO, _HI,
-                   ("role", _enum("head", "mid", "tail", "solo"), _REQ, None),
-                   ("pred", _PEER, _REQ, None), ("next", _PEER, None, None),
-                   ("ret", _PEER, _REQ, None), ("backup", _PEER, None, None),
-                   ("max_pos", U32_, _REQ, None), ("W", U16_, _REQ, None),
-                   ("cx", _CODEC, _REQ, None), ("ct", _enum("none", "bf16"), "none", None),
-                   ("drafter", _NAME, None, None), ("seed", _HEX64, None, None),
-                   ("salt", _HEX32B, None, None), ("ekey", _HEX32B, None, None),
-                   ("nonce", _NONCE, _REQ, None),
-                   ("lease", _bytes(1, 4096), _REQ, "b")],
+    "lease_open": _LEASE + [_TOKEN],
     "lease_update": [_SID, _RTE, ("pred", _PEER, None, None), ("next", _PEER, None, None),
-                     ("ret", _PEER, None, None), ("backup", _PEER, None, None),
+                     ("ret", _PEER, None, None),
+                     ("backup", _re(r"[A-Za-z0-9]{0,128}", "a PeerId, or '' to clear"), None, None),
                      ("truncate_to", _CPOS, _REQ, None),
                      ("sig", _bytes(1, 512), _REQ, "b")],
     "ckpt": [_SID, ("ck", _bytes(1, 65536), _REQ, "b")],
@@ -363,9 +398,7 @@ _CONTROL = {
                ("ck", _bytes(1, 65536), None, "b")],
     "mirror_open": [_SID, ("primary", _PEER, _REQ, None), _LO, _HI, ("max_pos", U32_, _REQ, None)],
     "mirror_close": [_SID, ("primary", _PEER, _REQ, None), _LO, _HI],
-    "takeover": [_SID, _RTE, ("F", _CPOS, _REQ, None), ("g_entry", U32_, _REQ, None),
-                 ("pred", _PEER, _REQ, None), ("next", _PEER, None, None),
-                 ("ret", _PEER, _REQ, None), ("lease", _bytes(1, 4096), _REQ, "b")],
+    "takeover": _LEASE + [("F", _CPOS, _REQ, None), ("g_entry", U32_, _REQ, None), _TOKEN],
     "log_fetch": [_SID, _PLO, _PHI],
     "log_rows": [_SID, _PLO, _PHI, ("cx", _CODEC, _REQ, None),
                  ("ct", _enum("none", "bf16"), "none", None), ("seg", _seg, _REQ, None)] + _PAYLOAD,
@@ -451,8 +484,14 @@ def _check_frame(m):
             raise ValueError("a fenced frame is header-only")
         return
     _payload(m, n)
-    if m["eid"] is not None and len(m["eid"]) > 4 * n + EID_SLACK:
-        raise ValueError(f"eid {len(m['eid'])} B > 4·n + {EID_SLACK}")
+    if m["eid"] is not None:
+        if m["kind"] == "P" and m["sub"] != 0:
+            raise ValueError("a prefill chunk's eid rides its sub=0 piece only")
+        # a hidden-state prefill piece carries its whole injected chunk's eid (the head cannot split
+        # ciphertext); every other frame, the entry->head chunk included, holds exactly its n rows
+        ids = MAX_ROWS if m["kind"] == "P" and m["cx"] != "ids" else n   # +1 below: optional dnxt
+        if len(m["eid"]) > 4 * (ids + 1) + EID_SLACK:
+            raise ValueError(f"eid {len(m['eid'])} B > 4·({ids}+1) + {EID_SLACK}")
 
 
 def _check_reply(m):
@@ -477,13 +516,15 @@ def _check_control(m):
     cmd = m["cmd"]
     if "lo" in m and not m["lo"] < m["hi"]:
         raise ValueError(f"layer range [{m['lo']}, {m['hi']}) is empty")
-    if cmd == "lease_open":
+    if cmd in ("lease_open", "takeover"):
+        if m["cx"] == "ids" and m["ct"] != "none":
+            raise ValueError("cx=ids implies ct=none")
         role = m["role"]
         tailish = role in ("tail", "solo")
         for key, allowed in (("next", not tailish), ("seed", tailish), ("ekey", tailish),
                              ("salt", role != "mid")):
             if (m[key] is not None) != allowed:
-                raise ValueError(f"lease_open role={role}: {key} must be "
+                raise ValueError(f"{cmd} role={role}: {key} must be "
                                  f"{'present' if allowed else 'absent'}")
         if m["drafter"] is not None and role == "mid":
             raise ValueError("a mid hop has no drafter")
@@ -539,8 +580,6 @@ def _head(m, schema):
             t = v if kind == "t" else Tensor("u8", (len(v),), v)
             obj[key] = {"__t__": len(blobs), "dtype": _DT[t.dtype][0], "shape": list(t.shape)}
             blobs.append(t.data)
-        elif key == "hint":                               # dnxt may be token 0: test `is not None`
-            obj[key] = {k: v[k] for k in ("dnxt", "lic") if v[k] is not None and v[k] is not False}
         else:
             obj[key] = v
     return json.dumps(obj).encode("ascii"), blobs
@@ -584,10 +623,14 @@ def signing_bytes(msg) -> bytes:
                     [p for b in blobs for p in (struct.pack("!Q", len(b)), b)])
 
 
+def _int_literal(s):
+    if len(s) > 11:                    # every JSON number here is in [-1, 2^32): at most 10 digits
+        raise ValueError(f"integer literal {s[:24]}... out of range")
+    return int(s)
+
+
 def _decode(body):
-    mv = memoryview(body)
-    if mv.ndim != 1 or mv.format != "B":
-        mv = mv.cast("B")
+    mv = _flat(body).toreadonly()      # decoded tensors must not be writable views of the frame
     if len(mv) > MAX_FRAME:
         raise FrameError(f"body {len(mv)} B > MAX_FRAME")
     if len(mv) < 4:
@@ -596,7 +639,7 @@ def _decode(body):
     if hlen > MAX_HEADER or 4 + hlen > len(mv):
         raise FrameError(f"header length {hlen} out of bounds")
     hb = bytes(mv[4:4 + hlen])
-    obj = json.loads(hb.decode("ascii"))       # floats/NaN parse, then fail the `type is int` checks
+    obj = json.loads(hb.decode("ascii"), parse_int=_int_literal)   # floats fail the `type is int` checks
     if type(obj) is not dict:
         raise FrameError("header is not a JSON object")
     blobs, off = [], 4 + hlen
@@ -657,12 +700,21 @@ def wire_row(msg, i) -> bytes:
 
 
 # ── socket helpers: shard/transport's framing and I/O, unchanged ────────────────────────────────
+_T = None
+_CHUNK = 1 << 20
+
+
 def _transport():
-    try:
-        import transport                                  # flat layout (engine files side by side)
-    except ImportError:
-        from shard import transport
-    return transport
+    """shard.transport when imported as a package, the flat `transport` next to it otherwise
+    (engine files side by side on a box). Resolved once."""
+    global _T
+    if _T is None:
+        if __package__:
+            from . import transport
+        else:
+            import transport
+        _T = transport
+    return _T
 
 
 def send(sock, msg) -> int:
@@ -673,11 +725,26 @@ def send(sock, msg) -> int:
     return 8 + n
 
 
+def _read_body(sock, n) -> bytearray:
+    """n bytes into ONE buffer whose capacity is at most 2x what has arrived (a stalled peer pins
+    what it sent, not what it claimed). The zero pad from bytes(k) is calloc'd, so it is not
+    resident."""
+    buf, got = bytearray(min(n, _CHUNK)), 0
+    while got < n:
+        if got == len(buf):
+            buf.extend(bytes(min(len(buf), n - len(buf))))
+        with memoryview(buf) as mv, mv[got:] as free:      # released before the next resize
+            r = sock.recv_into(free)
+        if not r:
+            raise ConnectionError("sidecar closed the connection")
+        got += r
+    return buf
+
+
 def recv(sock) -> dict:
     """receive + decode one message. A closed link or a bad message raises ConnectionError
     (FrameError for the latter). An oversized length is refused before the body is read."""
-    read = _transport()._read_exact
-    (n,) = struct.unpack("!Q", read(sock, 8))
+    (n,) = struct.unpack("!Q", _transport()._read_exact(sock, 8))
     if n > MAX_FRAME:
         raise FrameError(f"frame length {n} exceeds MAX_FRAME ({MAX_FRAME})")
-    return decode(read(sock, n))
+    return decode(_read_body(sock, n))

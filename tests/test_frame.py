@@ -69,10 +69,11 @@ def frames():
         out.append(F.frame(**BASE, n=n, kind=kind, cpos=99, cx="bf16", x=hid(n), ld=[1, 2]))
         out.append(F.frame(**BASE, n=n, kind=kind, cpos=-1, cx="fp8", x=hid(n, dtype="fp8"),
                            xs=F.Tensor("f32", (n,), rb(4 * n)), ct="bf16", tap=hid(n, seed=2),
-                           hint={"dnxt": 0, "lic": True}, eid=rb(40)))
+                           hint={"lic": True}, eid=rb(40)))
         out.append(F.frame(**BASE, n=n, kind=kind, cpos=109, cx="bf16", ct="bf16", fen=True))
     out.append(F.frame(**BASE, n=4, kind="P", sub=3, last=False, cpos=-1, cx="bf16", x=hid(4)))
-    out.append(F.frame(**BASE, n=1, kind="S", cpos=100, cx="bf16", x=hid(1), hint={"dnxt": 42}))
+    out.append(F.frame(**BASE, n=1, kind="S", cpos=100, cx="bf16", x=hid(1), hint={"lic": True},
+                       eid=rb(4 * 2 + F.EID_SLACK)))           # id + encrypted dnxt, max slack
     return out
 
 
@@ -108,8 +109,9 @@ def controls():
         F.control("mirror", sid=SID, rte=2, pos_lo=128, pos_hi=128, kv=b""),
         F.control("mirror_open", sid=SID, primary=PEER, lo=0, hi=7, max_pos=32768),
         F.control("mirror_close", sid=SID, primary=PEER, lo=0, hi=7),
-        F.control("takeover", sid=SID, rte=3, F=255, g_entry=128, pred=PEER, next="Qm2",
-                  ret=PEER, lease=lease),
+        F.control("takeover", sid=SID, rte=3, lo=42, hi=48, role="tail", pred=PEER, ret=PEER,
+                  max_pos=32768, W=8, cx="bf16", drafter="mimo-mtp3", seed="0" * 16,
+                  salt="a" * 64, ekey="b" * 64, nonce="0f" * 16, F=255, g_entry=128, lease=lease),
         F.control("log_fetch", sid=SID, pos_lo=0, pos_hi=900),
         F.control("log_rows", sid=SID, pos_lo=10, pos_hi=14, cx="fp8", ct="bf16",
                   seg=[[0, 12, "bf16", "prefill"], [12, 2, "bf16", "decode"]],
@@ -174,7 +176,7 @@ def test_encoding_is_deterministic_and_input_shape_independent():
     alt = dict(reversed(list(m.items())))                  # other key order
     alt["ld"] = tuple(m["ld"])
     alt["eid"] = bytearray(m["eid"])
-    alt["hint"] = {"lic": True, "dnxt": 0}
+    alt["hint"] = {"lic": True}
     assert body(m) == body(m) == body(alt)
     raw = {k: v for k, v in m.items() if k not in ("sub", "last", "fen", "ld")}   # defaults omitted
     assert body(raw) == body(m)
@@ -278,7 +280,7 @@ FRAME_BAD = [
     ("sub", [1, -1]),                                        # sub/last are prefill-only (kind T)
     ("last", [False, 0]),
     ("fen", [1]),
-    ("hint", [{"dnxt": -1}, {"dnxt": 2 ** 31}, {"lic": 1}, {"dprev": True}, [1]]),
+    ("hint", [{"dnxt": 5}, {"dnxt": 0, "lic": True}, {"lic": 1}, {"dprev": True}, [1]]),
 ]
 
 
@@ -293,7 +295,7 @@ def test_frame_bounds_accept_extremes():
     x = hid(1)
     F.decode(body(F.frame(sid="f" * 16, rte=U32, seq=U32, sep=U32, pos=U32 - 1, n=1, kind="S",
                           cpos=U32, lg="all", cx="bf16", x=x, ld=[255] * 255,
-                          hint={"dnxt": 2 ** 31 - 1})))
+                          hint={"lic": True})))
     F.decode(body(F.frame(sid="0" * 16, rte=0, seq=0, sep=0, pos=0, n=1, kind="P", sub=65535,
                           last=False, cpos=-1, lg="none", cx="bf16", x=x)))
 
@@ -316,7 +318,7 @@ def test_payload_rules():
         dict(cx="ids", x=ids([1, 2, 3]), ct="bf16", tap=hid(n)),           # tap at the entry
         dict(cx="ids", x=ids([1, -2, 3])),                                 # negative token id
         dict(cx="ids", x=hid(n)),
-        dict(cx="bf16", x=hid(n), eid=rb(4 * n + F.EID_SLACK + 1)),        # eid too long
+        dict(cx="bf16", x=hid(n), eid=rb(4 * (n + 1) + F.EID_SLACK + 1)),  # eid too long
         dict(cx="bf16", x=hid(n), eid=b""),
         dict(cx="bf16", x=hid(n), fen=True),                               # fenced with payload
         dict(cx="bf16", fen=True, eid=rb(8)),
@@ -325,7 +327,23 @@ def test_payload_rules():
     for kw in bad:
         with pytest.raises(ValueError):
             F.encode({"v": 2, "op": "f", **base, **kw})
-    F.encode({"v": 2, "op": "f", **base, "cx": "bf16", "x": hid(n), "eid": rb(4 * n + F.EID_SLACK)})
+    F.encode({"v": 2, "op": "f", **base, "cx": "bf16", "x": hid(n),
+              "eid": rb(4 * (n + 1) + F.EID_SLACK)})
+
+
+def test_prefill_eid_rides_sub0_and_covers_the_whole_chunk():
+    """the head splits a prefill chunk into sub-chunks but holds no ekey, so it cannot split eid:
+    the whole chunk's eid rides sub=0, and later pieces carry none"""
+    p = dict(**BASE, n=4, kind="P", cpos=-1, cx="bf16", x=hid(4))
+    whole = rb(4 * (F.MAX_ROWS + 1) + F.EID_SLACK)
+    F.decode(body(F.frame(**p, sub=0, last=False, eid=whole)))
+    for kw in (dict(sub=1, eid=rb(16)), dict(sub=0, eid=whole + b"x")):
+        with pytest.raises(ValueError):
+            F.frame(**p, **kw)
+    entry = dict(**BASE, n=4, kind="P", cpos=-1, cx="ids", x=ids([1, 2, 3, 4]))   # entry -> head
+    F.frame(**entry, eid=rb(4 * 5 + F.EID_SLACK))       # its n IS the whole chunk: tight bound
+    with pytest.raises(ValueError):
+        F.frame(**entry, eid=rb(4 * 5 + F.EID_SLACK + 1))
 
 
 def test_reply_bounds():
@@ -369,6 +387,13 @@ def test_control_bounds():
     for kw in (dict(ekey=None), dict(seed=None), dict(salt=None), dict(next="Qm2")):
         with pytest.raises(ValueError):
             F.encode({**tail, **kw})
+    take = controls()[12]                            # takeover leases like lease_open
+    for kw in (dict(ekey=None), dict(nonce=None), dict(role="mid", next="Qm2"),
+               dict(F=-2), dict(g_entry=-1), dict(lease=None), dict(ct="bf16", cx="ids")):
+        with pytest.raises(ValueError):
+            F.encode({**take, **kw})
+    with pytest.raises(ValueError):
+        F.encode({**lo, "cx": "ids", "ct": "bf16"})
     for m, kw in ((controls()[8], dict(pos_lo=129)), (controls()[13], dict(pos_hi=0)),
                   (controls()[13], dict(pos_hi=65536)), (controls()[14], dict(pos_hi=15)),
                   (controls()[14], dict(seg=[])), (controls()[14], dict(seg=[[0, 0, "bf16", "decode"]])),
@@ -500,6 +525,22 @@ def test_header_cap_trips_before_parsing():
     assert peak < 1 << 20, f"decode peaked at {peak} B on an oversized header"
 
 
+def test_int_literals_are_bounded_regardless_of_process_settings():
+    """a library may lift int_max_str_digits process-wide. A ~1M-digit literal (it fits the header
+    cap) then costs ~1 s to convert; the bounded parse must refuse it without converting."""
+    import time
+    old = sys.get_int_max_str_digits()
+    sys.set_int_max_str_digits(0)
+    try:
+        b = raw(b'{"v": 2, "op": "f", "rte": ' + b"7" * (F.MAX_HEADER - 64) + b"}")
+        t = time.perf_counter()
+        with pytest.raises(F.FrameError):
+            F.decode(b)
+        assert time.perf_counter() - t < 0.2
+    finally:
+        sys.set_int_max_str_digits(old)
+
+
 def test_unreferenced_trailing_blob_is_refused():
     """only the header is re-encoded for the canonical check, so the blob count needs its own rule"""
     for m in (frames()[1], controls()[6], replies()[1]):
@@ -569,6 +610,55 @@ def test_recv_refuses_oversize_length_before_reading_the_body(monkeypatch):
     b.close()
 
 
+def test_recv_stalled_large_claim_pins_only_what_arrived():
+    """a peer claiming a 200 MiB frame that then stalls must not make recv allocate 200 MiB"""
+    import tracemalloc
+    a, b = socket.socketpair()
+    b.settimeout(0.5)
+    a.sendall(struct.pack("!Q", 200 << 20) + b"\x00" * 1000)
+    tracemalloc.start()
+    try:
+        with pytest.raises(OSError):                        # socket timeout: the peer stalled
+            F.recv(b)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        a.close()
+        b.close()
+    assert peak < 4 << 20, f"recv pinned {peak} B for a stalled 200 MiB claim"
+
+
+def test_recv_large_frame_over_the_chunked_path():
+    n, h = 2048, 4096                                          # 16 MiB bf16 prefill piece
+    import tracemalloc
+    m = F.frame(**BASE, n=n, kind="P", cpos=-1, cx="bf16", x=hid(n, h))
+    size = len(body(m))
+    a, b = socket.socketpair()
+    b.settimeout(10)
+    t = threading.Thread(target=F.send, args=(a, m))
+    tracemalloc.start()
+    t.start()
+    try:
+        got = F.recv(b)
+        peak = tracemalloc.get_traced_memory()[1]
+    finally:
+        tracemalloc.stop()
+        t.join()
+        a.close()
+        b.close()
+    assert got == m
+    # one growing buffer plus a transient calloc'd pad (not resident); a join of chunks costs 2x
+    assert peak < 1.6 * size, f"recv peaked at {peak / size:.2f}x the body"
+
+
+def test_transport_resolves_to_the_package_module(monkeypatch):
+    """a foreign top-level `transport` module must never be picked up by shard.frame"""
+    from shard import transport as T
+    monkeypatch.setitem(sys.modules, "transport", object())
+    monkeypatch.setattr(F, "_T", None)
+    assert F._transport() is T
+
+
 def test_recv_truncated_then_closed_is_connection_error():
     a, b = socket.socketpair()
     b.settimeout(2)
@@ -606,7 +696,7 @@ def test_byte_budget():
     bf = lambda n: F.Tensor("bf16", (n, h), bytes(2 * n * h))             # noqa: E731
     bare = dict(sid=SID, rte=3, seq=1234, sep=7, pos=12345, n=1, kind="T", cpos=12344, lg="last")
     worst = dict(sid="f" * 16, rte=U, seq=U, sep=U, pos=U - 1, n=1, kind="S", cpos=U, lg="last",
-                 hint={"dnxt": 2 ** 31 - 1, "lic": True}, ld=[255] * 7)
+                 hint={"lic": True}, ld=[255] * 7)
     fp8 = dict(cx="fp8", x=F.Tensor("fp8", (1, h), bytes(h)), xs=F.Tensor("f32", (1,), bytes(4)))
     cases = [
         # MiMo-Flash decode frame: 8 KiB bf16 row + a header of about 200 B (§5.1)
@@ -705,6 +795,26 @@ def test_tensor_views_match_torch_bits():
     assert empty.torch().shape == (0, 4)
 
 
+def test_decoded_payload_is_read_only():
+    """receipts hash the received bytes; a consumer must not be able to edit them in place"""
+    d = F.decode(bytearray(body(frames()[2])))
+    assert d["x"].data.readonly and d["eid"].readonly
+    np = pytest.importorskip("numpy")
+    assert not d["x"].numpy().flags.writeable
+
+
+def test_tensor_rejects_strided_and_big_endian_buffers():
+    np = pytest.importorskip("numpy")
+    for buf in (memoryview(bytes(12))[::2], np.zeros((4, 4), "<u2")[:, ::2],
+                np.zeros(6, ">f4"), np.zeros(6, [("a", ">f4")])):
+        with pytest.raises(ValueError):
+            F.Tensor("u8" if isinstance(buf, memoryview) else "bf16" if buf.itemsize == 2 else "f32",
+                     (6,) if isinstance(buf, memoryview) else buf.shape, buf)
+    with pytest.raises(ValueError):
+        F.frame(**BASE, n=1, kind="T", cpos=99, cx="bf16", x=hid(1), eid=memoryview(bytes(8))[::2])
+    assert F.Tensor("f32", (2, 3), np.zeros((2, 3), "<f4")).data.nbytes == 24
+
+
 def test_tensor_rejects_size_lies():
     for args in (("bf16", (2, 3), bytes(11)), ("bf16", (2, -3), b""), ("f64", (1,), bytes(8)),
                  ("i32", (True,), bytes(4))):
@@ -713,6 +823,16 @@ def test_tensor_rejects_size_lies():
 
 
 # ── signed control ──────────────────────────────────────────────────────────────────────────────
+def test_lease_update_can_clear_the_backup():
+    m = controls()[4]
+    cleared = {**m, "backup": ""}
+    assert F.decode(body(cleared))["backup"] == ""
+    assert F.decode(body(m))["backup"] is None                  # absent = unchanged
+    assert F.signing_bytes(cleared) != F.signing_bytes(m)
+    with pytest.raises(ValueError):
+        F.encode({**controls()[0], "backup": ""})              # only lease_update may clear
+
+
 def test_lease_update_signing_bytes():
     m = controls()[4]
     s = F.signing_bytes(m)
