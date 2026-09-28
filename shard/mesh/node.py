@@ -1,0 +1,598 @@
+"""Node server v0 (ARCHITECTURE-v2 §4.2): one layer span, many sessions, shard-frame/2 over links.
+
+A node server owns one StageRuntime (any device: the runtime contract is device-neutral) and
+serves its layer span to every session whose lease names it. One thread, the node loop, owns
+the runtime and all session state, so every rule below is sequential and there is no locking
+of the data plane. Link threads only hand it messages through a clock Mailbox.
+
+Per inbound frame f of session s (§4.2):
+  1. lease check: (sid, rte) must match a live lease and f must arrive on a stream from the
+     lease's predecessor PeerId. Otherwise it is dropped and counted (an abuse signal).
+  2. queue: per-session FIFO. Everything below happens when the batcher reaches f, so it sees
+     the state every earlier frame of s left behind.
+  3. fence: f.fen or f.sep < s.sep_seen -> forwarded header-only (the tail replies `fen`),
+     nothing is computed. Otherwise s.sep_seen = f.sep.
+  4. seek, judged against the frontier f.cpos will set: pos > length is a gap, pos below the
+     frontier a rollback, pos + n past frontier + W a window refusal. A refused frame changes
+     nothing (not even the frontier) and is reported loudly: `ack{seq, code}` to the lease's
+     `ret`. Otherwise commit(cpos) (rows < cpos are final); pos < length is an implicit
+     truncate.
+  5. batch: when the loop is free it runs ONE runtime step holding at most one segment per
+     session under the runtime's token budget (round-robin across sessions). A frame larger
+     than the budget runs alone as consecutive steps and is forwarded whole.
+  6. forward: non-tail hops send the output rows to the lease's successor with the same header
+     and their load byte appended to `ld`. The tail replies to `ret` with the tokens `lg` asks
+     for (none on a prefill sub-chunk that is not `last`).
+If the successor is unreachable after a re-dial, the frame is lost and the node sends
+`ack{seq, next_down}` to `ret`. A malformed inbound message resets that stream only.
+
+Control (§5.3): lease_open (admission: S_max, span and role, codecs, then the runtime's own KV /
+W refusals; answered with `ack` to the sender), lease_update (rte bump, re-pointing,
+truncate_to; acked), close. Every other command is counted as unsupported (M1 fills `_CONTROL`).
+
+Many sessions from day one. S_max (default 16) caps NEW leases and is itself capped at half the
+runtime's session table, keeping the other half as takeover headroom (C21).
+
+Not yet, each with a named seam:
+  * lease tokens and lease_update signatures are accepted unverified (`_verify_lease`,
+    `_verify_update`; M3 / M2);
+  * priority classes (rebuild > truth/spec > prefill; S3 extends `_pick`);
+  * prefill sub-chunk pipelining across hops (a too-large frame is computed in steps and
+    forwarded whole; `sub`/`last` from the entry pass through);
+  * activation log, mirroring, takeover, log_fetch, drain, ckpt, stats (M1: `_CONTROL`);
+  * the tap lane (a lease with ct=bf16 or a drafter is refused as unsupported);
+  * eid decryption and `acc` at the tail (D1). `eid` and `hint` pass through opaque;
+  * sampling parameters: lease_open carries only `seed`, so the tail draws greedily.
+
+Wire codecs. Hidden rows travel as the runtime's wire dtype: bf16 -> cx=bf16, fp8_e4m3 -> cx=fp8
+with per-row `xs`. shard-frame/2 has no integer codec, so a runtime whose wire dtype is i32 (the
+integer ToyRuntime) sends its rows bit-exact as bf16 PAIRS: cx=bf16, shape [n, 2H]. The bytes on
+the wire (and so every §7.1 wire row) are the i32 rows' bytes.
+"""
+from __future__ import annotations
+
+import threading
+from collections import deque
+from dataclasses import dataclass
+
+import numpy as np
+
+from .. import frame
+from ..runtime.api import (KVFull, PositionGap, RollbackPastCommit, Rows, SessionExists, Segment,
+                           SpecWindowExceeded, StageRuntimeError, StepIn, WTooDeep)
+from .clock import Closed, RealClock, Timeout
+from .links import TcpLinks
+
+_ROLE = {(True, False): "head", (False, False): "mid", (False, True): "tail", (True, True): "solo"}
+
+
+def _code(e: Exception) -> str:
+    """ack code for a runtime refusal of one frame."""
+    if isinstance(e, PositionGap):
+        return "gap"
+    if isinstance(e, RollbackPastCommit):
+        return "rollback"
+    if isinstance(e, SpecWindowExceeded):
+        return "window"
+    if isinstance(e, (KVFull, WTooDeep, SessionExists)):
+        return "bad"
+    if isinstance(e, StageRuntimeError) and isinstance(e, ValueError):     # BadRequest
+        return "bad"
+    return "fault"
+
+
+class _Refuse(Exception):
+    def __init__(self, code: str):
+        super().__init__(code)
+        self.code = code
+
+
+@dataclass
+class Lease:
+    """One session's lease on this hop (§5.3 lease_open). M1 hangs the activation log, the
+    mirror and the checkpoint state here."""
+    sid: int
+    hex: str
+    rte: int
+    role: str
+    pred: str
+    next: str | None
+    ret: str
+    backup: str | None
+    max_pos: int
+    W: int
+    cx: str
+    seed: int | None
+    sep_seen: int = 0
+
+
+class NodeServer:
+    """Serves `runtime`'s layer span to many sessions over `links_factory` links."""
+
+    def __init__(self, runtime, peer_id: str, *, resolve, clock=None, s_max: int = 16,
+                 links_factory=TcpLinks, host: str = "127.0.0.1", trace=None):
+        self.rt = runtime
+        self.cap = runtime.describe()
+        self.peer_id = peer_id
+        self.clock = clock or RealClock()
+        self.role = _ROLE[(self.cap.is_head, self.cap.is_tail)]
+        self.s_max = max(1, min(s_max, self.cap.max_sessions // 2 or 1))
+        self._budget = self.cap.max_tokens_per_step
+        self._in_codecs = {"ids"} if self.cap.is_head else self._wire_codecs(self.cap.codecs_in)
+        self._out_cx = next(iter(self._wire_codecs((self.cap.wire_dtype,))), "bf16")
+        self._trace = trace
+        self._inbox = self.clock.mailbox(f"{peer_id}.inbox")
+        self.links = links_factory(peer_id, resolve, clock=self.clock, on_message=self._on_msg,
+                                   on_send_error=self._on_send_error, host=host)
+        self._leases: dict[int, Lease] = {}
+        self._fifo: dict[int, deque] = {}
+        self._rr: deque = deque()            # sessions with queued frames, round-robin order
+        self._queued_rows = 0
+        self._dead = False
+        self._slock = threading.Lock()
+        self.stats: dict[str, int] = {}
+        self.addr = None
+        self._loop_thread = None
+
+    # ── lifecycle ─────────────────────────────────────────────────────────────────────────
+    def start(self) -> tuple[str, int]:
+        self.addr = self.links.start()
+        self._loop_thread = self.clock.spawn(f"{self.peer_id}.loop", self._loop)
+        return self.addr
+
+    def stop(self) -> None:
+        """Graceful: finish the current step, drop queued work, close sessions and links."""
+        self._inbox.put(("stop",))
+
+    def kill(self) -> None:
+        """Crash (the fault harness's kill -9): links reset at once, all state is lost."""
+        self._dead = True
+        self._inbox.close()
+        self.links.close(abrupt=True)
+
+    @property
+    def alive(self) -> bool:
+        return not self._dead
+
+    def count(self, key: str, k: int = 1) -> None:
+        with self._slock:
+            self.stats[key] = self.stats.get(key, 0) + k
+
+    def snapshot(self) -> dict:
+        with self._slock:
+            return dict(self.stats)
+
+    def describe(self) -> dict:
+        """This hop as a directory would see it (a subset of the §4.4 holder record)."""
+        c = self.rt.describe()
+        return {"peer": self.peer_id, "model": c.model, "span": [c.lo, c.hi], "role": self.role,
+                "device": c.to_dict()["device"], "numerics_id": c.numerics_id,
+                "service_ms": [list(e) for e in c.service_ms], "kv_free": c.kv_free_bytes,
+                "sessions": len(self._leases), "s_max": self.s_max, "rho": self._rho(),
+                "queue": self._queued_rows}
+
+    # ── link callbacks (link threads) ─────────────────────────────────────────────────────
+    def _on_msg(self, peer: str, msg: dict) -> None:
+        self._inbox.put(("msg", peer, msg, self.clock.now()))
+
+    def _on_send_error(self, peer: str, meta: dict, err) -> None:
+        self._inbox.put(("send_failed", peer, meta))
+
+    # ── the node loop ─────────────────────────────────────────────────────────────────────
+    def _pause(self) -> None:
+        """Harness seam (a hang injector parks the loop here). No-op in production."""
+
+    def _loop(self) -> None:
+        try:
+            while not self._dead:
+                try:
+                    ev = self._inbox.get(timeout=0 if self._rr else None)
+                except Timeout:
+                    ev = None
+                while ev is not None and not self._dead:
+                    self._pause()
+                    self._handle(ev)
+                    try:
+                        ev = self._inbox.get(timeout=0)
+                    except Timeout:
+                        ev = None
+                if self._rr and not self._dead:
+                    self._pause()
+                    self._step_once()
+        except Closed:
+            pass
+        finally:
+            if not self._dead:              # graceful stop: release every session
+                for sid in list(self._leases):
+                    self._drop_session(sid)
+                self._dead = True
+                self.links.close()
+
+    def _handle(self, ev) -> None:
+        kind = ev[0]
+        if kind == "msg":
+            _, peer, m, t = ev
+            if m["op"] == "f":
+                self._on_frame(peer, m, t)
+            elif m["op"] == "c":
+                self._on_control(peer, m)
+            else:
+                self.count("unexpected")
+        elif kind == "send_failed":
+            self._on_send_failed(ev[1], ev[2])
+        elif kind == "stop":
+            raise Closed("stop")
+
+    # ── control ───────────────────────────────────────────────────────────────────────────
+    _CONTROL = {"lease_open": "_lease_open", "lease_update": "_lease_update", "close": "_close"}
+
+    def _on_control(self, peer: str, m: dict) -> None:
+        name = self._CONTROL.get(m["cmd"])
+        if name is None:
+            self.count("unsupported_ctl")
+            if m.get("sid") is not None and m.get("rte") is not None:
+                self._ack(peer, m["sid"], m["rte"], "unsupported")
+            return
+        getattr(self, name)(peer, m)
+
+    def _verify_lease(self, m: dict) -> bool:
+        """M3 seam: check the orchestrator-signed lease token. v0 accepts any token."""
+        return True
+
+    def _verify_update(self, m: dict) -> bool:
+        """M2 seam: check the entry's signature over frame.signing_bytes(m). v0 accepts."""
+        return True
+
+    def _admit(self, sid: int, m: dict) -> str:
+        if sid in self._leases:
+            return "exists"
+        if len(self._leases) >= self.s_max:
+            return "busy"
+        if (m["lo"], m["hi"]) != (self.cap.lo, self.cap.hi) or m["role"] != self.role:
+            return "span"
+        if m["ct"] != "none" or m["drafter"] is not None:
+            return "unsupported"
+        if m["cx"] not in self._in_codecs:
+            return "unsupported"
+        if not self._verify_lease(m):
+            return "bad"
+        return "ok"
+
+    def _lease_open(self, peer: str, m: dict) -> None:
+        sid = int(m["sid"], 16)
+        code = self._admit(sid, m)
+        if code == "ok":
+            try:
+                self.rt.open(sid, m["max_pos"], m["W"])
+            except KVFull:
+                code = "kv_full"
+            except WTooDeep:
+                code = "w_too_deep"
+            except SessionExists:
+                code = "exists"
+            except StageRuntimeError:
+                code = "bad"
+        if code == "ok":
+            self._leases[sid] = Lease(sid=sid, hex=m["sid"], rte=m["rte"], role=m["role"],
+                                      pred=m["pred"], next=m["next"], ret=m["ret"],
+                                      backup=m["backup"], max_pos=m["max_pos"], W=m["W"], cx=m["cx"],
+                                      seed=None if m["seed"] is None else int(m["seed"], 16))
+        self.count(f"lease_{code}")
+        self._ack(peer, m["sid"], m["rte"], code)
+
+    def _lease_update(self, peer: str, m: dict) -> None:
+        sid = int(m["sid"], 16)
+        L = self._leases.get(sid)
+        if L is None:
+            self.count("update_no_lease")
+            return
+        if m["rte"] <= L.rte or not self._verify_update(m):
+            self._ack(peer, m["sid"], m["rte"], "bad")
+            return
+        F = m["truncate_to"]
+        if 0 <= F < self.rt.length(sid):
+            try:
+                self.rt.truncate(sid, F)
+            except StageRuntimeError as e:
+                self._ack(peer, m["sid"], m["rte"], _code(e))
+                return
+        L.rte = m["rte"]                      # queued frames of the old rte die at dequeue
+        for k in ("pred", "next", "ret"):
+            if m[k] is not None:
+                setattr(L, k, m[k])
+        if m["backup"] is not None:
+            L.backup = m["backup"] or None
+        self._ack(peer, m["sid"], m["rte"], "ok")
+
+    def _close(self, peer: str, m: dict) -> None:
+        self._drop_session(int(m["sid"], 16))
+
+    def _drop_session(self, sid: int) -> None:
+        self._leases.pop(sid, None)
+        q = self._fifo.pop(sid, None)
+        if q:
+            self._queued_rows -= sum(f["n"] for f, _ in q)
+        try:
+            self._rr.remove(sid)
+        except ValueError:
+            pass
+        self.rt.close(sid)
+
+    def _ack(self, peer: str, sid_hex: str, rte: int, code: str, seq: int | None = None) -> None:
+        self._send(peer, frame.control("ack", sid=sid_hex, rte=rte, seq=seq, code=code))
+
+    # ── frames ────────────────────────────────────────────────────────────────────────────
+    def _on_frame(self, peer: str, f: dict, t: float) -> None:
+        sid = int(f["sid"], 16)
+        L = self._leases.get(sid)
+        if L is None or f["rte"] != L.rte:
+            self.count("drop_no_lease")
+            return
+        if peer != L.pred:
+            self.count("drop_not_pred")
+            return
+        q = self._fifo.setdefault(sid, deque())
+        if not q:
+            self._rr.append(sid)
+        q.append((f, t))
+        self._queued_rows += f["n"]
+        self.count("frames_in")
+        if self._trace is not None:
+            self._trace("in", self.peer_id, f["sid"], f["seq"], f["pos"], f["n"], t)
+
+    def _pop(self, sid: int):
+        f, t = self._fifo[sid].popleft()
+        self._queued_rows -= f["n"]
+        return f, t
+
+    def _pick(self):
+        """(sessions for one batched step, or a session whose frame exceeds the budget).
+        Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through."""
+        chosen, total = [], 0
+        for sid in list(self._rr):
+            q = self._fifo.get(sid)
+            L = self._leases.get(sid)
+            while q:
+                f, _ = q[0]
+                if L is None or f["rte"] != L.rte:
+                    self._pop(sid)
+                    self.count("drop_stale_rte")
+                elif f["fen"] or f["sep"] < L.sep_seen:
+                    self._pop(sid)
+                    self._forward_fence(L, f)
+                else:
+                    break
+            if not q:
+                continue
+            n = q[0][0]["n"]
+            if n > self._budget:
+                if not chosen:
+                    return [], sid
+                continue
+            if total + n <= self._budget:
+                chosen.append(sid)
+                total += n
+        return chosen, None
+
+    def _step_once(self) -> None:
+        chosen, big = self._pick()
+        served = chosen or ([big] if big is not None else [])
+        if chosen:
+            self._run(chosen)
+        elif big is not None:
+            self._run_big(big)
+        rest = [s for s in self._rr if s not in served and self._fifo.get(s)]
+        self._rr = deque(rest + [s for s in served if self._fifo.get(s)])
+
+    def _segment(self, L: Lease, f: dict, x: Rows | None = None, lo: int = 0, hi: int | None = None):
+        n = f["n"] if hi is None else hi - lo
+        if f["kind"] == "R":
+            raise _Refuse("unsupported")      # rebuild feeds come with takeover (M1)
+        if f["ct"] != "none":
+            raise _Refuse("unsupported")
+        if x is None:
+            x = self._rows_in(f)
+        kind = "prefill" if f["kind"] == "P" else ("decode" if n == 1 else "verify")
+        tokens = "none"
+        if L.role in ("tail", "solo") and (f["kind"] != "P" or f["last"]):
+            tokens = f["lg"]
+        return Segment(L.sid, f["pos"] + lo, n, x, kind=kind, tokens=tokens)
+
+    def _admit_frame(self, L: Lease, f: dict) -> None:
+        """Seek checks for the whole frame against the frontier its cpos WILL set, then commit.
+        A refused frame changes nothing: not even the committed frontier (a gap frame's cpos
+        must not raise the rollback floor)."""
+        info = self.rt.info(L.sid)
+        pos, n = f["pos"], f["n"]
+        c = max(info.committed, f["cpos"])
+        if pos > info.length:
+            raise PositionGap(f"frame at {pos}, length {info.length}")
+        if pos < info.length and pos < c:
+            raise RollbackPastCommit(f"frame at {pos} below the frontier {c}")
+        if pos + n > c + info.spec_window or pos + n > info.max_pos or f["cpos"] > info.max_pos:
+            raise SpecWindowExceeded(f"frame ends at {pos + n}, frontier {c} + W {info.spec_window}")
+        if f["cpos"] >= 0:
+            self.rt.commit(L.sid, f["cpos"])
+
+    def _run(self, sids: list) -> None:
+        work = {}
+        for sid in sids:
+            f, _ = self._pop(sid)
+            L = self._leases[sid]
+            try:
+                seg = self._segment(L, f)
+                self._admit_frame(L, f)
+            except _Refuse as r:
+                self._refuse(L, f, r.code)
+                continue
+            except StageRuntimeError as e:
+                self._refuse(L, f, _code(e))
+                continue
+            L.sep_seen = f["sep"]
+            work[sid] = (L, f, seg)
+        while work:
+            try:
+                out = self.rt.step(StepIn(tuple(seg for _, _, seg in work.values())))
+            except StageRuntimeError as e:
+                if e.sid in work:
+                    L, f, _ = work.pop(e.sid)
+                    self._refuse(L, f, _code(e))
+                    continue
+                self._fault(work)
+                return
+            except Exception:                 # backend fault: those sessions are undefined (§4.1)
+                self._fault(work)
+                return
+            self.count("steps")
+            self.count("rows", sum(seg.n for _, _, seg in work.values()))
+            self._max("max_batch", len(work))
+            for (L, f, _), o in zip(work.values(), out.outs):
+                self._emit(L, f, o.hidden, o.tokens)
+            return
+
+    def _run_big(self, sid: int) -> None:
+        """A frame larger than the token budget: validate the whole frame first, then run it
+        as consecutive steps (no step can then refuse) and forward it whole."""
+        f, _ = self._pop(sid)
+        L = self._leases[sid]
+        n = f["n"]
+        try:
+            x = self._rows_in(f)
+            self._segment(L, f, x.slice(0, 1), 0, 1)       # kind / ct checks
+            self._admit_frame(L, f)
+        except _Refuse as r:
+            self._refuse(L, f, r.code)
+            return
+        except StageRuntimeError as e:
+            self._refuse(L, f, _code(e))
+            return
+        L.sep_seen = f["sep"]
+        hidden, toks = [], []
+        try:
+            for lo in range(0, n, self._budget):
+                hi = min(n, lo + self._budget)
+                seg = self._segment(L, f, x.slice(lo, hi), lo, hi)
+                if seg.tokens == "last" and hi < n:
+                    seg = Segment(seg.sid, seg.start_pos, seg.n, seg.x, kind=seg.kind)
+                o = self.rt.step(StepIn((seg,))).outs[0]
+                self.count("steps")
+                self.count("rows", seg.n)
+                hidden.append(o.hidden)
+                if o.tokens is not None:
+                    toks.append(o.tokens)
+        except Exception:
+            self._fault({sid: (L, f, None)})
+            return
+        self._max("max_batch", 1)
+        self._emit(L, f, Rows.concat(hidden), Rows.concat(toks) if toks else None)
+
+    def _refuse(self, L: Lease, f: dict, code: str) -> None:
+        self.count(f"refused_{code}")
+        self._ack(L.ret, f["sid"], L.rte, code, seq=f["seq"])
+
+    def _fault(self, work: dict) -> None:
+        for sid, (L, f, _) in list(work.items()):
+            self.count("faults")
+            self._drop_session(sid)
+            self._ack(L.ret, f["sid"], L.rte, "fault", seq=f["seq"])
+
+    def _max(self, key: str, v: int) -> None:
+        with self._slock:
+            if v > self.stats.get(key, 0):
+                self.stats[key] = v
+
+    # ── output ────────────────────────────────────────────────────────────────────────────
+    def _rho(self) -> float:
+        return min(1.0, self._queued_rows / max(1, self._budget))
+
+    def _ld(self, f: dict) -> list:
+        return (list(f["ld"]) + [int(round(255 * self._rho()))])[-frame.MAX_HOPS:]
+
+    def _emit(self, L: Lease, f: dict, hidden: Rows, tokens: Rows | None) -> None:
+        hdr = {k: f[k] for k in ("sid", "seq", "sep", "pos", "n")}
+        if L.role in ("head", "mid"):
+            msg = dict(hdr, rte=L.rte, kind=f["kind"], cpos=f["cpos"], sub=f["sub"],
+                       last=f["last"], lg=f["lg"], hint=f["hint"], ld=self._ld(f), eid=f["eid"],
+                       **self._payload_out(hidden))
+            self._send_frame(L, frame.frame(**msg))
+            return
+        if f["kind"] == "P" and not f["last"]:
+            return
+        toks = np.zeros(0, dtype="<i4") if tokens is None else np.ascontiguousarray(tokens.data, dtype="<i4")
+        r = frame.reply(**hdr, rte=L.rte, ld=self._ld(f),
+                        toks=frame.Tensor("i32", (len(toks),), toks))
+        self._send(L.ret, r)
+        self.count("replies")
+        if self._trace is not None:
+            self._trace("reply", self.peer_id, f["sid"], f["seq"], f["pos"], f["n"], self.clock.now())
+
+    def _forward_fence(self, L: Lease, f: dict) -> None:
+        self.count("fenced")
+        hdr = {k: f[k] for k in ("sid", "seq", "sep", "pos", "n")}
+        if L.role in ("head", "mid"):
+            self._send_frame(L, frame.frame(**hdr, rte=L.rte, kind=f["kind"], cpos=f["cpos"],
+                                            sub=f["sub"], last=f["last"], lg=f["lg"],
+                                            cx=self._out_cx, fen=True, ld=self._ld(f)))
+        elif f["kind"] != "P" or f["last"]:
+            self._send(L.ret, frame.reply(**hdr, rte=L.rte, fen=True, ld=self._ld(f)))
+
+    def _send_frame(self, L: Lease, msg: dict) -> None:
+        self._send(L.next, msg)
+        self.count("frames_out")
+        if self._trace is not None:
+            self._trace("out", self.peer_id, msg["sid"], msg["seq"], msg["pos"], msg["n"], self.clock.now())
+
+    def _send(self, peer: str, msg: dict) -> None:
+        if not self._dead:
+            self.links.send(peer, msg)
+
+    def _on_send_failed(self, peer: str, meta: dict) -> None:
+        self.count("send_failed")
+        if meta.get("op") != "f" or meta.get("sid") is None:
+            return
+        L = self._leases.get(int(meta["sid"], 16))
+        if L is not None and L.next == peer:
+            self.count("next_down")
+            self._ack(L.ret, meta["sid"], L.rte, "next_down", seq=meta["seq"])
+
+    # ── codecs ────────────────────────────────────────────────────────────────────────────
+    @staticmethod
+    def _wire_codecs(dtypes) -> set:
+        out = set()
+        for d in dtypes:
+            if d == "bf16" or d == "i32":     # i32: bit-exact bf16 pairs (module docstring)
+                out.add("bf16")
+            elif d == "fp8_e4m3":
+                out.add("fp8")
+        return out
+
+    def _rows_in(self, f: dict) -> Rows:
+        x, cx, n, H = f["x"], f["cx"], f["n"], self.cap.hidden_size
+        codecs = self.cap.codecs_in
+        if cx == "ids":
+            if not self.cap.is_head:
+                raise _Refuse("bad")
+            return Rows("i32", np.frombuffer(x.data, dtype="<i4").astype(np.int32))
+        if self.cap.is_head:
+            raise _Refuse("bad")
+        if cx == "bf16" and "bf16" in codecs and x.shape == (n, H):
+            return Rows("bf16", np.frombuffer(x.data, dtype="<u2").reshape(n, H).astype(np.uint16))
+        if cx == "bf16" and "i32" in codecs and x.shape == (n, 2 * H):
+            return Rows("i32", np.frombuffer(x.data, dtype="<i4").reshape(n, H).astype(np.int32))
+        if cx == "fp8" and "fp8_e4m3" in codecs and x.shape == (n, H):
+            return Rows("fp8_e4m3", np.frombuffer(x.data, dtype=np.uint8).reshape(n, H).copy(),
+                        np.frombuffer(f["xs"].data, dtype="<f4").astype(np.float32))
+        raise _Refuse("bad")
+
+    @staticmethod
+    def _payload_out(rows: Rows) -> dict:
+        d = rows.data
+        if rows.dtype == "bf16":
+            return {"cx": "bf16", "x": frame.Tensor("bf16", d.shape, np.ascontiguousarray(d, dtype="<u2"))}
+        if rows.dtype == "fp8_e4m3":
+            return {"cx": "fp8", "x": frame.Tensor("fp8", d.shape, np.ascontiguousarray(d)),
+                    "xs": frame.Tensor("f32", (rows.n,), np.ascontiguousarray(rows.scale, dtype="<f4"))}
+        if rows.dtype == "i32":
+            d = np.ascontiguousarray(d, dtype="<i4")
+            return {"cx": "bf16", "x": frame.Tensor("bf16", (d.shape[0], 2 * d.shape[1]), d.view("<u2"))}
+        raise ValueError(f"no shard-frame/2 codec for wire dtype {rows.dtype}")
