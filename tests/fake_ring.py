@@ -11,7 +11,8 @@ absolute position p (plain chunk: start+i; tree node: pos_ids[i]) the reply toke
 model's greedy argmax depends only on the position, never on the (possibly wrong) draft token in
 that slot. This preserves speculative-accept accounting exactly: a draft token is accepted iff it
 equals the true continuation, and every committed stream must therefore be a prefix of T after the
-prompt. Losslessness == `output_ids == T[P:P+n]`, assertable to the token.
+prompt. Losslessness == `output_ids == T[P:P+n]`, assertable to the token. The oracle rule, the T
+builders and the fake tokenizers are model-agnostic and live in tests/oracle.py (re-exported here).
 
 EAGLE aux convention (mirrors serve()'s tail return {"toks":..., "aux":{str(li): [s,H]}}):
 aux[li][i] is filled with the ABSOLUTE POSITION of slot i, as float32 (the real tail sends bf16,
@@ -62,27 +63,10 @@ if not os.path.exists(os.path.join(os.environ.get("M25_DIR", "/nonexistent"), "c
 import torch                                       # noqa: E402
 import m25_pipe as MP                              # noqa: E402  (imports m25_stage on CPU)
 from node_kv import send_msg, recv_msg             # noqa: E402  (libp2p codec — same one the coordinator uses)
+from oracle import (FakeTok, FakeTokB, novel_T, repetitive_T, trap_T,   # noqa: E402,F401  (re-exported)
+                    oracle_token)
 
 S = MP.S
-
-
-class FakeTok:
-    """The minimal tokenizer surface coordinate_pipe touches: eos (an id NOT in T so generation never
-    stops early), decode() for the result text, and apply_chat_template() so render_ids() yields
-    exactly the chosen prompt prefix of T."""
-
-    def __init__(self, prompt_ids, eos_id=10 ** 6):
-        self._ids = [int(t) for t in prompt_ids]
-        self.eos_token_id = eos_id
-
-    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, return_dict=True, **kw):
-        return {"input_ids": list(self._ids)}
-
-    def decode(self, ids, skip_special_tokens=True):
-        return " ".join(str(int(i)) for i in ids)
-
-    def __call__(self, text, add_special_tokens=False):   # render_ids' reasoning=False path (unused but cheap)
-        return {"input_ids": []}
 
 
 class RecordingDrafter:
@@ -154,7 +138,7 @@ class FakeRing(threading.Thread):
     # oracle: the target's greedy argmax AT absolute position p is T[p+1] (clamped past the end so
     # deep in-flight speculation never crashes the ring — those replies get discarded anyway)
     def _tok_at(self, p):
-        return self.T[p + 1] if p + 1 < len(self.T) else self.T[-1]
+        return oracle_token(self.T, p)
 
     def _aux(self, positions):
         n = len(positions)
@@ -294,8 +278,7 @@ class FakeRingB(threading.Thread):
         self.error = None
 
     def _tok_at(self, b, p):
-        T = self.Ts[b]
-        return T[p + 1] if p + 1 < len(T) else T[-1]
+        return oracle_token(self.Ts[b], p)
 
     def _aux(self, positions):
         n = len(positions)
@@ -376,24 +359,6 @@ class FakeRingB(threading.Thread):
                     pass
 
 
-class FakeTokB:
-    """FakeTok for the rows coordinator: ONE tokenizer, per-stream prompts — a message's content is
-    the stream index and apply_chat_template returns that stream's prompt prefix."""
-
-    def __init__(self, prompts, eos_id=10 ** 6):
-        self._prompts = [list(map(int, p)) for p in prompts]
-        self.eos_token_id = eos_id
-
-    def apply_chat_template(self, messages, tools=None, add_generation_prompt=True, return_dict=True, **kw):
-        return {"input_ids": list(self._prompts[int(messages[-1]["content"])])}
-
-    def decode(self, ids, skip_special_tokens=True):
-        return " ".join(str(int(i)) for i in ids)
-
-    def __call__(self, text, add_special_tokens=False):
-        return {"input_ids": []}
-
-
 def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill_chunk=24, timeout=30,
                          **ring_kw):
     """One coordinate_pipe_rows job against a fresh FakeRingB. S.M25_TREE (monkeypatched by the
@@ -431,46 +396,6 @@ def run_rows_coordinator(Ts, prompt_lens, drafters, *, K=8, max_new=160, prefill
     if ring.error is not None:
         raise AssertionError(f"fake rows ring crashed: {type(ring.error).__name__}: {ring.error}")
     return res, ring
-
-
-# ---- target-sequence builders ------------------------------------------------------------------
-# Token ids stay < 100 (the synthetic EAGLE head's target vocab) so the real EagleDrafter's embed
-# lookups are always in range on every path.
-
-def novel_T(n, seed=1234):
-    """Pseudo-random tokens — no n-gram structure, the drafter is blind."""
-    import random
-    rng = random.Random(seed)
-    return [rng.randrange(2, 100) for _ in range(n)]
-
-
-def repetitive_T(n, seed=99, phrase_len=30):
-    """A ~30-token phrase repeated verbatim — the n-gram drafter matches long runs (rag-quote-like)."""
-    import random
-    rng = random.Random(seed)
-    phrase = [rng.randrange(2, 100) for _ in range(phrase_len)]
-    out = []
-    while len(out) < n:
-        out.extend(phrase)
-    return out[:n]
-
-
-def trap_T(n, seed=7, break_at=168, novel_len=30):
-    """Repetition that BREAKS once: phrase A repeats through `break_at`, then a novel run, then a
-    different phrase B repeats. The n-gram drafter confidently speculates A's continuation across the
-    break -> a mid-stream divergence with chunks in flight (the discard-bookkeeping trap)."""
-    import random
-    rng = random.Random(seed)
-    a = [rng.randrange(2, 100) for _ in range(26)]
-    b = [rng.randrange(2, 100) for _ in range(26)]
-    out = []
-    while len(out) < break_at:
-        out.extend(a)
-    out = out[:break_at]
-    out += [rng.randrange(2, 100) for _ in range(novel_len)]
-    while len(out) < n:
-        out.extend(b)
-    return out[:n]
 
 
 # ---- runner --------------------------------------------------------------------------------------
