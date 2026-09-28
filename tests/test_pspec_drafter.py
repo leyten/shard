@@ -76,8 +76,9 @@ def test_fused_bytes_are_row_local_and_placement_invariant():
 
 
 def test_bf16_round_is_the_wire_cast():
-    """The tap lane's rounding is torch's float32 -> bfloat16 cast, bit for bit (a GPU stage and a
-    CPU stage must put the same bytes on the wire), with NaN kept a NaN."""
+    """The tap lane's rounding is torch's float32 -> bfloat16 cast, bit for bit on every finite
+    value and +-inf. NaN stays a NaN but its payload is not canonical across devices, which is
+    why `partial` refuses non-finite rows (next test)."""
     torch = pytest.importorskip("torch")
     rng = np.random.default_rng(9)
     x = (rng.standard_normal(50000) * 10.0 ** rng.uniform(-44, 38, 50000)).astype(np.float32)
@@ -88,6 +89,18 @@ def test_bf16_round_is_the_wire_cast():
     nan = np.isnan(want)
     assert np.array_equal(np.isnan(got), nan)
     assert np.array_equal(got[~nan].view(np.uint32), want[~nan].view(np.uint32))
+
+
+def test_tap_lane_refuses_non_finite_rows():
+    spec = TapSpec(MIMO_TAPS, H)
+    W = np.eye(H, dtype=np.float32)
+    ok = np.ones((2, H), np.float32)
+    for bad in (np.nan, np.inf, 3.4e38):
+        h = ok.copy()
+        h[1, 3] = bad
+        acc = None if bad != 3.4e38 else ok * 3.4e38          # overflow to inf in the add
+        with pytest.raises(ValueError, match="non-finite"), np.errstate(over="ignore", invalid="ignore"):
+            spec.partial(acc, W, h)
 
 
 def test_tapspec_rejects_bad_specs():

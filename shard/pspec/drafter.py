@@ -139,12 +139,17 @@ class TapSpec:
         return tuple(l for l in self.layers if lo <= l < hi)
 
     def partial(self, acc, W_l, h_rows, wire="bf16"):
-        """One stage's contribution: acc + W_l . h per row (acc None = zeros), rounded to the wire
-        dtype. Row-local: row i depends on acc[i] and h_rows[i] only."""
+        """One tap layer's contribution: acc + W_l . h per row (acc None = zeros), rounded to the
+        wire dtype. Row-local: row i depends on acc[i] and h_rows[i] only. A non-finite row is
+        refused (ValueError): NaN payload bits differ across devices (torch CPU vs CUDA casts), so
+        such a row has no canonical bytes for a receipt to hash, and it means the stage is broken."""
         h_rows = np.asarray(h_rows, F32)
         add = rows_mv(W_l, h_rows)
         out = add if acc is None else np.asarray(acc, F32) + add
-        return bf16_round(out) if wire == "bf16" else out.astype(F32)
+        out = bf16_round(out) if wire == "bf16" else out.astype(F32)
+        if not np.isfinite(out).all():
+            raise ValueError("TapSpec: a non-finite tap accumulator row; the lane refuses it")
+        return out
 
     def fuse(self, taps_by_layer, W, spans=None, wire="bf16"):
         """Run the accumulator through the path: `spans` = [(lo, hi)] per stage in path order (None:
