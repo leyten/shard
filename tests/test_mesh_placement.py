@@ -582,3 +582,17 @@ def test_hole_repair_with_k_min_1_never_bounces_the_only_holder():
     seat(c, 1, 0, 24)
     seat(c, 2, 24, 40)                                     # [40, 48) a hole; everyone is alone on its span
     assert c.repair(10.0) == []
+
+
+@pytest.mark.parametrize("k", [1, 2, 3, 4, 8])
+def test_co_located_heads_never_starve_the_only_valid_path(k):
+    """Skeptic re-check: 3 cheap heads share the tail's subnet S, 1 pricier head R does not, and
+    8 middles sit between. A label cap dropped every R label for k in 2..4."""
+    base = {"role": "stage", "layer_ms": 1.15, "reliability": 1.0, "rho": 0.0, "sessions": 0,
+            "kv_free": 10 ** 6, "uplink_mbps": 100.0}
+    hs = [dict(base, id=f"S{i}", span=[0, 10], subnet="S") for i in range(3)]
+    hs += [dict(base, id="R", span=[0, 10], subnet="T", layer_ms=2.0)]
+    hs += [dict(base, id=f"Q{i}", span=[10, 20], subnet=f"u{i}") for i in range(8)]
+    hs += [dict(base, id="G", span=[20, 40], subnet="V"), dict(base, id="Tl", span=[40, 48], subnet="S")]
+    paths = candidate_paths(hs, FLASH, POL, k=k)
+    assert len(paths) == min(k, 8) and all([h["id"] for h in p["hops"]][0] == "R" for p in paths)

@@ -664,8 +664,8 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
     the first place it could (Petals cut only at span ends; with equal costs nothing changes and
     the state space stays one state per holder). The search is
     a DAG over (holder, cut) states ordered by position, keeping per state the cheapest labels that
-    are not dominated k times (a label is dominated by a cheaper one whose subnet set it contains,
-    so the distinct-subnet filter can never be starved by pruning). Hop cost =
+    are not dominated k times (prune: co-located holders never starve the distinct-subnet
+    filter). Hop cost =
     leg + (q - p) * t * qf(rho) + unreliability_ms * (1 - reliability); step_ms adds the return
     leg and profile.tail_ms; a non-finite or negative rtt is an unreachable pair. Hard filters:
     primaries need rho < rho_max, sessions < s_max and kv_free >= kv_tokens; subnets on a path are
@@ -694,13 +694,19 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
         par = c[2]
         return ((par[2] if par else ()) + (c[3]["id"],), (par[3] if par else ()) + (-c[4],))
 
-    def prune(cands):
+    def prune(cands, shared):
         """Scan candidates in (cost, hops, ids, later cuts first) order; keep a label unless its
-        holder sequence is already kept or k kept labels with subset subnets dominate it. Labels
-        are materialised only when scanned: (cost, hops, ids, -starts, path, subnets)."""
+        holder sequence is already kept or k kept labels dominate it: no costlier, with a conflict
+        signature (its subnets that another primary shares) contained in its own. Then any suffix
+        that avoids B's shared subnets avoids each dominator's too, so co-located holders can
+        never starve the distinct-subnet filter; with unique subnets a state keeps about k labels.
+        The one approximation: a dominator may already hold a holder that B's best suffix re-enters
+        after an early cut (a holder never serves twice on a path), so that suffix may continue
+        from a different label. Labels are materialised only when scanned:
+        (cost, hops, ids, -starts, path, subnets, sig)."""
         cands.sort(key=itemgetter(0, 1))
-        kept, seqs, i, cap = [], set(), 0, max(4 * k, 16)
-        while i < len(cands) and len(kept) < cap:
+        kept, seqs, i = [], set(), 0
+        while i < len(cands):
             j = i + 1
             while j < len(cands) and cands[j][0] == cands[i][0] and cands[j][1] == cands[i][1]:
                 j += 1
@@ -708,18 +714,22 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
             for c in run:
                 seq, neg = full_key(c)
                 subs = (c[2][5] if c[2] else frozenset()) | {c[3]["subnet"]}
-                if seq in seqs or sum(1 for a in kept if a[5] <= subs) >= k:
+                path = (c[2][4] if c[2] else ()) + ((c[3], c[4], c[5]),)
+                sig = subs & shared
+                if seq in seqs or sum(1 for a in kept if a[6] <= sig) >= k:
                     continue
-                kept.append((c[0], c[1], seq, neg, (c[2][4] if c[2] else ()) + ((c[3], c[4], c[5]),), subs))
+                kept.append((c[0], c[1], seq, neg, path, subs, sig))
                 seqs.add(seq)
-                if len(kept) >= cap:
-                    break
             i = j
         return kept
 
     def search(roles):
         prim = {h["id"]: h for h in hs if h["role"] in roles and ok_primary(h)}
         per = {hid: h["layer_ms"] * _qf(h["rho"]) for hid, h in prim.items()}     # loaded ms per layer
+        seen, shared = set(), set()
+        for h in prim.values():
+            (shared if h["subnet"] in seen else seen).add(h["subnet"])
+        shared = frozenset(shared)
         states = sorted((q, hid) for hid, h in prim.items()
                         for q in {h["span"][1]} | {g["span"][0] for gid, g in prim.items()
                                                    if h["span"][0] < g["span"][0] < h["span"][1]
@@ -742,7 +752,7 @@ def candidate_paths(holders: Iterable[Mapping], profile: ModelProfile, policy: P
                     for lab in glabels:
                         if h["subnet"] not in lab[5]:
                             cands.append((lab[0] + lg + hop, lab[1] + 1, lab, h, p, q))
-            kept = prune(cands)
+            kept = prune(cands, shared)
             if q not in by_end:
                 by_end[q] = []
                 insort(ends, q)
