@@ -4,7 +4,9 @@ The scenarios (tests/receipt_mesh.py) run real ToyRuntime stages over encoded sh
 messages: plain decode, pipelined speculation with rejections, two batched sessions, fp8 wire,
 two route changes (a fatter node, then a re-split with a chained rebuild), a KV-mirror takeover
 in other numerics (valid, not bit-exact), and a dead tail rebuilt from its predecessor's log.
-The mutation suite then makes one party lie at a time and requires a rejection that names it.
+The mutation suite then makes one party lie at a time and requires a rejection that names it;
+the regressions at the end are the adversarial review's attacks (each was accepted, crashed, or
+falsely rejected a legitimate recovery before the fix).
 
 Run: OMP_NUM_THREADS=2 python3 -m pytest tests/test_receipt2.py -q
 """
@@ -406,6 +408,33 @@ def test_entry_cannot_forge_a_hops_checkpoint():
     rejects(b, "bad signature")
 
 
+def test_entry_cannot_move_the_prompt_boundary():
+    """prompt_len splits prefill (cheap) from decode pay: the head and tail sign it."""
+    for d in (40, -40):
+        b = gen("spec")
+        resign_path(b, lambda pl, d=d: pl.update(prompt_len=pl["prompt_len"] + d))
+        rejects(b, "signed prompt_len")
+
+
+def test_seg_pins_the_prompt_boundary_too():
+    """Defence in depth: truth/spec segments never lie inside the prompt, prefill never past it."""
+    lg = type("L", (), {"seg_recs": [[0, 32, "bf16", "prefill"], [32, 4, "bf16", "verify"]],
+                        "seg_at": {36: 2}, "log": "serve"})()
+    with pytest.raises(ReceiptError, match="below the prompt"):
+        R2._seg_check(lg, 0, P=40, codec_of=lambda k: None, where="t")
+    with pytest.raises(ReceiptError, match="past the prompt"):
+        R2._seg_check(lg, 0, P=20, codec_of=lambda k: None, where="t")
+    R2._seg_check(lg, 0, P=32, codec_of=lambda k: None, where="t")
+
+
+def test_seated_record_must_name_a_hop():
+    b = gen("takeover")
+    fake = R2._pub(M.key("fake"))
+    resign_path(b, lambda pl: pl["rtes"][1]["seated"].append(
+        {"pubkey": fake, "tier": "log", "a": 0, "upto": 0, "replaces": None}))
+    rejects(b, "seated", "not on the path")
+
+
 def test_orchestrator_leases_are_required():
     b = gen("spec")
     b["leases"] = [le for le in b["leases"] if le["lo"] != 3]
@@ -461,3 +490,168 @@ def test_tail_needs_a_drawn_token_for_every_produced_slot():
     lg.record(0, 3, kind="prefill", codec="bf16", in_rows=_rows(0, 3), ids=[5, 6, 7], toks=[None, None, None])
     with pytest.raises(ReceiptError, match="drew no token"):
         lg.commit(3)
+
+
+# ── regressions from the adversarial review (each was accepted, crashed or falsely rejected) ──
+def _forge_grid(b, lo, upto):
+    """The dead hop of rte 0 signs further grid checkpoints: roots copied from its neighbours
+    (leaves are untagged) where they exist, invented past them."""
+    mine = sorted(hop_ckpts(b, lo), key=lambda c: (c["pos"], c["kind"] != "grid"))
+    last = mine[-1]
+    pred = {c["pos"]: c for c in b["checkpoints"] if c["rte"] == 0 and c["log"] == "serve" and c["hi"] == lo}
+    succ = {c["pos"]: c for c in b["checkpoints"] if c["rte"] == 0 and c["log"] == "serve" and c["lo"] == last["hi"]}
+    chains = {k: bytes.fromhex(v["chain"]) for k, v in last["logs"].items()}
+    prev, out = R2.ckpt_id(last), []
+    for pos in range(last["pos"] + R2.GRID, upto + 1, R2.GRID):
+        k = pos // R2.GRID - 1
+        logs = {}
+        for name in last["logs"]:
+            src = {"in": (pred, "out"), "out": (succ, "in")}.get(name)
+            if src and pos in src[0]:
+                root = src[0][pos]["logs"][src[1]]["roots"][0][1]
+            else:
+                root = hashlib.sha256(f"{name}/{k}".encode()).hexdigest()
+            chains[name] = R2._chain(chains[name], k, bytes.fromhex(root))
+            logs[name] = {"lo": 0, "hi": pos, "roots": [[k, root]], "chain": chains[name].hex()}
+        body = {kk: vv for kk, vv in last.items() if kk not in ("sig", "pubkey")}
+        body.update(kind="grid", pos=pos, prev_ckpt=prev, logs=logs,
+                    seg={"lo": 0, "recs": [], "chain": last["seg"]["chain"]})
+        ck = R2._sign(node_of(b, lo).priv, body)
+        prev = R2.ckpt_id(ck)
+        out.append(ck)
+    return out
+
+
+def test_dead_hop_cannot_sign_past_the_rte_end():
+    b = gen("takeover")
+    b["checkpoints"] += _forge_grid(b, 6, 640)
+    rejects(b, "past the rte end")
+
+
+def test_entry_cannot_zero_a_hop_by_dropping_all_its_checkpoints():
+    for lo in (6, 9):                              # a mid hop, and the tail (closure skipped)
+        b = gen("spec")
+        victim = node_of(b, lo).pub
+        b["checkpoints"] = [c for c in b["checkpoints"] if c["pubkey"] != victim]
+        resign_path(b, lambda pl, v=victim: pl["rtes"][0]["dead"].append(v))
+        rejects(b, "declared dead with no checkpoint")
+
+
+def test_death_bound_uses_the_leased_window_not_the_path_log():
+    b = gen("spec")
+    victim = node_of(b, 6).pub
+    keep = [c for c in hop_ckpts(b, 6) if c["pos"] <= 128]
+    b["checkpoints"] = [c for c in b["checkpoints"] if c["pubkey"] != victim] + keep
+    resign_path(b, lambda pl: (pl["rtes"][0]["dead"].append(victim), pl.update(W=10 ** 9)))
+    rejects(b, "a live hop would have checkpointed")
+
+
+def test_kv_import_range_is_pinned():
+    b = gen("takeover", bugs_backup=("lie_kv",))
+    rb = [c for c in b["checkpoints"] if c["log"] == "rebuild"]
+    upto = rb[0]["rebuild"]["upto"]
+    bk = next(n for n in b["job"].paths[1] if n.lo == 6)
+
+    def empty(ck):
+        ck["logs"]["kvi"] = {"lo": upto, "hi": upto, "roots": [], "chain": R2._chain0(upto).hex()}
+    replace(b, rb, relink(bk.priv, rb, empty))
+    rejects(b, "sub-log kvi starts at")
+
+
+@pytest.mark.parametrize("kw", [{"which": "mid"}, {"which": "tail"},
+                                {"which": "tail", "cx": "fp8", "cx_prefill": "fp8"}])
+def test_chained_recovery_after_a_double_death(kw):
+    """Two adjacent hops die; the first replacement (other numerics; an SWA-only span in "mid")
+    forwards its rebuilt rows, which differ from the committed ones. The chained successor is
+    checked against those rows only, and the forwarder is owed the rows it had to rebuild."""
+    b = gen("double", **kw)
+    v = M.verify(b)
+    F = b["job"].rtes[1]["pos_start"]
+    assert sorted(w["positions"] for w in v["work"] if w["kind"] == "rebuild") == [F, F]
+
+
+def test_integers_past_u32_are_rejected_not_crashed():
+    b = gen("spec")
+    old = hop_ckpts(b, 6)
+    replace(b, old, relink(node_of(b, 6).priv, old[:1], lambda ck: ck.update(pos_lo=2 ** 32)))
+    rejects(b, "2^32")
+    b = gen("spec")
+    old = hop_ckpts(b, 6)
+
+    def big(ck):
+        ck["logs"]["in"]["lo"] = 2 ** 40
+    replace(b, old, relink(node_of(b, 6).priv, old[:1], big))
+    with pytest.raises(ReceiptError):
+        M.verify(b)
+
+
+def test_duplicate_checkpoint_is_a_retransmit_not_a_fork():
+    b = gen("spec")
+    b["checkpoints"].append(copy.deepcopy(hop_ckpts(b, 3)[1]))
+    assert M.verify(b)["ok"]
+    g = [c for c in hop_ckpts(b, 9) if c["kind"] == "grid"][0]
+    b["checkpoints"].append(R2.resign(node_of(b, 9).priv, dict(g, n_rows=g["n_rows"] + 1)))
+    rejects(b, "forked sequence")
+
+
+def test_backup_rebuild_credit_does_not_depend_on_replaces():
+    b = gen("takeover", tier="log", replaces=False)
+    v = M.verify(b)
+    F = b["job"].rtes[1]["pos_start"]
+    acked = [w for w in v["work"] if w["kind"] == "mirror"][0]["positions"]
+    rb = [w for w in v["work"] if w["kind"] == "rebuild"][0]
+    assert rb["positions"] == F - R2.rebuild_rule(M.KINDS[6:9], M.WINDOW, F, acked) < F
+
+
+def test_seg_schedule_is_checked_past_an_early_death():
+    """The head died early; a mid hop's shape lie after that point is still compared."""
+    b = gen("takeover", victim=0)
+    assert M.verify(b)["ok"]
+    old = hop_ckpts(b, 6)
+    new = [copy.deepcopy(c) for c in sorted(old, key=lambda c: (c["pos"], c["kind"] != "grid"))]
+    for ck in new:
+        recs = ck["seg"]["recs"]
+        i = [i for i in range(1, len(recs) - 1)
+             if recs[i][0] > 200 and recs[i + 1][0] <= recs[i - 1][0] + recs[i - 1][1]]
+        if i:
+            recs.pop(i[0])
+            break
+    rechain_seg(new)
+    replace(b, old, relink(node_of(b, 6).priv, new))
+    rejects(b, "SEG lie")
+
+
+def test_tail_tok_next_is_validated():
+    b = gen("spec")
+    close = [c for c in hop_ckpts(b, 9) if c["kind"] == "close"]
+    replace(b, close, [R2.resign(node_of(b, 9).priv, dict(close[0], tok_next=""))])
+    rejects(b, "tok_next")
+
+
+def test_rejoin_after_own_death_earns_no_rebuild_credit():
+    b = gen("dead", rejoin=True)
+    v = M.verify(b)
+    tail = node_of(b, 9)
+    assert [w["positions"] for w in v["work"] if w["kind"] == "rebuild"] == [0]
+    assert any(w["pubkey"] == tail.pub and w["rte"] == 1 and w["decode"] > 0 for w in v["work"])
+
+
+def test_tokens_no_live_tail_signed_are_reported():
+    b = gen("dead")
+    v = M.verify(b)
+    e = b["job"].rtes[0]
+    g = max(c["pos"] for c in hop_ckpts(b, 9))
+    assert v["tokens_unattested"] == e["pos_end"] + 1 - max(g, b["job"].P) > 0
+    assert gen("spec") and M.verify(gen("spec"))["tokens_unattested"] == 0
+
+
+def test_lease_pins_numerics_and_the_orchestrator_pins_the_manifest():
+    b = gen("spec")
+    old = hop_ckpts(b, 6)
+    replace(b, old, relink(node_of(b, 6).priv, old, lambda ck: ck.update(numerics_id="nid1-other")))
+    rejects(b, "its lease says")
+    b = gen("spec")
+    with pytest.raises(ReceiptError, match="manifest"):
+        R2.verify_coverage_v2(b["path_log"], b["checkpoints"], leases=b["leases"],
+                              entry_pubkey=b["entry_pubkey"], nonce=b["nonce"], job_id=b["job_id"],
+                              **dict(M.MODEL_INFO, manifest_cid="toy-other"))

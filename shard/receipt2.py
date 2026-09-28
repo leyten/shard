@@ -49,6 +49,22 @@ which hops died during it and how each new hop was seated. `verify_coverage_v2` 
 the orchestrator's own leases (the entry cannot invent hops), every checkpoint against the path
 log, and every claim against its neighbours; it fails closed with a specific reason, and on
 success returns the attested work that `shard.settle2` turns into payouts.
+
+WHAT THE ENTRY CANNOT DO. Invent a hop or backup (leases); move the prompt boundary (head and
+tail sign prompt_len); declare a live hop dead to cut its pay by more than 2*grid + W positions
+(W from the hop's lease, not the path log), or at all once the hop signed its close; attribute
+positions past an rte's end. A dead hop keeps pay to its last delivered checkpoint.
+
+KNOWN LIMITS (by design, for the audit seam or the doc):
+  * receipts prove consistency, not computation: a hop that forwards garbage chains fine and is
+    caught by the replay audit (§7.4). Rebuild inputs prove fetching, not computing.
+  * a mirror ack proves receipt, not retention: the primary's checkpoint copy rides `mirror`, so
+    a backup can ack its chain without storing KV. It gains little: w_mirror is tiny, and a
+    takeover pays rebuild credit only from the rule's start given the acked frontier.
+  * the non-prefill SEG schedule must be identical on every hop of an rte. That holds while
+    decode/verify frames are forwarded whole and never coalesced (C15 defers coalescing).
+  * fail closed per job: one hop's bad signature or fork voids the job for everyone. The reason
+    names the signer or link so c0mpute can attribute it; per-signer isolation is a design fork.
 """
 from __future__ import annotations
 
@@ -245,6 +261,8 @@ class HopLedger:
                      "lo": lo, "hi": hi, "role": role, "log": log, "pos_lo": pos_lo}
         if of is not None:
             self.meta["of"] = of
+        if self.headish or self.tailish:
+            self.meta["prompt_len"] = prompt_len     # pins the prefill/decode split the entry claims
         self.subs: dict[str, SubLog] = {}
         if log == "serve":
             self.subs["in"] = SubLog(pos_lo)
@@ -452,8 +470,8 @@ def _fail(msg):
 
 
 def _int(v, what, lo=0):
-    if type(v) is not int or v < lo:
-        _fail(f"{what}: want int >= {lo}, got {v!r}")
+    if type(v) is not int or not lo <= v <= 0xFFFFFFFF:
+        _fail(f"{what}: want an int in [{lo}, 2^32), got {str(v)[:24]}")
     return v
 
 
@@ -487,7 +505,7 @@ class _Sub:
         """Fold one checkpoint's view of this sub-log: new interval roots, chain, edge leaves."""
         if type(d) is not dict or set(d) - {"lo", "hi", "roots", "chain", "leaves"}:
             _fail(f"{where}: malformed sub-log")
-        if d.get("lo") != self.lo or d.get("hi") != hi or hi < self.hi:
+        if d.get("lo") != self.lo or type(hi) is not int or d.get("hi") != hi or hi < self.hi:
             _fail(f"{where}: covers [{d.get('lo')}, {d.get('hi')}), want [{self.lo}, {hi})")
         self.hi = hi
         roots = d.get("roots")
@@ -536,8 +554,10 @@ class _Log:
         first = ckpts[0]
         self.lo, self.hi, self.role = first.get("lo"), first.get("hi"), first.get("role")
         self.pos_lo = _int(first.get("pos_lo"), "pos_lo")
+        for k in ("lo", "hi"):
+            _int(first.get(k), k)
         self.fixed = {k: first.get(k) for k in ("lo", "hi", "role", "pos_lo", "numerics_id", "of",
-                                                 "rebuild")}
+                                                 "rebuild", "prompt_len")}
         self.rebuild = first.get("rebuild")
         by_prev = {}
         for ck in ckpts:
@@ -616,6 +636,12 @@ class _Log:
                     _fail(f"{where}: SEG chain does not fold its records")
                 self.seg_at[pos] = len(self.seg_recs)
             self.tok_next = ck.get("tok_next")
+        want_lo = {"in": self.pos_lo, "out": self.pos_lo, "kv": self.pos_lo}
+        if self.log == "rebuild" and type(self.rebuild) is dict:
+            want_lo = {"in": self.pos_lo, "kvi": 0, "kv": self.rebuild.get("upto")}
+        for name, sub_ in self.subs.items():
+            if name in want_lo and sub_.lo != want_lo[name]:
+                _fail(f"{self.who}: sub-log {name} starts at {sub_.lo}, want {want_lo[name]}")
         self.kinds = [ck["kind"] for ck in seq]
         self.end = seq[-1]["pos"]
         self.closed = closed or self.log == "rebuild"
@@ -645,6 +671,8 @@ def _seg_check(log: _Log, lo: int, *, P: int, codec_of, where: str):
             _fail(f"{where}: SEG lie: decode segment [{s}, {n}] is not one row")
         if kind == "prefill" and s + n > P:
             _fail(f"{where}: SEG lie: prefill segment [{s}, {n}] runs past the prompt ({P})")
+        if kind in ("verify", "decode") and s < P:
+            _fail(f"{where}: SEG lie: {kind} segment at {s} lies below the prompt ({P})")
         if (kind == "rebuild") != (log.log == "rebuild"):
             _fail(f"{where}: SEG lie: {kind} segment at {s} in a {log.log} log")
         want = codec_of(kind)
@@ -715,32 +743,36 @@ def rebuild_rule(kinds, window: int, F: int, upto: int) -> int:
 
 
 def verify_coverage_v2(path_log: dict, checkpoints: list, *, leases, entry_pubkey: str, nonce: str,
-                       job_id: str, layer_kinds, window: int) -> dict:
+                       job_id: str, manifest_cid: str, layer_kinds, window: int) -> dict:
     """The job-level check before any v2 pay (§7.3), fail closed: any defect raises ReceiptError
     with a specific reason. On success returns {ok, job_id, sid, layers, prompt_len, pos_end,
-    tokens, work}, `work` being the attested units settlement pays:
+    tokens, tokens_unattested, work}, `work` being the attested units settlement pays:
         {pubkey, rte, lo, hi, kind: "serve", prefill: n, decode: n}
         {pubkey, rte, lo, hi, kind: "rebuild", positions: n}
         {pubkey, rte, lo, hi, kind: "mirror", positions: n}
-    leases: the ORCHESTRATOR's own records [{sid, rte, pubkey, lo, hi, role}] (role "backup" for a
-    mirror), never taken from the entry. layer_kinds ("global"/"swa" per layer) and window come
-    from the manifest: the rebuild rule needs them."""
+    leases: the ORCHESTRATOR's own records [{sid, rte, pubkey, lo, hi, role, W, numerics_id?}]
+    (role "backup" for a mirror), never taken from the entry: W (the lease's spec window) bounds
+    how far before an rte's end a declared death may lie. manifest_cid, layer_kinds
+    ("global"/"swa" per layer) and window come from the orchestrator's manifest.
+    tokens_unattested: generated tokens no live tail signed (a tail died before the rte ended)."""
     try:
-        return _Verifier(path_log, checkpoints, leases, entry_pubkey, nonce, job_id,
+        return _Verifier(path_log, checkpoints, leases, entry_pubkey, nonce, job_id, manifest_cid,
                          tuple(layer_kinds), window).run()
     except ReceiptError:
         raise
-    except (KeyError, TypeError, ValueError, AttributeError, IndexError) as e:
+    except (KeyError, TypeError, ValueError, AttributeError, IndexError, OverflowError,
+            RecursionError, struct.error) as e:
         raise ReceiptError(f"malformed receipts ({type(e).__name__}: {str(e)[:120]})") from None
 
 
 class _Verifier:
-    def __init__(self, pl, ckpts, leases, entry_pubkey, nonce, job_id, kinds, window):
+    def __init__(self, pl, ckpts, leases, entry_pubkey, nonce, job_id, manifest, kinds, window):
         self.pl, self.ckpts, self.leases = pl, ckpts, leases
-        self.entry, self.nonce, self.job_id = entry_pubkey, nonce, job_id
+        self.entry, self.nonce, self.job_id, self.manifest = entry_pubkey, nonce, job_id, manifest
         self.kinds, self.window, self.L = kinds, window, len(kinds)
         self.work = []
         self.mirror_ok = {}
+        self.unattested = 0
 
     def has_kv(self, lo, hi):
         return any(k == "global" for k in self.kinds[lo:hi])
@@ -758,15 +790,16 @@ class _Verifier:
         _check_sig(pl, "entry")
         if pl.get("nonce") != self.nonce:
             _fail("path log nonce != job nonce (stale or replayed)")
-        if pl.get("job_id") != self.job_id or pl.get("layers") != L:
-            _fail("path log is for another job or model")
+        if pl.get("job_id") != self.job_id or pl.get("layers") != L or pl.get("manifest_cid") != self.manifest:
+            _fail("path log is for another job, model or manifest")
         self.sid = pl.get("sid")
         self.P = _int(pl.get("prompt_len"), "prompt_len", 1)
-        self.W = _int(pl.get("W"), "W", 1)
         rtes = pl.get("rtes")
         if type(rtes) is not list or not rtes:
             _fail("path log has no rte")
-        issued = {(le["sid"], le["rte"], le["pubkey"], le["lo"], le["hi"], le["role"]) for le in self.leases}
+        issued = self.issued = {}
+        for le in self.leases:
+            issued[(le["sid"], le["rte"], le["pubkey"], le["lo"], le["hi"], le["role"])] = le
         self.rtes, self.spans, self.hops, self.backups = rtes, [], [], []
         for r, e in enumerate(rtes):
             if e.get("rte") != r:
@@ -776,7 +809,7 @@ class _Verifier:
                 _fail(f"rte {r}: positions [{ps}, {pe}) do not continue the previous rte")
             if e.get("cx") not in ("bf16", "fp8") or e.get("cx_prefill") not in ("bf16", "fp8"):
                 _fail(f"rte {r}: codecs {e.get('cx')!r}/{e.get('cx_prefill')!r}")
-            hops = sorted(e.get("hops") or [], key=lambda h: h["lo"])
+            hops = sorted((dict(h) for h in e.get("hops") or []), key=lambda h: h["lo"])
             cur, seen = 0, set()
             for h in hops:
                 pk, lo, hi, role = h["pubkey"], h["lo"], h["hi"], h["role"]
@@ -789,8 +822,11 @@ class _Verifier:
                 if pk in seen:
                     _fail(f"rte {r}: duplicate signer {pk[:10]}.. (one identity per rte)")
                 seen.add(pk)
-                if (self.sid, r, pk, lo, hi, role) not in issued:
+                le = issued.get((self.sid, r, pk, lo, hi, role))
+                if le is None:
                     _fail(f"rte {r}: no issued lease for hop {pk[:10]}.. [{lo}, {hi}) (invented hop)")
+                h["_W"] = _int(le.get("W"), f"rte {r}: lease W of {pk[:10]}..", 1)
+                h["_nid"] = le.get("numerics_id")
             if cur != L:
                 _fail(f"rte {r}: layers end at {cur}, the model has {L}")
             bk = {}
@@ -806,6 +842,9 @@ class _Verifier:
             dead = set(e.get("dead") or [])
             if dead - seen:
                 _fail(f"rte {r}: declares dead a pubkey that is not on its path")
+            st = [x["pubkey"] for x in (e.get("seated") or [])]
+            if set(st) - seen or len(st) != len(set(st)):
+                _fail(f"rte {r}: a seated pubkey is not on the path (or seated twice)")
             self.spans.append(hops)
             self.hops.append({h["pubkey"]: h for h in hops})
             self.backups.append(bk)
@@ -815,8 +854,13 @@ class _Verifier:
 
     # 2. checkpoints: signature, job binding, placement in the path log
     def _checkpoints(self):
-        groups = {}
+        groups, seen_ids = {}, set()
         for ck in self.ckpts:
+            if type(ck) is dict:
+                cid = ckpt_id(ck)
+                if cid in seen_ids:
+                    continue                      # the same signed checkpoint delivered twice
+                seen_ids.add(cid)
             if type(ck) is not dict or ck.get("schema") != CKPT_SCHEMA:
                 _fail("checkpoint: unknown schema")
             _check_sig(ck)
@@ -825,7 +869,7 @@ class _Verifier:
                 _fail(f"checkpoint of {str(pk)[:10]}.. carries nonce {str(ck.get('nonce'))[:16]!r}, "
                       f"not the job's (stale or replayed)")
             if (ck.get("job_id"), ck.get("sid"), ck.get("manifest_cid")) != \
-                    (self.job_id, self.sid, self.pl.get("manifest_cid")):
+                    (self.job_id, self.sid, self.manifest):
                 _fail(f"checkpoint of {str(pk)[:10]}.. is bound to another job/session/manifest")
             if type(r) is not int or not 0 <= r < len(self.rtes):
                 _fail(f"checkpoint for unknown rte {r!r}")
@@ -836,6 +880,9 @@ class _Verifier:
                 if (ck.get("lo"), ck.get("hi"), ck.get("role")) != (h["lo"], h["hi"], h["role"]):
                     _fail(f"checkpoint of {pk[:10]}.. attests [{ck.get('lo')}, {ck.get('hi')}) "
                           f"{ck.get('role')}; the path log has [{h['lo']}, {h['hi']}) {h['role']}")
+                if h["_nid"] is not None and ck.get("numerics_id") != h["_nid"]:
+                    _fail(f"checkpoint of {pk[:10]}.. runs numerics {str(ck.get('numerics_id'))[:16]}, "
+                          f"its lease says {str(h['_nid'])[:16]}")
             elif lg == "mirror":
                 h = self.backups[r].get(pk)
                 if (h is None or ck.get("of") != h["pubkey"] or ck.get("role") != "backup"
@@ -863,7 +910,9 @@ class _Verifier:
         last_tail = self.serve(len(self.rtes) - 1, self.spans[-1][-1]["pubkey"])
         tokens = self.pos_end + 1 - self.P if last_tail is not None and last_tail.tok_next else 0
         return {"ok": True, "job_id": self.job_id, "sid": self.sid, "layers": self.L,
-                "prompt_len": self.P, "pos_end": self.pos_end, "tokens": tokens, "work": self.work}
+                "prompt_len": self.P, "pos_end": self.pos_end, "tokens": tokens,
+                "tokens_unattested": min(tokens, self.unattested) if tokens else self.unattested,
+                "work": self.work}
 
     def _rte(self, r):
         e, P, G = self.rtes[r], self.P, GRID
@@ -881,8 +930,13 @@ class _Verifier:
             if lg is None:
                 if pk not in dead:
                     _fail(f"rte {r}: hop {pk[:10]}.. delivered no checkpoint and is not declared dead")
+                if pe - ps > 2 * G + h["_W"]:
+                    _fail(f"rte {r}: {pk[:10]}.. declared dead with no checkpoint but the rte ran "
+                          f"{pe - ps} positions: a live hop would have checkpointed (> 2*grid + W)")
                 ends[pk] = (False, ps)
                 continue
+            if lg.end > pe:
+                _fail(f"rte {r}: {pk[:10]}.. signed a checkpoint at {lg.end}, past the rte end {pe}")
             if lg.pos_lo != ps:
                 _fail(f"rte {r}: {pk[:10]}.. log starts at {lg.pos_lo}, the rte at {ps}")
             if set(lg.subs) != ({"in", "out", "kv"} if self.has_kv(lo, hi) else {"in", "out"}):
@@ -891,7 +945,7 @@ class _Verifier:
                 if lg.closed:
                     _fail(f"rte {r}: {pk[:10]}.. is declared dead but signed the {lg.close_kind} "
                           f"(false death claim)")
-                if pe - lg.end > 2 * G + self.W:
+                if pe - lg.end > 2 * G + h["_W"]:
                     _fail(f"rte {r}: {pk[:10]}.. declared dead at {lg.end} but the rte ran to {pe}: a "
                           f"live hop would have checkpointed (more than 2*grid + W positions)")
                 ends[pk] = (False, lg.end)
@@ -902,8 +956,11 @@ class _Verifier:
                 if lg.close_kind != ("close" if final else "rte_close"):
                     _fail(f"rte {r}: {pk[:10]}.. closed with {lg.close_kind}")
                 ends[pk] = (True, pe)
-            if role in ("tail", "solo") and lg.closed and pe > ps and lg.tok_next is None:
-                _fail(f"rte {r}: tail {pk[:10]}.. closed without tok_next")
+            if role in ("tail", "solo") and lg.closed and pe > ps:
+                _hex32(lg.tok_next, f"rte {r}: tail {pk[:10]}.. tok_next")
+            if role != "mid" and lg.fixed.get("prompt_len") != P:
+                _fail(f"rte {r}: {pk[:10]}.. signed prompt_len {lg.fixed.get('prompt_len')!r}, the path "
+                      f"log says {P}")
             if role in ("head", "solo"):
                 codec_of = lambda kind: "ids"      # noqa: E731
             else:
@@ -937,15 +994,13 @@ class _Verifier:
         # SEG schedules agree: decode/verify frames are forwarded whole and never coalesced
         # (C15), so every hop of an rte ran the same non-prefill segments (a hop re-splits only
         # prefill). A hop whose shape log differs lies about it, or computed a frame its path did not.
-        ref_pk, ref = None, None
-        for h in self.spans[r]:
-            lg = self.serve(r, h["pubkey"])
-            if lg is None:
-                continue
+        logged = [(self.serve(r, h["pubkey"]), h) for h in self.spans[r] if self.serve(r, h["pubkey"])]
+        longest = max(logged, key=lambda x: x[0].end, default=(None, None))[0]
+        if longest is not None:
+            ref_pk, ref_end = longest.pubkey, longest.end
+            ref = [(x[0], x[1], x[3]) for x in longest.seg_recs if x[3] != "prefill"]
+        for lg, h in logged:
             sched = [(x[0], x[1], x[3]) for x in lg.seg_recs if x[3] != "prefill"]
-            if ref is None:
-                ref_pk, ref, ref_end = h["pubkey"], sched, lg.end
-                continue
             cut = min(lg.end, ref_end)
             a_, b_ = [x for x in ref if x[0] < cut], [x for x in sched if x[0] < cut]
             if a_ != b_:
@@ -954,6 +1009,9 @@ class _Verifier:
                       f"{b_[i] if i < len(b_) else None} where {ref_pk[:10]}.. ran "
                       f"{a_[i] if i < len(a_) else None}")
 
+        tl, tend = ends[self.spans[r][-1]["pubkey"]]
+        if not tl:
+            self.unattested += max(0, pe + 1 - max(tend, P))
         for h in self.spans[r]:
             live, end = ends[h["pubkey"]]
             pre = max(0, min(end, P) - ps)
@@ -981,8 +1039,8 @@ class _Verifier:
             ml = self.logs.get((b, r, "mirror"))
             if ml is None:
                 continue
-            if set(ml.subs) != {"kv"} or ml.pos_lo != ps:
-                _fail(f"rte {r}: mirror log of {b[:10]}.. malformed")
+            if set(ml.subs) != {"kv"} or ml.pos_lo != ps or ml.end > pe:
+                _fail(f"rte {r}: mirror log of {b[:10]}.. malformed or past the rte end")
             pl_ = self.serve(r, h["pubkey"])
             prim = pl_.chains("kv") if pl_ is not None else {}
             ok = ps
@@ -998,8 +1056,7 @@ class _Verifier:
                               "positions": ok - ps})
 
     def _boundary(self, b, r, what):
-        """Everything attested at layer boundary b (b = 0: the token boundary) before rte r, plus a
-        seated predecessor's forwarded rebuild rows in rte r (a chained rebuild)."""
+        """Everything committed at layer boundary b (b = 0: the token boundary) before rte r."""
         ref = _Ref(what)
         for q in range(r):
             for h in self.spans[q]:
@@ -1013,10 +1070,6 @@ class _Verifier:
                         ref.add(lg.subs["out"])               # the tail's token log
                     elif b > 0 and h["hi"] == b and "out" in lg.subs:
                         ref.add(lg.subs["out"])
-        for h in self.spans[r]:
-            lg = self.logs.get((h["pubkey"], r, "rebuild"))
-            if b > 0 and h["hi"] == b and lg is not None and "out" in lg.subs:
-                ref.add(lg.subs["out"])
         return ref
 
     def _kv_history(self, pk, lo, hi, r):
@@ -1062,12 +1115,27 @@ class _Verifier:
             _fail(f"{who}: inputs must start at {a // GRID * GRID}")
         if set(rb.subs) - {"out"} != {"in"} | ({"kvi", "kv"} if self.has_kv(lo, hi) else set()):
             _fail(f"{who}: keeps logs {sorted(rb.subs)}")
-        if "out" in rb.subs and rb.subs["out"].lo < a:
-            _fail(f"{who}: forwards rows below a={a} it never computed")
+        n_swa = sum(k == "swa" for k in self.kinds[lo:hi])
+        a_fwd = None
+        if "out" in rb.subs:
+            a_fwd = max(0, rb.subs["out"].lo - (self.window - 1) * n_swa)
+            if a > a_fwd:
+                _fail(f"{who}: forwards rows from {rb.subs['out'].lo} but started at {a}: they are not "
+                      f"exact before {a + (self.window - 1) * n_swa}")
         _seg_check(rb, a, P=self.P, codec_of=lambda kind: None, where=who)
 
-        # inputs: what the predecessor (at the head: the token logs) attested at boundary lo
-        ref = self._boundary(lo, r, f"the committed activations at layer {lo}")
+        # inputs: a chained rebuild's come from its seated predecessor's forwarded rows (which may
+        # differ from the committed ones: other numerics, other codec); any other rebuild's are
+        # the committed activations at boundary lo (at the head: the token logs)
+        if tier == "chain":
+            pred = next((x for x in self.spans[r] if x["hi"] == lo), None)
+            plg = self.logs.get((pred["pubkey"], r, "rebuild")) if pred is not None else None
+            if plg is None or "out" not in plg.subs:
+                _fail(f"{who}: a chained rebuild needs a seated predecessor that forwarded its rows")
+            ref = _Ref(f"the rows {pred['pubkey'][:10]}.. forwarded")
+            ref.add(plg.subs["out"])
+        else:
+            ref = self._boundary(lo, r, f"the committed activations at layer {lo}")
         ref.check(rb.subs["in"], f"{who}: forged rebuild, its inputs")
 
         upto_pay = upto
@@ -1084,14 +1152,19 @@ class _Verifier:
             self._kv_history(repl, lo, hi, r - 1).check(rb.subs["kvi"], f"{who}: KV lie, imported KV")
         elif upto != 0:
             _fail(f"{who}: tier {tier} imports no KV (upto must be 0)")
-        # Pay from the rule's start given the KV the replacement could have held: a leased backup
-        # that acked mirror rows to g_ack is paid as if it had imported them (withholding a mirror
-        # to earn rebuild credit earns nothing).
-        if repl is not None and r > 0 and repl in self.ends[r - 1]:
-            g_rep = self.ends[r - 1][repl][1]
-            bh = self.backups[r - 1].get(pk)
-            if bh is not None and bh["pubkey"] == repl and (pk, r - 1) in self.mirror_ok:
-                upto_pay = max(upto_pay, min(g_rep, self.mirror_ok[(pk, r - 1)]))
-        a_pay = max(a, rebuild_rule(span, self.window, F, upto_pay))
+        # Pay from the rule's start given the KV the replacement could have held: the leased
+        # backup of this span that acked mirror rows to g_ack is paid as if it had imported them,
+        # whatever it claims to replace (withholding a mirror earns nothing). A forwarder is owed
+        # the rows its successor needed exact. A key re-seated after its own death is owed nothing.
+        bh = self.backups[r - 1].get(pk)
+        if bh is not None and (bh["lo"], bh["hi"]) == (lo, hi) and (pk, r - 1) in self.mirror_ok:
+            g_rep = self.ends[r - 1][bh["pubkey"]][1]
+            upto_pay = max(upto_pay, min(g_rep, self.mirror_ok[(pk, r - 1)]))
+        need = rebuild_rule(span, self.window, F, upto_pay)
+        if a_fwd is not None:
+            need = min(need, a_fwd)
+        owed = max(0, F - max(a, need))
+        if pk in (self.rtes[r - 1].get("dead") or []):
+            owed = 0
         self.work.append({"pubkey": pk, "rte": r, "lo": lo, "hi": hi, "kind": "rebuild",
-                          "positions": max(0, F - a_pay)})
+                          "positions": owed})

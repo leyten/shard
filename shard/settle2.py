@@ -52,7 +52,9 @@ def capped_weights(units: dict, cap=REBUILD_CAP) -> tuple[dict, bool]:
     num, den = cap
     base = sum(u["base"] for u in units.values())
     reb = sum(u["rebuild"] for u in units.values())
-    if base > 0 and reb * den > (reb + base) * num:
+    if base == 0 and reb > 0:
+        raise ReceiptError("no serve work attested: rebuild credit alone is not payable")
+    if reb * den > (reb + base) * num:
         # rebuild total R scaled to R' = base*num/(den-num): multiply base by R*(den-num), rebuild by base*num
         fb, fr = reb * (den - num), base * num
         return {pk: u["base"] * fb + u["rebuild"] * fr for pk, u in units.items()}, True
@@ -81,13 +83,14 @@ def settle_work(work, pool: int, *, pay=None, cap=REBUILD_CAP) -> dict:
     return {"payouts": split_pool(pool, weights), "weights": weights, "capped": capped}
 
 
-def settle_v2(path_log, checkpoints, pool: int, *, leases, entry_pubkey, nonce, job_id, layer_kinds,
-              window, pay=None, cap=REBUILD_CAP) -> dict:
+def settle_v2(path_log, checkpoints, pool: int, *, leases, entry_pubkey, nonce, job_id, manifest_cid,
+              layer_kinds, window, pay=None, cap=REBUILD_CAP) -> dict:
     """Verify (fail closed) and split the pool. Returns the coverage verdict plus the payouts."""
     try:
         from .receipt2 import verify_coverage_v2
     except ImportError:
         from receipt2 import verify_coverage_v2
     cov = verify_coverage_v2(path_log, checkpoints, leases=leases, entry_pubkey=entry_pubkey,
-                             nonce=nonce, job_id=job_id, layer_kinds=layer_kinds, window=window)
+                             nonce=nonce, job_id=job_id, manifest_cid=manifest_cid,
+                             layer_kinds=layer_kinds, window=window)
     return dict(cov, **settle_work(cov["work"], pool, pay=pay, cap=cap))

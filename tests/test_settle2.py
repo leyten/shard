@@ -142,7 +142,7 @@ def test_random_jobs_pay_exactly_the_pool():
         try:
             r = S.settle_work(work, pool)
         except ReceiptError as e:
-            assert "no attested work" in str(e)
+            assert "no attested work" in str(e) or "no serve work" in str(e)
             continue
         assert sum(r["payouts"].values()) == pool
         assert all(v >= 0 for v in r["payouts"].values())
@@ -157,6 +157,8 @@ def test_settle_rejects_bad_input():
         S.settle_work([], 10)
     with pytest.raises(ReceiptError, match="pool"):
         S.settle_work([{"pubkey": "a", "lo": 0, "hi": 1, "kind": "serve", "prefill": 0, "decode": 1}], -1)
+    with pytest.raises(ReceiptError, match="no serve work"):
+        S.settle_work([{"pubkey": "a", "lo": 0, "hi": 1, "kind": "rebuild", "positions": 9}], 10)
     with pytest.raises(ReceiptError, match="unknown work kind"):
         S.settle_work([{"pubkey": "a", "lo": 0, "hi": 1, "kind": "tip", "positions": 1}], 10)
 

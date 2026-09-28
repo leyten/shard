@@ -19,9 +19,10 @@ bytes depend on segment shape, like float kernels), so every path mixes numerics
 CUDA card and a Mac would. fp8 is a real per-row-scaled lossy codec over the toy's integers.
 
 Faults and bugs are scripted: kill a hop (optionally losing its in-flight checkpoint), take over
-from a KV mirror, rebuild from a predecessor's log, reroute to another path shape, and node bugs
-for the mutation suite (fold at c, accept any sender, forge rebuild inputs, lie about a token or
-the imported KV).
+from a KV mirror (mid hop or head), rebuild from a predecessor's log, a double death recovered by
+a chained rebuild (the first replacement forwards its rebuilt rows), a dead hop re-seated, reroute
+to another path shape, and node bugs for the mutation suite (fold at c, accept any sender, forge
+rebuild inputs, lie about a token or the imported KV).
 """
 from __future__ import annotations
 
@@ -49,7 +50,7 @@ W = 16                               # spec window of every lease
 MAX_POS = 1024
 WEIGHTS = ToyWeights(PATTERN, hidden=H, vocab=V, seed=7)
 MANIFEST = WEIGHTS.artifact_cid
-MODEL_INFO = {"layer_kinds": list(KINDS), "window": WINDOW}
+MODEL_INFO = {"layer_kinds": list(KINDS), "window": WINDOW, "manifest_cid": MANIFEST}
 
 
 def key(name: str) -> ed25519.Ed25519PrivateKey:
@@ -340,10 +341,10 @@ class Job:
             if b is not None:
                 h["backup"] = b.pub
                 self.leases.append({"sid": self.sid, "rte": r, "pubkey": b.pub, "lo": n.lo, "hi": n.hi,
-                                    "role": "backup"})
+                                    "role": "backup", "W": W})
             hops.append(h)
             self.leases.append({"sid": self.sid, "rte": r, "pubkey": n.pub, "lo": n.lo, "hi": n.hi,
-                                "role": n.role})
+                                "role": n.role, "W": W, "numerics_id": n.nid})
         self.paths.append(list(path))
         self.rtes.append({"rte": r, "pos_start": ps, "pos_end": None, "cx": self.cx,
                           "cx_prefill": self.cx_prefill, "hops": hops, "dead": [], "seated": seated})
@@ -488,8 +489,8 @@ class Job:
                            and ck["rte"] == self.rte] + [self.rtes[-1]["pos_start"]])
             upto = min(g_entry, bk.acked)
             n.rt.import_state(rsid, bk.blob(upto), upto)
-        a = n.rt.rebuild_from(rsid, F, floor=F)
-        fwd_lo = 0 if forward else None
+        fwd_lo = 0 if forward else None                  # a chained successor rebuilds from 0
+        a = n.rt.rebuild_from(rsid, F, floor=F, exact_from=fwd_lo)
         rb = R2.RebuildLog(n.priv, job_id=self.job_id, sid=self.sid, nonce=self.nonce, manifest_cid=MANIFEST,
                            numerics_id=n.nid, rte=self.rte + 1, lo=n.lo, hi=n.hi, role=n.role, a=a, F=F,
                            upto=upto, tier=tier, replaces=repl.pub if repl is not None else None,
@@ -569,7 +570,7 @@ class Job:
 
     def path_log(self):
         body = {"job_id": self.job_id, "sid": self.sid, "nonce": self.nonce, "manifest_cid": MANIFEST,
-                "layers": L, "prompt_len": self.P, "W": W, "rtes": copy.deepcopy(self.rtes)}
+                "layers": L, "prompt_len": self.P, "rtes": copy.deepcopy(self.rtes)}
         return R2.sign_path_log(self.entry, body)
 
     def bundle(self):
@@ -727,7 +728,7 @@ def path_a(tag, modes=("chunk_invariant", "adversarial", "chunk_invariant", "adv
     return [Node(f"{tag}/h{i}", lo, hi, modes[i], bugs.get(i, ())) for i, (lo, hi) in enumerate(spans)]
 
 
-def scenario(which, **kw):
+def scenario(which, /, **kw):
     return SCENARIOS[which](**kw)
 
 
@@ -778,7 +779,7 @@ def sc_reroute(**kw):
 
     def second(j):
         drain(j)
-        j.failover([fat, m2, t2], seated={m2: ("chain", None), t2: ("chain", None)})
+        j.failover([fat, m2, t2], seated={m2: ("log", None), t2: ("chain", None)})
     run([job], events=[(job, 290, first), (job, 400, second)])
     return job.bundle()
 
@@ -789,30 +790,56 @@ def drain(j):
         j.on_reply(msg, rep)
 
 
-def sc_takeover(bugs_backup=(), tier="mirror", **kw):
+def sc_takeover(bugs_backup=(), tier="mirror", victim=2, replaces=True, **kw):
     """kill -9 of [6,9) (global KV) with its in-flight checkpoint lost; its leased backup imports
     the mirrored KV to g_eff and rebuilds [a, F) from [3,6)'s log. The backup runs other numerics
-    (adversarial vs the primary's chunk_invariant), so the continuation is valid, not bit-exact."""
-    path = path_a("takeover")
-    bk = Node("takeover/backup", 6, 9, "adversarial", bugs_backup)
-    job = Job(path, name="takeover", K=3, depth=2, miss=4, n_new=330, backups={path[2]: bk})
-    job.on_death = lambda j: j.failover([path[0], path[1], bk, path[3]], dead=[path[2]],
-                                        seated={bk: (tier, path[2])})
-    run([job], events=[(job, 350, lambda j: kill(path[2], j))])
+    (adversarial vs the primary's chunk_invariant), so the continuation is valid, not bit-exact.
+    victim=0: the head dies instead (its backup re-derives token leaves from the entry's ids)."""
+    tag = "takeover" if victim == 2 else f"takeover-v{victim}"
+    path = path_a(tag)
+    v = path[victim]
+    bk = Node(f"{tag}/backup", v.lo, v.hi, "adversarial", bugs_backup)
+    job = Job(path, name=tag, K=3, depth=2, miss=4, n_new=330, backups={v: bk})
+    new = [bk if n is v else n for n in path]
+    job.on_death = lambda j: j.failover(new, dead=[v], seated={bk: (tier, v if replaces else None)})
+    run([job], events=[(job, 350, lambda j: kill(v, j))])
     return job.bundle()
 
 
-def sc_dead(bugs_new=(), **kw):
+def sc_dead(bugs_new=(), rejoin=False, **kw):
     """The tail dies with no backup. A fresh holder rebuilds [0, F) from [6,9)'s log (tier 2); the
-    dead tail is paid to its last delivered checkpoint, the positions after it are unchained."""
-    path = path_a("dead")
-    t2 = Node("dead/tail2", 9, 12, "chunk_invariant", bugs_new)
-    job = Job(path, name="dead", K=3, depth=2, miss=4, n_new=330)
-    job.on_death = lambda j: j.failover([path[0], path[1], path[2], t2], dead=[path[3]],
-                                        seated={t2: ("log", None)})
+    dead tail is paid to its last delivered checkpoint, the positions after it are unchained.
+    rejoin=True: the dead tail itself comes back and is re-seated (owed no rebuild credit)."""
+    tag = "dead-rejoin" if rejoin else "dead"
+    path = path_a(tag)
+    t2 = path[3] if rejoin else Node(f"{tag}/tail2", 9, 12, "chunk_invariant", bugs_new)
+
+    def on_death(j):
+        path[3].alive = path[3].alive or rejoin
+        j.failover([path[0], path[1], path[2], t2], dead=[path[3]], seated={t2: ("log", None)})
+    job = Job(path, name=tag, K=3, depth=2, miss=4, n_new=330)
+    job.on_death = on_death
     run([job], events=[(job, 300, lambda j: kill(path[3], j))])
     return job.bundle()
 
 
+def sc_double(which="mid", **kw):
+    """Two adjacent hops die together, so the second replacement's input boundary has no live
+    holder: the first replacement (other numerics; for "mid" an SWA-only span, which must rebuild
+    from 0 to forward exact rows) forwards its rebuilt rows and the second is seated on them
+    (a chained rebuild). "mid": [3,6)+[6,9) die; "tail": [6,9)+[9,12) die."""
+    tag = f"double-{which}" + ("-fp8" if kw.get("cx") == "fp8" else "")
+    path = path_a(tag)
+    i = 1 if which == "mid" else 2
+    dead = [path[i], path[i + 1]]
+    n1 = Node(f"{tag}/n1", dead[0].lo, dead[0].hi, "adversarial")
+    n2 = Node(f"{tag}/n2", dead[1].lo, dead[1].hi, "chunk_invariant")
+    new = path[:i] + [n1, n2] + path[i + 2:]
+    job = Job(path, name=tag, K=3, depth=2, miss=4, n_new=330, **kw)
+    job.on_death = lambda j: j.failover(new, dead=dead, seated={n1: ("log", None), n2: ("chain", None)})
+    run([job], events=[(job, 300, lambda j: [kill(n, j) for n in dead])])
+    return job.bundle()
+
+
 SCENARIOS = {"plain": sc_plain, "spec": sc_spec, "batch": sc_batch, "fp8": sc_fp8,
-             "reroute": sc_reroute, "takeover": sc_takeover, "dead": sc_dead}
+             "reroute": sc_reroute, "takeover": sc_takeover, "dead": sc_dead, "double": sc_double}

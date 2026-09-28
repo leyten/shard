@@ -64,7 +64,8 @@ def settle_v2(req: dict) -> dict:
     from .settle2 import REBUILD_CAP, settle_v2 as _settle_v2
     out = _settle_v2(req["path_log"], req["checkpoints"], req["pool"], leases=req["leases"],
                      entry_pubkey=req["entry_pubkey"], nonce=req["expected_nonce"], job_id=req["job_id"],
-                     layer_kinds=req["layer_kinds"], window=req["window"], pay=req.get("pay"),
+                     manifest_cid=req["manifest_cid"], layer_kinds=req["layer_kinds"],
+                     window=req["window"], pay=req.get("pay"),
                      cap=tuple(req.get("rebuild_cap", REBUILD_CAP)))
     out["weights"] = {k: str(v) for k, v in out["weights"].items()}
     return out
@@ -76,7 +77,8 @@ def _main() -> int:
     a rejected set). mode "payment" (the default) REQUIRES assignments — missing/empty is a config
     bug (exit 2), not a verdict; mode "unpinned" routes to settle_unpinned and ignores them.
     mode "v2" is a mesh job: {path_log, checkpoints, leases, entry_pubkey, expected_nonce, job_id,
-    layer_kinds, window, pool, pay?, rebuild_cap?} -> settle_v2's {ok, work, weights, payouts, ...}."""
+    manifest_cid, layer_kinds, window, pool, pay?, rebuild_cap?} -> settle_v2's {ok, work,
+    weights, payouts, ...}."""
     try:
         req = json.load(sys.stdin)
     except Exception as e:  # noqa: BLE001
