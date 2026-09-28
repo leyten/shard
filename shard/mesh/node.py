@@ -59,8 +59,11 @@ the tail computes every row's token, judges `acc` with the Frontier (the prefill
 answers only the rows `lg` asks for. A frame whose cpos claims more than the tail has committed
 (cpos > cfront + 1) is refused before anything moves. With a drafter named in the lease (one the
 node was built with: `drafters={name: factory(lease) -> blocks(cfront, mfront)}`), every accepted
-frame's reply carries `blk`, the proposals for cfront+2.. (V4's convention). A lease_update's
-truncate_to below the frontier re-opens it at F: the entry's next frame at F carries the token.
+frame's reply carries `blk`, the proposals for cfront+2.. (V4's convention); a drafter fault
+costs that reply its block, never the node. A lease_update's truncate_to below the frontier
+re-opens it at F with the token this tail computed there (`Lease.path`), so the entry's re-feed
+is judged, not trusted. A solo hop also refuses an eid that is not the ids it computes, and a
+second prefill is refused (it would reset the frontier unjudged).
 
 Wire codecs. Hidden rows travel as the runtime's wire dtype: bf16 -> cx=bf16, fp8_e4m3 -> cx=fp8
 with per-row `xs`. shard-frame/2 has no integer codec, so a runtime whose wire dtype is i32 (the
@@ -499,8 +502,9 @@ class NodeServer:
         return ids
 
     def _check_judged(self, L: Lease, f: dict) -> None:
-        """Before anything moves: the eid opens to n ids, a decode frame has a prefilled frontier
-        to be judged against, and its cpos claims no more than the tail has committed."""
+        """Before anything moves: the eid opens to n ids (a solo hop's are the ids it computes),
+        a prefill is the lease's first, and a decode frame has a prefilled frontier to be judged
+        against and a cpos claiming no more than the tail has committed."""
         if not self._judged(L, f):
             return
         ids = self._eid_ids(L, f)
