@@ -14,7 +14,7 @@ rename of ARCHITECTURE-v2 §0.3), the sender-side fence (`FrameSender`, :1780-18
   * Blocks come from the tail's drafter (reply `blk`, V4) or from an entry-side drafter (a
     callable over the committed ids: M2.5's n-gram/EAGLE shape, called only when a block is used).
   * The state machine (`Session`) does no I/O and owns no thread; `run` drives one session over a
-    `Link`, and a multi-session loop (S3) can drive many sessions through one shared sender.
+    `Link`, and `run_many` (S3) drives many sessions through one shared sender.
   * The sender stamps nothing: seq/sep/cpos are fixed when the frame is built and validated.
   * Not lifted (V4 measurement or V4-only levers): the lazy-draft hints, runner-up/rescue and
     per-depth counters, topup agreement counters, fill time-integration, lever audit.

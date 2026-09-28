@@ -284,7 +284,7 @@ def _replay_session(m, frames, max_pos, W):
         for i, rt in enumerate(rts):
             if f["cpos"] >= 0:
                 rt.commit(1, f["cpos"])
-            b, outs, tail = m.devices[i].budget, [], i == m.D - 1
+            b, outs, tail = m.nodes[i]._budget, [], i == m.D - 1
             for lo in range(0, n, b):
                 hi = min(n, lo + b)
                 tok = "none"
@@ -306,6 +306,7 @@ def test_adversarial_shape_mode_equals_the_replayed_schedule(mesh_factory):
     with the sessions batched together on every hop."""
     K, box = 4, {}
     m = _mesh(mesh_factory, 3, box, K, seed=11, mode="adversarial")
+    m.nodes[1]._budget = 3                  # the mid hop re-chunks every larger frame (_run_big)
     jobs = _jobs(m, box, 8, random.Random(11), K)
     sessions = [_open(m, job, K=K) for job in jobs]
     link = _LoggingLink(m)
@@ -322,6 +323,7 @@ def test_adversarial_shape_mode_equals_the_replayed_schedule(mesh_factory):
             assert got[(h, seq)] == toks, (job[0], seq)
         differs += res[h]["tokens"] != _want(job)
     assert max(n.snapshot().get("max_batch", 0) for n in m.nodes) > 1
+    assert m.nodes[1].snapshot()["steps"] > m.nodes[0].snapshot()["steps"]    # it did re-chunk
     assert differs > 0              # the mode is really shape-dependent (else this is vacuous)
 
 
