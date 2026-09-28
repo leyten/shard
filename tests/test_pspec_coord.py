@@ -17,12 +17,13 @@ an off-path row answers a GARBAGE token no greedy stream contains.
   8. differential: the real V4 coordinator and the real M2.5 coordinate_pipe, same oracle, same
      drafts, compared result for result and frame for frame
 """
+import collections
 import socket
 import threading
 
 import pytest
 
-from scripted_pipe import (SID, ScriptedPipeline, alpha_miss, entry_drafter,
+from scripted_pipe import (SID, ScriptedPipeline, alpha_miss, entry_drafter, run_acked,
                            run_pspec, tail_blocks, toy_greedy, truth)
 
 from shard import frame as F
@@ -190,6 +191,35 @@ def test_cpos_never_exceeds_c_minus_1_and_is_tight(policy, floor):
     assert len(first_of_sep) == r["cancels"] + 1
 
 
+@pytest.mark.parametrize("policy", coord.POLICIES)
+@pytest.mark.parametrize("src", ["tail", "entry"])
+@pytest.mark.parametrize("lag", [0, 2, 5])
+def test_a_gateway_ack_caps_cpos_and_keeps_re_adoption_legal(policy, src, lag):
+    """cpos is the stages' rollback floor (runtime/api.py commit): with the gateway holding only
+    part of the committed stream, no frame may declare rows final past what the gateway holds, so
+    a re-adopting entry's truncate_to = acked-1 stays legal at every stage. The speculation shrinks
+    by the lag instead (frames still end within cpos + W, which the stages enforce)."""
+    W = 8
+    r, pipe, s, built = run_acked(T, P, 60, lag, W=W, policy=policy, **_src(src, "random"))
+    assert r["tokens"] == toy_greedy(T, P, 60)
+    for f in pipe.log:
+        assert f["cpos"] <= built[f["seq"]] - 1, f
+        assert f["pos"] + f["n"] <= f["cpos"] + W, f
+    assert all(st.committed <= s.acked - 1 for st in pipe.st), "re-adoption would be refused"
+    assert r["max_inflight"] <= W - (lag > 0), "a lagging ack must shrink the speculation"
+
+
+def test_an_ack_that_lags_by_W_fails_loudly():
+    """No room for the frontier frame itself: raise, rather than send a frame a stage must refuse."""
+    with pytest.raises(RuntimeError, match="ack lags"):
+        run_acked(T, P, 60, 8, W=8, **_src("tail", "full"))
+
+
+def test_ack_needs_a_session_built_with_acked():
+    with pytest.raises(RuntimeError, match="without acked"):
+        coord.Session(T[:P], 5, sid=SID).ack(P)
+
+
 # ── 6. the seam ────────────────────────────────────────────────────────────────────────────────
 
 class _Corrupt:
@@ -236,10 +266,11 @@ def test_an_entry_drafter_runs_without_acc(why):
 
 
 def test_over_real_sockets_via_socketlink():
-    """The adapter the node server and the fake mesh use: frames and replies as bytes on sockets."""
+    """The adapter the node server and the fake mesh use: frames and replies as bytes on sockets,
+    with a hop's `ckpt` control interleaved on the return stream (C19) and routed aside."""
     a_pipe, b_pipe = socket.socketpair()
     a_ret, b_ret = socket.socketpair()
-    done = threading.Event()
+    done, ckpts = threading.Event(), []
     with ScriptedPipeline(T, depth=3, blocks=tail_blocks(T, K, ACCEPT["random"])) as pipe:
         def head():
             try:
@@ -249,9 +280,14 @@ def test_over_real_sockets_via_socketlink():
                 return
 
         def tail():
+            k = 0
             while not done.is_set():
                 try:
-                    F.send(b_ret, pipe.recv(0.2))
+                    rep = pipe.recv(0.2)
+                    k += 1
+                    if k % 5 == 0:
+                        F.send(b_ret, F.control("ckpt", sid=SID, ck=b"signed-grid-checkpoint"))
+                    F.send(b_ret, rep)
                 except TimeoutError:
                     continue
                 except (ConnectionError, OSError):
@@ -261,7 +297,7 @@ def test_over_real_sockets_via_socketlink():
             t.start()
         try:
             s = coord.Session(T[:P], 50, sid=SID, W=K + 1, policy="pertoken", seal=bytes)
-            r = coord.run(coord.SocketLink(a_pipe, a_ret), s, timeout=10)
+            r = coord.run(coord.SocketLink(a_pipe, a_ret, on_control=ckpts.append), s, timeout=10)
         finally:
             done.set()
             for x in (a_pipe, b_pipe, a_ret, b_ret):
@@ -269,6 +305,27 @@ def test_over_real_sockets_via_socketlink():
             for t in ts:
                 t.join(5)
     assert r["tokens"] == toy_greedy(T, P, 50) and r["cancels"] > 0
+    assert ckpts and all(c["cmd"] == "ckpt" for c in ckpts)
+
+
+def test_socketlink_without_a_control_handler_refuses_a_control():
+    a, b = socket.socketpair()
+    try:
+        F.send(b, F.control("ckpt", sid=SID, ck=b"x"))
+        with pytest.raises(ConnectionError, match="no control handler"):
+            coord.SocketLink(None, a).recv(2)
+    finally:
+        a.close()
+        b.close()
+
+
+def test_a_control_message_where_a_reply_belongs_changes_nothing():
+    s = coord.Session(T[:P], 5, sid=SID)
+    fr = s.prefill()
+    s.st.pending, s.st.outstanding = 1, collections.deque([(0, 0, fr["n"], 0)])
+    with pytest.raises(RuntimeError, match="route control messages elsewhere"):
+        s.on_reply(F.control("ckpt", sid=SID, ck=b"x"))
+    assert s.st.pending == 1 and len(s.st.outstanding) == 1, "the owed frame was consumed"
 
 
 class _Rec:
@@ -318,7 +375,8 @@ def test_one_sender_serves_several_sessions():
 @pytest.mark.parametrize("prompt,max_new,kw,match", [
     (T[:P], 5, {"W": 0}, "in-flight cap"), (T[:P], 5, {"floor": 0}, "refill floor"),
     (T[:P], 5, {"policy": "tree"}, "frame policy"), (T[:P], 0, {}, "max_new"),
-    ([], 5, {}, "prefill frame"), ([1] * (F.MAX_ROWS + 1), 5, {}, "prefill frame")])
+    ([], 5, {}, "prefill frame"), ([1] * (F.MAX_ROWS + 1), 5, {}, "prefill frame"),
+    (T[:P], 5, {"acked": P - 1}, "below the prompt")])
 def test_session_refuses_bad_arguments(prompt, max_new, kw, match):
     with pytest.raises(ValueError, match=match):
         coord.Session(prompt, max_new, sid=SID, **kw)
@@ -355,7 +413,9 @@ def test_7c_full_accept_never_cancels_and_fills_the_pipeline():
     assert r["cancels"] == 0 and r["accept_hist"] == {r["accepted"]: 1}
     assert r["max_inflight"] == 4, "block of 3 + the frontier frame in flight"
     assert r["accepted"] >= 6 and r["g"] == r["generated"]
-    assert r["stale_replies"] + r["unsent_frames"] > 0, "the post-max_new drain is fenced, not judged"
+    # V4 streamed past max_new and fenced the leftovers; v2 streams no row the job cannot use, so a
+    # full-accept run that ends on max_new has nothing in flight to fence.
+    assert r["stale_replies"] + r["unsent_frames"] == 0
 
 
 def test_7c_partial_accept_cancels_at_the_first_divergence():
@@ -423,24 +483,28 @@ def _v4_signature(r):
     return d
 
 
+# (blocks, the generated token that is EOS, V4 kwargs). Every case stops on EOS with max_new=30:
+# the one deliberate difference from V4 is at a max_new stop, where v2 streams no row the job
+# cannot use and V4 streams and then fences them (pinned by the §7c tests above), so max_new
+# stops are compared there and EOS stops here, where the two must agree on everything.
 V4_CASES = {
-    "perfect": (lambda q: _perfect_block(q), {"max_new": 10}),
-    "partial": (lambda q: [_perfect_block(q)[0], 777, 778], {"max_new": 8}),
-    "zero": (lambda q: [901, 902, 903], {"max_new": 6}),
-    "eos": (lambda q: _perfect_block(q), {"max_new": 10, "eos_ids": (TRUTH[6],)}),
-    "max_new": (lambda q: _perfect_block(q), {"max_new": 3}),
-    "max_new=1": (lambda q: _perfect_block(q), {"max_new": 1}),
-    "W=2": (lambda q: _perfect_block(q), {"max_new": 8, "depth": 2}),
-    "W=3 miss": (lambda q: [_perfect_block(q)[0], 9, 9], {"max_new": 12, "depth": 3}),
-    "floor=2": (lambda q: _perfect_block(q), {"max_new": 14, "floor": 2}),
-    "floor=3": (lambda q: _perfect_block(q), {"max_new": 14, "floor": 3}),
-    "floor=3 deep miss": (lambda q: _perfect_block(q)[:2] + [90777], {"max_new": 12, "floor": 3}),
+    "perfect": (lambda q: _perfect_block(q), 10, {}),
+    "partial": (lambda q: [_perfect_block(q)[0], 777, 778], 8, {}),
+    "zero": (lambda q: [901, 902, 903], 6, {}),
+    "eos mid-block": (lambda q: _perfect_block(q), 4, {}),
+    "eos at 3": (lambda q: _perfect_block(q), 3, {}),
+    "eos at the prefill": (lambda q: _perfect_block(q), 1, {}),
+    "W=2": (lambda q: _perfect_block(q), 8, {"depth": 2}),
+    "W=3 miss": (lambda q: [_perfect_block(q)[0], 9, 9], 12, {"depth": 3}),
+    "floor=2": (lambda q: _perfect_block(q), 12, {"floor": 2}),
+    "floor=3": (lambda q: _perfect_block(q), 12, {"floor": 3}),
+    "floor=3 deep miss": (lambda q: _perfect_block(q)[:2] + [90777], 12, {"floor": 3}),
     "floor=3 miss@8": (lambda q: [(424242 if q + 2 + i == 8 else TRUTH[q + 2 + i]) for i in range(3)],
-                       {"max_new": 12, "floor": 3}),
-    "wide W=6": (lambda q: _perfect_block(q, n=8), {"max_new": 12, "depth": 6}),
+                       12, {"floor": 3}),
+    "wide W=6": (lambda q: _perfect_block(q, n=8), 12, {"depth": 6}),
     "wide floor=8 miss": (lambda q: [(424242 if i + 1 >= 6 else TRUTH[q + 2 + i]) for i in range(8)],
-                          {"max_new": 12, "floor": 8}),
-    "shrinking block": (lambda q: _perfect_block(q, n=(1 if q >= 6 else 3)), {"max_new": 12}),
+                          12, {"floor": 8}),
+    "shrinking block": (lambda q: _perfect_block(q, n=(1 if q >= 6 else 3)), 12, {}),
 }
 
 
@@ -451,10 +515,12 @@ def test_v4_differential_same_round_as_coordinate_dspark_pipelined(case):
     blocks consumed, accepts, cancels, the accept histogram, the fill, the fenced count)."""
     pytest.importorskip("torch")
     V4T = pytest.importorskip("test_v4_pipe")
-    blocks, kw = V4_CASES[case]
-    r4, _ = V4T._pipelined(blocks, **kw)
-    r2, _, _ = run_pspec(VT, 3, kw["max_new"], W=kw.get("depth", 16), floor=kw.get("floor", 1),
-                         eos=kw.get("eos_ids", ()), blocks=blocks, policy="pertoken")
+    blocks, at, kw = V4_CASES[case]
+    eos = (TRUTH[3 + at - 1],)
+    r4, _ = V4T._pipelined(blocks, max_new=30, eos_ids=eos, **kw)
+    r2, _, _ = run_pspec(VT, 3, 30, W=kw.get("depth", 16), floor=kw.get("floor", 1), eos=eos,
+                         blocks=blocks, policy="pertoken")
+    assert r2["generated"] == at
     assert _v4_signature(r2) == _v4_signature(r4)
 
 
@@ -496,5 +562,41 @@ def test_m25_differential_chunk_at_depth_1_is_coordinate_pipe_frame_for_frame(ac
     res, ring = FR.run_coordinator(Tm, Pm, d, K=Km, depth=1, max_new=60, on_commit=d.on_commit)
     r, pipe, _ = run_pspec(Tm, Pm, 60, W=Km + 1, policy="chunk", drafter=entry_drafter(Tm, Km, miss))
     m25 = [(e["start"], e["token_ids"]) for e in ring.log if e["op"] == "verify"]
-    assert m25 == [(f["pos"], f["toks"]) for f in pipe.log]
+    mine = [(f["pos"], f["toks"]) for f in pipe.log]
+    assert len(m25) == len(mine)
+    last_row = Pm + 60 - 2                                  # the last row the job can use
+    for (p4, t4), (p2, t2) in zip(m25, mine):
+        assert p4 == p2
+        # identical, except that a frame at the job's end is cut to the rows the job can use
+        assert t2 == t4[:max(1, last_row - p2 + 1)], (p2, t4, t2)
+    assert sum(len(t) for _, t in mine) < sum(len(t) for _, t in m25) or accept == "zero"
     assert res["output_ids"][:60] == r["tokens"] == toy_greedy(Tm, Pm, 60)
+
+
+def test_m25_snapshot_drafter_skews_after_a_bonus_where_pspec_does_not():
+    """Pins the drafter-timing difference coord.py documents: M2.5 requests the next block while
+    the chunk is in flight, so a drafter that proposes for its request snapshot (the NgramDrafter
+    contract) is one position behind after every full accept, and a PERFECT proposer still misses.
+    This loop asks after the commit, so the same proposer never cancels."""
+    pytest.importorskip("torch")
+    FR = pytest.importorskip("fake_ring")
+    if FR.S.M25_EAGLE or FR.S.M25_TREE:
+        pytest.skip("M25_EAGLE/M25_TREE set in this environment: not the plain depth-1 loop")
+    Tm = FR.novel_T(400, seed=5)
+    Pm, Km = 12, 6
+    propose = entry_drafter(Tm, Km)
+
+    class Snapshot:
+        def request(self, ids, k):
+            self.pending = (list(ids), k)
+
+        def fetch(self):
+            ids, k = self.pending
+            return propose(ids)[:k]
+
+        def cancel(self):
+            pass
+    res, _ = FR.run_coordinator(Tm, Pm, Snapshot(), K=Km, depth=1, max_new=60)
+    r, _, _ = run_pspec(Tm, Pm, 60, W=Km + 1, policy="chunk", drafter=propose)
+    assert res["mean_accept"] < Km - 1, "the snapshot skew is gone: update coord.py's docstring"
+    assert r["cancels"] == 0 and r["tokens"] == res["output_ids"][:60]

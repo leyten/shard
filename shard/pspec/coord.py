@@ -24,11 +24,21 @@ newest committed token. Every frame is built at pos >= f and carries cpos = f, t
 frontier F of ARCHITECTURE C18: rows < F were computed on committed inputs, the row at F may
 still hold a draft that the correction re-feeds. The deepest rewind this coordinator can ever ask
 for is a correction at some f' > f, so declaring rows < f final is safe even for a stage that
-applies cpos the moment a frame arrives (before its seek). V4 sent f-1 (v4_pipe.py:2022), one
-row more conservative, to match its stage's "drop checkpoints ending at or before cpos".
+applies cpos the moment a frame arrives (before its seek). V4 sent f-1 (v4_pipe.py:2022), one row
+more conservative than its own stage needs.
+
+cpos IS ALSO THE ROLLBACK FLOOR (runtime/api.py `commit`): an entry that may be re-adopted from the
+gateway's last checkpoint (ARCHITECTURE §4.3, `truncate_to = len(ckpt_ids) - 1`) must not let
+stages commit past it. `Session(acked=...)` / `ack(count)` cap cpos at acked-1 (count = committed
+tokens the gateway holds, prompt included); None = no re-adoption to protect. A lagging cpos
+shrinks the speculation: nothing is streamed past cpos + W - 1, and a lag that leaves no room for
+the frontier frame itself (f > cpos + W - 1) raises rather than send a frame a stage must refuse.
+Whether the lease W absorbs the checkpoint lag or cpos waits for a synchronous ack is M2's call.
 
 IN-FLIGHT CAP W. A burst streams [m] + block[:W-1] from f, so positions in flight never exceed
-f..f+W-1 and every frame's last row ends at or before cpos + W: the stage's spec window.
+f..f+W-1 and every frame's last row ends at or before cpos + W: the stage's spec window. Nothing is
+streamed past the last row the job can use either (row c-1 + tokens still to generate - 1), so a
+lease of max_pos = prompt + max_new - 1 rows always suffices.
 
 REFILL FLOOR. A reply's block is consumed when fewer than `floor`+1 positions are in flight
 (floor 1 = V4's shipped drain-only round). A chunk burst is judged whole by one reply, so under
@@ -38,11 +48,18 @@ M2.5 AT DEPTH 1 IS `chunk` + an entry drafter + floor 1 + W >= K+1: after the pr
 drafter proposes K tokens for the committed ids and one frame [cur] + drafts goes out at cur's
 position; its reply commits `plan_verify_round(drafts, toks)` (the full-accept bonus included);
 the next frame is [last committed] + a fresh block at that token's position, which is also the
-rewind. That is m25_pipe.coordinate_pipe's depth-1 loop (:937-1008) frame for frame;
-tests/test_pspec_coord.py drives the real coordinate_pipe and this loop over the same oracle and
-compares their wire frames. Two presentation differences are left to the M2.5 adapter (S4): M2.5
+rewind. That is m25_pipe.coordinate_pipe's depth-1 loop (:937-1008) frame for frame, given a
+drafter that proposes from the committed stream: tests/test_pspec_coord.py drives the real
+coordinate_pipe and this loop over the same oracle and proposals and compares their wire frames. Two presentation differences are left to the M2.5 adapter (S4): M2.5
 strips the EOS token from its output and does not clip a round that crosses max_new; this loop
-emits through the first EOS and clips at max_new.
+emits through the first EOS and clips at max_new. One drafter-timing difference: M2.5 requests the
+next block while the chunk is in flight (`d_request(dprefix + ds)`), before the full-accept bonus
+exists, so a drafter that proposes for its request snapshot (NgramDrafter) drafts one position
+behind after every full accept at depth 1 (pinned in the tests: a perfect proposer's frames
+differ). EAGLE, M2.5's actual depth-1 drafter, drafts from the context it extends over committed
+positions (phase0/eagle_draft.py:302), which is the contract this loop assumes: it asks the drafter
+after the commit. EAGLE also needs the reply's aux rows, which shard-frame/2 replies do not carry
+yet (design §3.3 `ctx`); that and the drafter's ctx input are S4/D1's, not this loop's.
 """
 import collections
 import queue
@@ -60,8 +77,9 @@ class Link(Protocol):
     """The seam between the coordinator and whatever carries its frames.
 
     `send` is called from the sender thread only, `recv` from the receiver only. Messages are
-    shard-frame/2 dicts: `send` gets a validated frame, `recv` returns a decoded reply. A dead
-    link raises ConnectionError (shard.frame.FrameError is one) or a timeout (OSError)."""
+    shard-frame/2 dicts: `send` gets a validated frame, `recv` returns a decoded REPLY (op "r"):
+    control messages on the same stream (a hop's `ckpt`, C19) are the Link's to route elsewhere.
+    A dead link raises ConnectionError (shard.frame.FrameError is one) or a timeout (OSError)."""
 
     def send(self, msg: dict) -> None: ...
 
@@ -70,18 +88,26 @@ class Link(Protocol):
 
 class SocketLink:
     """Link over two sockets: frames to the head (`pipe`), replies from the tail (`ret`). This is
-    the whole adapter for the node server and the fake mesh: both terminate the entry's streams
-    on sockets and speak shard-frame/2."""
+    the adapter for the node server and the fake mesh: both terminate the entry's streams on
+    sockets and speak shard-frame/2. Control messages arriving on `ret` go to `on_control`; with
+    none set, one is a protocol error (ConnectionError)."""
 
-    def __init__(self, pipe, ret):
-        self.pipe, self.ret = pipe, ret
+    def __init__(self, pipe, ret, on_control=None):
+        self.pipe, self.ret, self.on_control = pipe, ret, on_control
 
     def send(self, msg):
         F.send(self.pipe, msg)
 
     def recv(self, timeout):
         self.ret.settimeout(timeout)
-        return F.recv(self.ret)
+        while True:
+            msg = F.recv(self.ret)
+            if msg["op"] == "r":
+                return msg
+            if msg["op"] != "c" or self.on_control is None:
+                raise ConnectionError(f"pspec: op {msg['op']!r} on the return stream with no "
+                                      f"control handler")
+            self.on_control(msg)
 
 
 class PipeSpecState:
@@ -177,10 +203,12 @@ class Session:
     have to agree. Otherwise a callable `drafter(committed_ids) -> [tokens]` proposing the tokens
     for positions len(ids), len(ids)+1, ... (an entry-side drafter); `acc` is then optional and
     cross-checked when present. `seal(plaintext) -> bytes` seals the `eid` (the frame's ids, for
-    the tail); None sends no eid, which leaves the tail unable to judge `acc`."""
+    the tail); None sends no eid, which leaves the tail unable to judge `acc`. `acked`: committed
+    tokens (prompt included) the gateway holds, which caps cpos (see the module docstring); None
+    when there is no re-adoption to protect. Advance it with `ack`."""
 
     def __init__(self, prompt_ids, max_new, *, sid, rte=0, W=16, floor=1, policy="chunk",
-                 eos_ids=(), drafter=None, seal=None, on_token=None):
+                 eos_ids=(), drafter=None, seal=None, on_token=None, acked=None):
         prompt = [int(t) for t in prompt_ids]
         if not 1 <= len(prompt) <= F.MAX_ROWS:
             raise ValueError(f"pspec: a prompt of {len(prompt)} ids does not fit one prefill frame "
@@ -194,10 +222,14 @@ class Session:
                              f"so it must be at least 1 (1 = drain-only)")
         if policy not in POLICIES:
             raise ValueError(f"pspec: frame policy {policy!r} not in {POLICIES}")
+        if acked is not None and acked < len(prompt):
+            raise ValueError(f"pspec: acked={acked} below the prompt ({len(prompt)} ids): the "
+                             f"gateway holds the prompt it sent")
         self.sid, self.rte, self.W, self.floor, self.policy = sid, int(rte), int(W), int(floor), policy
         self.max_new, self.eos = int(max_new), {int(t) for t in eos_ids}
         self.drafter, self.seal, self.on_token = drafter, seal, on_token
         self.require_acc = drafter is None
+        self.acked = None if acked is None else int(acked)
         self.st = PipeSpecState()
         self.prompt = prompt
         self.ids = list(prompt)                              # committed stream, prompt included
@@ -213,12 +245,37 @@ class Session:
         self.trace = []                                      # (pos, tokens) per burst, for tests
 
     # ── frames ───────────────────────────────────────────────────────────────────────────────────
+    def ack(self, count):
+        """The gateway now holds `count` committed tokens (prompt included). Monotone."""
+        if self.acked is None:
+            raise RuntimeError("pspec: ack() on a session built without acked=; its cpos was never "
+                               "capped, so stages may already be committed past any checkpoint")
+        self.acked = max(self.acked, int(count))
+
+    def _cpos(self):
+        f = len(self.ids) - 1
+        return f if self.acked is None else min(f, self.acked - 1)
+
+    def _room(self, f):
+        """Draft positions a burst may stream past the frontier f: none past the last row the job
+        can use, none past the stage's spec window (cpos + W - 1). Negative: not even the
+        frontier frame fits (the gateway's ack lags by W or more)."""
+        return min(self.max_new - len(self.out) - 1, self._cpos() + self.W - 1 - f)
+
+    def _frontier(self, f):
+        room = self._room(f)
+        if room < 0:
+            raise RuntimeError(
+                f"pspec: the frontier frame at {f} does not fit the spec window W={self.W} past cpos "
+                f"{self._cpos()}: the gateway's ack lags the committed stream by W or more")
+        return room
+
     def _frame(self, pos, toks, kind, lg):
         """Build and validate one frame; the seq is spent even if the sender later drops it."""
         seq, self._seq = self._seq, self._seq + 1
         eid = None if self.seal is None else self.seal(F.eid_pack(toks))
         return F.frame(sid=self.sid, rte=self.rte, seq=seq, sep=self.st.sep, pos=pos, n=len(toks),
-                       kind=kind, cpos=len(self.ids) - 1, lg=lg, cx="ids", x=_i32(toks), eid=eid)
+                       kind=kind, cpos=self._cpos(), lg=lg, cx="ids", x=_i32(toks), eid=eid)
 
     def prefill(self):
         """The prompt as one frame at position 0; its reply returns the model's token at P."""
@@ -288,6 +345,9 @@ class Session:
                 f"taking. One accept rule, and it is plan_verify_round.")
 
     def on_reply(self, rep):
+        if rep.get("op") != "r":                             # before any state moves
+            raise RuntimeError(f"pspec: a {rep.get('op')!r} message where a reply belongs: the Link "
+                               f"must route control messages elsewhere")
         with self.st.lock:
             if not self.st.outstanding:
                 raise RuntimeError("pspec: a reply arrived for no frame on the wire")
@@ -321,18 +381,17 @@ class Session:
         if self.drafter is None:
             self.issued += bool(rep["blk"] is not None)
         f = len(self.ids) - 1
-        blk = self._block(rep, need=True)
-        burst = [(f, self.ids[f])] + [(f + 1 + i, d) for i, d in enumerate(blk[:self.W - 1])]
+        room = self._frontier(f)
+        blk = self._block(rep) if room > 0 else []
+        burst = [(f, self.ids[f])] + [(f + 1 + i, d) for i, d in enumerate(blk[:room])]
         if blk:
             self.drafted += 1
         return self._stream(burst)
 
-    def _block(self, rep, need):
+    def _block(self, rep):
         """The block for positions f+1.. : the reply's (tail drafter) or the entry drafter's."""
         if self.drafter is None:
             return _ints(rep["blk"])
-        if not need:
-            return []
         self.issued += 1
         return [int(t) for t in self.drafter(list(self.ids))]
 
@@ -373,15 +432,17 @@ class Session:
             for p in [p for p in self.sent if p >= f]:       # the discarded future
                 del self.sent[p]
             self.horizon = f - 1
+        room = self._room(f)
         if verdict != RUN:                                   # the frontier frame: pos f IS the rewind
+            room = self._frontier(f)
             burst.append((f, m))
         top = f if verdict != RUN else self.horizon          # deepest position in flight after it
-        if top - f + 1 <= self.floor:                        # at or under the floor: consume a block
-            blk = self._block(rep, need=True)
+        if top - f + 1 <= self.floor and room > 0:           # at or under the floor: consume a block
+            blk = self._block(rep)
             if blk:
                 self.drafted += 1
                 self.topups += top > f
-                for i, d in enumerate(blk[:self.W - 1]):
+                for i, d in enumerate(blk[:room]):
                     p = f + 1 + i
                     if p > top:                              # a frame on the wire is never re-streamed
                         burst.append((p, d))
@@ -392,7 +453,10 @@ class Session:
         return frames
 
     def result(self):
-        self.hist[self.run] = self.hist.get(self.run, 0) + 1
+        """V4's result keys. `g` is tokens per cycle (cycles = cancels + 1), as V4 counts it; under
+        `chunk` every rejection is a cycle, so tokens per round there is generated / frames."""
+        hist = dict(self.hist)                               # the run still open is a cycle too
+        hist[self.run] = hist.get(self.run, 0) + 1
         gen = len(self.out)
         cycles = self.cancels + 1
         return {"ok": True, "tokens": list(self.out), "prompt_tokens": len(self.prompt),
@@ -400,7 +464,7 @@ class Session:
                 "frames": self.frames, "rows": self.rows, "drafted": self.drafted,
                 "drafts_issued": self.issued, "topups": self.topups, "accepted": self.accepted,
                 "cancels": self.cancels, "cycles": cycles, "g": gen / cycles,
-                "accept_hist": dict(self.hist),
+                "accept_hist": hist,
                 "max_inflight": max(self.depths) if self.depths else 0,
                 "mean_inflight": round(sum(self.depths) / len(self.depths), 2) if self.depths else 0.0,
                 "frames_per_token": round(self.frames / gen, 3) if gen else 0.0,
@@ -418,6 +482,9 @@ def run(link, session, timeout=600.0):
     try:
         sender.put(session.st, session.prefill())
         while True:
+            if sender.err is not None:
+                raise RuntimeError(f"pspec: the frame sender died: {type(sender.err).__name__}: "
+                                   f"{sender.err}") from sender.err
             if session.owed() == 0:
                 if session.stop:
                     break

@@ -13,7 +13,8 @@ import types
 
 import pytest
 
-from scripted_pipe import alpha_miss, entry_drafter, run_pspec, tail_blocks, toy_greedy, truth
+from scripted_pipe import (alpha_miss, entry_drafter, run_acked, run_pspec, tail_blocks,
+                           toy_greedy, truth)
 from test_pspec_coord import sender_fence_case
 
 from shard.pspec import accept as ACC
@@ -90,8 +91,18 @@ def case_sender_fence(cm, fr):
     sender_fence_case(cm)
 
 
+def case_ack_lag(cm, fr):
+    """A gateway 3 tokens behind: cpos never passes its ack, re-adoption stays legal."""
+    r, pipe, s, built = run_acked(T, P, 40, 3, W=K + 1, blocks=tail_blocks(T, K, alpha_miss(0.7, 4)),
+                                  frontier=fr, mod=cm, timeout=4)
+    assert r["tokens"] == toy_greedy(T, P, 40), "not lossless"
+    assert all(f["cpos"] <= built[f["seq"]] - 1 for f in pipe.log), "cpos passed the gateway ack"
+    assert all(st.committed <= s.acked - 1 for st in pipe.st)
+
+
 BATTERY = [case_lossless_matrix, case_full_accept, case_W_truncation,
-           case_chunk_divergence_at_every_row, case_cpos_on_the_wire, case_sender_fence]
+           case_chunk_divergence_at_every_row, case_cpos_on_the_wire, case_sender_fence,
+           case_ack_lag]
 _BROKEN = (NameError, AttributeError, TypeError, SyntaxError, ImportError, UnboundLocalError)
 
 
@@ -131,13 +142,21 @@ MUTANTS = {
          "self.cfront, self.mfront = pos + k + 1, committed[-1]"),
     # the frontier / cpos
     "cpos = c (off-by-one frontier watermark)":
-        (COORD, "cpos=len(self.ids) - 1, lg=lg", "cpos=len(self.ids), lg=lg"),
+        (COORD, "return f if self.acked is None else", "return f + 1 if self.acked is None else"),
+    "cpos ignores the gateway ack":
+        (COORD, "return f if self.acked is None else min(f, self.acked - 1)", "return f"),
     "block placed one position early":
         (COORD, "                    p = f + 1 + i\n", "                    p = f + i\n"),
     "correction fed one position late":
         (COORD, "            burst.append((f, m))", "            burst.append((f + 1, m))"),
     "in-flight cap W off by one":
-        (COORD, "for i, d in enumerate(blk[:self.W - 1]):", "for i, d in enumerate(blk[:self.W]):"),
+        (COORD, "self._cpos() + self.W - 1 - f)", "self._cpos() + self.W - f)"),
+    "drafts streamed past the rows the job can use":
+        (COORD, "return min(self.max_new - len(self.out) - 1, ", "return min(10 ** 9, "),
+    "every frame marked T":
+        (COORD, 'kind = "T" if pos + len(toks) - 1 <= f else "S"', 'kind = "T"'),
+    "every frame marked S":
+        (COORD, 'kind = "T" if pos + len(toks) - 1 <= f else "S"', 'kind = "S"'),
     # the fence
     "stale-sep reply not fenced (judged as live)":
         (COORD, 'if rep["fen"] or sep != self.st.sep:', 'if rep["fen"]:'),
