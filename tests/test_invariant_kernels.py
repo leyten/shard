@@ -441,3 +441,21 @@ def test_attn_naive_batch_dependent_split_fails_invariance(attn_env):
     changed = [not torch.equal(out[idx].view(torch.int16), alone[i].view(torch.int16)) for i, idx in at]
     assert any(changed), "naive batch-dependent split did not change any probe: the test is vacuous"
 
+
+# ------------------------------------------------------------------------------------------------
+# HW2 measurement stub: GPU-less end to end
+# ------------------------------------------------------------------------------------------------
+
+def test_hw2_cost_stub_smoke(tmp_path):
+    """The HW2 T2/T4 script runs on CPU (tiny shapes), emits its schema, never claims a speed verdict from
+    interpreter timings, and its on-device invariance probe passes here."""
+    import json
+
+    from shard.ops import hw2_invariant_cost as hw2
+    out = tmp_path / "hw2.json"
+    res = hw2.main(["--smoke", "--out", str(out)])
+    assert json.loads(out.read_text())["summary"] == res["summary"]
+    assert {r["op"] for r in res["rows"]} == {"moe", "attn_global", "attn_swa"}
+    assert all(r["ratio"] > 0 for r in res["rows"])
+    assert res["summary"]["pass_ratio"] is None and res["meta"]["timings_meaningful"] is False
+    assert res["summary"]["pass_invariance"] is True
