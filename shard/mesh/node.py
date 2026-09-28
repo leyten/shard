@@ -21,8 +21,9 @@ Per inbound frame f of session s (§4.2):
      the commit: cpos is the entry's statement about committed tokens, not about this
      frame's payload, so the frontier it set stands.
   5. batch: when the loop is free it runs ONE runtime step holding at most one segment per
-     session under the runtime's token budget (round-robin across sessions). A frame larger
-     than the budget runs alone as consecutive steps and is forwarded whole.
+     session under the runtime's token budget, in the §4.2 priority classes (rebuild, then
+     truth/spec frontier-first, then prefill; round-robin ties, no starvation: `_pick`). A frame
+     larger than the budget runs alone as consecutive steps and is forwarded whole.
   6. forward: non-tail hops send the output rows to the lease's successor with the same header
      and their load byte appended to `ld`. The tail replies to `ret` with the tokens `lg` asks
      for (none on a prefill sub-chunk that is not `last`).
@@ -42,7 +43,8 @@ runtime's session table, keeping the other half as takeover headroom (C21).
 Not yet, each with a named seam:
   * lease tokens and lease_update signatures are accepted unverified (`_verify_lease`,
     `_verify_update`; M3 / M2);
-  * priority classes (rebuild > truth/spec > prefill; S3 extends `_pick`);
+  * the takeover share (phi >= 0.5 while a takeover is pending) waits for takeover (M1); the
+    priority classes themselves are in `_pick`;
   * prefill sub-chunk pipelining across hops (a too-large frame is computed in steps and
     forwarded whole; `sub`/`last` from the entry pass through);
   * activation log, mirroring, takeover, log_fetch, drain, ckpt, stats (M1: `_CONTROL`);
@@ -148,6 +150,7 @@ class NodeServer:
         self._leases: dict[int, Lease] = {}
         self._fifo: dict[int, deque] = {}
         self._rr: deque = deque()            # sessions with queued frames, round-robin order
+        self._skips: dict[int, int] = {}     # consecutive steps a ready session was passed over
         self._queued_rows = 0
         self._dead = False
         self._slock = threading.Lock()
@@ -360,6 +363,7 @@ class NodeServer:
             self._rr.remove(sid)
         except ValueError:
             pass
+        self._skips.pop(sid, None)
         self.rt.close(sid)
 
     def _ack(self, peer: str, sid_hex: str, rte: int, code: str, seq: int | None = None) -> None:
@@ -378,6 +382,7 @@ class NodeServer:
         q = self._fifo.setdefault(sid, deque())
         if not q:
             self._rr.append(sid)
+            self._skips.pop(sid, None)
         q.append((f, t))
         self._queued_rows += f["n"]
         self.count("frames_in")
@@ -389,11 +394,17 @@ class NodeServer:
         self._queued_rows -= f["n"]
         return f, t
 
+    STARVE = 4       # steps a ready session may be passed over before it goes first
+
     def _pick(self):
         """(sessions for one batched step, or a session whose frame exceeds the budget).
-        Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through."""
-        chosen, total = [], 0
-        for sid in list(self._rr):
+        Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through.
+        Then the §4.2 priority classes over each session's head frame: rebuild feeds, then
+        TRUTH/SPEC frontier-first (smallest pos - cpos), then PREFILL; ties in round-robin
+        order. A session passed over STARVE steps in a row goes first (a prefill, or a frame
+        over the budget, is never starved by a steady decode load)."""
+        ready = []
+        for i, sid in enumerate(list(self._rr)):
             q = self._fifo.get(sid)
             L = self._leases.get(sid)
             while q:
@@ -406,9 +417,14 @@ class NodeServer:
                     self._forward_fence(L, f)
                 else:
                     break
-            if not q:
-                continue
-            n = q[0][0]["n"]
+            if q:
+                f = q[0][0]
+                cls = 0 if f["kind"] == "R" else (2 if f["kind"] == "P" else 1)
+                starved = self._skips.get(sid, 0) >= self.STARVE
+                ready.append(((not starved, cls, f["pos"] - f["cpos"], i), sid, f["n"]))
+        ready.sort()
+        chosen, total = [], 0
+        for _key, sid, n in ready:
             if n > self._budget:
                 if not chosen:
                     return [], sid
@@ -433,6 +449,10 @@ class NodeServer:
             self._run_big(big)
         rest = [s for s in self._rr if s not in served and self._fifo.get(s)]
         self._rr = deque(rest + [s for s in served if self._fifo.get(s)])
+        for s in served:
+            self._skips.pop(s, None)
+        for s in rest:
+            self._skips[s] = self._skips.get(s, 0) + 1
 
     def _segment(self, L: Lease, f: dict, x: Rows | None = None, lo: int = 0, hi: int | None = None):
         n = f["n"] if hi is None else hi - lo
