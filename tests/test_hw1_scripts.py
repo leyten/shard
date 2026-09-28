@@ -285,6 +285,11 @@ def test_xfamily_dump_and_compare(tmp_path):
     assert any(r["op"] == "xfamily_router" and r["topk_set_agreement"] == 1.0 for r in d["records"])
     sp = [r for r in d["records"] if r["op"] == "xfamily_speed"]
     assert sp and all(r["ratio_b_over_a"] > 0 for r in sp)
+    chk = {c["id"]: c for c in d["checks"]}
+    assert chk["K10"]["pass"] and chk["K10"]["rel"] > 0 and chk["K11"]["ratio"] == pytest.approx(1.0)
+    t["L1.out"] = (t["L1.out"].float() * 1.2).bfloat16()               # a real cross-family break
+    save_file(t, str(b_json) + ".st")
+    assert xfamily.compare(load(a_json), load(b_json))["checks"][-1]["pass"] is False
 
 
 # ── C: system ───────────────────────────────────────────────────────────────────────────────────
@@ -367,6 +372,7 @@ def test_calib_fit_gates_and_refuses_stub(tmp_path):
     assert g["K4"]["value"] == pytest.approx(1.5) and g["K5"]["pass"] is False
     assert g["K9"]["pass"] and g["K8"]["value"] > 0
     assert cal["mesh"]["replay_rate_tok_s"] == 2500.0 and cal["stub"] is True
+    assert g["K12"]["pass"] is False and g["K12"]["value"] == {"cpu": False}   # torch fallback != fast path
 
 
 def test_calib_changes_both_sims(tmp_path):

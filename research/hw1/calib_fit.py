@@ -118,15 +118,14 @@ def fit(docs):
             if k1:
                 gates["K1"] = {"value": k1[0]["detail"], "threshold": "within 20%", "pass": k1[0]["pass"]}
 
-    # ── B: MiMo ──
-    for path, d in docs:
-        if d["script"] != "mimo_ops" or d["mode"] != "ops":
-            continue
+    # ── B: MiMo. Replay rate + kfac calibrate on the 5090 (Blackwell) if present; every family feeds K7/K12 ──
+    mimo = [(p, d) for p, d in docs if d["script"] == "mimo_ops" and d["mode"] == "ops"]
+    cal = [x for x in mimo if x[1]["device"]["family"] == "blackwell"] or mimo[:1]
+    for path, d in cal[:1]:
         dv = d["derived"]
         if dv.get("replay_tok_s_span"):
-            mesh["replay_rate_tok_s"] = dv["replay_tok_s_span"]
+            r = mesh["replay_rate_tok_s"] = dv["replay_tok_s_span"]
             src["replay"] = path
-            r = dv["replay_tok_s_span"]
             gates["K5"] = {"value": r, "threshold": ">= 4000 tok/s (1500-4000 k>=3,S<=16; <1000 drop claim)",
                            "pass": r >= 4000}
         if dv.get("layer_ms_T9"):
@@ -136,14 +135,21 @@ def fit(docs):
                 pip["kfac"] = dv["layer_ms_T9"] / m25["ms_per_layer"]
                 src["kfac"] = [path, "A1 eager B=1 s=9 ctx %s" % c1]
                 gates["K6"] = {"value": pip["kfac"], "threshold": "<= 2.0 (> 3 re-plan)", "pass": pip["kfac"] <= 2.0}
+    for path, d in mimo:
+        fam = d["device"]["family"]
+        chk = {c["id"]: c for c in d["checks"]}
+        sink, marl = chk.get("sink_effect", {}), chk.get("marlin_vs_ref", {})
+        fast = bool(sink.get("pass") and sink.get("backend") == "flashinfer_sink" and marl.get("pass"))
+        k12 = gates.setdefault("K12", {"value": {}, "pass": True,
+                                       "threshold": "fast backends pass sink_effect + marlin_vs_ref, per family"})
+        k12["value"][fam] = fast
+        k12["pass"] = k12["pass"] and fast
         fp = [r for r in d["records"] if r["op"] == "footprint_experts" and r.get("resident_bytes")]
         if fp:
             worst = max(r["resident_bytes"] / r["disk_bytes"] for r in fp)
-            gates.setdefault("K7", {"value": {}, "threshold": "<= 1.1x on-disk", "pass": True})
-            fam = d["device"]["family"]
-            gates["K7"]["value"][fam] = worst
-            gates["K7"]["pass"] = gates["K7"]["pass"] and worst <= 1.1 and all(
-                r.get("backend") == "marlin" for r in fp)
+            k7 = gates.setdefault("K7", {"value": {}, "threshold": "<= 1.1x on-disk, Marlin backend", "pass": True})
+            k7["value"][fam] = worst
+            k7["pass"] = k7["pass"] and worst <= 1.1 and all(r.get("backend") == "marlin" for r in fp)
 
     # ── A4 / C: mirror, K8, K9 ──
     imp = [r for _, r in _recs(docs, "m25_curve", "kv", "kv_import")]

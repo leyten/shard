@@ -26,6 +26,8 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import hw1_common as C  # noqa: E402
 
 DUMP_T = 17
+K10_REL, K10_AGREE = 2e-2, 0.97       # pre-registered (README K10)
+K11_RATIO = 2.5                       # pre-registered (README K11); b / a with a = the 5090
 
 
 def dump(res, Ls, experts, attn, d, device, inputs, path, router, rms):
@@ -105,7 +107,20 @@ def compare(a_doc, b_doc, a_ops=None, b_ops=None, out=None):
         mx = (af - bf).abs().max().item()
         rel = mx / (af.abs().max().item() + 1e-12)
         res.record("D", "xfamily_diff", prm, max_abs=mx, rel=rel, bit_equal=bool(torch.equal(a, b)))
+    outs = [r for r in res.doc["records"] if r["op"] == "xfamily_diff" and r["params"]["tensor"].endswith(".out")]
+    routs = [r for r in res.doc["records"] if r["op"] == "xfamily_router"]
+    if outs:
+        worst = max(r["rel"] for r in outs)
+        agree = min((r["topk_set_agreement"] for r in routs), default=1.0)
+        res.check("K10", worst <= K10_REL and agree >= K10_AGREE,
+                  f"{fb} vs {fa}: worst layer-out rel {worst:.3e} (<= {K10_REL}), "
+                  f"router top-k agreement {agree:.3f} (>= {K10_AGREE})", rel=worst, agreement=agree)
     if a_ops and b_ops:
+        la, lb = a_ops["derived"].get("layer_ms_T9"), b_ops["derived"].get("layer_ms_T9")
+        if la and lb:
+            res.check("K11", lb / la <= K11_RATIO, f"{fb}/{fa} per-layer time at T=9: {lb / la:.2f}x "
+                      f"(<= {K11_RATIO})", ratio=lb / la)
+
         ia = {_key(r): r for r in a_ops["records"] if "ms" in r and not r.get("skipped")}
         for r in b_ops["records"]:
             if "ms" in r and not r.get("skipped") and _key(r) in ia:
