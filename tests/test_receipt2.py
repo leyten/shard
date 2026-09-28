@@ -88,20 +88,19 @@ def resign_path(b, edit):
 
 
 # ── every scenario verifies ───────────────────────────────────────────────────────────────────
-@pytest.mark.parametrize("name", ["plain", "spec", "fp8", "reroute", "takeover", "dead"])
+@pytest.mark.parametrize("name", ["plain", "spec", "fp8", "reroute", "takeover", "dead", "double"])
 def test_scenario_verifies(name):
     b = gen(name)
     v = M.verify(b)
     assert v["ok"] and v["pos_end"] == b["job"].F
     assert v["tokens"] == len(b["tokens"]), "the last tail's tok_next attests every generated token"
-    # serve work tiles layers x positions exactly once, minus a dead hop's unchained tail
+    # serve work tiles layers x positions of every rte exactly once (a dead hop included: the
+    # rte's frontier only advanced through it)
     job = b["job"]
     for r, e in enumerate(job.rtes):
         units = sum((w["hi"] - w["lo"]) * (w["prefill"] + w["decode"]) for w in v["work"]
                     if w["kind"] == "serve" and w["rte"] == r)
-        dead_gap = sum((w["hi"] - w["lo"]) * (e["pos_end"] - e["pos_start"] - w["prefill"] - w["decode"])
-                       for w in v["work"] if w["kind"] == "serve" and w["rte"] == r and w["pubkey"] in e["dead"])
-        assert units + dead_gap == M.L * (e["pos_end"] - e["pos_start"])
+        assert units == M.L * (e["pos_end"] - e["pos_start"])
 
 
 def test_batched_sessions_verify_independently():
@@ -159,14 +158,17 @@ def test_fp8_wire_is_lossy_and_still_chained():
     assert M.verify(b)["ok"]
 
 
-def test_dead_hop_paid_to_its_last_delivered_checkpoint():
+def test_dead_hop_paid_for_what_its_rte_proves():
+    """The tail died after its checkpoint at g (a later one was lost in flight). Every row below
+    the rte's end reached the entry through it, so it is paid to the end, not to g; only the
+    tokens it produced after g are reported unattested."""
     b = gen("dead")
     v = M.verify(b)
     dead = node_of(b, 9)
+    e = b["job"].rtes[0]
     g = max(c["pos"] for c in hop_ckpts(b, 9))
     w = [w for w in v["work"] if w["pubkey"] == dead.pub]
-    assert len(w) == 1 and w[0]["prefill"] + w[0]["decode"] == g
-    assert b["job"].rtes[0]["pos_end"] - g > 0, "positions [g, F) of the dead tail are unchained, unpaid"
+    assert len(w) == 1 and w[0]["prefill"] + w[0]["decode"] == e["pos_end"] > g
     rb = [w for w in v["work"] if w["kind"] == "rebuild"]
     assert rb and rb[0]["positions"] == b["job"].rtes[0]["pos_end"], "a fresh tail rebuilds [0, F)"
 
@@ -392,12 +394,19 @@ def test_entry_false_death_claim():
     rejects(b, "false death claim")
 
 
+def _serve_positions(v, pk):
+    return sum(w["prefill"] + w["decode"] for w in v["work"] if w["pubkey"] == pk and w["kind"] == "serve")
+
+
 def test_entry_withholds_a_live_hops_checkpoints_and_declares_it_dead():
+    """Framing by a death claim cuts nothing: the hop is paid to the rte's proven frontier."""
     b = gen("spec")
+    victim = node_of(b, 6).pub
+    honest = _serve_positions(M.verify(b), victim)
     keep = [c for c in hop_ckpts(b, 6) if c["pos"] <= 128]
     b["checkpoints"] = [c for c in b["checkpoints"] if c not in hop_ckpts(b, 6)] + keep
-    resign_path(b, lambda pl: pl["rtes"][0]["dead"].append(node_of(b, 6).pub))
-    rejects(b, "a live hop would have checkpointed")
+    resign_path(b, lambda pl: pl["rtes"][0]["dead"].append(victim))
+    assert _serve_positions(M.verify(b), victim) == honest
 
 
 def test_entry_cannot_forge_a_hops_checkpoint():
@@ -529,21 +538,27 @@ def test_dead_hop_cannot_sign_past_the_rte_end():
 
 
 def test_entry_cannot_zero_a_hop_by_dropping_all_its_checkpoints():
-    for lo in (6, 9):                              # a mid hop, and the tail (closure skipped)
+    for lo in (6, 9):                              # a mid hop, and the tail
         b = gen("spec")
         victim = node_of(b, lo).pub
+        honest = _serve_positions(M.verify(b), victim)
         b["checkpoints"] = [c for c in b["checkpoints"] if c["pubkey"] != victim]
         resign_path(b, lambda pl, v=victim: pl["rtes"][0]["dead"].append(v))
-        rejects(b, "declared dead with no checkpoint")
+        assert _serve_positions(M.verify(b), victim) == honest
 
 
-def test_death_bound_uses_the_leased_window_not_the_path_log():
-    b = gen("spec")
-    victim = node_of(b, 6).pub
-    keep = [c for c in hop_ckpts(b, 6) if c["pos"] <= 128]
-    b["checkpoints"] = [c for c in b["checkpoints"] if c["pubkey"] != victim] + keep
-    resign_path(b, lambda pl: (pl["rtes"][0]["dead"].append(victim), pl.update(W=10 ** 9)))
-    rejects(b, "a live hop would have checkpointed")
+def test_short_job_cannot_be_given_to_one_hop():
+    """A job shorter than two grid intervals: the entry keeps only the head's checkpoints and
+    declares every other hop dead. Each is still paid the positions the head's checkpoints prove."""
+    job = M.Job(M.path_a("short"), name="short", K=3, depth=2, miss=4, prompt_len=100, n_new=150)
+    M.run([job])
+    b = job.bundle()
+    head = node_of(b, 0).pub
+    others = [n.pub for n in job.paths[0] if n.pub != head]
+    b["checkpoints"] = [c for c in b["checkpoints"] if c["pubkey"] == head]
+    resign_path(b, lambda pl: pl["rtes"][0]["dead"].extend(others))
+    v = M.verify(b)
+    assert {_serve_positions(v, pk) for pk in [head] + others} == {job.F}
 
 
 def test_kv_import_range_is_pinned():
@@ -655,3 +670,65 @@ def test_lease_pins_numerics_and_the_orchestrator_pins_the_manifest():
         R2.verify_coverage_v2(b["path_log"], b["checkpoints"], leases=b["leases"],
                               entry_pubkey=b["entry_pubkey"], nonce=b["nonce"], job_id=b["job_id"],
                               **dict(M.MODEL_INFO, manifest_cid="toy-other"))
+
+
+# ── regressions from the second adversarial pass ──────────────────────────────────────────────
+def test_forwarded_rows_need_a_chained_successor():
+    """A replacement adds an `out` log nobody consumed, to be paid as a forwarder from 0."""
+    b = gen("takeover", tier="log")
+    rb = [c for c in b["checkpoints"] if c["log"] == "rebuild"]
+    F = rb[0]["rebuild"]["F"]
+    bk = next(n for n in b["job"].paths[1] if n.lo == 6)
+    out = R2.SubLog(0)
+    for p in range(F):
+        out.append(hashlib.sha256(b"o" + bytes([p % 256])).digest())
+
+    def add_out(ck):
+        ck["logs"]["out"] = out.flush(final=True, ship_partial=True)
+    replace(b, rb, relink(bk.priv, rb, add_out))
+    rejects(b, "no chained successor")
+
+
+def test_backup_withholding_its_acks_is_still_capped():
+    """Without its mirror acks the backup is capped by what its primary signed it mirrored."""
+    b = gen("takeover", tier="log")
+    F = b["job"].rtes[1]["pos_start"]
+    with_acks = [w["positions"] for w in M.verify(b)["work"] if w["kind"] == "rebuild"]
+    b["checkpoints"] = [c for c in b["checkpoints"] if c["log"] != "mirror"]
+    v = M.verify(b)
+    assert [w["positions"] for w in v["work"] if w["kind"] == "rebuild"] == with_acks
+    assert with_acks[0] < F and not [w for w in v["work"] if w["kind"] == "mirror" and w["positions"]]
+
+
+@pytest.mark.parametrize("kw", [{"which": "mid"}, {"which": "tail"},
+                                {"which": "tail", "cx": "fp8", "cx_prefill": "fp8"}])
+def test_chained_recovery_then_a_later_rebuild(kw):
+    """After the chain, the chained hop dies too and a third node rebuilds its span from the
+    forwarder's log: the rows the span's state was built on, not the older committed ones."""
+    b = gen("double", then_rebuild=True, **kw)
+    v = M.verify(b)
+    assert len(b["job"].rtes) == 3 and len([w for w in v["work"] if w["kind"] == "rebuild"]) == 3
+
+
+def test_death_on_the_last_prefill_chunk():
+    """F = P-1 before the first token: the entry re-sends the last prompt row with drafts."""
+    b = gen("dead", on_last_prefill=True)
+    assert b["job"].rtes[0]["pos_end"] == b["job"].P - 1
+    assert M.verify(b)["ok"]
+
+
+def test_empty_rte_does_not_hide_a_substituted_token():
+    """Two route changes with no progress between them, then the entry feeds a token the tail
+    never produced at F: the closure looks back past the empty rte."""
+    for empty in (False, True):
+        job = M.Job(M.path_a(f"empty-{empty}"), name=f"empty-{empty}", K=3, depth=2, miss=4, n_new=260)
+
+        def ev(j, empty=empty):
+            M.drain(j)
+            j.failover(list(j.path))
+            if empty:
+                j.failover(list(j.path))
+            j.ids[j.F] = (j.ids[j.F] + 1) % M.V
+        M.run([job], events=[(job, 300, ev)])
+        assert (job.rtes[1]["pos_end"] == job.rtes[1]["pos_start"]) == empty
+        rejects(job.bundle(), "token closure broken")

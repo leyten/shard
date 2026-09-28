@@ -51,16 +51,22 @@ log, and every claim against its neighbours; it fails closed with a specific rea
 success returns the attested work that `shard.settle2` turns into payouts.
 
 WHAT THE ENTRY CANNOT DO. Invent a hop or backup (leases); move the prompt boundary (head and
-tail sign prompt_len); declare a live hop dead to cut its pay by more than 2*grid + W positions
-(W from the hop's lease, not the path log), or at all once the hop signed its close; attribute
-positions past an rte's end. A dead hop keeps pay to its last delivered checkpoint.
+tail sign prompt_len); attribute positions past an rte's end; cut a hop's pay by declaring it dead
+or withholding its checkpoints. The committed frontier only advances through replies that crossed
+every hop, so one hop's checkpoint at X proves every hop of that rte computed the rows below X:
+each hop of an rte is paid to the rte's proven frontier (the furthest checkpoint any of its hops
+delivered, at most pos_end), a dead one included. A hop that signed its close cannot be called dead.
 
 KNOWN LIMITS (by design, for the audit seam or the doc):
   * receipts prove consistency, not computation: a hop that forwards garbage chains fine and is
     caught by the replay audit (§7.4). Rebuild inputs prove fetching, not computing.
   * a mirror ack proves receipt, not retention: the primary's checkpoint copy rides `mirror`, so
     a backup can ack its chain without storing KV. It gains little: w_mirror is tiny, and a
-    takeover pays rebuild credit only from the rule's start given the acked frontier.
+    takeover pays rebuild credit only from the rule's start given the frontier the backup acked
+    or its primary signed it mirrored (`mirrored`), whichever is further.
+  * a malicious entry can still force unpaid rebuild work on a hop (declare it dead, re-seat it:
+    a key re-seated after its own death is owed no rebuild credit, so self-kill cannot farm it
+    under the sticky rejoin of C22). Its serve pay is unaffected.
   * the non-prefill SEG schedule must be identical on every hop of an rte. That holds while
     decode/verify frames are forwarded whole and never coalesced (C15 defers coalescing).
   * fail closed per job: one hop's bad signature or fork voids the job for everyone. The reason
@@ -279,6 +285,7 @@ class HopLedger:
         self.n_rows = 0
         self._prev = ""
         self.closed = False
+        self.mirrored = None      # a primary: its backup holds KV rows [0, mirrored) (the node sets it)
 
     @property
     def folded(self) -> int:
@@ -368,7 +375,7 @@ class HopLedger:
         if self._next != F:
             raise ReceiptError(f"close at {F}: rows from {self._next} were never written")
         extra = {}
-        if self.tailish and F > self.pos_lo:
+        if self.tailish and F > self.pos_lo and F >= self.P:   # row F-1 drew a token
             extra["tok_next"] = leaf_tok(self.salt, F, self._need_tok(F)).hex()
         out.append(self._ckpt("close" if final else "rte_close", seal=True, ship=not final, **extra))
         self.closed = True
@@ -385,6 +392,8 @@ class HopLedger:
                     **extra)
         if self.seg is not None:
             body["seg"] = self.seg.flush()
+        if self.mirrored is not None:
+            body["mirrored"] = self.mirrored
         ck = _sign(self.priv, body)
         self._prev = ckpt_id(ck)
         return ck
@@ -581,7 +590,7 @@ class _Log:
             else self.pos_lo
         seg_chain = _seg0(_int(seg_lo, f"{self.who} seg lo"))
         grid_next = (self.pos_lo // GRID + 1) * GRID
-        n_rows, closed, self.tok_next = 0, False, None
+        n_rows, closed, self.tok_next, self.mirrored = 0, False, None, 0
         for i, ck in enumerate(seq):
             pos = _int(ck.get("pos"), f"{self.who} pos")
             kind = ck.get("kind")
@@ -636,6 +645,8 @@ class _Log:
                     _fail(f"{where}: SEG chain does not fold its records")
                 self.seg_at[pos] = len(self.seg_recs)
             self.tok_next = ck.get("tok_next")
+            if ck.get("mirrored") is not None:
+                self.mirrored = max(self.mirrored, _int(ck["mirrored"], f"{where} mirrored"))
         want_lo = {"in": self.pos_lo, "out": self.pos_lo, "kv": self.pos_lo}
         if self.log == "rebuild" and type(self.rebuild) is dict:
             want_lo = {"in": self.pos_lo, "kvi": 0, "kv": self.rebuild.get("upto")}
@@ -671,7 +682,7 @@ def _seg_check(log: _Log, lo: int, *, P: int, codec_of, where: str):
             _fail(f"{where}: SEG lie: decode segment [{s}, {n}] is not one row")
         if kind == "prefill" and s + n > P:
             _fail(f"{where}: SEG lie: prefill segment [{s}, {n}] runs past the prompt ({P})")
-        if kind in ("verify", "decode") and s < P:
+        if kind in ("verify", "decode") and s < P - 1:
             _fail(f"{where}: SEG lie: {kind} segment at {s} lies below the prompt ({P})")
         if (kind == "rebuild") != (log.log == "rebuild"):
             _fail(f"{where}: SEG lie: {kind} segment at {s} in a {log.log} log")
@@ -687,20 +698,47 @@ def _seg_check(log: _Log, lo: int, *, P: int, codec_of, where: str):
 
 
 class _Ref:
-    """Attested leaves at one layer boundary (or of one span's KV), merged from several sub-logs."""
+    """Attested leaves at one layer boundary (or of one span's KV), merged from several sub-logs
+    in layers, newest first: a position takes its value from the newest layer that attests it.
+    After a chained recovery a span's state was built on forwarded rows, whose bytes may differ
+    from older committed rows at the same positions; a later rebuild must reproduce that state.
+    Within one layer (one rte) two attestations must agree."""
 
     def __init__(self, what):
         self.what = what
-        self.roots: dict[int, bytes] = {}
-        self.leaves: dict[int, bytes] = {}
+        self.layers: list[tuple[dict, dict]] = []
+
+    def layer(self):
+        self.layers.append(({}, {}))
+        return self
 
     def add(self, sub: _Sub):
+        if not self.layers:
+            self.layer()
+        roots, leaves = self.layers[-1]
         for k, r in sub.roots.items():
-            if sub.full(k) and self.roots.setdefault(k, r) != r:
+            if sub.full(k) and roots.setdefault(k, r) != r:
                 _fail(f"{self.what}: two attestations disagree on interval {k}")
         for p, lf in sub.leaves.items():
-            if self.leaves.setdefault(p, lf) != lf:
+            if leaves.setdefault(p, lf) != lf:
                 _fail(f"{self.what}: two attestations disagree at position {p}")
+
+    def _leaf(self, p):
+        for _, leaves in self.layers:
+            if p in leaves:
+                return leaves[p]
+        return None
+
+    def _ref_root(self, k):
+        span = range(k * GRID, (k + 1) * GRID)
+        seen = False
+        for roots, leaves in self.layers:
+            if k in roots and not seen:
+                return roots[k]                   # the newest attestation of k is a whole interval
+            seen = seen or k in roots or any(p in leaves for p in span)
+        if all(self._leaf(p) is not None for p in span):
+            return interval_root([self._leaf(p) for p in span])
+        return None
 
     def _root(self, leaves, roots, k):
         if roots is not None and k in roots:
@@ -715,16 +753,16 @@ class _Ref:
             return
         for k in range(sub.lo // GRID, -(-sub.hi // GRID)):
             a = sub.root(k) or self._root(sub.leaves, None, k)
-            b = self._root(self.leaves, self.roots, k)
+            b = self._ref_root(k)
             if a is not None and b is not None:
                 if a != b:
                     _fail(f"{label}: interval [{k * GRID}, {(k + 1) * GRID}) differs from {self.what}")
                 continue
             for p in range(max(k * GRID, sub.lo), min((k + 1) * GRID, sub.hi)):
-                if p not in sub.leaves or p not in self.leaves:
+                if p not in sub.leaves or self._leaf(p) is None:
                     _fail(f"{label}: position {p} cannot be checked against {self.what} "
                           f"(unattested or no leaves)")
-                if sub.leaves[p] != self.leaves[p]:
+                if sub.leaves[p] != self._leaf(p):
                     _fail(f"{label}: position {p} differs from {self.what}")
 
 
@@ -750,9 +788,8 @@ def verify_coverage_v2(path_log: dict, checkpoints: list, *, leases, entry_pubke
         {pubkey, rte, lo, hi, kind: "serve", prefill: n, decode: n}
         {pubkey, rte, lo, hi, kind: "rebuild", positions: n}
         {pubkey, rte, lo, hi, kind: "mirror", positions: n}
-    leases: the ORCHESTRATOR's own records [{sid, rte, pubkey, lo, hi, role, W, numerics_id?}]
-    (role "backup" for a mirror), never taken from the entry: W (the lease's spec window) bounds
-    how far before an rte's end a declared death may lie. manifest_cid, layer_kinds
+    leases: the ORCHESTRATOR's own records [{sid, rte, pubkey, lo, hi, role, numerics_id?}]
+    (role "backup" for a mirror), never taken from the entry. manifest_cid, layer_kinds
     ("global"/"swa" per layer) and window come from the orchestrator's manifest.
     tokens_unattested: generated tokens no live tail signed (a tail died before the rte ended)."""
     try:
@@ -825,7 +862,6 @@ class _Verifier:
                 le = issued.get((self.sid, r, pk, lo, hi, role))
                 if le is None:
                     _fail(f"rte {r}: no issued lease for hop {pk[:10]}.. [{lo}, {hi}) (invented hop)")
-                h["_W"] = _int(le.get("W"), f"rte {r}: lease W of {pk[:10]}..", 1)
                 h["_nid"] = le.get("numerics_id")
             if cur != L:
                 _fail(f"rte {r}: layers end at {cur}, the model has {L}")
@@ -915,7 +951,7 @@ class _Verifier:
                 "work": self.work}
 
     def _rte(self, r):
-        e, P, G = self.rtes[r], self.P, GRID
+        e, P = self.rtes[r], self.P
         ps, pe = e["pos_start"], e["pos_end"]
         dead = set(e.get("dead") or [])
         seated = {s["pubkey"]: s for s in (e.get("seated") or [])}
@@ -930,9 +966,6 @@ class _Verifier:
             if lg is None:
                 if pk not in dead:
                     _fail(f"rte {r}: hop {pk[:10]}.. delivered no checkpoint and is not declared dead")
-                if pe - ps > 2 * G + h["_W"]:
-                    _fail(f"rte {r}: {pk[:10]}.. declared dead with no checkpoint but the rte ran "
-                          f"{pe - ps} positions: a live hop would have checkpointed (> 2*grid + W)")
                 ends[pk] = (False, ps)
                 continue
             if lg.end > pe:
@@ -945,9 +978,6 @@ class _Verifier:
                 if lg.closed:
                     _fail(f"rte {r}: {pk[:10]}.. is declared dead but signed the {lg.close_kind} "
                           f"(false death claim)")
-                if pe - lg.end > 2 * G + h["_W"]:
-                    _fail(f"rte {r}: {pk[:10]}.. declared dead at {lg.end} but the rte ran to {pe}: a "
-                          f"live hop would have checkpointed (more than 2*grid + W positions)")
                 ends[pk] = (False, lg.end)
             else:
                 if not lg.closed or lg.end != pe:
@@ -956,7 +986,7 @@ class _Verifier:
                 if lg.close_kind != ("close" if final else "rte_close"):
                     _fail(f"rte {r}: {pk[:10]}.. closed with {lg.close_kind}")
                 ends[pk] = (True, pe)
-            if role in ("tail", "solo") and lg.closed and pe > ps:
+            if role in ("tail", "solo") and lg.closed and pe > ps and pe >= P:
                 _hex32(lg.tok_next, f"rte {r}: tail {pk[:10]}.. tok_next")
             if role != "mid" and lg.fixed.get("prompt_len") != P:
                 _fail(f"rte {r}: {pk[:10]}.. signed prompt_len {lg.fixed.get('prompt_len')!r}, the path "
@@ -985,8 +1015,11 @@ class _Verifier:
                 if ih[x] != ot[x]:
                     _fail(f"rte {r}: token closure broken by {x}: the tokens the tail signed are not "
                           f"the tokens the head attests it was fed")
+        q = r - 1
+        while q > 0 and self.rtes[q]["pos_start"] == self.rtes[q]["pos_end"]:
+            q -= 1                                        # an empty rte produced nothing at ps
         if r > 0 and lh is not None and ps in lh.subs["in"].leaves:
-            pt = self.serve(r - 1, self.spans[r - 1][-1]["pubkey"])
+            pt = self.serve(q, self.spans[q][-1]["pubkey"])
             if pt is not None and pt.tok_next is not None and lh.subs["in"].leaves[ps].hex() != pt.tok_next:
                 _fail(f"rte {r}: token closure broken at {ps}: the rte's first input is not the token "
                       f"the previous tail produced")
@@ -1012,8 +1045,10 @@ class _Verifier:
         tl, tend = ends[self.spans[r][-1]["pubkey"]]
         if not tl:
             self.unattested += max(0, pe + 1 - max(tend, P))
+        proven = max((min(x.end, pe) for x in (self.serve(r, h["pubkey"]) for h in self.spans[r]) if x),
+                     default=ps)
         for h in self.spans[r]:
-            live, end = ends[h["pubkey"]]
+            end = proven
             pre = max(0, min(end, P) - ps)
             self.work.append({"pubkey": h["pubkey"], "rte": r, "lo": h["lo"], "hi": h["hi"],
                               "kind": "serve", "prefill": pre, "decode": max(0, end - ps) - pre})
@@ -1056,9 +1091,11 @@ class _Verifier:
                               "positions": ok - ps})
 
     def _boundary(self, b, r, what):
-        """Everything committed at layer boundary b (b = 0: the token boundary) before rte r."""
+        """What was attested at layer boundary b (b = 0: the token boundary) before rte r, newest rte
+        first: serve rows, and the rows each rebuild consumed or forwarded there."""
         ref = _Ref(what)
-        for q in range(r):
+        for q in range(r - 1, -1, -1):
+            ref.layer()
             for h in self.spans[q]:
                 for name in ("serve", "rebuild"):
                     lg = self.logs.get((h["pubkey"], q, name))
@@ -1118,10 +1155,15 @@ class _Verifier:
         n_swa = sum(k == "swa" for k in self.kinds[lo:hi])
         a_fwd = None
         if "out" in rb.subs:
-            a_fwd = max(0, rb.subs["out"].lo - (self.window - 1) * n_swa)
+            succ = next((x for x in self.spans[r] if x["lo"] == hi), None)
+            seated = {x["pubkey"]: x for x in (self.rtes[r].get("seated") or [])}
+            slog = self.logs.get((succ["pubkey"], r, "rebuild")) if succ is not None else None
+            if slog is None or seated.get(succ["pubkey"], {}).get("tier") != "chain":
+                _fail(f"{who}: forwards rows that no chained successor consumes")
+            need_lo = slog.subs["in"].lo
+            a_fwd = max(0, need_lo - (self.window - 1) * n_swa)
             if a > a_fwd:
-                _fail(f"{who}: forwards rows from {rb.subs['out'].lo} but started at {a}: they are not "
-                      f"exact before {a + (self.window - 1) * n_swa}")
+                _fail(f"{who}: its successor needs exact rows from {need_lo} but it started at {a}")
         _seg_check(rb, a, P=self.P, codec_of=lambda kind: None, where=who)
 
         # inputs: a chained rebuild's come from its seated predecessor's forwarded rows (which may
@@ -1157,9 +1199,11 @@ class _Verifier:
         # whatever it claims to replace (withholding a mirror earns nothing). A forwarder is owed
         # the rows its successor needed exact. A key re-seated after its own death is owed nothing.
         bh = self.backups[r - 1].get(pk)
-        if bh is not None and (bh["lo"], bh["hi"]) == (lo, hi) and (pk, r - 1) in self.mirror_ok:
+        if bh is not None and (bh["lo"], bh["hi"]) == (lo, hi):
             g_rep = self.ends[r - 1][bh["pubkey"]][1]
-            upto_pay = max(upto_pay, min(g_rep, self.mirror_ok[(pk, r - 1)]))
+            plog = self.serve(r - 1, bh["pubkey"])
+            held = max(self.mirror_ok.get((pk, r - 1), 0), plog.mirrored if plog is not None else 0)
+            upto_pay = max(upto_pay, min(g_rep, held))
         need = rebuild_rule(span, self.window, F, upto_pay)
         if a_fwd is not None:
             need = min(need, a_fwd)

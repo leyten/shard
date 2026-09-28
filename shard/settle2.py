@@ -9,7 +9,7 @@ Weights, in units of one layer x one decode position = PAY["decode"]:
     rebuild  layers x PAY["rebuild"] x rebuild positions   (a replacement re-deriving its state)
     mirror   layers x PAY["mirror"]  x acknowledged positions (a backup holding verified KV)
 Each (layer, position) of serve work belongs to exactly one hop: rtes cover disjoint positions and
-a dead hop is paid only to its last delivered checkpoint, so nothing is paid twice. The rebuild
+each hop of an rte is paid to the frontier that rte proves, so nothing is paid twice. The rebuild
 share of the pool is capped (REBUILD_CAP = 1/5): above it, every rebuild weight is scaled down
 by one common factor. The pool is then split by largest remainder (ties to the smaller pubkey),
 so payouts are integers that sum to the pool exactly. The defaults are estimates (design-mesh

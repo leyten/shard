@@ -133,15 +133,17 @@ class Backup:
         self.pending = []
         self.ok = True
 
-    def receive(self, blob: KVBlob, ckpts):
-        self.blobs.append(blob)
-        for p in range(blob.lo_pos, blob.hi_pos):
-            self.rows[p] = blob.pos_bytes(p)
+    def receive(self, blob, ckpts):
+        """a KV delta (or None) and/or the primary's checkpoint copies riding `mirror`"""
+        if blob is not None:
+            self.blobs.append(blob)
+            for p in range(blob.lo_pos, blob.hi_pos):
+                self.rows[p] = blob.pos_bytes(p)
+            if self.ledger.folded < blob.hi_pos:
+                self.pending += self.ledger.commit(blob.hi_pos, lambda lo, hi: [self.rows[p] for p in range(lo, hi)])
         for ck in ckpts:
             if ck["kind"] == "grid" and "kv" in ck["logs"]:
                 self.copies[ck["pos"]] = ck["logs"]["kv"]["chain"]
-        if self.ledger.folded < blob.hi_pos:
-            self.pending += self.ledger.commit(blob.hi_pos, lambda lo, hi: [self.rows[p] for p in range(lo, hi)])
         keep = []
         for ack in self.pending:                      # ack only what matches the primary's checkpoint
             want = self.copies.get(ack["pos"])
@@ -214,7 +216,7 @@ class Node:
             rsid = int(job.sid, 16)
             if msg["cpos"] >= 0:
                 self.rt.commit(rsid, msg["cpos"])
-                self._fold(job, s, msg["cpos"], [])     # §4.2 step 5: commit on arrival
+                self._fold(job, s, msg["cpos"])         # §4.2 step 5: commit on arrival
             n = msg["n"]
             if self.head:
                 x = Rows("i32", np.array(ids_of(msg["x"]), dtype=np.int32))
@@ -260,19 +262,25 @@ class Node:
                 s.alog[pos + j] = (codec, bytes(out["x"].row(j)), bytes(xs.row(j)) if xs is not None else b"")
             toks = None
         self._record(s, pos, n, kind, cx_in, in_rows, out_rows, ids, toks)
-        self._fold(job, s, msg["cpos"], [])            # and again for this frame's own prompt rows
+        self._fold(job, s, msg["cpos"])                # and again for this frame's own prompt rows
         return out
 
-    def _fold(self, job, s, cpos, _):
-        F = cpos + (1 if "fold_at_c" in self.bugs else 0)
+    def _fold(self, job, s, cpos):
+        """Mirror the final KV rows first (so the checkpoint's `mirrored` claim is current), fold
+        the ledger, send the checkpoints to the entry and their copies to the backup."""
         rsid = int(job.sid, 16)
+        if s.mirror_to is not None:
+            hi = min(cpos, self.rt.length(rsid))
+            if hi > s.mirrored:
+                s.mirror_to.receive(self.rt.export_state(rsid, s.mirrored, hi), [])
+                s.mirrored = hi
+            s.ledger.mirrored = s.mirrored
+        F = cpos + (1 if "fold_at_c" in self.bugs else 0)
         cks = s.ledger.commit(F, self.kv_rows(rsid))
         for ck in cks:
             job.deliver(ck)
-        if s.mirror_to is not None and s.ledger.folded > s.mirrored:
-            blob = self.rt.export_state(rsid, s.mirrored, s.ledger.folded)
-            s.mirrored = s.ledger.folded
-            s.mirror_to.receive(blob, cks)
+        if s.mirror_to is not None and cks:
+            s.mirror_to.receive(None, cks)
 
     def _record(self, s, pos, n, kind, codec, in_rows, out_rows, ids, toks):
         lg = s.ledger
@@ -341,10 +349,10 @@ class Job:
             if b is not None:
                 h["backup"] = b.pub
                 self.leases.append({"sid": self.sid, "rte": r, "pubkey": b.pub, "lo": n.lo, "hi": n.hi,
-                                    "role": "backup", "W": W})
+                                    "role": "backup"})
             hops.append(h)
             self.leases.append({"sid": self.sid, "rte": r, "pubkey": n.pub, "lo": n.lo, "hi": n.hi,
-                                "role": n.role, "W": W, "numerics_id": n.nid})
+                                "role": n.role, "numerics_id": n.nid})
         self.paths.append(list(path))
         self.rtes.append({"rte": r, "pos_start": ps, "pos_end": None, "cx": self.cx,
                           "cx_prefill": self.cx_prefill, "hops": hops, "dead": [], "seated": seated})
@@ -473,7 +481,7 @@ class Job:
                 bk = Backup(b, self, n, self.rte, F)
                 b.backing[(self.sid, n.pub)] = bk
                 s.mirror_to = bk
-                s.mirrored = F
+                s.mirrored = 0                          # a new backup is caught up from 0
         self.dead_node = None
 
     def _seat(self, n, i, tier, repl, F, fwd, forward):
@@ -546,14 +554,16 @@ class Job:
                 "replaces": repl.pub if repl is not None else None}
 
     def _committed_rows(self, b):
-        """The committed output rows at layer boundary b: per closed rte, the activation log of the
-        hop that sent them (log_fetch goes to whoever held the boundary for those positions)."""
+        """The rows at layer boundary b a rebuild fetches (log_fetch): from the newest rte back, the
+        activation log of a LIVE hop that sent them (a dead hop's log died with it), below that
+        rte's end (rows past it were speculative)."""
         out = {}
-        for e, path in zip(self.rtes, self.paths):
+        for e, path in reversed(list(zip(self.rtes, self.paths))):
             for n in path:
-                if n.hi == b and self.sid in n.S:
-                    alog = n.S[self.sid].alog
-                    out.update({p: alog[p] for p in range(e["pos_start"], e["pos_end"]) if p in alog})
+                if n.hi == b and n.alive and self.sid in n.S:
+                    for p, row in n.S[self.sid].alog.items():
+                        if p < e["pos_end"] and p not in out:
+                            out[p] = row
         return out
 
     def close(self):
@@ -806,11 +816,14 @@ def sc_takeover(bugs_backup=(), tier="mirror", victim=2, replaces=True, **kw):
     return job.bundle()
 
 
-def sc_dead(bugs_new=(), rejoin=False, **kw):
+def sc_dead(bugs_new=(), rejoin=False, on_last_prefill=False, **kw):
     """The tail dies with no backup. A fresh holder rebuilds [0, F) from [6,9)'s log (tier 2); the
-    dead tail is paid to its last delivered checkpoint, the positions after it are unchained.
-    rejoin=True: the dead tail itself comes back and is re-seated (owed no rebuild credit)."""
-    tag = "dead-rejoin" if rejoin else "dead"
+    dead tail is paid to the rte's proven frontier; the tokens it produced after its last
+    delivered checkpoint are reported unattested (no live tail signed them).
+    rejoin=True: the dead tail itself comes back and is re-seated (owed no rebuild credit).
+    on_last_prefill=True: the tail dies while the last prefill chunk is in flight, so the failover
+    lands at F = P-1, before the first token (the entry re-sends the last prompt row + drafts)."""
+    tag = "dead-rejoin" if rejoin else "dead-prefill" if on_last_prefill else "dead"
     path = path_a(tag)
     t2 = path[3] if rejoin else Node(f"{tag}/tail2", 9, 12, "chunk_invariant", bugs_new)
 
@@ -819,25 +832,47 @@ def sc_dead(bugs_new=(), rejoin=False, **kw):
         j.failover([path[0], path[1], path[2], t2], dead=[path[3]], seated={t2: ("log", None)})
     job = Job(path, name=tag, K=3, depth=2, miss=4, n_new=330)
     job.on_death = on_death
-    run([job], events=[(job, 300, lambda j: kill(path[3], j))])
+    if on_last_prefill:
+        tail, orig = path[3], path[3].process
+
+        def process(batch):
+            if any(m["kind"] == "P" and m["pos"] + m["n"] == job.P for _, m, _ in batch):
+                tail.alive = False
+            return orig(batch)
+        tail.process = process
+        run([job])
+    else:
+        run([job], events=[(job, 300, lambda j: kill(path[3], j))])
     return job.bundle()
 
 
-def sc_double(which="mid", **kw):
+def sc_double(which="mid", then_rebuild=False, **kw):
     """Two adjacent hops die together, so the second replacement's input boundary has no live
     holder: the first replacement (other numerics; for "mid" an SWA-only span, which must rebuild
     from 0 to forward exact rows) forwards its rebuilt rows and the second is seated on them
-    (a chained rebuild). "mid": [3,6)+[6,9) die; "tail": [6,9)+[9,12) die."""
-    tag = f"double-{which}" + ("-fp8" if kw.get("cx") == "fp8" else "")
+    (a chained rebuild). "mid": [3,6)+[6,9) die; "tail": [6,9)+[9,12) die.
+    then_rebuild=True: later the chained hop dies too and a third node rebuilds its span from the
+    log (its reference mixes committed rows and the rows the chain was built on)."""
+    tag = f"double-{which}" + ("-fp8" if kw.get("cx") == "fp8" else "") + ("-then" if then_rebuild else "")
     path = path_a(tag)
     i = 1 if which == "mid" else 2
     dead = [path[i], path[i + 1]]
     n1 = Node(f"{tag}/n1", dead[0].lo, dead[0].hi, "adversarial")
     n2 = Node(f"{tag}/n2", dead[1].lo, dead[1].hi, "chunk_invariant")
     new = path[:i] + [n1, n2] + path[i + 2:]
+    n3 = Node(f"{tag}/n3", n2.lo, n2.hi, "chunk_invariant")
     job = Job(path, name=tag, K=3, depth=2, miss=4, n_new=330, **kw)
-    job.on_death = lambda j: j.failover(new, dead=dead, seated={n1: ("log", None), n2: ("chain", None)})
-    run([job], events=[(job, 300, lambda j: [kill(n, j) for n in dead])])
+
+    def on_death(j):
+        if j.dead_node in dead:
+            j.failover(new, dead=dead, seated={n1: ("log", None), n2: ("chain", None)})
+        else:
+            j.failover([n3 if n is n2 else n for n in new], dead=[n2], seated={n3: ("log", n2)})
+    job.on_death = on_death
+    events = [(job, 300, lambda j: [kill(n, j) for n in dead])]
+    if then_rebuild:
+        events.append((job, 420, lambda j: kill(n2, j)))
+    run([job], events=events)
     return job.bundle()
 
 
