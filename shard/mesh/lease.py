@@ -1,8 +1,9 @@
 """shard-lease/1: orchestrator-signed lease tokens and the node-side admission gate.
 
 A lease token authorizes ONE stream edge of ONE session: node `to` serves session `sid` at route
-epoch `rte` for layers [lo, hi) with `kv` tokens of KV reserved, and accepts that session's frames
-(roles head/mid/tail/solo) or KV mirror (role backup) from the PeerId `from` only, until `exp`
+epoch `rte` for layers [lo, hi) with `kv` tokens of KV reserved, forwards to `next` and replies to
+`ret`, and accepts that session's frames (roles head/mid/tail/solo) or KV mirror (role backup) from
+the PeerId `from` only, until `exp`
 (ARCHITECTURE-v2 §4.6 lease-token admission instead of a static -allow list; C20 predecessor
 binding). The orchestrator is the only signer at launch (the directory); node-signed leases come
 with the DHT directory (design-mesh M6).
@@ -10,12 +11,14 @@ with the DHT directory (design-mesh M6).
 FLOW. The entry delivers each hop its token inside lease_open / takeover (frame.py's opaque
 `lease` blob, <= 4096 bytes); a backup's token rides with its mirror_open. The node checks the
 signature, that it is the audience, and that the message's own fields (sid, rte, lo, hi, role,
-pred / primary) equal the signed claims (`binding_of`), then admits `from` for that session. It
-never matters who carried the token: what the token grants is bound to `to` and `from`, and the
-sidecar tags every inbound stream with the verified remote PeerId, so frames from anyone but
+pred / primary, next, ret) equal the signed claims (`binding_of`), then admits `from` for that
+session. It never matters who carried the token: everything the message could steer is bound, and
+the sidecar tags every inbound stream with the verified remote PeerId, so frames from anyone but
 `from` are dropped (`LeaseGate.accepts`). A path change bumps the route epoch: surviving hops
 learn it from the entry-signed lease_update (C6, `LeaseGate.supersede`), replacement edges get new
-orchestrator tokens (`Directory.reroute`).
+orchestrator tokens (`Directory.reroute`). Backups get no lease_update (§5.3 sends it to hops), so
+a backup follows the epoch its admitted primaries mirror at. An edge is honoured until its own
+token's `exp`; a longer session renews (`Directory.reroute(..., renew=True)`).
 
 WIRE FORM. `b64url(payload) "." b64url(sig)`, no padding, where payload is the canonical claims
 JSON (sorted keys, no whitespace, ASCII only) and sig = Ed25519(orchestrator key,
@@ -75,6 +78,8 @@ _CLAIMS = {
     "role": re.compile("|".join(ROLES)),
     "from": re.compile(_PEER),
     "to": re.compile(_PEER),
+    "next": re.compile(r"[A-Za-z0-9]{0,128}"),     # the hop's successor ("" at the tail / for a backup)
+    "ret": re.compile(r"[A-Za-z0-9]{0,128}"),      # where the tail replies (the entry; "" for a backup)
     "iss": re.compile(r"[A-Za-z0-9+/]{43}="),
     "rte": U32, "lo": 0xFFFF, "hi": 0xFFFF, "kv": U32, "iat": U32, "exp": U32,
 }
@@ -185,30 +190,29 @@ def verify(token, orch_pub: str, *, audience: str, now: int, skew: int = 30) -> 
     return claims
 
 
-BIND_KEYS = ("sid", "lo", "hi", "role", "from")
+BIND_KEYS = ("sid", "lo", "hi", "role", "from", "next", "ret")
 
 
 def binding_of(msg) -> dict:
     """The claims a decoded shard-frame/2 control message asserts about its token: lease_open and
-    takeover bind sid, rte, span, role and pred; mirror_open binds sid, span and its primary (the
-    mirror source) under role backup. admit() requires the token to carry exactly these."""
+    takeover bind sid, rte, span, role, pred, next and ret; mirror_open binds sid, span and its
+    primary (the mirror source) under role backup, with no next or ret. admit() requires the
+    token to carry exactly these."""
     cmd = msg["cmd"]
     if cmd in ("lease_open", "takeover"):
         return {"sid": msg["sid"], "rte": msg["rte"], "lo": msg["lo"], "hi": msg["hi"], "role": msg["role"],
-                "from": msg["pred"]}
+                "from": msg["pred"], "next": msg.get("next") or "", "ret": msg["ret"]}
     if cmd == "mirror_open":
-        return {"sid": msg["sid"], "lo": msg["lo"], "hi": msg["hi"], "role": "backup", "from": msg["primary"]}
+        return {"sid": msg["sid"], "lo": msg["lo"], "hi": msg["hi"], "role": "backup", "from": msg["primary"],
+                "next": "", "ret": ""}
     raise ValueError(f"{cmd} carries no lease")
-
-
-def _kind(role: str) -> str:
-    return "mirror" if role == "backup" else "frame"
 
 
 @dataclass
 class _SidState:
     rte: int = 0
-    edges: dict = field(default_factory=lambda: {"frame": set(), "mirror": set()})
+    frame: tuple | None = None                               # (pred, exp) of the frame edge
+    mirrors: dict = field(default_factory=dict)              # (lo, hi) -> (primary, exp)
     horizon: int = 0          # no token this state guards against can be valid after this
     closed: bool = False
 
@@ -223,7 +227,9 @@ class LeaseGate:
 
     def admit(self, token, *, now: int, bind) -> dict:
         """Verify a delivered token and bind it to its carrying message (binding_of). Returns the
-        claims; afterwards accepts(sid, rte, claims['from'], kind) holds."""
+        claims; afterwards accepts(sid, rte, claims['from'], kind, now) holds until its exp. A
+        newer route epoch keeps the session's other edges (a backup's other primaries, a hop's
+        predecessor when only its backup token was reissued) and replaces this one."""
         missing = [k for k in BIND_KEYS if k not in bind]
         if missing:
             raise ValueError(f"bind must name {BIND_KEYS}, missing {missing}")
@@ -239,27 +245,34 @@ class LeaseGate:
                 raise LeaseError("stale_rte", f"rte {c['rte']} < {st.rte}")
         else:
             st = self._sids[c["sid"]] = _SidState()
-        if c["rte"] > st.rte:
-            st.rte, st.edges = c["rte"], {"frame": set(), "mirror": set()}
-        st.edges[_kind(c["role"])].add(c["from"])
+        st.rte = max(st.rte, c["rte"])
+        if c["role"] == "backup":
+            st.mirrors[(c["lo"], c["hi"])] = (c["from"], c["exp"])
+        else:
+            st.frame = (c["from"], c["exp"])
         st.horizon = max(st.horizon, c["iat"] + MAX_TTL_S)   # older tokens were issued before iat
         return c
 
-    def accepts(self, sid: str, rte: int, sender: str, kind: str = "frame") -> bool:
+    def accepts(self, sid: str, rte: int, sender: str, kind: str, now: int) -> bool:
         """May `sender` (the verified PeerId of an inbound stream) deliver this session's frames
-        (kind "frame") or KV mirror (kind "mirror") at route epoch `rte`?"""
+        (kind "frame", at exactly the current route epoch) or KV mirror (kind "mirror", at the
+        current epoch or a newer one: backups learn epochs from their primaries) right now?"""
         st = self._sids.get(sid)
-        return st is not None and not st.closed and rte == st.rte and sender in st.edges[kind]
+        if st is None or st.closed:
+            return False
+        if kind == "frame":
+            return rte == st.rte and st.frame is not None and st.frame[0] == sender and now < st.frame[1]
+        return rte >= st.rte and any(p == sender and now < e for p, e in st.mirrors.values())
 
     def supersede(self, sid: str, rte: int, now: int, pred: str | None = None) -> None:
-        """An entry-signed lease_update moved the session to route epoch `rte` (C6): the admitted
-        edges carry over, the frame predecessor becomes `pred` when the update names one. Older
-        route epochs are refused from now on."""
+        """An entry-signed lease_update moved the session to route epoch `rte` (C6): the edges
+        carry over (with their tokens' expiry), the frame predecessor becomes `pred` when the update
+        names one. Older route epochs are refused from now on."""
         st = self._sids.setdefault(sid, _SidState())
         if rte > st.rte:
             st.rte = rte
-            if pred is not None:
-                st.edges["frame"] = {pred}
+            if pred is not None and st.frame is not None:
+                st.frame = (pred, st.frame[1])
         st.horizon = max(st.horizon, now + MAX_TTL_S)
 
     def close(self, sid: str, now: int) -> None:
@@ -268,6 +281,7 @@ class LeaseGate:
 
     def prune(self, now: int) -> None:
         """Forget a session once every token issued before its last event has expired: a token
-        lives at most MAX_TTL_S from its iat, so nothing it guarded against can verify any more."""
+        lives at most MAX_TTL_S from its iat, so nothing it guarded against can verify any more
+        (and accepts() already refuses every edge past its exp)."""
         for sid in [s for s, st in self._sids.items() if st.horizon + self.skew <= now]:
             del self._sids[sid]

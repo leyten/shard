@@ -14,7 +14,8 @@ PUB = pub_b64(KEY)
 OTHER = ed25519.Ed25519PrivateKey.from_private_bytes(bytes(range(1, 33)))
 CLAIMS = {"typ": L.TYP, "lid": "00112233445566ff", "job": "job-1", "sid": "0123456789abcdef", "rte": 3,
           "model": "XiaomiMiMo/MiMo-V2.6-Flash", "cell": "eu-1", "role": "mid", "from": "PeerA",
-          "to": "PeerB", "lo": 8, "hi": 16, "kv": 4096, "iat": 1_000, "exp": 4_600}
+          "to": "PeerB", "next": "PeerC", "ret": "Entry", "lo": 8, "hi": 16, "kv": 4096, "iat": 1_000,
+          "exp": 4_600}
 
 
 def tok(**over):
@@ -56,14 +57,16 @@ def test_rides_lease_open_and_binds_to_its_fields():
     back = lease_open(tok())
     g = L.LeaseGate(PUB, "PeerB")
     c = g.admit(bytes(back["lease"]), now=2_000, bind=L.binding_of(back))
-    assert c["role"] == "mid" and g.accepts(CLAIMS["sid"], 3, "PeerA")
-    assert not g.accepts(CLAIMS["sid"], 3, "PeerX") and not g.accepts(CLAIMS["sid"], 2, "PeerA")
-    assert not g.accepts(CLAIMS["sid"], 3, "PeerA", kind="mirror")
+    sid = CLAIMS["sid"]
+    assert c["role"] == "mid" and g.accepts(sid, 3, "PeerA", "frame", 2_000)
+    assert not g.accepts(sid, 3, "PeerX", "frame", 2_000) and not g.accepts(sid, 2, "PeerA", "frame", 2_000)
+    assert not g.accepts(sid, 3, "PeerA", "mirror", 2_000)
+    assert not g.accepts(sid, 3, "PeerA", "frame", 4_600)                # the edge ends with its token
 
 
 @pytest.mark.parametrize("over", [{"role": "head", "pred": "Entry", "salt": "00" * 32}, {"lo": 9}, {"hi": 15},
                                   {"rte": 4},
-                                  {"pred": "PeerX"}, {"sid": "f" * 16}])
+                                  {"pred": "PeerX"}, {"sid": "f" * 16}, {"next": "PeerX"}, {"ret": "Other"}])
 def test_a_token_is_refused_in_a_message_that_claims_something_else(over):
     back = lease_open(tok(), **over)
     with pytest.raises(L.LeaseError) as e:
@@ -72,14 +75,31 @@ def test_a_token_is_refused_in_a_message_that_claims_something_else(over):
 
 
 def test_a_backup_token_is_only_a_mirror_edge():
-    t = tok(role="backup", lid="00112233445566fc")
+    t = tok(role="backup", lid="00112233445566fc", next="", ret="")
     g = L.LeaseGate(PUB, "PeerB")
     with pytest.raises(L.LeaseError) as e:                  # not as a primary lease_open
         g.admit(t, now=2_000, bind=L.binding_of(lease_open(t)))
     assert e.value.code == "binding"
     mo = {"cmd": "mirror_open", "sid": CLAIMS["sid"], "primary": "PeerA", "lo": 8, "hi": 16, "max_pos": 32768}
     g.admit(t, now=2_000, bind=L.binding_of(mo))
-    assert g.accepts(CLAIMS["sid"], 3, "PeerA", kind="mirror") and not g.accepts(CLAIMS["sid"], 3, "PeerA")
+    sid = CLAIMS["sid"]
+    assert g.accepts(sid, 3, "PeerA", "mirror", 2_000) and not g.accepts(sid, 3, "PeerA", "frame", 2_000)
+    assert g.accepts(sid, 4, "PeerA", "mirror", 2_000)     # backups follow their primary's newer epoch
+
+
+def test_a_newer_token_keeps_the_sessions_other_edges():
+    """A backup of six hops gets a new mirror token for one of them at rte+1: the other five
+    primaries keep mirroring (backups receive no lease_update)."""
+    g = L.LeaseGate(PUB, "PeerB")
+    for i in range(6):
+        t = tok(role="backup", lid=f"{i:016x}", **{"from": f"P{i}"}, lo=8 * i, hi=8 * i + 8, next="", ret="")
+        g.admit(t, now=2_000, bind={"sid": CLAIMS["sid"], "lo": 8 * i, "hi": 8 * i + 8, "role": "backup",
+                                    "from": f"P{i}", "next": "", "ret": ""})
+    t = tok(role="backup", lid="00000000000000aa", rte=4, **{"from": "Q2"}, lo=16, hi=24, next="", ret="")
+    g.admit(t, now=2_001, bind={"sid": CLAIMS["sid"], "lo": 16, "hi": 24, "role": "backup", "from": "Q2",
+                                "next": "", "ret": ""})
+    ok_ = [p for p in ("P0", "P1", "P2", "P3", "P4", "P5", "Q2") if g.accepts(CLAIMS["sid"], 4, p, "mirror", 2_002)]
+    assert ok_ == ["P0", "P1", "P3", "P4", "P5", "Q2"]
 
 
 def test_admit_demands_a_binding():
@@ -188,19 +208,20 @@ def test_gate_redelivery_is_idempotent_stale_and_closed_sessions_are_refused():
     t3, t4 = tok(), tok(rte=4, lid="00112233445566fe")
     assert admit(g, t3, 2_000)["rte"] == 3
     assert admit(g, t3, 2_001)                             # a retried lease_open
-    assert admit(g, t4, 2_002)["rte"] == 4 and not g.accepts(CLAIMS["sid"], 3, "PeerA")
+    assert admit(g, t4, 2_002)["rte"] == 4 and not g.accepts(CLAIMS["sid"], 3, "PeerA", "frame", 2_002)
     with pytest.raises(L.LeaseError) as e:
         admit(g, t3, 2_003)
     assert e.value.code == "stale_rte"
     g.supersede(CLAIMS["sid"], 5, now=2_004, pred="PeerZ")  # entry-signed lease_update: new predecessor
-    assert g.accepts(CLAIMS["sid"], 5, "PeerZ") and not g.accepts(CLAIMS["sid"], 5, "PeerA")
+    assert g.accepts(CLAIMS["sid"], 5, "PeerZ", "frame", 2_004)
+    assert not g.accepts(CLAIMS["sid"], 5, "PeerA", "frame", 2_004)
     with pytest.raises(L.LeaseError) as e:
         admit(g, t4, 2_005)
     assert e.value.code == "stale_rte"
     g.supersede(CLAIMS["sid"], 6, now=2_006)                # no pred named: the edge carries over
-    assert g.accepts(CLAIMS["sid"], 6, "PeerZ")
+    assert g.accepts(CLAIMS["sid"], 6, "PeerZ", "frame", 2_006)
     g.close(CLAIMS["sid"], now=2_007)
-    assert not g.accepts(CLAIMS["sid"], 6, "PeerZ")
+    assert not g.accepts(CLAIMS["sid"], 6, "PeerZ", "frame", 2_007)
     with pytest.raises(L.LeaseError) as e:
         admit(g, tok(rte=7, lid="00112233445566fd"), 2_008)
     assert e.value.code == "closed"

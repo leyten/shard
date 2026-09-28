@@ -131,7 +131,8 @@ def test_every_token_admits_exactly_its_edge_at_its_node():
         g, c = gate_admits(d, t)
         assert (c["sid"], c["rte"], c["kv"], c["exp"]) == (SID, 0, 4096, 100 + d.lease_ttl_s)
         kind = "mirror" if t["role"] == "backup" else "frame"
-        assert g.accepts(SID, 0, t["from"], kind) and not g.accepts(SID, 0, "Mallory", kind)
+        assert g.accepts(SID, 0, t["from"], kind, 100) and not g.accepts(SID, 0, "Mallory", kind, 100)
+        assert not g.accepts(SID, 0, t["from"], kind, 100 + d.lease_ttl_s)
         with pytest.raises(L.LeaseError):
             L.LeaseGate(d.pubkey, "Mallory").admit(t["token"], now=100, bind={k: c[k] for k in L.BIND_KEYS})
     for t in (x for x in toks if x["role"] == "backup"):
@@ -190,7 +191,9 @@ def test_reroute_replaces_a_dead_hop_without_double_counting_survivors():
     hops[2] = {"id": dead["backup"], "lo": dead["lo"], "hi": dead["hi"], "backup": None}   # tier-1 takeover
     r = d.reroute(le["lease"], rte=1, hops=hops, now=160)
     changed = {(t["role"], t["from"], t["to"]) for t in r["tokens"]}
-    assert changed == {("mid", hops[1]["id"], hops[2]["id"]), ("mid", hops[2]["id"], hops[3]["id"])}
+    assert changed == {("mid", hops[0]["id"], hops[1]["id"]),     # its bound `next` changed
+                       ("mid", hops[1]["id"], hops[2]["id"]), ("mid", hops[2]["id"], hops[3]["id"])}
+    assert r["exp"] == le["exp"]                              # new edges end with the session
     view = {v["id"]: v for v in d.snapshot("eu-1", M)}
     assert view[dead["id"]]["sessions"] == 0 and view[hops[2]["id"]]["sessions"] == 1
     assert all(view[h["id"]]["sessions"] == 1 for h in hops)  # survivors still count the session once
@@ -200,6 +203,26 @@ def test_reroute_replaces_a_dead_hop_without_double_counting_survivors():
     with pytest.raises(LeaseRefused) as e:
         d.reroute(le["lease"], rte=1, hops=hops, now=170)
     assert e.value.code == "stale_rte"
+
+
+def test_reroute_refusals_change_nothing_and_renew_reissues_every_edge():
+    d = twelve()
+    p = d.paths("eu-1", M)[0]
+    le = lease(d, p)
+    snap = d.snapshot("eu-1", M)
+    bad = [dict(h) for h in p["hops"]]
+    bad[1]["lo"] = float(bad[1]["lo"])                        # 9.0 is not an int anywhere
+    with pytest.raises(LeaseRefused) as e:
+        d.reroute(le["lease"], rte=1, hops=bad, now=150)
+    assert e.value.code == "bad_path" and d.snapshot("eu-1", M) == snap
+    r = d.reroute(le["lease"], rte=1, hops=p["hops"], now=3000)
+    assert r["tokens"] == [] and r["exp"] == le["exp"]        # same path: nothing to issue
+    r = d.reroute(le["lease"], rte=2, hops=p["hops"], now=3500, renew=True)
+    assert len(r["tokens"]) == len(le["tokens"]) and r["exp"] == 3500 + d.lease_ttl_s
+    view = {v["id"]: v for v in d.snapshot("eu-1", M)}
+    assert all(view[h["id"]]["sessions"] == 1 for h in p["hops"])   # renewal is not a new session
+    lease(d, d.paths("eu-1", M)[0], sid="3333333333333333", now=3600 + 60)   # expiry sweep runs
+    assert d._leases[le["lease"]]["exp"] == 3500 + d.lease_ttl_s           # the renewed lease lives
 
 
 def test_a_backup_is_charged_once_per_session_not_once_per_hop():

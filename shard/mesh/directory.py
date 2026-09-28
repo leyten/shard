@@ -173,7 +173,7 @@ class Directory:
 
     def _bad_request(self, **claims) -> None:
         probe = {"typ": lease_mod.TYP, "lid": "0" * 16, "role": "head", "to": "x", "lo": 0, "hi": 1,
-                 "iss": self.pubkey, **claims}
+                 "next": "", "ret": "", "iss": self.pubkey, **claims}
         try:
             lease_mod.check_claims(probe)
         except lease_mod.LeaseError as e:
@@ -184,7 +184,9 @@ class Directory:
         holders before a reroute) does not already hold. Returns the new bumps {id: (ds, dr, dk)}
         without the load (the caller fills it)."""
         pol, n = self.policy, self.profiles[model].n_layers
-        if not hops or hops[0]["lo"] != 0 or hops[-1]["hi"] != n or any(
+        if not hops or any(type(h.get("lo")) is not int or type(h.get("hi")) is not int for h in hops):
+            raise LeaseRefused("bad_path", "hop bounds are ints")
+        if hops[0]["lo"] != 0 or hops[-1]["hi"] != n or any(
                 a["hi"] != b["lo"] for a, b in zip(hops, hops[1:])) or any(h["lo"] >= h["hi"] for h in hops):
             raise LeaseRefused("bad_path", f"hops must tile [0, {n}) contiguously")
         ids = [h["id"] for h in hops]
@@ -229,20 +231,22 @@ class Directory:
         return roles
 
     def _edges(self, hops: list, entry: str) -> list[tuple]:
+        """(role, from, to, lo, hi, next, ret) per stream edge: pred -> hop, primary -> backup."""
         out = []
         for j, (h, role) in enumerate(zip(hops, _roles(hops))):
-            out.append((role, entry if j == 0 else hops[j - 1]["id"], h["id"], h["lo"], h["hi"]))
+            nxt = hops[j + 1]["id"] if j + 1 < len(hops) else ""
+            out.append((role, entry if j == 0 else hops[j - 1]["id"], h["id"], h["lo"], h["hi"], nxt, entry))
             if h.get("backup") is not None:
-                out.append(("backup", h["id"], h["backup"], h["lo"], h["hi"]))
+                out.append(("backup", h["id"], h["backup"], h["lo"], h["hi"], "", ""))
         return out
 
-    def _tokens(self, le: dict, edges: list, now: int) -> list[dict]:
+    def _tokens(self, le: dict, rte: int, exp: int, edges: list, now: int) -> list[dict]:
         out = []
-        for role, frm, to, lo, hi in edges:
-            lid = _hex16(le["id"], le["rte"], role, frm, to, lo, hi)
-            claims = {"typ": lease_mod.TYP, "lid": lid, "job": le["job"], "sid": le["sid"], "rte": le["rte"],
+        for role, frm, to, lo, hi, nxt, ret in edges:
+            lid = _hex16(le["id"], rte, role, frm, to, lo, hi, nxt, ret)
+            claims = {"typ": lease_mod.TYP, "lid": lid, "job": le["job"], "sid": le["sid"], "rte": rte,
                       "model": le["model"], "cell": le["cell"], "role": role, "from": frm, "to": to, "lo": lo,
-                      "hi": hi, "kv": le["kv"], "iat": now, "exp": le["exp"]}
+                      "hi": hi, "next": nxt, "ret": ret, "kv": le["kv"], "iat": now, "exp": exp}
             out.append({"role": role, "from": frm, "to": to, "lid": lid, "token": lease_mod.issue(self._key, claims)})
         return out
 
@@ -278,17 +282,18 @@ class Directory:
         le = {"id": _hex16(job, sid), "job": job, "sid": sid, "rte": rte, "model": model, "cell": cell,
               "kv": kv_tokens, "load": float(load), "exp": now + self.lease_ttl_s, "hops": [dict(h) for h in hops],
               "entry": entry, "holders": {}}
-        tokens = self._tokens(le, self._edges(hops, entry), now)
+        tokens = self._tokens(le, rte, le["exp"], self._edges(hops, entry), now)
         self._apply_bumps(le, roles)
         self._leases[le["id"]], self._sids[sid] = le, le["id"]
         return {"lease": le["id"], "rte": rte, "exp": le["exp"], "tokens": tokens}
 
-    def reroute(self, lease_id: str, *, rte: int, hops: list, now: int) -> dict:
+    def reroute(self, lease_id: str, *, rte: int, hops: list, now: int, renew: bool = False) -> dict:
         """Move a live session to `hops` at route epoch `rte` (> its current one): a failover
         replacement, a drain, a re-route at a turn boundary. Surviving edges keep their tokens (the
-        entry-signed lease_update carries rte to them, C6); every changed edge gets a new token.
+        entry-signed lease_update carries rte to them, C6); every changed edge gets a new token,
+        and with renew=True every edge does (a session outliving lease_ttl_s: same hops, rte+1).
         Only holders new to the session are capacity-checked and bumped; dropped ones are
-        released. Same return shape as lease(), tokens for the changed edges only."""
+        released. Same return shape as lease(). Refusals change nothing."""
         self._expire(now)
         le = self._leases.get(lease_id)
         if le is None:
@@ -298,9 +303,13 @@ class Directory:
         c = self.cells[(le["cell"], le["model"])]
         roles = self._check(c, le["model"], hops, le["kv"], le["entry"], prior=le["holders"])
         old = set(self._edges(le["hops"], le["entry"]))
-        new = [e for e in self._edges(hops, le["entry"]) if e not in old]
-        le.update(rte=rte, exp=now + self.lease_ttl_s, hops=[dict(h) for h in hops])
-        tokens = self._tokens(le, new, now)
+        new = [e for e in self._edges(hops, le["entry"]) if renew or e not in old]
+        exp = now + self.lease_ttl_s if renew else le["exp"]       # new edges end with the session
+        try:
+            tokens = self._tokens(le, rte, exp, new, now)          # before any state changes
+        except lease_mod.LeaseError as e:
+            raise LeaseRefused("bad_request", str(e)) from None
+        le.update(rte=rte, exp=exp, hops=[dict(h) for h in hops])
         self._apply_bumps(le, roles)
         return {"lease": le["id"], "rte": rte, "exp": le["exp"], "tokens": tokens}
 
