@@ -390,7 +390,7 @@ class MTPDrafter(_Sessions):
         logits = []
         for k in range(self.D):
             Kd, Vd, out = dict(s["K"][k]), dict(s["V"][k]), {}
-            for i in range(q - k + 1, q + 1):              # temp rows: tok[i+k+1] is a draft
+            for i in range(max(base, q - k + 1), q + 1):   # temp rows: tok[i+k+1] is a draft
                 hp = prev_out[i] if prev_out and i in prev_out else (
                     s["h0"][i] if k == 0 else s["out"][k - 1][i])
                 x, xn, Kd[i], Vd[i] = self._row(k, i, hp, tok[i + k + 1])

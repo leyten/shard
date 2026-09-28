@@ -147,6 +147,21 @@ def test_position_discipline_refuses_loudly():
         d.open("t", _ids(rng, 5), _rows(rng, 5))                 # ctx rows != ids - 1
 
 
+@pytest.mark.parametrize("make", [lambda: MTPDrafter(window=16), lambda: DFlashDrafter(window=32)])
+def test_a_history_shorter_than_the_block_drafts(make):
+    """A 1-token prompt, or a rebuild from a single row: fewer positions than MTP's depth. Rows
+    before the session's start do not exist; the drafter must draft from what it has."""
+    rng = np.random.default_rng(10)
+    d = make()
+    d.open("s", _ids(rng, 2), _rows(rng, 1))
+    assert len(d.propose("s", 0)) == d.block
+    d.advance("s", 1, [5], _rows(rng, 1))
+    assert len(d.propose("s", 1)) == d.block
+    r = make()
+    r.rebuild("s", 37, _ids(rng, 2), _rows(rng, 1))
+    assert len(r.propose("s", 37)) == r.block
+
+
 # ── 3. rejected state never leaks ───────────────────────────────────────────────────────────────
 
 @pytest.mark.parametrize("make", [lambda: MTPDrafter(window=16), lambda: DFlashDrafter(window=32)])
@@ -262,3 +277,12 @@ def test_end_to_end_with_a_real_drafter(kind, policy, lazy=False):
     assert r["tokens"] == toy_greedy(Tt, P, n), "the committed stream left the greedy stream"
     assert r["accepted"] > 0 and r["cancels"] > 0, (r["accepted"], r["cancels"])
     assert host.drafted > 0
+
+
+@pytest.mark.parametrize("kind", ["mtp", "dflash"])
+def test_end_to_end_one_token_prompt(kind):
+    ctx = LastHidden(H) if kind == "mtp" else FusedTaps(TapSpec(MIMO_TAPS, H), DFlashDrafter().fc)
+    make = MTPDrafter if kind == "mtp" else DFlashDrafter
+    Tt = _truth_for(make, ctx, 3, 60, P=1)
+    r, *_ = run_pspec(Tt, 1, 30, W=8, policy="pertoken", host=TailDrafterHost(make()), ctx=ctx)
+    assert r["tokens"] == toy_greedy(Tt, 1, 30)
