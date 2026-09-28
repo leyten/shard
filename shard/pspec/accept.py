@@ -4,7 +4,8 @@ Model-agnostic and stdlib-only (no torch, no engine, no wire), so an entry, a no
 drafter host on any device family import the same code. Lifted from the V4 engine:
 
   plan_verify_round   engines/deepseek_v4/v4_dspark_draft.py:189-226, body unchanged
-  wants_block         engines/deepseek_v4/v4_dspark_draft.py:762-795, logic unchanged; it takes
+  wants_block         engines/deepseek_v4/v4_dspark_draft.py:762-795, logic unchanged but for
+                      one tightening (a `lic` dereference needs a block of >= 2 drafts); it takes
                       the v2 names (`pos`, `dnxt`, `lic`) instead of a V4 step-frame dict
   Frontier            the tail's incremental rule of v4_dspark_draft.py:672-708
                       (_on_chunk_pipelined), generalised from s=1 frames to frames of n rows
@@ -154,10 +155,15 @@ def wants_block(pos, m, dnxt=None, lic=False, last=None):
     on this reply) always drafts, because that reply is the one the entry refills from. `lic` says
     "your successor is the head of the block you returned one frame ago"; every condition that
     makes that dereference sound is re-checked here (the block exists, is ours, from EXACTLY the
-    previous position, non-empty), and any failure falls back to drafting."""
+    previous position, AT LEAST TWO drafts), and any failure falls back to drafting.
+
+    THE ONE CHANGE FROM V4: V4 dereferenced any non-empty block. With a 1-draft block the refill
+    streams a single position, so this frame's own reply is RUN with one row in flight and is
+    itself the next refill (pspec.coord LAZY LICENCE): skipping it would starve the pipe. The
+    entry also sends `lic` only when W >= 3, so the refill's room is >= 2 as well."""
     nxt = dnxt
     if nxt is None and lic and last is not None:
         at, blk = last
-        if blk and at == int(pos) - 1:
+        if blk and len(blk) >= 2 and at == int(pos) - 1:
             nxt = blk[0]
     return nxt is None or int(nxt) != m

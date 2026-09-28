@@ -39,6 +39,7 @@ def test_plan_verify_round_is_v4s_over_every_small_input():
 
 
 def test_wants_block_is_v4s_over_every_hint_shape():
+    """V4's predicate, except that a `lic` dereference of a 1-draft block drafts (see its docstring)."""
     v4 = _v4()
     lasts = [None, (4, []), (4, [7]), (4, [8, 1]), (5, [7]), (3, [7])]
     for pos, m, dnxt, lic, last in itertools.product([5], [7, 8], [None, 7, 8], [False, True], lasts):
@@ -47,8 +48,10 @@ def test_wants_block_is_v4s_over_every_hint_shape():
             msg["dnxt"] = dnxt
         if lic:
             msg["dprev"] = True
-        assert wants_block(pos, m, dnxt=dnxt, lic=lic, last=last) == v4.wants_block(msg, m, last), \
-            (pos, m, dnxt, lic, last)
+        want = v4.wants_block(msg, m, last)
+        if dnxt is None and lic and last is not None and last[0] == pos - 1 and len(last[1]) == 1:
+            want = True               # the one tightening: never dereference a 1-draft block
+        assert wants_block(pos, m, dnxt=dnxt, lic=lic, last=last) == want, (pos, m, dnxt, lic, last)
 
 
 # ── one rule for every frame length ────────────────────────────────────────────────────────────

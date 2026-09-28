@@ -61,10 +61,10 @@ last row is r, streamed in a burst ending at H:
     block[:room] from r+1. The skip is sound only if that refill streams at least TWO positions:
     with one (room 1 or a 1-draft block), r's own reply is RUN with one row in flight and is itself
     the refill. So: W >= 3 here (room = min(max_new-left, W-1) with no ack cap, which is why `lazy`
-    refuses `acked`), the tail dereferences `lic` only for its own block of >= 2 drafts from exactly
-    r-1 (TailDrafterHost), and when max_new caps the refill at one position, r's reply has room 0
-    and consumes nothing. At floor > 1 the refill comes from an earlier reply at a block offset, so
-    no `lic` is sent.
+    refuses `acked`), the tail dereferences `lic` only for its own block of >= 2 drafts from
+    exactly r-1 (pspec.accept.wants_block), and when max_new caps the refill at one position, r's
+    reply has room 0 and consumes nothing. At floor > 1 the refill comes from an earlier reply at
+    a block offset, so no `lic` is sent.
   * Unhinted means draft: chunk frames, bursts of one and the prefill are never hinted.
 
 M2.5 AT DEPTH 1 IS `chunk` + an entry drafter + floor 1 + W >= K+1: after the prefill reply the

@@ -507,10 +507,8 @@ class TailDrafterHost:
         self.d.advance(sid, pos, [int(t) for t in toks[:k + 1]], np.asarray(ctx)[:k + 1])
         n = len(fed)
         last_row = pos + n - 1
-        last = self.last[sid]
-        if last is not None and len(last[1]) < 2:          # `lic` needs a refill of >= 2 positions
-            last = None                                     # (pspec.coord LAZY LICENCE)
-        if k == n - 1 and not wants_block(last_row, int(toks[-1]), dnxt=dnxt, lic=lic, last=last):
+        if k == n - 1 and not wants_block(last_row, int(toks[-1]), dnxt=dnxt, lic=lic,
+                                          last=self.last[sid]):
             self.last[sid] = None
             self.skipped += 1
             return True, None, True

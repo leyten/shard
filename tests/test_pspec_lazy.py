@@ -6,7 +6,7 @@ proves unused and answers `lz`, and the entry raises if it ever needs the block 
      no unsound skip (the raise), over the real TailDrafterHost with scripted blocks
   2. not vacuous: it skips drafts at floor 1 (`lic` + `dnxt`) and at floor 2 (`dnxt` alone)
   3. mutant licences (lic at floor 2, lic at W = 2, dnxt one row too far, the host dereferencing
-     `lic` through a 1-draft block) are caught by the raise
+     `lic` through a 1-draft block, V4's rule) are caught by the raise
   4. end to end with a real (tiny) MTP-3 / DFlash on the tail, lazy
 """
 import inspect
@@ -95,20 +95,19 @@ def test_an_unsound_licence_is_caught(old, new, W, floor, k):
         _lazy_run("pertoken", "full", W, floor, k, mod=bad, max_new=60)
 
 
-def test_the_hosts_two_draft_guard_is_load_bearing(monkeypatch):
-    """Without it, a 1-draft block refills a single position and the `lic` frame's own reply is the
-    refill: V4's `wants_block` dereference (non-empty block) alone is unsound here."""
-    import sys
-
+def test_the_two_draft_dereference_guard_is_load_bearing(monkeypatch):
+    """V4's `wants_block` dereferenced any non-empty block. With a 1-draft block the refill streams
+    a single position and the `lic` frame's own reply is the refill: V4's rule is unsound here."""
+    from shard.pspec import accept as ACC
     from shard.pspec import drafter as DR
-    src = inspect.getsource(DR)
-    old = "if last is not None and len(last[1]) < 2:"
+    src = inspect.getsource(ACC)
+    old = "if blk and len(blk) >= 2 and at == int(pos) - 1:"
     assert src.count(old) == 1
-    m = types.ModuleType("shard.pspec.drafter_mutant")
-    m.__package__, m.__file__ = DR.__package__, DR.__file__
-    monkeypatch.setitem(sys.modules, m.__name__, m)
-    exec(compile(src.replace(old, "if False:"), DR.__file__, "exec"), m.__dict__)
-    host = m.TailDrafterHost(BlocksDrafter(tail_blocks(T, 1), 1))
+    m = types.ModuleType("shard.pspec.accept_mutant")
+    m.__package__, m.__file__ = ACC.__package__, ACC.__file__
+    exec(compile(src.replace(old, "if blk and at == int(pos) - 1:"), ACC.__file__, "exec"), m.__dict__)
+    monkeypatch.setattr(DR, "wants_block", m.wants_block)
+    host = TailDrafterHost(BlocksDrafter(tail_blocks(T, 1), 1))
     with pytest.raises(RuntimeError, match="lazy licence"):
         run_pspec(T, P, 60, W=K + 1, floor=1, policy="pertoken", host=host, lazy=True)
 
