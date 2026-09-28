@@ -71,7 +71,7 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
@@ -126,6 +126,8 @@ class Lease:
     sep_seen: int = 0
     front: Frontier | None = None        # tail/solo: the pspec accept frontier (module docstring)
     draft: object = None                 # tail/solo: blocks(cfront, mfront) -> [ids], or None
+    path: dict = field(default_factory=dict)   # tail/solo: pos -> the model's token there, on
+                                               # the committed path (restores a re-opened mfront)
 
 
 class NodeServer:
@@ -301,15 +303,20 @@ class NodeServer:
                 code = "exists"
             except StageRuntimeError:
                 code = "bad"
+        draft = None
+        if code == "ok" and m["drafter"] is not None:
+            try:                              # a plugin fault refuses this lease, nothing more
+                draft = self._drafters[m["drafter"]](m)
+            except Exception:                 # noqa: BLE001
+                self.rt.close(sid)
+                code = "unsupported"
         if code == "ok":
             tail = m["role"] in ("tail", "solo")
             self._leases[sid] = Lease(sid=sid, hex=m["sid"], rte=m["rte"], role=m["role"],
                                       pred=m["pred"], next=m["next"], ret=m["ret"],
                                       backup=m["backup"], max_pos=m["max_pos"], W=m["W"], cx=m["cx"],
                                       seed=None if m["seed"] is None else int(m["seed"], 16),
-                                      front=Frontier() if tail else None,
-                                      draft=None if m["drafter"] is None
-                                      else self._drafters[m["drafter"]](m))
+                                      front=Frontier() if tail else None, draft=draft)
         self.count(f"lease_{code}")
         self._ack(peer, m["sid"], m["rte"], code)
 
@@ -335,7 +342,11 @@ class NodeServer:
                 return
         fr = L.front
         if fr is not None and fr.cfront is not None and 0 <= F <= fr.cfront:
-            fr.cfront, fr.mfront = F - 1, None    # re-opened: the next frame at F carries the token
+            # re-opened at F: the model's token there is the one this tail computed on the
+            # committed path; only a tail without that record (none yet) takes the entry's word
+            fr.cfront, fr.mfront = F - 1, L.path.get(F)
+            for p in [p for p in L.path if p > F]:
+                del L.path[p]
         L.rte = m["rte"]                      # queued frames of the old rte die at dequeue
         for k in ("pred", "next", "ret"):
             if m[k] is not None:
@@ -492,11 +503,16 @@ class NodeServer:
         to be judged against, and its cpos claims no more than the tail has committed."""
         if not self._judged(L, f):
             return
-        self._eid_ids(L, f)
-        if f["kind"] != "P":
-            cf = L.front.cfront
-            if cf is None or f["cpos"] > cf + 1:
-                raise _Refuse("bad")
+        ids = self._eid_ids(L, f)
+        if L.role == "solo" and f["cx"] == "ids" and f["x"] is not None:
+            if ids != [int(t) for t in np.frombuffer(f["x"].data, dtype="<i4")]:
+                raise _Refuse("bad")          # the ids it judges must be the ids it computes
+        cf = L.front.cfront
+        if f["kind"] == "P":
+            if cf is not None:                # one prefill per lease: a later P would reset
+                raise _Refuse("bad")          # the frontier to whatever it fed, unjudged
+        elif cf is None or f["cpos"] > cf + 1:
+            raise _Refuse("bad")
 
     def _admit_frame(self, L: Lease, f: dict) -> None:
         """Seek checks for the whole frame against the frontier its cpos WILL set, then commit.
@@ -642,15 +658,23 @@ class NodeServer:
         fr, ids, pos = L.front, self._eid_ids(L, f), f["pos"]
         if f["kind"] == "P":
             fr.prefill(pos + f["n"], toks[-1])
+            L.path[pos + f["n"]] = toks[-1]
             acc = True
         else:
-            if fr.mfront is None and pos == fr.cfront + 1:     # re-opened by a lease_update
+            if fr.mfront is None and pos == fr.cfront + 1:     # re-opened, no record: trusted
                 fr.mfront = ids[0]
-            acc, _k = fr.judge(pos, ids, toks)
+                L.path[pos] = ids[0]
+            acc, k = fr.judge(pos, ids, toks)
+            for j in range(k + 1):                             # k = -1 when off the path
+                L.path[pos + j + 1] = toks[j]
         blk = None
         if acc and L.draft is not None:
-            b = [int(t) for t in L.draft(fr.cfront, fr.mfront)][:frame.MAX_BLK]
-            if b:
+            try:                              # a plugin fault costs this reply its block only
+                b = [int(t) for t in L.draft(fr.cfront, fr.mfront)][:frame.MAX_BLK]
+            except Exception:                 # noqa: BLE001
+                b = []
+                self.count("draft_errors")
+            if b and min(b) >= 0 and max(b) < self.cap.vocab_size:
                 blk = frame.Tensor("i32", (len(b),), np.asarray(b, dtype="<i4"))
         self.count("judged_acc" if acc else "judged_off")
         return acc, blk

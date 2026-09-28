@@ -134,16 +134,19 @@ def _eid(ids):
     return frame.eid_pack(ids)
 
 
-def _submit(m, sid, *, kind, pos, ids, sep=0, cpos=None, lg="all", eid=True):
-    """FakeMesh.submit plus the eid (FakeMesh's submit carries none)."""
+def _submit(m, sid, *, kind, pos, ids, sep=0, cpos=None, lg="all", eid=True, rte=1):
+    """FakeMesh.submit plus the eid (FakeMesh's submit carries none). eid: True = the frame's
+    ids, a list = those ids instead, False = none."""
     seq = m._seq[sid]
     m._seq[sid] = seq + 1
     n = len(ids)
     if cpos is None:
         cpos = pos + n - 1 if kind == "P" else pos
-    body = frame.frame(sid=hexsid(sid), rte=1, seq=seq, sep=sep, pos=pos, n=n, kind=kind, cpos=cpos,
+    if eid is True:
+        eid = ids
+    body = frame.frame(sid=hexsid(sid), rte=rte, seq=seq, sep=sep, pos=pos, n=n, kind=kind, cpos=cpos,
                        lg=lg, cx="ids", x=frame.Tensor("i32", (n,), np.asarray(ids, dtype="<i4")),
-                       eid=_eid(ids) if eid else None)
+                       eid=_eid(eid) if eid else None)
     m._sent_at[(hexsid(sid), seq)] = m.clock.now()
     m.entry.links.send(m.peers[0], body)
     return seq
@@ -413,3 +416,99 @@ def test_a_node_refusal_surfaces_at_the_coordinator(mesh_factory):
     with pytest.raises(HopRefusal) as ei:
         coord.run(MeshLink(m), s, timeout=10.0)
     assert ei.value.code == "window" and ei.value.peer == "hop0"
+
+
+# ── skeptic-review regressions ────────────────────────────────────────────────────────────────
+def test_a_drafter_fault_costs_the_block_not_the_node(mesh_factory):
+    box, calls = {}, [0]
+    good = tail_drafter(box, 3, _miss(0.6, 5))
+
+    def flaky(lease):
+        if lease["sid"] == hexsid(9):
+            raise RuntimeError("plugin failed to load")
+        inner = good(lease)
+
+        def blocks(q, mf):
+            calls[0] += 1
+            if calls[0] % 3 == 0:
+                raise RuntimeError("drafter fault")
+            return inner(q, mf)
+        return blocks
+    m = mesh_factory(3, clock="real", cost_scale=0.0, drafters={"toy": flaky})
+    assert m.open(9, drafter="toy", expect_ok=False)["hop2"] == "unsupported"
+    prompt = [7, 3, 9, 1]
+    T = direct_greedy(m.weights, prompt, 30)
+    box["T"] = T
+    r, _s, _l = run_mesh(m, 1, prompt, 20, policy="pertoken")
+    assert r["tokens"] == T[4:24]
+    assert m.nodes[2].alive and m.nodes[2].snapshot()["draft_errors"] > 0
+    assert m.open(9, drafter=None, expect_ok=False)["hop2"] == "ok"   # the tail kept nothing
+
+
+def test_reopen_restores_the_frontier_token_from_the_tails_record(mesh_factory):
+    m = mesh_factory(3)
+    prompt = [2, 9, 4]
+    P = len(prompt)
+    T = direct_greedy(m.weights, prompt, 10)
+    m.open(1, W=8)
+    _req(m, 1, kind="P", pos=0, ids=prompt, lg="last")
+    assert _req(m, 1, kind="S", pos=P, ids=T[P:P + 4])["acc"] is True     # frontier at P+3
+    F = P + 2
+    for peer in m.peers:
+        m.entry.links.send(peer, frame.control("lease_update", sid=hexsid(1), rte=2,
+                                               truncate_to=F, sig=b"s"))
+    m.entry.pump_until(lambda: all(m.entry.acks.get((hexsid(1), p), ("",))[1:2] == (2,)
+                                   for p in m.peers), m.clock.now() + 1.0)
+    fr = m.nodes[-1]._leases[1].front
+    _settle(m)
+    assert (fr.cfront, fr.mfront) == (F - 1, T[F])  # from the record, not from the entry
+    r = _req(m, 1, kind="T", pos=F, ids=[_wrong(T[F], 0)], cpos=F, rte=2)  # a wrong re-feed
+    assert r["acc"] is False
+    r = _req(m, 1, kind="T", pos=F, ids=[T[F]], cpos=F, rte=2)
+    assert r["acc"] is True and reply_tokens(r) == [T[F + 1]]
+
+
+def test_solo_refuses_an_eid_that_is_not_the_ids_it_computes(mesh_factory):
+    m = mesh_factory(1)
+    prompt = [5, 5, 6]
+    P = len(prompt)
+    T = direct_greedy(m.weights, prompt, 5)
+    m.open(1)
+    _req(m, 1, kind="P", pos=0, ids=prompt, lg="last")
+    with pytest.raises(HopError) as ei:
+        _req(m, 1, kind="T", pos=P, ids=[_wrong(T[P], 0)], eid=[T[P]])
+    assert ei.value.code == "bad"
+    assert _req(m, 1, kind="T", pos=P, ids=[T[P]])["acc"] is True
+
+
+def test_a_second_prefill_is_refused_at_the_tail(mesh_factory):
+    m = mesh_factory(2)
+    prompt = [1, 1, 2, 3]
+    P = len(prompt)
+    m.open(1)
+    _req(m, 1, kind="P", pos=0, ids=prompt, lg="last")
+    _settle(m)
+    before = _state(m, 1)[1]
+    with pytest.raises(HopError) as ei:
+        _req(m, 1, kind="P", pos=P, ids=[40, 41, 42], lg="last")
+    assert (ei.value.code, ei.value.peer) == ("bad", "hop1")
+    _settle(m)
+    assert _state(m, 1)[1] == before
+
+
+def test_a_judged_frame_over_the_tail_budget(mesh_factory):
+    """_run_big with judging: a 7-row spec frame through a tail whose budget is 3."""
+    m = mesh_factory(2)
+    m.nodes[-1]._budget = 3
+    prompt = [3, 8, 3]
+    P = len(prompt)
+    T = direct_greedy(m.weights, prompt, 12)
+    m.open(1, W=8)
+    _req(m, 1, kind="P", pos=0, ids=prompt, lg="last")
+    ids = T[P:P + 5] + [_wrong(T[P + 5], 0), T[P + 6]]
+    r = _req(m, 1, kind="S", pos=P, ids=ids, lg="all")
+    assert r["acc"] is True and reply_tokens(r)[:5] == T[P + 1:P + 6]
+    fr = m.nodes[-1]._leases[1].front
+    _settle(m)
+    assert (fr.cfront, fr.mfront) == (P + 4, T[P + 5])
+    assert m.nodes[-1].snapshot()["steps"] >= 1 + 3
