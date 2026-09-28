@@ -41,11 +41,12 @@ class ToyFactory:
         self.name = f"{cls.__name__}[{mode},{geom}]"
         self.weights = ToyWeights(PATTERN, hidden=HIDDEN, vocab=VOCAB, taps=TAPS)
 
-    def _spec(self, lo, hi, is_head, is_tail, tap_mode="raw", spec_window=None, max_sessions=8,
+    def _spec(self, lo, hi, is_head, is_tail, tap_mode="raw", spec_window=64, max_sessions=8,
               max_ctx=None, kv_budget_bytes=0):
+        # Stages accept speculation up to 64 deep (a production default); sessions open with W.
         return StageSpec("toy", lo, hi, is_head=is_head, is_tail=is_tail, taps=TAPS,
                          tap_mode=tap_mode, max_sessions=max_sessions,
-                         max_ctx=max_ctx or self.max_ctx, spec_window=spec_window or self.W,
+                         max_ctx=max_ctx or self.max_ctx, spec_window=max(spec_window or 64, self.W),
                          kv_budget_bytes=kv_budget_bytes)
 
     def _build(self, lo, hi, is_head, is_tail, **kw):
@@ -56,6 +57,13 @@ class ToyFactory:
         rt = self._build(lo, hi, is_head, is_tail, **kw)
         rt.load(self.weights)
         return rt
+
+    def make_unloaded(self, lo, hi, *, is_head=False, is_tail=False):
+        return self._build(lo, hi, is_head, is_tail), self.weights
+
+    def kv_bytes_per_pos(self, lo, hi):
+        kinds = self.layer_kinds[lo:hi]
+        return kinds.count("global") * HIDDEN * 4, kinds.count("swa") * HIDDEN * 4
 
     def reference(self, lo, hi, *, is_head=False, is_tail=False, tap_mode="raw"):
         return ToyReference(self.weights, self._spec(lo, hi, is_head, is_tail, tap_mode=tap_mode),
@@ -336,6 +344,82 @@ class NoTokenRangeCheck(ToyRuntime):
             raise BadRequest("token ids must be Rows i32/i64 [n]", sid=sid)
 
 
+class RowCoupledN17(ToyRuntime):
+    """Couples rows only in segments of 17+ rows: invisible to verify chunks of <= 16."""
+    def _row_term(self, ctx, seg, li, r, x):
+        return super()._row_term(ctx, seg, li, r, x) + (int(x.sum() % 1009) if seg.n >= 17 else 0)
+
+
+class SidAlias32(ToyRuntime):
+    """Keys KV storage by the low 32 bits of the sid."""
+    _strict = False
+
+    def open(self, sid, max_pos, spec_window):
+        super().open(sid, max_pos, spec_window)
+        me = self._sess[sid]
+        for other, s in self._sess.items():
+            if other != sid and other & 0xFFFFFFFF == sid & 0xFFFFFFFF and (s.max_pos, s.W) == (max_pos, spec_window):
+                me.glob, me.swa, me.tag = s.glob, s.swa, s.tag
+                break
+
+
+def _page(p):
+    return p if p < 192 else 128 + (p - 128) % 64       # a 3-page table that wraps its last page
+
+
+class PosPageBug(ToyRuntime):
+    """Global KV past position 191 wraps onto an earlier page."""
+    def _write_kv(self, s, li, p, row, rebuilding):
+        if self.kinds_all[li] == "global":
+            if not (rebuilding and p < s.upto):
+                s.glob[li][_page(p)] = row
+        else:
+            super()._write_kv(s, li, p, row, rebuilding)
+
+    def _attend_global(self, s, li, p):
+        coef = self._qw[:p + 1] * self._pow[p::-1] % P
+        return (s.glob[li][[_page(q) for q in range(p + 1)]] * coef[:, None]).sum(0) % P
+
+
+class KVBytesUnderreported(ToyRuntime):
+    """describe() halves the global KV bytes and reports no SWA KV: admission over-promises."""
+    def describe(self):
+        c = super().describe()
+        return dataclasses.replace(c, global_kv_bytes_per_pos=c.global_kv_bytes_per_pos // 2, swa_kv_bytes_per_pos=0)
+
+
+class TopK0MeansOne(ToyRuntime):
+    """Reads top_k=0 ("no cut") as k=1, i.e. greedy."""
+    def _draw(self, logits_row, sampling, p, r):
+        if sampling is not None and sampling.top_k == 0:
+            sampling = dataclasses.replace(sampling, top_k=1)
+        return toy_draw(logits_row, sampling, p)
+
+
+class FakeServiceMs(ToyRuntime):
+    """warmup() reports a flat 0.001 ms cost curve instead of measuring."""
+    def warmup(self, buckets=(1, 8, 32), contexts=(0,), sessions=(1,)):
+        super().warmup(buckets, contexts, sessions)
+        self._service = tuple((n, b, c, 0.001) for n, b, c, _ in self._service)
+        return self.describe()
+
+
+class IgnoresRebuildFloor(ToyRuntime):
+    """rebuild_from ignores the rollback floor: committed jumps to F, re-adoption cannot rewind."""
+    def rebuild_from(self, sid, F, exact_from=None, floor=None):
+        return super().rebuild_from(sid, F, exact_from)
+
+
+class FloorWithoutEarlyStart(ToyRuntime):
+    """Honours the floor as the commit frontier but rebuilds from the F rule: a rewind to the
+    floor then reads SWA rows computed on partial windows."""
+    def rebuild_from(self, sid, F, exact_from=None, floor=None):
+        a = super().rebuild_from(sid, F, exact_from)
+        if floor is not None:
+            self._get(sid).committed = floor
+        return a
+
+
 # mutant -> (geometry, the checks DESIGNED to catch it; each must fail in both numeric modes)
 MUTANTS = {
     MirrorOverwrite: ("w4W4", {"check_rebuild", "check_export_import"}),
@@ -359,6 +443,14 @@ MUTANTS = {
     SamplerKeyedByRow: ("w4W4", {"check_tokens", "check_reference"}),
     PrefillSkipsRollbackCheck: ("w4W4", {"check_validation_atomic"}),
     NoTokenRangeCheck: ("w4W4", {"check_validation_atomic"}),
+    RowCoupledN17: ("w4W4", {"check_row_independence", "check_batch_invariance"}),
+    SidAlias32: ("w4W4", {"check_replay", "check_mixed_kinds"}),
+    PosPageBug: ("w4W4", {"check_long_context"}),
+    KVBytesUnderreported: ("w4W4", {"check_describe"}),
+    TopK0MeansOne: ("w4W4", {"check_tokens"}),
+    FakeServiceMs: ("w4W4", {"check_describe"}),
+    IgnoresRebuildFloor: ("w4W4", {"check_rebuild"}),
+    FloorWithoutEarlyStart: ("w4W4", {"check_rebuild"}),
 }
 
 

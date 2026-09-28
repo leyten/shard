@@ -23,8 +23,9 @@ distance). Two modes:
     invariant, row independent, replayable) but chunking changes them, like real float
     kernels. What holds here holds without chunk invariance.
 The tail's logits are lm_head . (out * norm) mod P; tokens are drawn by `toy_draw` (greedy =
-first maximum; sampled = a top-k pick by a counter hash of (seed, position): integer logits
-carry no probabilities, so temperature > 0 only switches sampling on and top_p is unused).
+first maximum; sampled = a uniform pick among the top ceil(top_p * k) of the top_k candidates,
+by a counter hash of (seed, position): integer logits carry no probabilities, so temperature
+> 0 only switches sampling on and top_p cuts by rank).
 
 Storage mirrors a real runtime on purpose: global rows in a per-session [max_pos, H] array,
 SWA rows in a ring of exactly (w - 1 + spec_window) slots per layer, so the classic "ring of w
@@ -40,6 +41,7 @@ from __future__ import annotations
 
 import hashlib
 import json
+import math
 import os
 import platform
 import time
@@ -66,10 +68,11 @@ def _shape_term(start: int, n: int, r: int, layer: int) -> int:
 def toy_draw(logits_row, sampling: Sampling | None, p: int) -> int:
     """The toy's token draw at absolute position p (part of the model's definition)."""
     row = [int(v) for v in logits_row]
-    if sampling is None or sampling.temperature == 0:
+    if sampling is None or sampling.temperature == 0 or sampling.top_k == 1:
         return max(range(len(row)), key=lambda i: (row[i], -i))
     order = sorted(range(len(row)), key=lambda i: (-row[i], i))
     k = min(sampling.top_k or len(row), len(row))
+    k = max(1, math.ceil(sampling.top_p * k))
     r = int.from_bytes(hashlib.sha256(f"{sampling.seed}/{p}".encode()).digest()[:8], "little")
     return order[r % k]
 
@@ -251,7 +254,9 @@ class ToyRuntime:
             global_kv_bytes_per_pos=len(self._glob_layers) * self.H * 4,
             swa_kv_bytes_per_pos=len(self._swa_layers) * self.H * 4, kv_page_positions=1,
             kv_free_bytes=self._budget - self._used,
-            weight_bytes=sum(4 * int(np.prod(self._shape_of(nm))) for nm in self._needed()),
+            layer_weight_bytes=tuple(3 * self.H * 4 for _ in self.kinds),
+            edge_weight_bytes=sum(4 * int(np.prod(self._shape_of(nm))) for nm in self._needed()
+                                  if not nm.startswith("layers.")),
             load_peak_extra_bytes=0, max_sessions=sp.max_sessions,
             max_ctx=sp.max_ctx, spec_window_max=sp.spec_window,
             max_tokens_per_step=self.max_tokens_per_step, tap_layers_held=self._tap_layers,
@@ -259,30 +264,35 @@ class ToyRuntime:
             chunk_invariant=self.mode == "chunk_invariant", service_ms=self._service,
             self_probe_ok=self._probe, open_sessions=len(self._sess))
 
-    def warmup(self, buckets=(1, 8, 32), contexts=(0,)) -> Capability:
-        """Time one prefill step per (bucket, context) on scratch sessions (never registered,
-        never charged to the KV pool) after an untimed prefix of `context` rows, and
-        self-probe: the repeat run must be byte-equal."""
+    def warmup(self, buckets=(1, 8, 32), contexts=(0,), sessions=(1,)) -> Capability:
+        """Time one step per shape (s sessions x b tokens at context c) on scratch sessions
+        (never registered, never charged to the KV pool) after an untimed prefix of c rows
+        each, and self-probe: the repeat run must be byte-equal."""
         self._loaded()
         service, probe = [], True
-        for ctx in contexts:
-            for b in buckets:
-                b = min(int(b), self.max_tokens_per_step)
-                if b < 1 or ctx + b > self.spec.max_ctx:
-                    continue
-                runs, best = [], float("inf")
-                for _ in range(2):
-                    s = self._new_sess(ctx + b, 1, 0)
-                    s.committed = ctx + b
-                    for p0 in range(0, ctx, self.max_tokens_per_step):
-                        n0 = min(self.max_tokens_per_step, ctx - p0)
-                        self._run(s, self._probe_seg(p0, n0), _StepCtx(n0, 1))
-                    seg = self._probe_seg(ctx, b)
-                    t0 = time.perf_counter()
-                    runs.append(self._run(s, seg, _StepCtx(b, 1)))
-                    best = min(best, time.perf_counter() - t0)
-                probe &= runs[0].hidden == runs[1].hidden and runs[0].logits == runs[1].logits
-                service.append((b, int(ctx), best * 1000.0))
+        for n_s in sessions:
+            for ctx in contexts:
+                for b in buckets:
+                    b = int(b)
+                    if b < 1 or n_s * b > self.max_tokens_per_step or ctx + b > self.spec.max_ctx:
+                        continue
+                    runs, best = [], float("inf")
+                    for _ in range(2):
+                        scratch = []
+                        for _ in range(int(n_s)):
+                            s = self._new_sess(ctx + b, 1, 0)
+                            s.committed = ctx + b
+                            for p0 in range(0, ctx, self.max_tokens_per_step):
+                                n0 = min(self.max_tokens_per_step, ctx - p0)
+                                self._run(s, self._probe_seg(p0, n0), _StepCtx(n0, 1))
+                            scratch.append(s)
+                        seg = self._probe_seg(ctx, b)
+                        t0 = time.perf_counter()
+                        outs = [self._run(s, seg, _StepCtx(n_s * b, int(n_s))) for s in scratch]
+                        best = min(best, time.perf_counter() - t0)
+                        runs.append(outs[0])
+                    probe &= runs[0].hidden == runs[1].hidden and runs[0].logits == runs[1].logits
+                    service.append((int(n_s), b, int(ctx), best * 1000.0))
         self._service, self._probe = tuple(service), bool(probe)
         return self.describe()
 
@@ -394,18 +404,25 @@ class ToyRuntime:
         s.upto = upto
         s.imported = True
 
-    def rebuild_from(self, sid: int, F: int, exact_from: int | None = None) -> int:
+    def rebuild_from(self, sid: int, F: int, exact_from: int | None = None,
+                     floor: int | None = None) -> int:
         s = self._get(sid)
         if s.length != 0 or s.rebuild_hi is not None:
             raise BadRequest("rebuild_from needs a fresh or freshly imported session", sid=sid)
         if not s.upto <= F <= s.max_pos:
             raise BadRequest(f"F={F} must satisfy imported upto {s.upto} <= F <= max_pos {s.max_pos}", sid=sid)
+        floor = F if floor is None else floor
+        if not 0 <= floor <= F or F - floor > s.W:
+            raise BadRequest(f"floor {floor} must satisfy F - spec_window <= floor <= F={F}", sid=sid)
+        if exact_from is not None and not 0 <= exact_from <= F:
+            raise BadRequest(f"exact_from {exact_from} must lie in [0, F={F}]", sid=sid)
         try:
-            a = rebuild_start(self.kinds, self.window, F, s.upto, exact_from)
+            a = rebuild_start(self.kinds, self.window, F, s.upto,
+                              floor if exact_from is None else min(exact_from, floor))
         except BadRequest as e:
             raise BadRequest(str(e), sid=sid) from None
         s.length, s.swa_lo, s.imported = a, a, False
-        s.committed = max(s.committed, F)
+        s.committed = max(s.committed, floor)
         s.rebuild_hi = F if a < F else None
         return a
 
@@ -417,12 +434,17 @@ class ToyRuntime:
         self._check_ids(ids, ids.n if isinstance(ids, Rows) else -1, None)
         return Rows("i32", self._w["embed"][ids.data.astype(np.int64)].astype(np.int32))
 
-    def project(self, hidden: Rows) -> Rows:
+    def project(self, hidden: Rows, *, tokens: bool = False, start_pos: int = 0,
+                sampling: Sampling | None = None) -> Rows:
         self._loaded()
         if not self.spec.is_tail:
             raise BadRequest("project() is tail-only")
         self._check_hidden(hidden, hidden.n if isinstance(hidden, Rows) else -1, None, "hidden")
-        return Rows("i32", self._logits(hidden.data.astype(np.int64)).astype(np.int32))
+        lg = self._logits(hidden.data.astype(np.int64))
+        if not tokens:
+            return Rows("i32", lg.astype(np.int32))
+        return Rows("i32", np.array([self._draw(lg[i], sampling, start_pos + i, i) for i in range(hidden.n)],
+                                    dtype=np.int32))
 
     def _logits(self, x: np.ndarray) -> np.ndarray:
         y = x * self._w["norm"] % P
@@ -654,10 +676,12 @@ class ToyReference:
                 s["kv"][li][q] = [int(v) for v in r.data[q - blob.lo_pos]]
         s["upto"] = upto
 
-    def rebuild_from(self, sid, F, exact_from=None):
+    def rebuild_from(self, sid, F, exact_from=None, floor=None):
         s = self.s[sid]
-        a = rebuild_start(self.kinds, self.window, F, s["upto"], exact_from)
-        s["length"], s["committed"] = a, max(s["committed"], F)
+        floor = F if floor is None else floor
+        a = rebuild_start(self.kinds, self.window, F, s["upto"],
+                          floor if exact_from is None else min(exact_from, floor))
+        s["length"], s["committed"] = a, max(s["committed"], floor)
         s["rb"] = F if a < F else None
         return a
 
@@ -669,9 +693,12 @@ class ToyReference:
         y = [row[h] * self.W["norm"][h] % P for h in range(self.H)]
         return [sum(y[h] * self.W["lm_head"][v][h] for h in range(self.H)) % P for v in range(self.V)]
 
-    def project(self, hidden):
-        return Rows("i32", np.array([self._lg([int(v) for v in r]) for r in hidden.data],
-                                    dtype=np.int64).reshape(hidden.n, self.V).astype(np.int32))
+    def project(self, hidden, *, tokens=False, start_pos=0, sampling=None):
+        lg = [self._lg([int(v) for v in r]) for r in hidden.data]
+        if tokens:
+            return Rows("i32", np.array([toy_draw(r, sampling, start_pos + i) for i, r in enumerate(lg)],
+                                        dtype=np.int32))
+        return Rows("i32", np.array(lg, dtype=np.int64).reshape(hidden.n, self.V).astype(np.int32))
 
     def step(self, x):
         return StepOut(tuple(self._seg(seg) for seg in x.segs))

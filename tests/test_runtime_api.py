@@ -92,17 +92,18 @@ def _cap(dev, n_layers, weight_bytes_per_layer=3 * GiB):
                                   "bf16", (4, 192, 128)),
         global_kv_bytes_per_pos=n_g * 4 * (192 + 128) * 2, swa_kv_bytes_per_pos=(n_layers - n_g) * 8 * (192 + 128) * 2,
         kv_page_positions=64, kv_free_bytes=max(0, dev.free_mem_bytes - wb - 2 * GiB),
-        weight_bytes=wb, load_peak_extra_bytes=GiB // 2,
+        layer_weight_bytes=tuple(weight_bytes_per_layer for _ in kinds), edge_weight_bytes=0,
+        load_peak_extra_bytes=GiB // 2,
         max_sessions=256, max_ctx=65536, spec_window_max=64, max_tokens_per_step=2048,
         tap_layers_held=(), tap_mode="fc_partial",
         numerics_id=make_numerics_id(backend=dev.backend, arch_class=dev.arch_class, mode="invariant"),
         numerics_mode="invariant", chunk_invariant=False,
-        service_ms=((1, 0, 4.0), (16, 0, 6.5), (16, 32768, 9.0)))
+        service_ms=((1, 1, 0, 4.0), (1, 16, 0, 6.5), (16, 1, 32768, 9.0)))
 
 
 def _layers_that_fit(dev, cap, ctx, sessions):
     """What placement computes before assigning a span: every input comes from the records."""
-    per_layer = cap.weight_bytes_per_layer + sessions * cap.session_kv_bytes(ctx, 64) / (cap.hi - cap.lo)
+    per_layer = max(cap.layer_weight_bytes) + sessions * cap.session_kv_bytes(ctx, 64) / (cap.hi - cap.lo)
     return int((dev.free_mem_bytes - cap.load_peak_extra_bytes) // per_layer)
 
 
@@ -116,7 +117,7 @@ def test_one_code_path_reasons_about_a_mixed_fleet():
         keys = keys or set(d) | set(d["device"])
         assert set(d) | set(d["device"]) == keys, f"{name}: the record's shape depends on the backend"
         assert c.sessions_at(32768, 64) >= 1, name
-        assert c.layer_ms == tuple((b, x, ms / (c.hi - c.lo)) for b, x, ms in c.service_ms)
+        assert c.layer_ms == tuple((n, b, x, ms / (c.hi - c.lo)) for n, b, x, ms in c.service_ms)
     fmt = {k: FLEET[k].format_support("mxfp4") for k in FLEET}
     assert fmt == {"rtx3090": "emulated", "rtx4090": "emulated", "rtx5090": "hw", "pro6000": "hw",
                    "spark": "hw", "m2pro": "emulated", "7900xtx": None}

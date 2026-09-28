@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import json
 import random
+import time
 from typing import Callable, Mapping, Protocol
 
 import numpy as np
@@ -51,8 +52,9 @@ from shard.runtime.api import (BACKENDS, BadRequest, Capability, KVBlob, KVFull,
 
 REBUILD_PATTERNS = ("SSG", "SGS", "SSSSSG", "SGSGS", "GSS", "SSS", "GG")
 PREFILL_CHUNK = 16
-# Session ids are opaque u64s: include ones that collide modulo any small table size.
-SIDS = (0, 9, (1 << 33) + 1, (1 << 64) - 1)
+# Session ids are opaque u64s. 9 and 2**33 + 9 collide modulo every power of two up to 2**33
+# (a slot table, a 32-bit key); both are open together wherever SIDS[:3] are.
+SIDS = (0, 9, (1 << 33) + 9, (1 << 64) - 1)
 SAMPLE = Sampling(seed=1234, temperature=1.0, top_k=4)
 
 
@@ -96,6 +98,10 @@ class RuntimeFactory(Protocol):
 
     def make_broken(self, lo: int, hi: int) -> None:
         """Build + load a runtime whose weight source lacks one tensor (must raise LoadRefused)."""
+
+    # Optional: make_unloaded(lo, hi, *, is_head, is_tail) -> (runtime, WeightSource), so
+    # describe() can be checked before load(); kv_bytes_per_pos(lo, hi) -> (global, swa) bytes
+    # of one position from the model's geometry, so describe() cannot under-report KV.
 
 
 # ── small helpers ─────────────────────────────────────────────────────────────────────────────
@@ -316,6 +322,12 @@ def check_describe(f):
         assert cap.tap_layers_held == tuple(sorted(t for t in set(f.taps) if lo <= t < hi))
         assert cap.spec_window_max >= f.W and cap.max_tokens_per_step >= 32, "suite needs a 32-token step"
         assert cap.weight_bytes > 0 and cap.vocab_size > 0 and cap.hidden_size > 0
+        assert len(cap.layer_weight_bytes) == hi - lo and min(cap.layer_weight_bytes) > 0
+        geo = getattr(f, "kv_bytes_per_pos", None)
+        if geo:
+            g_b, s_b = geo(lo, hi)
+            assert cap.global_kv_bytes_per_pos >= g_b and cap.swa_kv_bytes_per_pos >= s_b, \
+                f"describe() under-reports KV: ({cap.global_kv_bytes_per_pos}, {cap.swa_kv_bytes_per_pos}) < ({g_b}, {s_b})"
         got = [cap.sessions_at(c, f.W) for c in (16, 64, f.max_ctx)]
         assert got == sorted(got, reverse=True) and got[-1] >= 1, got
         sid = SIDS[3]
@@ -330,12 +342,37 @@ def check_describe(f):
         if "global" in cap.layer_kinds:
             blob = rt.export_state(sid, 0, 3)
             assert blob.layout_id == cap.kv_layout_id and all(r.dtype == cap.kv_dtype for r in blob.rows)
+            assert cap.global_kv_bytes_per_pos >= len(blob.pos_bytes(0)), \
+                "describe() reports fewer global KV bytes per position than one exported position holds"
         rt.close(sid)
-        wcap = rt.warmup(buckets=(1, 4), contexts=(0, 8))
-        assert {(b, c) for b, c, _ in wcap.service_ms} == {(1, 0), (4, 0), (1, 8), (4, 8)}, wcap.service_ms
-        assert all(ms > 0 for _, _, ms in wcap.service_ms)
+        wcap = rt.warmup(buckets=(1, 4, 32), contexts=(0, 8), sessions=(1, 3))
+        shapes = {(n, b, c) for n, b, c, _ in wcap.service_ms}
+        assert shapes == {(n, b, c) for n in (1, 3) for b in (1, 4, 32) for c in (0, 8)
+                          if n * b <= cap.max_tokens_per_step}, wcap.service_ms
+        assert all(ms > 0 for *_, ms in wcap.service_ms)
         assert wcap.self_probe_ok is True and wcap.open_sessions == 0
         assert wcap.numerics_id == cap.numerics_id
+        claimed = dict(((n, b, c), ms) for n, b, c, ms in wcap.service_ms)[(1, 32, 0)]
+        best = float("inf")
+        for i in range(3):                               # the curve must be a real measurement
+            _open(rt, 100 + i, f)
+            rt.commit(100 + i, 32)
+            seg = _seg(100 + i, 0, _inp(f, head, 32, 6), logits="last" if tail else "none")
+            t0 = time.perf_counter()
+            _one(rt, seg)
+            best = min(best, (time.perf_counter() - t0) * 1000)
+            rt.close(100 + i)
+        assert best / 10 <= claimed <= best * 10, f"service_ms says {claimed:.3f} ms, a real step takes {best:.3f} ms"
+    unloaded = getattr(f, "make_unloaded", None)
+    if unloaded:                                         # placement sizes spans before loading
+        lo, hi, head, tail = _role(f, "tail")
+        rt, src = unloaded(lo, hi, is_head=head, is_tail=tail)
+        c0 = rt.describe()
+        rt.load(src)
+        c1 = rt.describe()
+        assert (c0.layer_kinds, c0.kv_layout_id, c0.global_kv_bytes_per_pos) == \
+            (c1.layer_kinds, c1.kv_layout_id, c1.global_kv_bytes_per_pos)
+        assert abs(c0.weight_bytes - c1.weight_bytes) <= 0.1 * c1.weight_bytes, (c0.weight_bytes, c1.weight_bytes)
 
 
 def check_admission(f):
@@ -519,13 +556,20 @@ def check_mixed_kinds(f):
         if ref is not None:
             prepare(ref, SIDS)
             routs = ref.step(StepIn(tuple(final[s] for s in SIDS))).outs
+        inv = f.numerics_mode == "invariant"          # fast mode: batch-mates may move bytes
+
+        def same(a, b):
+            if a is None or b is None:
+                return a is b
+            return a == b if inv else f.close_enough(a, b, "reference")
+
         for i, (s, o) in enumerate(zip(SIDS, outs)):
             solo = _mk(f, lo, hi, head, tail)
             prepare(solo, (s,))
             want = _one(solo, final[s])
-            assert o.hidden == want.hidden and o.logits == want.logits and o.tokens == want.tokens, \
+            assert same(o.hidden, want.hidden) and same(o.logits, want.logits) and same(o.tokens, want.tokens), \
                 f"session {s} differs in a mixed step"
-            assert dict(o.taps).keys() == dict(want.taps).keys() and all(o.taps[t] == want.taps[t] for t in o.taps)
+            assert dict(o.taps).keys() == dict(want.taps).keys() and all(same(o.taps[t], want.taps[t]) for t in o.taps)
             assert o.hidden.n == final[s].n
             nrows = {"none": None, "last": 1, "all": final[s].n}
             for field in ("logits", "tokens"):
@@ -547,7 +591,7 @@ def check_mixed_kinds(f):
                 r.commit(s, nxt)
             c1 = _one(mixed, _seg(s, nxt, xs[s].slice(nxt, nxt + 1)))
             c2 = _one(solo, _seg(s, nxt, xs[s].slice(nxt, nxt + 1)))
-            assert c1.hidden == c2.hidden, f"session {s} diverges after the mixed step"
+            assert same(c1.hidden, c2.hidden), f"session {s} diverges after the mixed step"
 
 
 def check_frontier(f):
@@ -637,10 +681,12 @@ def check_swa_retention(f):
 
 def check_row_independence(f):
     """A row's bytes (hidden, logits, tokens, taps) never depend on the VALUES of later rows in
-    its segment (finite perturbations, not NaN), for verify chunks up to W and up to 16 rows,
-    and truncating those rows leaves no trace."""
+    its segment (finite perturbations, not NaN), for verify chunks of W, 16 and the deepest
+    spec window the stage accepts, and truncating those rows leaves no trace."""
     _requires_invariant(f)
-    for K in sorted({f.W, 16}):
+    c0 = _mk(f, *_role(f, "mid")[:2], False, False).describe()
+    k_max = min(c0.spec_window_max, c0.max_tokens_per_step - 8, f.max_ctx - 48)
+    for K in sorted({f.W, 16, k_max}):
         for lo, hi, head, tail in _roles(f):
             kw = _tailkw(tail)
             x = _inp(f, head, 30 + K, 51)
@@ -700,11 +746,17 @@ def check_batch_invariance(f):
                 _open(rt, big, f)
                 rt.commit(big, n)
                 segs.insert(comp.index(big), _seg(big, 0, _inp(f, head, n, 99), "prefill", **kw))
-            for s, o in zip(comp, rt.step(StepIn(tuple(segs))).outs):
+            for s, o, sg in zip(comp, rt.step(StepIn(tuple(segs))).outs, segs):
                 sig = [_row_sig(o, r) for r in range(o.hidden.n)]
                 if s in seen and s != big:
                     assert seen[s] == sig, f"session {s} changes with its batch-mates {comp}"
                 seen[s] = sig
+                ref = _ref(f, lo, hi, head, tail) if s == big else None
+                if ref is not None:                      # the full-budget segment itself is right
+                    _open(ref, big, f)
+                    ref.commit(big, sg.n)
+                    _match_ref(f, _rows_of([(0, sg.n, o)]), _rows_of([(0, sg.n, _one(ref, sg))]),
+                               f"a {sg.n}-row segment in a full step")
 
 
 def check_replay(f):
@@ -983,12 +1035,14 @@ def _blob_prefix(blob: KVBlob, g: int) -> KVBlob:
     return KVBlob(0, g, blob.layers, tuple(r.slice(0, g) for r in blob.rows), blob.layout_id, blob.numerics_id)
 
 
-def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail):
-    """Import [0, g), rebuild [a, F) in `chunk`-row segments, continue 3 W-rounds."""
+def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail, floor=None):
+    """Import [0, g), rebuild [a, F) in `chunk`-row segments, then (with a floor) rewind to the
+    floor as a re-adopting entry would, and continue 3 W-rounds from the rollback floor."""
     _open(r, sid, f)
     if blob is not None:
         r.import_state(sid, blob, g)
-    a = r.rebuild_from(sid, F, exact_from)
+    a = r.rebuild_from(sid, F, exact_from, floor)
+    fl = F if floor is None else floor
     rb = []
     p = a
     while p < F:
@@ -997,16 +1051,20 @@ def _backup(r, sid, f, blob, g, F, true, chunk, exact_from, kinds, tail):
         p += n
     lo_exact = max(rebuild_exact_from(kinds, f.window, a), exact_from or 0)
     exact = {p + i: (o, i) for p, n, o in rb for i in range(n) if p + i >= lo_exact}
-    kv = r.export_state(sid, 0, F) if blob is not None else None
-    mirror_ok = blob is None or g == 0 or r.export_state(sid, 0, g) == _blob_prefix(blob, g)
-    cont = _rows_of(_continue(r, sid, true, F, f.W, **_tailkw(tail)))
+    kv = r.export_state(sid, 0, fl) if blob is not None else None
+    gm = min(g, fl)
+    mirror_ok = blob is None or gm == 0 or r.export_state(sid, 0, gm) == _blob_prefix(blob, gm)
+    if fl < F:
+        r.truncate(sid, fl)
+    cont = _rows_of(_continue(r, sid, true, fl, f.W, **_tailkw(tail)))
     return a, exact, kv, mirror_ok, cont
 
 
 def check_rebuild(f):
     """The takeover rebuild (§4.1 rule) for span patterns SSG, SGS, SSSSSG, SGSGS, GSS, SSS, GG
-    and the whole model, with g_eff = F, just below F, well below F and 0, and with an
-    exact_from request: a is exactly the rule; the continuation, the rebuilt KV and the
+    and the whole model, with g_eff = F, just below F, well below F and 0, with an exact_from
+    request, and with a rollback floor below F that the continuation then rewinds to (entry
+    re-adoption after a takeover): a is exactly the rule; the continuation, the rebuilt KV and the
     rebuild's output rows from rebuild_exact_from on match the reference (every numerics);
     mirrored rows are never overwritten; the same schedule replays byte-equal; with chunk
     invariance everything is also bit-equal to the fault-free primary, for any chunking."""
@@ -1028,17 +1086,20 @@ def check_rebuild(f):
         full = prim.export_state(sid, 0, F) if has_g else None
         ref_cont = _rows_of(_continue(prim, sid, true, F, f.W, **_tailkw(tail)))
         gs = sorted({g for g in (F, F - 1, F - w1 - 2, F - 3 * w1 - 5, w1 + 1, 0) if 0 <= g <= F}) if has_g else [0]
-        cfgs = [(g, None) for g in gs] + [(gs[-1], max(0, F - 3 * w1 - 2))]
-        for g, ex in cfgs:
-            where = f"span {pat} [{lo},{hi}) F={F} g={g} exact_from={ex}"
+        fl_cfg = max(F - min(f.W, 3), 0)
+        cfgs = ([(g, None, None) for g in gs] + [(gs[-1], max(0, F - 3 * w1 - 2), None)]
+                + [(g, None, fl_cfg) for g in (gs[-1], gs[len(gs) // 2])])
+        for g, ex, fl in cfgs:
+            where = f"span {pat} [{lo},{hi}) F={F} g={g} exact_from={ex} floor={fl}"
             blob = _blob_prefix(full, g) if has_g else None
-            rule = rebuild_start(kinds, f.window, F, g if has_g else 0, ex)
-            runs = [_backup(_mk(f, lo, hi, head, tail), sid, f, blob, g, F, true, ch, ex, kinds, tail)
+            fe = F if fl is None else fl
+            rule = rebuild_start(kinds, f.window, F, g if has_g else 0, fe if ex is None else min(ex, fe))
+            runs = [_backup(_mk(f, lo, hi, head, tail), sid, f, blob, g, F, true, ch, ex, kinds, tail, fl)
                     for ch in (5, 5, 3)]
             ref = _ref(f, lo, hi, head, tail)
             # Behaviour first: a wrong rebuild must show up as wrong state, not only as a formula.
             if ref is not None:
-                ra, rexact, rkv, _, rcont = _backup(ref, sid, f, blob, g, F, true, 5, ex, kinds, tail)
+                ra, rexact, rkv, _, rcont = _backup(ref, sid, f, blob, g, F, true, 5, ex, kinds, tail, fl)
                 a, exact, kv, _, cont = runs[0]
                 _match_ref(f, cont, rcont, f"continuation after rebuild ({where})")
                 _match_ref(f, exact, rexact, f"rebuild outputs from rebuild_exact_from on ({where})")
@@ -1046,9 +1107,15 @@ def check_rebuild(f):
             if f.chunk_invariant:
                 want = {p: _row_sig(*ref_cont[p]) for p in ref_cont}
                 for a, exact, kv, _, cont in (runs[0], runs[2]):
-                    assert {p: _row_sig(*cont[p]) for p in cont} == want, \
-                        f"continuation after rebuild != fault-free ({where})"
-                    assert kv is None or kv == full, f"KV after rebuild != fault-free ({where})"
+                    if fl is None:
+                        assert {p: _row_sig(*cont[p]) for p in cont} == want, \
+                            f"continuation after rebuild != fault-free ({where})"
+                    for p, (o, r) in cont.items():                 # from the floor: hidden bytes
+                        fault = pouts.get(p) or ref_cont.get(p)
+                        if fault is not None:
+                            assert o.hidden.row_bytes(r) == fault[0].hidden.row_bytes(fault[1]), \
+                                f"row {p} after rebuild + rewind != fault-free ({where})"
+                    assert kv is None or kv == _blob_prefix(full, kv.hi_pos), f"KV after rebuild != fault-free ({where})"
                     for p, (o, r) in exact.items():
                         assert o.hidden.row_bytes(r) == pouts[p][0].hidden.row_bytes(pouts[p][1]), \
                             f"rebuilt row {p} != fault-free ({where})"
@@ -1083,6 +1150,8 @@ def check_rebuild_protocol(f):
         rt.import_state(1, prim.export_state(1, 0, g), g)
         _raises(BadRequest, rt.rebuild_from, 1, g - 1)                # F below the imported rows
     _raises(BadRequest, rt.rebuild_from, 1, 30, 31)                   # exact_from past F
+    _raises(BadRequest, rt.rebuild_from, 1, 30, None, 31)             # floor past F
+    _raises(BadRequest, rt.rebuild_from, 1, 30, None, 29 - f.W)       # floor deeper than W
     a = rt.rebuild_from(1, 30)
     assert a < 30
     _raises(BadRequest, rt.step, StepIn((_seg(1, a, x.slice(a, a + 1), "decode"),)))
@@ -1106,6 +1175,26 @@ def check_rebuild_protocol(f):
     for kw in (dict(logits="last"), dict(tokens="last")):
         if a2 < 30:
             _raises(BadRequest, rt2.step, StepIn((_seg(1, a2, x.slice(a2, min(30, a2 + 8)), "rebuild", **kw),)))
+
+
+def check_long_context(f):
+    """A speculative history that crosses position 300 (past every small page table) matches
+    the reference row for row, and so does its exported KV."""
+    lo, hi, head, tail = _role(f, "mid")
+    if f.max_ctx < 360:
+        raise Skip("factory max_ctx < 360")
+    ref = _ref(f, lo, hi, head, tail)
+    if ref is None:
+        raise Skip("factory has no reference runtime")
+    ops, true, c = _spec_script(f, head, seed=201, prefix=300, rounds=8, W=f.W)
+    got = {}
+    for name, r in (("rt", _mk(f, lo, hi, head, tail)), ("ref", ref)):
+        _open(r, SIDS[2], f)
+        outs = _play(r, SIDS[2], ops) + _continue(r, SIDS[2], true, c, f.W)
+        got[name] = (_rows_of(outs), r.export_state(SIDS[2], 0, c) if "global" in f.layer_kinds[lo:hi] else None)
+    _match_ref(f, got["rt"][0], got["ref"][0], "long context")
+    if got["rt"][1] is not None:
+        assert _blob_close(f, got["rt"][1], got["ref"][1]), "long-context KV != reference"
 
 
 def check_close_isolation(f):
@@ -1132,9 +1221,10 @@ def check_close_isolation(f):
 
 
 def check_tokens(f):
-    """Tail tokens: greedy == argmax of the stage's own logits (lowest id on ties); "last" is the
-    last row of "all" for logits and tokens; sampled draws depend on the seed, match the
-    reference, and (with chunk invariance) are keyed by absolute position, not by row."""
+    """Tail tokens: a greedy token's logit is a maximum and top_k=1 is greedy; "last" is the last
+    row of "all" for logits and tokens; sampled draws depend on the seed, match the reference
+    for several (temperature, top_k, top_p) settings, equal project(tokens=True), and (with
+    chunk invariance) are keyed by absolute position, not by row."""
     lo, hi, head, tail = _role(f, "tail")
     x = _inp(f, head, 64, 181)
     N = 24
@@ -1147,9 +1237,12 @@ def check_tokens(f):
 
     chunks = [(p, min(8, N - p)) for p in range(0, N, 8)]
     greedy = run(chunks, logits="all", tokens="all")
-    for o in greedy:
-        want = np.argmax(_as_float(o.logits), axis=1)
-        assert (o.tokens.data == want).all(), "greedy tokens != argmax(logits)"
+    for o in greedy:                                    # the chosen logit is a maximum (the backend
+        lg = _as_float(o.logits)                        # may argmax in finer precision than it returns)
+        assert (lg[np.arange(o.tokens.n), o.tokens.data] == lg.max(axis=1)).all(), "greedy token is not a max"
+    g_all = _cat(greedy, "tokens")
+    assert _cat(run(chunks, tokens="all", sampling=Sampling(seed=5, temperature=1.0, top_k=1)), "tokens") == g_all, \
+        "top_k=1 is not greedy"
     last = run(chunks, logits="last", tokens="last")
     for a, o in zip(greedy, last):
         assert o.logits.n == 1 and o.tokens.n == 1
@@ -1160,10 +1253,21 @@ def check_tokens(f):
     assert s1 != s2, "the sampling seed does not change any of 24 draws"
     ref = _ref(f, lo, hi, head, tail)
     if ref is not None:
-        _open(ref, 1, f)
-        ref.commit(1, N)
-        r1 = _cat([_one(ref, _seg(1, s, x.slice(s, s + n), tokens="all", sampling=SAMPLE)) for s, n in chunks], "tokens")
-        assert f.close_enough(s1, r1, "reference"), "sampled tokens != reference"
+        configs = (SAMPLE, Sampling(seed=7, temperature=1.0, top_k=0),
+                   Sampling(seed=8, temperature=0.7, top_k=0, top_p=0.5), Sampling(seed=9, temperature=1.3, top_k=3))
+        for i, sp in enumerate(configs):
+            r = _ref(f, lo, hi, head, tail)
+            _open(r, 1, f)
+            r.commit(1, N)
+            want = _cat([_one(r, _seg(1, s, x.slice(s, s + n), tokens="all", sampling=sp)) for s, n in chunks], "tokens")
+            got = s1 if i == 0 else _cat(run(chunks, tokens="all", sampling=sp), "tokens")
+            assert f.close_enough(got, want, "reference"), f"sampled tokens != reference for {sp}"
+    tl = _mk(f, lo, hi, head, tail)
+    _open(tl, 1, f)
+    tl.commit(1, N)
+    o = _one(tl, _seg(1, 0, x.slice(0, 8), tokens="all", sampling=SAMPLE))
+    assert tl.project(o.hidden, tokens=True, start_pos=0, sampling=SAMPLE) == o.tokens, \
+        "project(tokens=True) draws differently from the step"
     if f.chunk_invariant:
         per = _cat(run([(p, 1) for p in range(N)], tokens="all", sampling=SAMPLE), "tokens")
         assert per == s1, "sampled tokens depend on the segment shape (keyed by row, not position)"
@@ -1210,8 +1314,8 @@ CHECKS = (check_describe, check_admission, check_validation_atomic, check_mixed_
           check_frontier, check_swa_retention, check_row_independence, check_batch_invariance,
           check_replay, check_chunk_invariance, check_reference, check_partition_invariance,
           check_taps_raw, check_taps_fc_partial, check_export_import, check_rebuild,
-          check_rebuild_protocol, check_close_isolation, check_tokens, check_embed_project,
-          check_load_refusal)
+          check_rebuild_protocol, check_long_context, check_close_isolation, check_tokens,
+          check_embed_project, check_load_refusal)
 
 
 def run_suite(f, checks=CHECKS) -> dict:
