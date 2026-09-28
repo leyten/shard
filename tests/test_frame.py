@@ -855,3 +855,17 @@ def test_lease_update_signing_bytes():
     assert s != F.signing_bytes({**m, "truncate_to": 128})
     assert s != F.signing_bytes({**m, "rte": 3})
     assert b"sig" not in s and b"sig" in body(m)
+
+
+# ── the eid plaintext ─────────────────────────────────────────────────────────
+
+def test_eid_plaintext_round_trips_ids_and_the_optional_dnxt():
+    assert F.eid_unpack(F.eid_pack([1, 2, 3]), 3) == ([1, 2, 3], None)
+    assert F.eid_unpack(F.eid_pack([1, 2, 3], dnxt=9), 3) == ([1, 2, 3], 9)
+    assert F.eid_pack([0x7FFFFFFF]) == b"\xff\xff\xff\x7f", "int32 little-endian"
+    with pytest.raises(ValueError):
+        F.eid_pack([-1])
+    with pytest.raises(ValueError):
+        F.eid_unpack(F.eid_pack([1, 2]), 3)
+    with pytest.raises(ValueError):
+        F.eid_unpack(b"\xff\xff\xff\xff", 1)

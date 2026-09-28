@@ -705,6 +705,32 @@ def decode(body) -> dict:
         raise FrameError(f"malformed shard-frame/2 ({type(e).__name__}: {str(e)[:120]})") from None
 
 
+def eid_pack(ids, dnxt=None) -> bytes:
+    """The `eid` PLAINTEXT (see the module docstring): int32le ids, then optionally `dnxt`.
+    Sealing it (the AEAD under the lease's `ekey`) is the caller's job."""
+    vals = [int(t) for t in ids] + ([] if dnxt is None else [int(dnxt)])
+    if any(not 0 <= v <= 0x7FFFFFFF for v in vals):
+        raise ValueError("eid ids must be non-negative int32")
+    a = array("i", vals)
+    if sys.byteorder != "little":                         # pragma: no cover (wire is little-endian)
+        a.byteswap()
+    return a.tobytes()
+
+
+def eid_unpack(plain, n) -> tuple:
+    """`eid` plaintext for n rows -> (ids[n], dnxt or None). The inverse of `eid_pack`."""
+    mv = _flat(plain)
+    if len(mv) not in (4 * n, 4 * n + 4):
+        raise ValueError(f"eid plaintext of {len(mv)} B is not {n} int32 ids (+ an optional dnxt)")
+    a = array("i")
+    a.frombytes(mv)
+    if sys.byteorder != "little":                         # pragma: no cover
+        a.byteswap()
+    if len(a) and min(a) < 0:
+        raise ValueError("eid: negative token id")
+    return list(a[:n]), (a[n] if len(a) > n else None)
+
+
 def wire_row(msg, i) -> bytes:
     """§7.1 wire row i (position pos+i, or pos_lo+i for log_rows): x[i] ‖ xs[i] ‖ tap[i], i.e. the
     exact blob bytes on the wire. `eid` and header fields are not part of it."""
