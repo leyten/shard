@@ -1253,8 +1253,8 @@ def _serve_tail(st, srv, lo, hi, node_key, receipts, timeout, ckpt_dir=None):
             if op == "step":
                 timer.lap("recv", msg)
                 if _fenced(msg, epoch):                       # stale speculation: answer, compute nothing
-                    send_msg(ret, {"fenced": True, "epoch": int(msg.get("epoch", 0)),
-                                   "pos": int(msg["start_pos"])})
+                    chan.send({"fenced": True, "epoch": int(msg.get("epoch", 0)),
+                               "pos": int(msg["start_pos"])})
                     continue
                 epoch = max(epoch, int(msg.get("epoch", 0)))
                 if "cpos" in msg:                             # settled frontier: free the spent snapshots
