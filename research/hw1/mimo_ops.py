@@ -497,15 +497,15 @@ def invariance(res, L, ex, d, device, mixes=11, seed=0):
     grouped GEMM (proves the byte test CAN fail); torch_dequant on CPU is typically invariant."""
     g = torch.Generator().manual_seed(seed)
     probe = (torch.randn(1, d["hidden"], generator=g) * 0.5).bfloat16().to(device)
-    hs = set()
+    hs = []
     for m in range(mixes):
         other = (torch.randn(1 + 3 * m, d["hidden"], generator=g) * 0.5).bfloat16().to(device)
         x = torch.cat([other[: m], probe, other[m:]])
         ids, w = router(L, x)
         y = ex(x, ids, w)[m]
-        hs.add(hashlib.sha256(y.float().cpu().numpy().tobytes()).hexdigest())
-    res.record("B4", "probe_bytes", {"layer": L.li, "mixes": mixes}, distinct_hashes=len(hs),
-               backend=ex.backend)
+        hs.append(hashlib.sha256(y.float().cpu().numpy().tobytes()).hexdigest())
+    res.record("B4", "probe_bytes", {"layer": L.li, "mixes": mixes}, distinct_hashes=len(set(hs)),
+               hashes=hs, backend=ex.backend)          # per-mix hashes: comparable across families (D)
 
 
 def attn_ms(recs, T, ctx=8192, start=0):

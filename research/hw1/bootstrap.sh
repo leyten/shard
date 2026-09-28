@@ -75,7 +75,11 @@ run() {
   "$PY" "$ROOT/research/hw1/sys_bench.py" --out "$OUT/${L}_c.json"
   log "B MiMo ops (+ D dump for the cross-family diff)"
   local inp=()
-  [ -f "$ROOT/research/hw1/golden_t32_bf16.safetensors" ] && inp=(--inputs "$ROOT/research/hw1/golden_t32_bf16.safetensors")
+  if [ -f "$ROOT/research/hw1/golden_t32_bf16.safetensors" ]; then
+    inp=(--inputs "$ROOT/research/hw1/golden_t32_bf16.safetensors")
+  else
+    log "WARNING: no golden_t32_bf16.safetensors -> random inputs, B is NOT calibration grade (K5/K6 no verdict)"
+  fi
   "$PY" -u "$ROOT/research/hw1/mimo_ops.py" --weights "$MIMO_DIR" "${inp[@]}" --out "$OUT/${L}_b.json"
   "$PY" -u "$ROOT/research/hw1/mimo_ops.py" --mode dump --weights "$MIMO_DIR" "${inp[@]}" \
     --dump "$OUT/${L}_dump.safetensors" --out "$OUT/${L}_dump.json"
