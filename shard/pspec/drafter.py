@@ -55,6 +55,7 @@ def bf16_round(x):
     a = np.ascontiguousarray(x, dtype=F32)
     u = a.view(np.uint32).astype(np.uint64)
     u = (u + 0x7FFF + ((u >> 16) & 1)) & 0xFFFF0000
+    u = np.where(np.isnan(a), 0x7FC00000, u)            # a NaN stays one quiet NaN (never inf)
     return u.astype(np.uint32).view(F32).reshape(a.shape)
 
 

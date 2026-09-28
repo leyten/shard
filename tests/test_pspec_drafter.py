@@ -75,6 +75,21 @@ def test_fused_bytes_are_row_local_and_placement_invariant():
     assert rev.tobytes() != whole.tobytes(), "this test cannot see an order change"
 
 
+def test_bf16_round_is_the_wire_cast():
+    """The tap lane's rounding is torch's float32 -> bfloat16 cast, bit for bit (a GPU stage and a
+    CPU stage must put the same bytes on the wire), with NaN kept a NaN."""
+    torch = pytest.importorskip("torch")
+    rng = np.random.default_rng(9)
+    x = (rng.standard_normal(50000) * 10.0 ** rng.uniform(-44, 38, 50000)).astype(np.float32)
+    x = np.concatenate([x, np.array([np.nan, np.inf, -np.inf, -0.0, 0.0, 3.3895314e38, 1e-45],
+                                    np.float32), np.array([0x7F800001], np.uint32).view(np.float32)])
+    got = bf16_round(x)
+    want = torch.from_numpy(x.copy()).to(torch.bfloat16).float().numpy()
+    nan = np.isnan(want)
+    assert np.array_equal(np.isnan(got), nan)
+    assert np.array_equal(got[~nan].view(np.uint32), want[~nan].view(np.uint32))
+
+
 def test_tapspec_rejects_bad_specs():
     with pytest.raises(ValueError):
         TapSpec((11, 0), H)
