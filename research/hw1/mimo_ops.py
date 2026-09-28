@@ -52,6 +52,7 @@ MOE = {0: False, 1: True, 5: True}                  # moe_layer_freq[0] == 0 (la
 T_GRID = (1, 2, 4, 8, 9, 16, 17, 32, 64, 128, 256, 900, 2048)
 PREFILL_T = (900, 2048)
 SPAN_LAYERS = 8
+PREFILL_PREFIX = 8192       # the global-layer prefix for the "replay deep in a session" variant
 
 
 # ── synthetic checkpoint (tiny, MiMo names/dtypes/packing) ──────────────────────────────────────
@@ -249,8 +250,11 @@ def attn_ref(q, k, v, sinks, window, start):
 class TorchAttn:
     backend = "torch_sink"
 
-    def __call__(self, q, k, v, sinks, window, start):
-        return attn_ref(q, k, v, sinks, window, start)
+    def bind(self, q, k, v, sinks, window, start):
+        return lambda: attn_ref(q, k, v, sinks, window, start)
+
+    def __call__(self, *a):
+        return self.bind(*a)()
 
 
 class FlashInferSinkAttn:
@@ -267,24 +271,26 @@ class FlashInferSinkAttn:
             head_dim_qk=dq, head_dim_vo=dv, window_left=self.window)
         self.planned = None
 
-    def __call__(self, q, k, v, sinks, window, start):
+    def bind(self, q, k, v, sinks, window, start):
+        """Plan + build the paged cache ONCE, outside the timed call; the returned closure is only
+        wrapper.run (so a timing never includes the KV re-layout copy or the planner)."""
         T, S, P = q.shape[0], k.shape[0], 16
         npg = -(-S // P)
-        key = (T, S)
-        if self.planned != key:
+        if self.planned != (T, S):
             i32 = dict(dtype=torch.int32, device=self.dev)
             self.w.plan(torch.tensor([0, T], **i32), torch.tensor([0, npg], **i32), torch.arange(npg, **i32),
                         torch.tensor([S - (npg - 1) * P], **i32), self.hq, self.hkv, self.dq, P,
                         head_dim_vo=self.dv, causal=True, window_left=self.window,
                         q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
-            self.planned = key
-            pad = npg * P - S
-            self._pad = pad
-        pad = self._pad
+            self.planned = (T, S)
+        pad = npg * P - S
         kc = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad)).view(npg, P, self.hkv, self.dq)
         vc = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad)).view(npg, P, self.hkv, self.dv)
-        snk = sinks if sinks is not None else torch.full((self.hq,), -1e30, device=self.dev)
-        return self.w.run(q, (kc, vc), snk.float().contiguous(), self.dq ** -0.5)
+        snk = (sinks if sinks is not None else torch.full((self.hq,), -1e30, device=self.dev)).float().contiguous()
+        return lambda: self.w.run(q, (kc, vc), snk, self.dq ** -0.5)
+
+    def __call__(self, *a):
+        return self.bind(*a)()
 
 
 def sink_effect_check(res, attn, d, device, tol=2e-2, seed=0):
@@ -381,13 +387,16 @@ def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iter
         return
     for kind, hkv, win in (("swa", d["kv_swa"], d["window"]), ("full", d["kv_full"], 0)):
         use = attn if kind == "swa" or attn.backend == "torch_sink" else (attn_full(attn, d, device) or TorchAttn())
-        for T in [t for t in tgrid if t in PREFILL_T]:          # prefill shapes (the replay-rate input)
-            q = torch.randn(T, d["heads"], d["qk"]).bfloat16().to(device)
-            k = torch.randn(T, hkv, d["qk"]).bfloat16().to(device)
-            v = torch.randn(T, hkv, d["v"]).bfloat16().to(device)
-            sk = torch.zeros(d["heads"], device=device) if kind == "swa" else None
-            st = C.time_fn(lambda: use(q, k, v, sk, win, 0), warmup=warmup, iters=iters, device=device)
-            res.record("B2", "attn_prefill", {"kind": kind, "T": T}, st, backend=use.backend)
+        # prefill shapes (the replay-rate input). A replayed chunk of a long session attends a prefix: the
+        # global layers are also timed at a PREFILL_PREFIX-token prefix (SWA cost is window-bounded).
+        for T in [t for t in tgrid if t in PREFILL_T]:
+            for start in ((0,) if kind == "swa" else (0, PREFILL_PREFIX)):
+                q = torch.randn(T, d["heads"], d["qk"]).bfloat16().to(device)
+                k = torch.randn(start + T, hkv, d["qk"]).bfloat16().to(device)
+                v = torch.randn(start + T, hkv, d["v"]).bfloat16().to(device)
+                sk = torch.zeros(d["heads"], device=device) if kind == "swa" else None
+                st = C.time_fn(use.bind(q, k, v, sk, win, start), warmup=warmup, iters=iters, device=device)
+                res.record("B2", "attn_prefill", {"kind": kind, "T": T, "start": start}, st, backend=use.backend)
         for ctx in ctxs:
             for B in bs:
                 for s in ss:
@@ -398,8 +407,8 @@ def run_ops(res, Ls, experts, attn, d, device, tgrid, bs, ctxs, ss, warmup, iter
                     sk = torch.zeros(d["heads"], device=device) if kind == "swa" else None
                     # B sequences of the same shape: B calls (a batched plan is the R5 job; this is the
                     # per-sequence cost -- recorded as such, not as a batched kernel)
-                    st = C.time_fn(lambda: [use(q, k, v, sk, win, ctx) for _ in range(B)], warmup=warmup,
-                                   iters=iters, device=device)
+                    fns = [use.bind(q, k, v, sk, win, ctx) for _ in range(B)]
+                    st = C.time_fn(lambda: [f() for f in fns], warmup=warmup, iters=iters, device=device)
                     res.record("B2", "attn", prm, st, backend=use.backend, batched_kernel=False)
 
 
@@ -431,12 +440,13 @@ def invariance(res, L, ex, d, device, mixes=11, seed=0):
                backend=ex.backend)
 
 
-def attn_ms(recs, T, ctx=8192):
+def attn_ms(recs, T, ctx=8192, start=0):
     """attention per layer at shape T, weighted by the Flash pattern (1 global : 5 SWA). Prefill T ->
     attn_prefill; decode T (s) -> attn at B=1, the ctx closest to `ctx`."""
     def one(kind):
         if T in PREFILL_T:
-            xs = [r["ms"] for r in recs if r["op"] == "attn_prefill" and r["params"] == {"kind": kind, "T": T}]
+            want = {"kind": kind, "T": T, "start": start if kind == "full" else 0}
+            xs = [r["ms"] for r in recs if r["op"] == "attn_prefill" and r["params"] == want]
         else:
             xs = [r for r in recs if r["op"] == "attn" and r["params"]["kind"] == kind
                   and r["params"]["B"] == 1 and r["params"]["s"] == T]
@@ -476,7 +486,10 @@ def derive(res, d):
         out[f"layer_ms_T{T}"] = layer_ms
         if T in PREFILL_T:
             out[f"replay_tok_s_T{T}"] = T / (layer_ms * SPAN_LAYERS) * 1e3
-    rates = [v for k, v in out.items() if k.startswith("replay_tok_s")]
+            deep = attn_ms(recs, T, start=PREFILL_PREFIX)
+            if deep is not None:                               # same span, global layers at an 8k prefix
+                out[f"replay_tok_s_T{T}_prefix8k"] = T / ((sum(per) / len(per) + deep) * 1.1 * SPAN_LAYERS) * 1e3
+    rates = [v for k, v in out.items() if k.startswith("replay_tok_s") and not k.endswith("prefix8k")]
     if rates:
         out["replay_tok_s_span"] = min(rates)
     res.doc["derived"].update(out)

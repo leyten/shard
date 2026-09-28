@@ -204,6 +204,7 @@ def test_mimo_ops_stub(tmp_path):
             "footprint", "footprint_experts"} <= ops
     assert {r["params"]["layer"] for r in d["records"] if r["op"] == "experts"} == {1, 5}   # layer 0 dense
     assert d["derived"]["replay_tok_s_span"] > 0 and d["derived"]["layer_ms_T9"] > 0
+    assert 0 < d["derived"]["replay_tok_s_T900_prefix8k"]                 # global layers at an 8k prefix
     assert d["derived"]["inputs"] == "random"
 
 
