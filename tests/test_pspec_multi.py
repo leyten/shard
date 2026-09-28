@@ -11,6 +11,7 @@ node batcher's priority classes (BUILD-PLAN §1 S3).
 """
 import random
 
+import numpy as np
 import pytest
 
 import fake_mesh as FM
@@ -85,11 +86,11 @@ def _want(job):
     return out
 
 
-def _mesh(mesh_factory, D, box, K, seed, legs_hi=3.0):
+def _mesh(mesh_factory, D, box, K, seed, legs_hi=3.0, **kw):
     rng = random.Random(seed)
     return mesh_factory(D, clock="real", cost_scale=0.0, devices=BIG[:D], s_max=16,
                         legs_ms=[rng.uniform(0.0, legs_hi) for _ in range(D + 1)],
-                        drafters={"toy": sid_drafter(box, K, _miss(0.6, seed))})
+                        drafters={"toy": sid_drafter(box, K, _miss(0.6, seed))}, **kw)
 
 
 _VOLATILE = ("stale_replies", "unsent_frames", "max_inflight", "mean_inflight")
@@ -247,3 +248,78 @@ def test_a_prefill_is_not_starved_by_decode_load(mesh_factory):
         m.collect(sid, seq)
     at = next(i for i, st in enumerate(steps) if "prefill" in st)
     assert at <= 5, (at, steps[:8])                  # STARVE = 4; strict priority: at == 12
+
+
+class _LoggingLink(MeshLink):
+    """MeshLink that records every frame it put on the wire, in order."""
+
+    def __init__(self, mesh):
+        super().__init__(mesh)
+        self.sent = []
+
+    def send(self, msg):
+        self.sent.append(msg)
+        super().send(msg)
+
+
+def _replay_session(m, frames, max_pos, W):
+    """The recorded frames of ONE session replayed without the mesh: one bare runtime per hop
+    span, the node's fence rule, each frame committed at its cpos and run in the hop's
+    budget-sized steps (the node's `_run_big` split). -> {seq: tail tokens per the frame's lg}
+    (None for a fenced frame). Batch invariance makes a per-session replay exact."""
+    rts = []
+    for i in range(m.D):
+        rt = m.runtime(i)._rt
+        rt.open(1, max_pos=max_pos, spec_window=W)
+        rts.append(rt)
+    sep_seen, out = 0, {}
+    for f in frames:
+        if f["fen"] or f["sep"] < sep_seen:
+            out[f["seq"]] = None
+            continue
+        sep_seen = f["sep"]
+        n, pos = f["n"], f["pos"]
+        x = FM.Rows("i32", np.frombuffer(f["x"].data, dtype="<i4").astype(np.int32))
+        kind = "prefill" if f["kind"] == "P" else ("decode" if n == 1 else "verify")
+        for i, rt in enumerate(rts):
+            if f["cpos"] >= 0:
+                rt.commit(1, f["cpos"])
+            b, outs, tail = m.devices[i].budget, [], i == m.D - 1
+            for lo in range(0, n, b):
+                hi = min(n, lo + b)
+                tok = "none"
+                if tail:
+                    tok = "all" if f["kind"] != "P" else ("last" if hi == n else "none")
+                outs.append(rt.step(FM.StepIn((FM.Segment(1, pos + lo, hi - lo, x.slice(lo, hi),
+                                                         kind=kind, tokens=tok),))).outs[0])
+            x = FM.Rows.concat([o.hidden for o in outs])
+        toks = [int(t) for o in outs if o.tokens is not None for t in o.tokens.data]
+        lg = f["lg"]
+        out[f["seq"]] = toks if lg == "all" else toks[-1:] if lg == "last" else []
+    return out
+
+
+def test_adversarial_shape_mode_equals_the_replayed_schedule(mesh_factory):
+    """Shape-dependent numerics (like float kernels): a verify chunk's bytes differ from the same
+    rows decoded one by one, so the mesh is NOT the direct greedy loop. What must hold: every
+    reply the entry got equals a replay of the recorded frame schedule, session by session, even
+    with the sessions batched together on every hop."""
+    K, box = 4, {}
+    m = _mesh(mesh_factory, 3, box, K, seed=11, mode="adversarial")
+    jobs = _jobs(m, box, 8, random.Random(11), K)
+    sessions = [_open(m, job, K=K) for job in jobs]
+    link = _LoggingLink(m)
+    res = coord.run_many(link, sessions, timeout=20.0)
+    got = {(r["sid"], r["seq"]): (None if r["fen"] else [int(t) for t in r["toks"].numpy()])
+           for r in link.replies}
+    differs = 0
+    for job in jobs:
+        h = hexsid(job[0])
+        frames = [f for f in link.sent if f["sid"] == h]
+        want = _replay_session(m, frames, len(job[1]) + job[2] - 1, job[5])
+        assert len(want) == len(frames) and all((h, seq) in got for seq in want)
+        for seq, toks in want.items():
+            assert got[(h, seq)] == toks, (job[0], seq)
+        differs += res[h]["tokens"] != _want(job)
+    assert max(n.snapshot().get("max_batch", 0) for n in m.nodes) > 1
+    assert differs > 0              # the mode is really shape-dependent (else this is vacuous)
