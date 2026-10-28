@@ -84,6 +84,7 @@ def _torch():
 
 def _load_layers(S, lo, n):
     torch = _torch()
+    S.vllm_ctx()        # vLLM's FusedMoE asserts a current config at construction (the anchor bench does this too)
     layers = [S.Layer(i) for i in range(lo, lo + n)]
     S.get_pe()
     gb = torch.cuda.memory_allocated() / 1e9 if S.dev != "cpu" and torch.cuda.is_available() else 0.0

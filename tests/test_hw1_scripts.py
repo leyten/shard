@@ -45,8 +45,11 @@ def fake_stage(batch=4, maxlen=160, graph_alen_max=64):
     W = torch.randn(16, 16, generator=torch.Generator().manual_seed(0)) * 0.1
     f = lambda h: (h.float() @ W).to(h.dtype)                             # noqa: E731
 
+    S._VLLM_CTX = False
+
     class Layer:
         def __init__(self, li):
+            assert S._VLLM_CTX, "Layer built before vllm_ctx(): vLLM's FusedMoE asserts a current config"
             self.li = li
             self.bkc = torch.randn(batch, S.NKV, maxlen, S.HD).bfloat16()
             self.bvc = torch.randn(batch, S.NKV, maxlen, S.HD).bfloat16()
@@ -79,7 +82,7 @@ def fake_stage(batch=4, maxlen=160, graph_alen_max=64):
 
     S.Layer, S.BatchGraphRunner, S.RowGraphRunner = Layer, BatchGraphRunner, RowGraphRunner
     S.get_pe = lambda: None
-    S.vllm_ctx = lambda: None
+    S.vllm_ctx = lambda: setattr(S, "_VLLM_CTX", True)
     S.run_block_decode_b = lambda layers, starts, h, vcfg: f(h)
     S.run_block_decode_row = lambda layers, row, start, h, vcfg: f(h)
     S.run_block_prefill_b = lambda layers, b, start, h, vcfg: f(h)
