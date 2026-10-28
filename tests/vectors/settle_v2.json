@@ -1,0 +1,750 @@
+{
+ "cases": [
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "4jlyh7UxOu5e1hp0Eu4b++on9suWpsDkPj139VbLlVw=": 250000000,
+     "HOurOq2Kj68l9wNw0gJ6spo+3DyrlwpkRzMljs6rxbY=": 250000000,
+     "po5Ndwm7plepyxbk+mO61lYpnVdZlCXiVmtCbEkwr8Q=": 250000000,
+     "zsTg8RJ3ltwmooVq5YsvpjdZCtTzOs0tKu9TJ00I8b0=": 250000000
+    },
+    "weights": {
+     "4jlyh7UxOu5e1hp0Eu4b++on9suWpsDkPj139VbLlVw=": "1005000",
+     "HOurOq2Kj68l9wNw0gJ6spo+3DyrlwpkRzMljs6rxbY=": "1005000",
+     "po5Ndwm7plepyxbk+mO61lYpnVdZlCXiVmtCbEkwr8Q=": "1005000",
+     "zsTg8RJ3ltwmooVq5YsvpjdZCtTzOs0tKu9TJ00I8b0=": "1005000"
+    }
+   },
+   "name": "mesh scenario: plain",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 320,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 150,
+     "pubkey": "HOurOq2Kj68l9wNw0gJ6spo+3DyrlwpkRzMljs6rxbY=",
+     "rte": 0
+    },
+    {
+     "decode": 320,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 150,
+     "pubkey": "4jlyh7UxOu5e1hp0Eu4b++on9suWpsDkPj139VbLlVw=",
+     "rte": 0
+    },
+    {
+     "decode": 320,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 150,
+     "pubkey": "po5Ndwm7plepyxbk+mO61lYpnVdZlCXiVmtCbEkwr8Q=",
+     "rte": 0
+    },
+    {
+     "decode": 320,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 150,
+     "pubkey": "zsTg8RJ3ltwmooVq5YsvpjdZCtTzOs0tKu9TJ00I8b0=",
+     "rte": 0
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "9RtiWqkz3ifkaidRGiwpgg+jQm79lSAKBMB+IorZeTk=": 152488991,
+     "FUwISi+AtAkI4yQkSd8M5Y+yXvY+M3P4e+rKf9tQWqo=": 110005843,
+     "IY2KHRR5SMuB0hhrDjC7UNgiAyaXl45vvx9llOhgvU4=": 245835056,
+     "K/sEmrmnxpSbDqAhHGfAf0GCWonSsVrLtsAeSBtr14k=": 245835055,
+     "hYrELnyxzm02Po8hl2Zh4SnrPB5Rq/pzgVPSrtvbXAw=": 245835055
+    },
+    "weights": {
+     "9RtiWqkz3ifkaidRGiwpgg+jQm79lSAKBMB+IorZeTk=": "642000",
+     "FUwISi+AtAkI4yQkSd8M5Y+yXvY+M3P4e+rKf9tQWqo=": "463140",
+     "IY2KHRR5SMuB0hhrDjC7UNgiAyaXl45vvx9llOhgvU4=": "1035000",
+     "K/sEmrmnxpSbDqAhHGfAf0GCWonSsVrLtsAeSBtr14k=": "1035000",
+     "hYrELnyxzm02Po8hl2Zh4SnrPB5Rq/pzgVPSrtvbXAw=": "1035000"
+    }
+   },
+   "name": "mesh scenario: takeover",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 199,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 150,
+     "pubkey": "hYrELnyxzm02Po8hl2Zh4SnrPB5Rq/pzgVPSrtvbXAw=",
+     "rte": 0
+    },
+    {
+     "decode": 199,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 150,
+     "pubkey": "K/sEmrmnxpSbDqAhHGfAf0GCWonSsVrLtsAeSBtr14k=",
+     "rte": 0
+    },
+    {
+     "decode": 199,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 150,
+     "pubkey": "9RtiWqkz3ifkaidRGiwpgg+jQm79lSAKBMB+IorZeTk=",
+     "rte": 0
+    },
+    {
+     "decode": 199,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 150,
+     "pubkey": "IY2KHRR5SMuB0hhrDjC7UNgiAyaXl45vvx9llOhgvU4=",
+     "rte": 0
+    },
+    {
+     "hi": 9,
+     "kind": "mirror",
+     "lo": 6,
+     "positions": 128,
+     "pubkey": "FUwISi+AtAkI4yQkSd8M5Y+yXvY+M3P4e+rKf9tQWqo=",
+     "rte": 0
+    },
+    {
+     "decode": 131,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "hYrELnyxzm02Po8hl2Zh4SnrPB5Rq/pzgVPSrtvbXAw=",
+     "rte": 1
+    },
+    {
+     "decode": 131,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 0,
+     "pubkey": "K/sEmrmnxpSbDqAhHGfAf0GCWonSsVrLtsAeSBtr14k=",
+     "rte": 1
+    },
+    {
+     "decode": 131,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 0,
+     "pubkey": "FUwISi+AtAkI4yQkSd8M5Y+yXvY+M3P4e+rKf9tQWqo=",
+     "rte": 1
+    },
+    {
+     "decode": 131,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 0,
+     "pubkey": "IY2KHRR5SMuB0hhrDjC7UNgiAyaXl45vvx9llOhgvU4=",
+     "rte": 1
+    },
+    {
+     "hi": 9,
+     "kind": "rebuild",
+     "lo": 6,
+     "positions": 221,
+     "pubkey": "FUwISi+AtAkI4yQkSd8M5Y+yXvY+M3P4e+rKf9tQWqo=",
+     "rte": 1
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "2MHZtCv/vpCm49KUQXbyv6G8pzMH2JZmvY9O5rAudwo=": 244698206,
+     "TROH595H87AjC8nhzBbZxsaLqTNxxPF2l65sYzy77yU=": 149585077,
+     "Z6bQmH5WFG2D6fyFgLyXaXsn9s77AO+43GsJA3C9lHs=": 116320306,
+     "fcg0K3w2IOhX3rqXjZYtAiiq8eCY4qZWEd37yT7Odps=": 244698206,
+     "i9i0+EI3/XQNmWYOWnOJQypEo/JKXOs3lRr7SdIia9A=": 244698205
+    },
+    "weights": {
+     "2MHZtCv/vpCm49KUQXbyv6G8pzMH2JZmvY9O5rAudwo=": "1035000",
+     "TROH595H87AjC8nhzBbZxsaLqTNxxPF2l65sYzy77yU=": "632700",
+     "Z6bQmH5WFG2D6fyFgLyXaXsn9s77AO+43GsJA3C9lHs=": "492000",
+     "fcg0K3w2IOhX3rqXjZYtAiiq8eCY4qZWEd37yT7Odps=": "1035000",
+     "i9i0+EI3/XQNmWYOWnOJQypEo/JKXOs3lRr7SdIia9A=": "1035000"
+    }
+   },
+   "name": "mesh scenario: dead",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 149,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 150,
+     "pubkey": "i9i0+EI3/XQNmWYOWnOJQypEo/JKXOs3lRr7SdIia9A=",
+     "rte": 0
+    },
+    {
+     "decode": 149,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 150,
+     "pubkey": "fcg0K3w2IOhX3rqXjZYtAiiq8eCY4qZWEd37yT7Odps=",
+     "rte": 0
+    },
+    {
+     "decode": 149,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 150,
+     "pubkey": "2MHZtCv/vpCm49KUQXbyv6G8pzMH2JZmvY9O5rAudwo=",
+     "rte": 0
+    },
+    {
+     "decode": 149,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 150,
+     "pubkey": "Z6bQmH5WFG2D6fyFgLyXaXsn9s77AO+43GsJA3C9lHs=",
+     "rte": 0
+    },
+    {
+     "decode": 181,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "i9i0+EI3/XQNmWYOWnOJQypEo/JKXOs3lRr7SdIia9A=",
+     "rte": 1
+    },
+    {
+     "decode": 181,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 0,
+     "pubkey": "fcg0K3w2IOhX3rqXjZYtAiiq8eCY4qZWEd37yT7Odps=",
+     "rte": 1
+    },
+    {
+     "decode": 181,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 0,
+     "pubkey": "2MHZtCv/vpCm49KUQXbyv6G8pzMH2JZmvY9O5rAudwo=",
+     "rte": 1
+    },
+    {
+     "decode": 181,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 0,
+     "pubkey": "TROH595H87AjC8nhzBbZxsaLqTNxxPF2l65sYzy77yU=",
+     "rte": 1
+    },
+    {
+     "hi": 12,
+     "kind": "rebuild",
+     "lo": 9,
+     "positions": 299,
+     "pubkey": "TROH595H87AjC8nhzBbZxsaLqTNxxPF2l65sYzy77yU=",
+     "rte": 1
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "3b5mLnblhfGMShtY+8mqTJSYlnNM6KJgtXhqLk70yu8=": 101476015,
+     "Fgvr3CDjLHxsCSQp48M0LeF24DoXk0gpL0G6fWyVZIY=": 101476015,
+     "K72DB3xDz+8bOuc5lmNoyFrr3vI414Hlycq7GFF/f8o=": 53110174,
+     "T/9qIpXniskgKEpfX9tJ47OxNmskm8Q4HNQboRsNxnU=": 106220348,
+     "gx1kFSr31Q2760dEL3R+xlh6XB6FDyNRWTl9PmJt+jc=": 173958882,
+     "o2iDndQ+YeCBwr1IAE4iEa/nfO0BrxxYukRj4uXhzJ0=": 289799684,
+     "sRevZ2WX8l65Sjs9/Q73y6ND2NWNqHgm3JEBLo9qR5o=": 173958882
+    },
+    "weights": {
+     "3b5mLnblhfGMShtY+8mqTJSYlnNM6KJgtXhqLk70yu8=": "462000",
+     "Fgvr3CDjLHxsCSQp48M0LeF24DoXk0gpL0G6fWyVZIY=": "462000",
+     "K72DB3xDz+8bOuc5lmNoyFrr3vI414Hlycq7GFF/f8o=": "241800",
+     "T/9qIpXniskgKEpfX9tJ47OxNmskm8Q4HNQboRsNxnU=": "483600",
+     "gx1kFSr31Q2760dEL3R+xlh6XB6FDyNRWTl9PmJt+jc=": "792000",
+     "o2iDndQ+YeCBwr1IAE4iEa/nfO0BrxxYukRj4uXhzJ0=": "1319400",
+     "sRevZ2WX8l65Sjs9/Q73y6ND2NWNqHgm3JEBLo9qR5o=": "792000"
+    }
+   },
+   "name": "mesh scenario: reroute",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 139,
+     "hi": 3,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 150,
+     "pubkey": "Fgvr3CDjLHxsCSQp48M0LeF24DoXk0gpL0G6fWyVZIY=",
+     "rte": 0
+    },
+    {
+     "decode": 139,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 3,
+     "prefill": 150,
+     "pubkey": "3b5mLnblhfGMShtY+8mqTJSYlnNM6KJgtXhqLk70yu8=",
+     "rte": 0
+    },
+    {
+     "decode": 139,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 150,
+     "pubkey": "gx1kFSr31Q2760dEL3R+xlh6XB6FDyNRWTl9PmJt+jc=",
+     "rte": 0
+    },
+    {
+     "decode": 139,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 150,
+     "pubkey": "sRevZ2WX8l65Sjs9/Q73y6ND2NWNqHgm3JEBLo9qR5o=",
+     "rte": 0
+    },
+    {
+     "decode": 110,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "o2iDndQ+YeCBwr1IAE4iEa/nfO0BrxxYukRj4uXhzJ0=",
+     "rte": 1
+    },
+    {
+     "decode": 110,
+     "hi": 9,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 0,
+     "pubkey": "gx1kFSr31Q2760dEL3R+xlh6XB6FDyNRWTl9PmJt+jc=",
+     "rte": 1
+    },
+    {
+     "decode": 110,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 9,
+     "prefill": 0,
+     "pubkey": "sRevZ2WX8l65Sjs9/Q73y6ND2NWNqHgm3JEBLo9qR5o=",
+     "rte": 1
+    },
+    {
+     "hi": 6,
+     "kind": "rebuild",
+     "lo": 0,
+     "positions": 289,
+     "pubkey": "o2iDndQ+YeCBwr1IAE4iEa/nfO0BrxxYukRj4uXhzJ0=",
+     "rte": 1
+    },
+    {
+     "decode": 81,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "o2iDndQ+YeCBwr1IAE4iEa/nfO0BrxxYukRj4uXhzJ0=",
+     "rte": 2
+    },
+    {
+     "decode": 81,
+     "hi": 8,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 0,
+     "pubkey": "K72DB3xDz+8bOuc5lmNoyFrr3vI414Hlycq7GFF/f8o=",
+     "rte": 2
+    },
+    {
+     "decode": 81,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 8,
+     "prefill": 0,
+     "pubkey": "T/9qIpXniskgKEpfX9tJ47OxNmskm8Q4HNQboRsNxnU=",
+     "rte": 2
+    },
+    {
+     "hi": 8,
+     "kind": "rebuild",
+     "lo": 6,
+     "positions": 399,
+     "pubkey": "K72DB3xDz+8bOuc5lmNoyFrr3vI414Hlycq7GFF/f8o=",
+     "rte": 2
+    },
+    {
+     "hi": 12,
+     "kind": "rebuild",
+     "lo": 8,
+     "positions": 399,
+     "pubkey": "T/9qIpXniskgKEpfX9tJ47OxNmskm8Q4HNQboRsNxnU=",
+     "rte": 2
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": true,
+    "payouts": {
+     "pk-a": 400000000,
+     "pk-b": 400000000,
+     "pk-c": 160000000,
+     "pk-d": 40000000
+    },
+    "weights": {
+     "pk-a": "4320000000000",
+     "pk-b": "4320000000000",
+     "pk-c": "1728000000000",
+     "pk-d": "432000000000"
+    }
+   },
+   "name": "rebuild cap binds",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 50,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 100,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "decode": 50,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 100,
+     "pubkey": "pk-b",
+     "rte": 0
+    },
+    {
+     "hi": 6,
+     "kind": "rebuild",
+     "lo": 0,
+     "positions": 4000,
+     "pubkey": "pk-c",
+     "rte": 1
+    },
+    {
+     "hi": 12,
+     "kind": "rebuild",
+     "lo": 6,
+     "positions": 1000,
+     "pubkey": "pk-d",
+     "rte": 1
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "pk-a": 494565218,
+     "pk-b": 494565217,
+     "pk-c": 10869565
+    },
+    "weights": {
+     "pk-a": "5460000",
+     "pk-b": "5460000",
+     "pk-c": "120000"
+    }
+   },
+   "name": "rebuild under the cap",
+   "pool": 1000000000,
+   "work": [
+    {
+     "decode": 900,
+     "hi": 6,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 100,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "decode": 900,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 6,
+     "prefill": 100,
+     "pubkey": "pk-b",
+     "rte": 0
+    },
+    {
+     "hi": 12,
+     "kind": "rebuild",
+     "lo": 6,
+     "positions": 200,
+     "pubkey": "pk-c",
+     "rte": 1
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "pk-a": 4,
+     "pk-b": 3,
+     "pk-c": 3
+    },
+    "weights": {
+     "pk-a": "4000",
+     "pk-b": "4000",
+     "pk-c": "4000"
+    }
+   },
+   "name": "remainder ties go to the smaller pubkey",
+   "pool": 10,
+   "work": [
+    {
+     "decode": 1,
+     "hi": 4,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "pk-c",
+     "rte": 0
+    },
+    {
+     "decode": 1,
+     "hi": 8,
+     "kind": "serve",
+     "lo": 4,
+     "prefill": 0,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "decode": 1,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 8,
+     "prefill": 0,
+     "pubkey": "pk-b",
+     "rte": 0
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "pk-a": 414599549,
+     "pk-b": 362154477,
+     "pk-c": 218284891,
+     "pk-d": 4961020
+    },
+    "weights": {
+     "pk-a": "585000",
+     "pk-b": "511000",
+     "pk-c": "308000",
+     "pk-d": "7000"
+    }
+   },
+   "name": "one key in two rtes and a mirror",
+   "pool": 999999937,
+   "work": [
+    {
+     "decode": 70,
+     "hi": 5,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 30,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "decode": 70,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 5,
+     "prefill": 30,
+     "pubkey": "pk-b",
+     "rte": 0
+    },
+    {
+     "decode": 44,
+     "hi": 5,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 0,
+     "pubkey": "pk-a",
+     "rte": 1
+    },
+    {
+     "decode": 44,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 5,
+     "prefill": 0,
+     "pubkey": "pk-c",
+     "rte": 1
+    },
+    {
+     "hi": 12,
+     "kind": "mirror",
+     "lo": 5,
+     "positions": 100,
+     "pubkey": "pk-d",
+     "rte": 0
+    }
+   ]
+  },
+  {
+   "cap": [
+    1,
+    10
+   ],
+   "expect": {
+    "capped": true,
+    "payouts": {
+     "pk-a": 111111110,
+     "pk-b": 12345679
+    },
+    "weights": {
+     "pk-a": "69984000000000",
+     "pk-b": "7776000000000"
+    }
+   },
+   "name": "custom pay and cap",
+   "pay": {
+    "prefill": 250,
+    "rebuild": 400
+   },
+   "pool": 123456789,
+   "work": [
+    {
+     "decode": 100,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 500,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "hi": 12,
+     "kind": "rebuild",
+     "lo": 0,
+     "positions": 600,
+     "pubkey": "pk-b",
+     "rte": 1
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": false,
+    "payouts": {
+     "pk-a": 0
+    },
+    "weights": {
+     "pk-a": "13200"
+    }
+   },
+   "name": "empty pool",
+   "pool": 0,
+   "work": [
+    {
+     "decode": 1,
+     "hi": 12,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 1,
+     "pubkey": "pk-a",
+     "rte": 0
+    }
+   ]
+  },
+  {
+   "expect": {
+    "capped": true,
+    "payouts": {
+     "pk-a": 1801439850948201,
+     "pk-b": 1801439850948201,
+     "pk-c": 900719925474101
+    },
+    "weights": {
+     "pk-a": "4608000000000000000",
+     "pk-b": "4608000000000000000",
+     "pk-c": "2304000000000000000"
+    }
+   },
+   "name": "48-layer long context, capped (weights past 2^53)",
+   "pool": 4503599627370503,
+   "work": [
+    {
+     "decode": 30000,
+     "hi": 24,
+     "kind": "serve",
+     "lo": 0,
+     "prefill": 200000,
+     "pubkey": "pk-a",
+     "rte": 0
+    },
+    {
+     "decode": 30000,
+     "hi": 48,
+     "kind": "serve",
+     "lo": 24,
+     "prefill": 200000,
+     "pubkey": "pk-b",
+     "rte": 0
+    },
+    {
+     "hi": 48,
+     "kind": "rebuild",
+     "lo": 24,
+     "positions": 400000,
+     "pubkey": "pk-c",
+     "rte": 1
+    }
+   ]
+  }
+ ],
+ "notes": "weights are decimal strings (BigInt); payouts sum to pool; ties -> smaller pubkey",
+ "pay": {
+  "decode": 1000,
+  "mirror": 10,
+  "prefill": 100,
+  "rebuild": 100
+ },
+ "rebuild_cap": [
+  1,
+  5
+ ],
+ "schema": "shard-settle-vectors/2"
+}
