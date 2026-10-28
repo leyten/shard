@@ -117,6 +117,8 @@ def controls():
                   seg=[[0, 12, "bf16", "prefill"], [12, 2, "bf16", "decode"]],
                   x=hid(4, dtype="fp8"), xs=F.Tensor("f32", (4,), rb(16)), tap=hid(4, seed=3)),
         F.control("stats", rec=b'{"cell":"eu-1"}'),
+        F.control("ack", sid=SID, rte=1, code="ok"),                    # lease_open answered
+        F.control("ack", sid=SID, rte=2, seq=U32, code="next_down"),   # a frame refused/lost
     ]
 
 
@@ -403,6 +405,18 @@ def test_control_bounds():
                   (controls()[4], dict(sig=None)), (controls()[4], dict(truncate_to=-2)),
                   (controls()[7], dict(sid=SID)), (controls()[6], dict(cmd="closed")),
                   (controls()[5], dict(ck=rb(65537)))):
+        with pytest.raises(ValueError):
+            F.encode({**m, **kw})
+
+
+def test_ack_bounds():
+    ok, refused = controls()[16], controls()[17]
+    assert F.decode(body(ok))["seq"] is None and F.decode(body(refused))["seq"] == U32
+    for code in F.ACK_CODES:
+        assert F.decode(body({**refused, "code": code}))["code"] == code
+    for m, kw in ((ok, dict(code="OK")), (ok, dict(code="")), (ok, dict(code=None)),
+                  (ok, dict(code=1)), (refused, dict(seq=-1)), (refused, dict(seq=U32 + 1)),
+                  (ok, dict(sid=None)), (ok, dict(rte=None)), (ok, dict(why="text"))):
         with pytest.raises(ValueError):
             F.encode({**m, **kw})
 
