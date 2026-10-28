@@ -230,6 +230,8 @@ class MarlinExperts:
         for p in (os.path.join(REPO, "vendor"), os.path.join(REPO, "engines", "kimi_k3")):
             if p not in sys.path:
                 sys.path.insert(0, p)             # k3_moe_mxfp4 hard-imports kimi_k3_ref (vendor/)
+        import k3_stage                           # the vendored reference imports OutputRecorder from where
+        k3_stage._tf_compat()                     # transformers 4.56 had it; 5.12 moved it (one shim, k3_stage)
         import k3_moe_mxfp4 as K
         K.spec(qc)
         self.m = K.MarlinRoutedExperts(cfg, qc, device=L.device).load(get_tensor, L.prefix + "mlp")
@@ -301,9 +303,15 @@ class FlashInferSinkAttn:
                         head_dim_vo=self.dv, causal=True, window_left=self.window,
                         q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16)
             self.planned = (T, S)
-        pad = npg * P - S
-        kc = torch.nn.functional.pad(k, (0, 0, 0, 0, 0, pad)).view(npg, P, self.hkv, self.dq)
-        vc = torch.nn.functional.pad(v, (0, 0, 0, 0, 0, pad)).view(npg, P, self.hkv, self.dv)
+        # flashinfer 0.6.12 requires the K and V page caches to have equal strides, and MiMo's QK 192 /
+        # V 128 differ. Both live in buffers of the wider head dim and the kernel gets views of the
+        # real width: equal strides, exact (the gap columns are never read).
+        D = max(self.dq, self.dv)
+        kb = torch.zeros(npg * P, self.hkv, D, dtype=k.dtype, device=k.device)
+        vb = torch.zeros(npg * P, self.hkv, D, dtype=v.dtype, device=v.device)
+        kb[:S, :, :self.dq], vb[:S, :, :self.dv] = k, v
+        kc = kb.view(npg, P, self.hkv, D)[..., :self.dq]
+        vc = vb.view(npg, P, self.hkv, D)[..., :self.dv]
         snk = (sinks if sinks is not None else torch.full((self.hq,), -1e30, device=self.dev)).float().contiguous()
         return lambda: self.w.run(q, (kc, vc), snk, self.dq ** -0.5)
 
