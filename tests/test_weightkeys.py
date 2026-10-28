@@ -101,6 +101,16 @@ def test_namespace_prefers_the_boundary_inside_the_chosen_stack():
     assert namespace(names)["norm"] == "language_model.model.norm"
 
 
+@pytest.mark.parametrize("prefix", ["", "model."])
+def test_namespace_prefers_the_stacks_direct_norm_over_an_mtp_blocks(prefix):
+    """DeepSeek-V4-style names put the final norm and the MTP block's own norm under the same
+    module (`norm` and `mtp.0.norm`, or both under `model.`). Both are "inside" the stack; the
+    tail's is the DIRECT child. Sorting alone picked `mtp.0.norm` ('m' < 'n')."""
+    names = [f"{prefix}layers.{j}.attn_norm.weight" for j in range(4)]
+    names += [f"{prefix}norm.weight", f"{prefix}mtp.0.norm.weight", f"{prefix}mtp.0.enorm.weight"]
+    assert namespace(names)["norm"] == f"{prefix}norm"
+
+
 def test_namespace_keeps_a_boundary_the_checkpoint_puts_outside_the_stack():
     """Some multimodal checkpoints keep lm_head at the root: take the path the checkpoint
     actually carries over the convention, which is only the last resort."""
