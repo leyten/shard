@@ -33,6 +33,15 @@ frame claims a cpos past the frontier the tail itself has committed, checks the 
 with an uncapped cpos, T is exactly the single-row frame at cpos), and answers a block from
 `blocks(q)` (the tail drafter: proposals for q+2.. where q is its new frontier, V4's convention)
 on every committed frame.
+
+A REAL TAIL DRAFTER (`host=`, a pspec.drafter.TailDrafterHost) replaces `blocks` and the bare
+Frontier: the host judges `acc`, advances its drafter over the committed rows, honours the lazy
+licence (`dnxt` from the eid, `hint.lic`) and answers `blk` or `lz`. Its context rows come from
+`ctx=`: `LastHidden` (MTP-3: the tail's last hidden) or `FusedTaps` (DFlash: every stage adds its
+taps' fc contribution to the frame's running accumulator, bf16 between hops, the tail hands the
+fused rows over). A layer's "hidden" at row p is a deterministic function of the causal history
+the stage holds (`fake_hidden`), so an off-path row yields a different context row: a drafter
+that ever ingested one would propose differently from one fed the greedy stream alone.
 """
 import queue
 import threading
@@ -40,6 +49,7 @@ import time
 from array import array
 from hashlib import blake2b
 
+import numpy as np
 from oracle import oracle_token
 
 from shard import frame as F
@@ -49,6 +59,76 @@ from shard.pspec.accept import Frontier
 GARBAGE = 2_000_000          # an off-path row answers GARBAGE + position
 WRONG = 5_000                # scripted wrong drafts are WRONG + position
 SID = "00000000000000a1"
+
+
+def fake_hidden(tag, hist, p, H):
+    """Layer `tag`'s output row at position p: a function of the recent causal history held."""
+    d = blake2b(repr((tag, list(hist[max(0, p - 3):p + 1]))).encode(), digest_size=8).digest()
+    return np.random.default_rng(int.from_bytes(d, "little")).standard_normal(H).astype(np.float32)
+
+
+class LastHidden:
+    """MTP-3's context: the tail's last hidden row per position; nothing rides the tap lane."""
+
+    def __init__(self, H):
+        self.H = H
+
+    def stage(self, k, D, hist, pos, n, acc):
+        return acc
+
+    def tail_rows(self, acc, hist, pos, n):
+        return np.stack([fake_hidden("last", hist, p, self.H) for p in range(pos, pos + n)])
+
+
+class FusedTaps:
+    """DFlash's context over the path: stage k holds target layers [k*L/D, (k+1)*L/D) and adds
+    W_l . h_l for each tap layer it holds, in ascending layer order (pspec.drafter.TapSpec)."""
+
+    def __init__(self, spec, fc, n_layers=48):
+        self.spec, self.W, self.L = spec, spec.split(fc), n_layers
+
+    def span(self, k, D):
+        return k * self.L // D, (k + 1) * self.L // D
+
+    def taps(self, layer, hist, pos, n):
+        return np.stack([fake_hidden(layer, hist, p, self.spec.hidden) for p in range(pos, pos + n)])
+
+    def stage(self, k, D, hist, pos, n, acc):
+        for layer in self.spec.held(*self.span(k, D)):
+            acc = self.spec.partial(acc, self.W[layer], self.taps(layer, hist, pos, n))
+        return acc
+
+    def tail_rows(self, acc, hist, pos, n):
+        return acc
+
+
+class BlocksDrafter:
+    """A scripted `blocks(q)` behind the Drafter protocol (no context), so the lazy-licence matrix
+    runs through the real TailDrafterHost at the scripted acceptance rates."""
+    location, taps, rebuild_rows, ctx_dim = "tail", None, 0, 1
+
+    def __init__(self, blocks, K):
+        self.blocks, self.block, self.c = blocks, K, {}
+
+    def open(self, sid, ids, ctx):
+        self.c[sid] = len(ids)
+
+    def advance(self, sid, pos, ids, ctx):
+        assert pos == self.c[sid] - 1, (pos, self.c[sid])
+        self.c[sid] += len(ids)
+
+    def propose(self, sid, frontier):
+        assert frontier == self.c[sid] - 2, (frontier, self.c[sid])
+        return self.blocks(frontier)
+
+    def propose_batch(self, reqs):
+        return [self.propose(s, f) for s, f in reqs]
+
+    def rebuild(self, sid, start, ids, ctx):
+        raise NotImplementedError
+
+    def close(self, sid):
+        self.c.pop(sid, None)
 
 
 def identity(b):
@@ -135,10 +215,12 @@ class ScriptedPipeline:
     """D in-process stages implementing coord.Link. Use as a context manager (joins the threads)."""
 
     def __init__(self, T, *, depth=3, W=16, leg_s=0.0, blocks=None, lie=None, judge=True,
-                 frontier=Frontier, sid=SID, rte=0, max_pos=None, tight_cpos=True):
+                 frontier=Frontier, sid=SID, rte=0, max_pos=None, tight_cpos=True, host=None,
+                 ctx=None):
         self.T, self.D, self.W, self.leg_s = list(T), int(depth), int(W), float(leg_s)
         self.max_pos, self.tight_cpos = max_pos, tight_cpos
         self.blocks, self.lie, self.judge = blocks, lie, judge
+        self.host, self.ctx = host, ctx
         self.sid, self.rte = sid, rte
         self.st = [_State() for _ in range(self.D)]
         self.front = frontier()
@@ -163,7 +245,7 @@ class ScriptedPipeline:
         rows = _ints(m["x"])
         self.log.append({k: m[k] for k in ("seq", "sep", "pos", "n", "kind", "cpos", "lg", "fen")}
                         | {"toks": rows})
-        self.q[0].put((m, rows, [True] * len(rows)))
+        self.q[0].put((m, rows, [True] * len(rows), None))
 
     def recv(self, timeout):
         end = time.monotonic() + timeout
@@ -198,7 +280,7 @@ class ScriptedPipeline:
                 continue
             (self.q[k + 1] if k + 1 < self.D else self.ret).put(out)
 
-    def _step(self, k, hdr, rows, ok):
+    def _step(self, k, hdr, rows, ok, acc):
         s, tail = self.st[k], k == self.D - 1
         if hdr["fen"] or hdr["sep"] < s.sep_seen:
             self.fenced.append((k, hdr["pos"], hdr["sep"]))
@@ -206,7 +288,7 @@ class ScriptedPipeline:
             if tail:
                 return _wire(F.reply(sid=hdr["sid"], rte=hdr["rte"], seq=hdr["seq"], sep=hdr["sep"],
                                      pos=hdr["pos"], n=hdr["n"], fen=True))
-            return hdr, None, None
+            return hdr, None, None, None
         s.sep_seen = max(s.sep_seen, hdr["sep"])
         s.committed = max(s.committed, hdr["cpos"])
         pos, n = hdr["pos"], hdr["n"]
@@ -227,7 +309,9 @@ class ScriptedPipeline:
         while s.good < min(len(s.hist), len(self.T)) and s.hist[s.good] == self.T[s.good]:
             s.good += 1
         ok = [ok[j] and pos + j < s.good for j in range(n)]
-        return self._reply(hdr, rows, ok) if tail else (hdr, rows, ok)
+        if self.ctx is not None:
+            acc = self.ctx.stage(k, self.D, s.hist, pos, n, acc)
+        return self._reply(hdr, rows, ok, acc) if tail else (hdr, rows, ok, acc)
 
     def _offpath(self, p):
         """The model's token at an off-path row p: a deterministic function of the recent history the
@@ -237,31 +321,45 @@ class ScriptedPipeline:
         h = blake2b(repr((p, self.st[-1].hist[max(0, p - 3):p + 1])).encode(), digest_size=2)
         return oracle_token(self.T, p) if h.digest()[0] & 1 else GARBAGE + p
 
-    def _reply(self, hdr, rows, ok):
+    def _reply(self, hdr, rows, ok, tap=None):
         pos, n = hdr["pos"], hdr["n"]
         toks = [oracle_token(self.T, pos + j) if ok[j] else self._offpath(pos + j) for j in range(n)]
         acc = blk = None
+        lz = False
         if hdr["eid"] is not None and self.judge:
-            ids, _ = F.eid_unpack(hdr["eid"], n)
+            ids, dnxt = F.eid_unpack(hdr["eid"], n)
             if ids != rows:
                 raise StageRefused(f"tail: eid ids {ids} disagree with the rows fed {rows}")
+            h = self.host
+            crow = None
+            if h is not None:
+                crow = (self.ctx.tail_rows(tap, self.st[-1].hist, pos, n) if self.ctx is not None
+                        else np.zeros((n, 1), np.float32))
             if hdr["kind"] == "P":
-                self.front.prefill(n, toks[-1])
+                if h is not None:
+                    blk = h.prefill(self.sid, ids, crow, toks[-1])
+                    self.front = h.front[self.sid]
+                else:
+                    self.front.prefill(n, toks[-1])
                 acc = True
             else:
                 if hdr["cpos"] > self.front.cfront + 1:
                     raise StageRefused(f"tail: cpos {hdr['cpos']} past the committed frontier "
                                        f"{self.front.cfront + 1}")
-                acc, _k = self.front.judge(pos, ids, toks)
-                if acc and self.blocks is not None:
-                    blk = self.blocks(self.front.cfront) or None
+                if h is not None:
+                    lic = bool(hdr["hint"] and hdr["hint"].get("lic"))
+                    acc, blk, lz = h.on_frame(self.sid, pos, ids, toks, crow, dnxt=dnxt, lic=lic)
+                else:
+                    acc, _k = self.front.judge(pos, ids, toks)
+                    if acc and self.blocks is not None:
+                        blk = self.blocks(self.front.cfront) or None
                 self._check_kind(hdr, acc)
                 if self.lie is not None:
                     acc = self.lie
         lg = hdr["lg"]
         out = toks if lg == "all" else toks[-1:] if lg == "last" else []
         return _wire(F.reply(sid=hdr["sid"], rte=hdr["rte"], seq=hdr["seq"], sep=hdr["sep"],
-                             pos=pos, n=n, toks=_i32(out), acc=acc,
+                             pos=pos, n=n, toks=_i32(out), acc=acc, lz=lz and acc is True,
                              blk=None if blk is None else _i32(blk)))
 
     def _check_kind(self, hdr, acc):
@@ -288,14 +386,15 @@ class ScriptedPipeline:
 
 def run_pspec(T, P, max_new, *, depth=3, W=16, leg_s=0.0, blocks=None, drafter=None,
               policy="chunk", floor=1, eos=(), seal=identity, lie=None, judge=True,
-              frontier=Frontier, mod=coord, timeout=20.0):
+              frontier=Frontier, mod=coord, timeout=20.0, host=None, ctx=None, lazy=False):
     """One job: T[:P] prompt, a fresh D-stage pipeline leased exactly the rows the job can use.
     -> (result, pipeline, session). `mod` swaps in a mutated coordinator module
     (tests/test_pspec_mutants.py)."""
     with ScriptedPipeline(T, depth=depth, W=W, leg_s=leg_s, blocks=blocks, lie=lie, judge=judge,
-                          frontier=frontier, max_pos=P + max_new - 1) as pipe:
+                          frontier=frontier, max_pos=P + max_new - 1, host=host, ctx=ctx) as pipe:
+        kw = {"lazy": True} if lazy else {}
         s = mod.Session(T[:P], max_new, sid=SID, W=W, floor=floor, policy=policy, eos_ids=eos,
-                        drafter=drafter, seal=seal)
+                        drafter=drafter, seal=seal, **kw)
         r = mod.run(pipe, s, timeout=timeout)
         if pipe.err is not None:
             raise AssertionError(f"the pipeline refused: {pipe.err}")

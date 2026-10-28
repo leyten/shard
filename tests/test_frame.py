@@ -869,3 +869,19 @@ def test_eid_plaintext_round_trips_ids_and_the_optional_dnxt():
         F.eid_unpack(F.eid_pack([1, 2]), 3)
     with pytest.raises(ValueError):
         F.eid_unpack(b"\xff\xff\xff\xff", 1)
+
+
+# ── the reply `lz` field (pspec lazy licence) ─────────────────────────────────────────────────
+
+def test_reply_lz_field():
+    base = dict(sid=SID, rte=0, seq=3, sep=0, pos=9, n=1, toks=ids([5]))
+    plain = F.reply(acc=True, **base)
+    lz = F.reply(acc=True, lz=True, **base)
+    wire = lambda m: b"".join(F.encode(m))                        # noqa: E731
+    assert b'"lz"' not in wire(plain), "an absent lz must keep the old canonical bytes"
+    assert F.decode(wire(lz))["lz"] is True and F.decode(wire(plain))["lz"] is False
+    for bad in (dict(acc=True, lz=True, blk=ids([1, 2])), dict(lz=True), dict(acc=False, lz=True)):
+        with pytest.raises(ValueError):
+            F.reply(**base, **bad)
+    with pytest.raises(ValueError):
+        F.reply(sid=SID, rte=0, seq=3, sep=0, pos=9, n=1, fen=True, lz=True)

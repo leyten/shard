@@ -5,4 +5,6 @@ accept  the accept rule: one rule for every frame length, the entry half (`accep
 coord   the single-session coordinator on shard-frame/2: `Session` (the per-session state machine,
         no I/O), `FrameSender` (the sender-side sep fence), `run` (a one-session driver) and the
         `Link` seam it talks through (`SocketLink` for the real node server and the fake mesh).
+drafter the drafter plug-in: `Drafter` protocol, `TapSpec` (fused `fc_partial` taps), the
+        `TailDrafterHost` (Frontier + drafter + lazy licence), CPU reference MTP-3 and DFlash.
 """

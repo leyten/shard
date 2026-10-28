@@ -16,8 +16,10 @@ rename of ARCHITECTURE-v2 §0.3), the sender-side fence (`FrameSender`, :1780-18
   * The state machine (`Session`) does no I/O and owns no thread; `run` drives one session over a
     `Link`, and a multi-session loop (S3) can drive many sessions through one shared sender.
   * The sender stamps nothing: seq/sep/cpos are fixed when the frame is built and validated.
-  * Not lifted (V4 measurement or V4-only levers): the lazy-draft hints, runner-up/rescue and
-    per-depth counters, topup agreement counters, fill time-integration, lever audit.
+  * The lazy-draft hints are lifted (`lazy=True`, tail drafters only) with a proof that holds at
+    every refill floor (LAZY LICENCE below) and an explicit reply field `lz` for "skipped".
+  * Not lifted (V4 measurement or V4-only levers): runner-up/rescue and per-depth counters, topup
+    agreement counters, fill time-integration, lever audit.
 
 FRONTIER AND cpos. `c` = committed token count (prompt included); f = c-1 is the position of the
 newest committed token. Every frame is built at pos >= f and carries cpos = f, the final-row
@@ -43,6 +45,27 @@ lease of max_pos = prompt + max_new - 1 rows always suffices.
 REFILL FLOOR. A reply's block is consumed when fewer than `floor`+1 positions are in flight
 (floor 1 = V4's shipped drain-only round). A chunk burst is judged whole by one reply, so under
 `chunk` only one frame is ever in flight and the floor has nothing to top up.
+
+LAZY LICENCE (`lazy=True`). The tail may skip drafting a reply's block when this loop has PROVEN it
+will not consume it (pspec.accept.wants_block; the reply then carries `lz`, and consuming the block
+of an `lz` reply raises: an unsound licence is a bug, not a slow path). The proof, per frame whose
+last row is r, streamed in a burst ending at H:
+  * RUN replies are consumed only when horizon - r <= floor (`_on_decode`), and within one sep the
+    horizon never drops below H (a REJECT bumps the sep, fencing every reply of the burst). So when
+    H - r > floor, this reply is consumed only if its verdict is not RUN; with r's successor already
+    streamed that means a mismatch at r+1, which the tail sees (m != dnxt) and drafts for.
+    -> `dnxt` = the token streamed at r+1 rides in the eid, set exactly when H - r > floor.
+  * `lic` (floor 1, W >= 3 only): the LAST frame of a per-token burst of >= 2 frames. Its successor
+    is the head of the block the reply for r-1 returns: that reply is RUN (else r is fenced) with
+    horizon exactly r (floor 1 tops up nothing earlier), so it consumes its block and streams
+    block[:room] from r+1. The skip is sound only if that refill streams at least TWO positions:
+    with one (room 1 or a 1-draft block), r's own reply is RUN with one row in flight and is itself
+    the refill. So: W >= 3 here (room = min(max_new-left, W-1) with no ack cap, which is why `lazy`
+    refuses `acked`), the tail dereferences `lic` only for its own block of >= 2 drafts from
+    exactly r-1 (pspec.accept.wants_block), and when max_new caps the refill at one position, r's
+    reply has room 0 and consumes nothing. At floor > 1 the refill comes from an earlier reply at
+    a block offset, so no `lic` is sent.
+  * Unhinted means draft: chunk frames, bursts of one and the prefill are never hinted.
 
 M2.5 AT DEPTH 1 IS `chunk` + an entry drafter + floor 1 + W >= K+1: after the prefill reply the
 drafter proposes K tokens for the committed ids and one frame [cur] + drafts goes out at cur's
@@ -208,7 +231,7 @@ class Session:
     when there is no re-adoption to protect. Advance it with `ack`."""
 
     def __init__(self, prompt_ids, max_new, *, sid, rte=0, W=16, floor=1, policy="chunk",
-                 eos_ids=(), drafter=None, seal=None, on_token=None, acked=None):
+                 eos_ids=(), drafter=None, seal=None, on_token=None, acked=None, lazy=False):
         prompt = [int(t) for t in prompt_ids]
         if not 1 <= len(prompt) <= F.MAX_ROWS:
             raise ValueError(f"pspec: a prompt of {len(prompt)} ids does not fit one prefill frame "
@@ -225,6 +248,11 @@ class Session:
         if acked is not None and acked < len(prompt):
             raise ValueError(f"pspec: acked={acked} below the prompt ({len(prompt)} ids): the "
                              f"gateway holds the prompt it sent")
+        if lazy and (drafter is not None or acked is not None):
+            raise ValueError("pspec: lazy hints are for the tail's drafter with an uncapped cpos "
+                             "(see LAZY LICENCE)")
+        self.lazy = bool(lazy)
+        self.lazy_skips = 0
         self.sid, self.rte, self.W, self.floor, self.policy = sid, int(rte), int(W), int(floor), policy
         self.max_new, self.eos = int(max_new), {int(t) for t in eos_ids}
         self.drafter, self.seal, self.on_token = drafter, seal, on_token
@@ -270,12 +298,13 @@ class Session:
                 f"{self._cpos()}: the gateway's ack lags the committed stream by W or more")
         return room
 
-    def _frame(self, pos, toks, kind, lg):
+    def _frame(self, pos, toks, kind, lg, dnxt=None, lic=False):
         """Build and validate one frame; the seq is spent even if the sender later drops it."""
         seq, self._seq = self._seq, self._seq + 1
-        eid = None if self.seal is None else self.seal(F.eid_pack(toks))
+        eid = None if self.seal is None else self.seal(F.eid_pack(toks, dnxt))
         return F.frame(sid=self.sid, rte=self.rte, seq=seq, sep=self.st.sep, pos=pos, n=len(toks),
-                       kind=kind, cpos=self._cpos(), lg=lg, cx="ids", x=_i32(toks), eid=eid)
+                       kind=kind, cpos=self._cpos(), lg=lg, cx="ids", x=_i32(toks), eid=eid,
+                       hint={"lic": True} if lic else None)
 
     def prefill(self):
         """The prompt as one frame at position 0; its reply returns the model's token at P."""
@@ -291,10 +320,18 @@ class Session:
         f = len(self.ids) - 1
         groups = [run] if self.policy == "chunk" else [[r] for r in run]
         out = []
-        for g in groups:
+        H = run[-1][0]
+        for gi, g in enumerate(groups):
             pos, toks = g[0][0], [t for _, t in g]
             kind = "T" if pos + len(toks) - 1 <= f else "S"          # T: every row is committed
-            out.append(self._frame(pos, toks, kind, "all"))
+            dnxt, lic = None, False
+            if self.lazy:                                            # LAZY LICENCE (docstring)
+                r = g[-1][0]
+                if gi + 1 < len(groups) and H - r > self.floor:
+                    dnxt = groups[gi + 1][0][1]
+                lic = (self.floor == 1 and self.W >= 3 and gi == len(groups) - 1 and gi >= 1
+                       and len(g) == 1 and len(groups[gi - 1]) == 1)
+            out.append(self._frame(pos, toks, kind, "all", dnxt, lic))
             for p, t in g:
                 self.sent[p] = t
             self.horizon = max(self.horizon, g[-1][0])
@@ -364,6 +401,7 @@ class Session:
             return []
         if self.stop:                                        # draining after EOS/max_new
             return []
+        self.lazy_skips += bool(rep["lz"])
         toks = _ints(rep["toks"])
         if not self._prefilled:
             return self._on_prefill(rep, toks)
@@ -391,6 +429,10 @@ class Session:
     def _block(self, rep):
         """The block for positions f+1.. : the reply's (tail drafter) or the entry drafter's."""
         if self.drafter is None:
+            if rep["lz"]:
+                raise RuntimeError(
+                    f"pspec: consuming the block of the reply for {rep['pos']}, which the tail skipped "
+                    f"under the lazy licence: the licence this loop sent was unsound")
             return _ints(rep["blk"])
         self.issued += 1
         return [int(t) for t in self.drafter(list(self.ids))]
@@ -468,7 +510,8 @@ class Session:
                 "max_inflight": max(self.depths) if self.depths else 0,
                 "mean_inflight": round(sum(self.depths) / len(self.depths), 2) if self.depths else 0.0,
                 "frames_per_token": round(self.frames / gen, 3) if gen else 0.0,
-                "stale_replies": self.stale, "unsent_frames": self.st.unsent}
+                "stale_replies": self.stale, "unsent_frames": self.st.unsent,
+                "lazy_skips": self.lazy_skips}
 
 
 def run(link, session, timeout=600.0):
