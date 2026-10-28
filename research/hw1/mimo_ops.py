@@ -230,8 +230,8 @@ class MarlinExperts:
         for p in (os.path.join(REPO, "vendor"), os.path.join(REPO, "engines", "kimi_k3")):
             if p not in sys.path:
                 sys.path.insert(0, p)             # k3_moe_mxfp4 hard-imports kimi_k3_ref (vendor/)
-        import k3_stage                           # the vendored reference imports OutputRecorder from where
-        k3_stage._tf_compat()                     # transformers 4.56 had it; 5.12 moved it (one shim, k3_stage)
+        import k3_stage                           # k3_moe_mxfp4 imports the vendored Kimi reference, which needs
+        k3_stage.ref()                            # fla (CPU stand-in) + the moved OutputRecorder: K3's own path
         import k3_moe_mxfp4 as K
         K.spec(qc)
         self.m = K.MarlinRoutedExperts(cfg, qc, device=L.device).load(get_tensor, L.prefix + "mlp")
@@ -285,7 +285,7 @@ class FlashInferSinkAttn:
         import flashinfer
         self.fi, self.dev, self.hq, self.hkv, self.dq, self.dv = flashinfer, device, hq, hkv, dq, dv
         self.window = window - 1 if window else -1      # flashinfer window_left excludes the query itself
-        ws = torch.empty(256 << 20, dtype=torch.uint8, device=device)
+        ws = torch.empty(1 << 30, dtype=torch.uint8, device=device)   # full attn's split-KV tmp_v filled 256 MiB
         self.w = flashinfer.BatchAttentionWithAttentionSinkWrapper(
             ws, kv_layout="NHD", backend="fa2", q_data_type=torch.bfloat16, kv_data_type=torch.bfloat16,
             head_dim_qk=dq, head_dim_vo=dv, window_left=self.window)
