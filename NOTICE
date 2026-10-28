@@ -25,3 +25,11 @@ phase0/k3_kda_cpu.py
     own reference implementations (fla/ops/kda/naive.py, fla/ops/kda/gate.py,
     fla/modules/fused_norm_gate.py), MIT licensed,
     Copyright (c) 2023-2026 Songlin Yang, Yu Zhang, Zhiyuan Li.
+
+vendor/mimo_v2_ref/
+    The decoder-layer subset (attention with sinks, RoPE, MoE gate, MLP, decoder layer) of
+    Xiaomi MiMo-V2's modeling_mimo_v2.py from huggingface.co/XiaomiMiMo/MiMo-V2.6-Flash-RL
+    (revision 5711b268169967567844e1e560e8a3966da959b1), used as the CI test oracle for the
+    MiMo adapter. Copyright 2026 Xiaomi Corporation and The HuggingFace Inc. team, licensed
+    under the Apache License, Version 2.0 (header preserved). Math lines verbatim; the
+    transformers plumbing was removed, as listed in vendor/mimo_v2_ref/PROVENANCE.md.
