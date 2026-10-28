@@ -21,8 +21,9 @@ Per inbound frame f of session s (§4.2):
      the commit: cpos is the entry's statement about committed tokens, not about this
      frame's payload, so the frontier it set stands.
   5. batch: when the loop is free it runs ONE runtime step holding at most one segment per
-     session under the runtime's token budget (round-robin across sessions). A frame larger
-     than the budget runs alone as consecutive steps and is forwarded whole.
+     session under the runtime's token budget, in the §4.2 priority classes (rebuild, then
+     truth/spec frontier-first, then prefill; round-robin ties, no starvation: `_pick`). A frame
+     larger than the budget runs alone as consecutive steps and is forwarded whole.
   6. forward: non-tail hops send the output rows to the lease's successor with the same header
      and their load byte appended to `ld`. The tail replies to `ret` with the tokens `lg` asks
      for (none on a prefill sub-chunk that is not `last`).
@@ -42,13 +43,27 @@ runtime's session table, keeping the other half as takeover headroom (C21).
 Not yet, each with a named seam:
   * lease tokens and lease_update signatures are accepted unverified (`_verify_lease`,
     `_verify_update`; M3 / M2);
-  * priority classes (rebuild > truth/spec > prefill; S3 extends `_pick`);
+  * the takeover share (phi >= 0.5 while a takeover is pending) waits for takeover (M1); the
+    priority classes themselves are in `_pick`;
   * prefill sub-chunk pipelining across hops (a too-large frame is computed in steps and
     forwarded whole; `sub`/`last` from the entry pass through);
   * activation log, mirroring, takeover, log_fetch, drain, ckpt, stats (M1: `_CONTROL`);
-  * the tap lane (a lease with ct=bf16 or a drafter is refused as unsupported);
-  * eid decryption and `acc` at the tail (D1). `eid` and `hint` pass through opaque;
+  * the tap lane (a lease with ct=bf16 is refused as unsupported);
+  * the eid AEAD under the lease's `ekey` (D1: `_open_eid` is the identity seam) and the lazy-draft
+    licence (`hint` passes through; the tail drafts on every committed frame);
   * sampling parameters: lease_open carries only `seed`, so the tail draws greedily.
+
+THE TAIL JUDGES (S2; tests/scripted_pipe.py `_reply` is the spec). A tail (or solo) lease keeps a
+`pspec.accept.Frontier`. A frame that carries an `eid` has its ids read with `frame.eid_unpack`;
+the tail computes every row's token, judges `acc` with the Frontier (the prefill sets it), and
+answers only the rows `lg` asks for. A frame whose cpos claims more than the tail has committed
+(cpos > cfront + 1) is refused before anything moves. With a drafter named in the lease (one the
+node was built with: `drafters={name: factory(lease) -> blocks(cfront, mfront)}`), every accepted
+frame's reply carries `blk`, the proposals for cfront+2.. (V4's convention); a drafter fault
+costs that reply its block, never the node. A lease_update's truncate_to below the frontier
+re-opens it at F with the token this tail computed there (`Lease.path`), so the entry's re-feed
+is judged, not trusted. A solo hop also refuses an eid that is not the ids it computes, and a
+second prefill is refused (it would reset the frontier unjudged).
 
 Wire codecs. Hidden rows travel as the runtime's wire dtype: bf16 -> cx=bf16, fp8_e4m3 -> cx=fp8
 with per-row `xs`. shard-frame/2 has no integer codec, so a runtime whose wire dtype is i32 (the
@@ -59,11 +74,12 @@ from __future__ import annotations
 
 import threading
 from collections import deque
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 
 import numpy as np
 
 from .. import frame
+from ..pspec.accept import Frontier
 from ..runtime.api import (KVFull, PositionGap, RollbackPastCommit, Rows, SessionExists, Segment,
                            SpecWindowExceeded, StageRuntimeError, StepIn, WTooDeep)
 from .clock import Closed, RealClock, Timeout
@@ -111,14 +127,19 @@ class Lease:
     cx: str
     seed: int | None
     sep_seen: int = 0
+    front: Frontier | None = None        # tail/solo: the pspec accept frontier (module docstring)
+    draft: object = None                 # tail/solo: blocks(cfront, mfront) -> [ids], or None
+    path: dict = field(default_factory=dict)   # tail/solo: pos -> the model's token there, on
+                                               # the committed path (restores a re-opened mfront)
 
 
 class NodeServer:
     """Serves `runtime`'s layer span to many sessions over `links_factory` links."""
 
     def __init__(self, runtime, peer_id: str, *, resolve, clock=None, s_max: int = 16,
-                 links_factory=TcpLinks, host: str = "127.0.0.1", trace=None):
+                 links_factory=TcpLinks, host: str = "127.0.0.1", trace=None, drafters=None):
         self.rt = runtime
+        self._drafters = dict(drafters or {})
         self.cap = runtime.describe()
         self.peer_id = peer_id
         self.clock = clock or RealClock()
@@ -134,6 +155,7 @@ class NodeServer:
         self._leases: dict[int, Lease] = {}
         self._fifo: dict[int, deque] = {}
         self._rr: deque = deque()            # sessions with queued frames, round-robin order
+        self._skips: dict[int, int] = {}     # consecutive steps a ready session was passed over
         self._queued_rows = 0
         self._dead = False
         self._slock = threading.Lock()
@@ -257,7 +279,10 @@ class NodeServer:
             return "exists"
         if (m["lo"], m["hi"]) != (self.cap.lo, self.cap.hi) or m["role"] != self.role:
             return "span"
-        if m["ct"] != "none" or m["drafter"] is not None:
+        if m["ct"] != "none":
+            return "unsupported"
+        if m["drafter"] is not None and (m["drafter"] not in self._drafters
+                                         or m["role"] not in ("tail", "solo")):
             return "unsupported"
         if m["cx"] not in self._in_codecs:
             return "unsupported"
@@ -281,11 +306,20 @@ class NodeServer:
                 code = "exists"
             except StageRuntimeError:
                 code = "bad"
+        draft = None
+        if code == "ok" and m["drafter"] is not None:
+            try:                              # a plugin fault refuses this lease, nothing more
+                draft = self._drafters[m["drafter"]](m)
+            except Exception:                 # noqa: BLE001
+                self.rt.close(sid)
+                code = "unsupported"
         if code == "ok":
+            tail = m["role"] in ("tail", "solo")
             self._leases[sid] = Lease(sid=sid, hex=m["sid"], rte=m["rte"], role=m["role"],
                                       pred=m["pred"], next=m["next"], ret=m["ret"],
                                       backup=m["backup"], max_pos=m["max_pos"], W=m["W"], cx=m["cx"],
-                                      seed=None if m["seed"] is None else int(m["seed"], 16))
+                                      seed=None if m["seed"] is None else int(m["seed"], 16),
+                                      front=Frontier() if tail else None, draft=draft)
         self.count(f"lease_{code}")
         self._ack(peer, m["sid"], m["rte"], code)
 
@@ -309,6 +343,13 @@ class NodeServer:
             except StageRuntimeError as e:
                 self._ack(peer, m["sid"], m["rte"], _code(e))
                 return
+        fr = L.front
+        if fr is not None and fr.cfront is not None and 0 <= F <= fr.cfront:
+            # re-opened at F: the model's token there is the one this tail computed on the
+            # committed path; only a tail without that record (none yet) takes the entry's word
+            fr.cfront, fr.mfront = F - 1, L.path.get(F)
+            for p in [p for p in L.path if p > F]:
+                del L.path[p]
         L.rte = m["rte"]                      # queued frames of the old rte die at dequeue
         for k in ("pred", "next", "ret"):
             if m[k] is not None:
@@ -336,6 +377,7 @@ class NodeServer:
             self._rr.remove(sid)
         except ValueError:
             pass
+        self._skips.pop(sid, None)
         self.rt.close(sid)
 
     def _ack(self, peer: str, sid_hex: str, rte: int, code: str, seq: int | None = None) -> None:
@@ -354,6 +396,7 @@ class NodeServer:
         q = self._fifo.setdefault(sid, deque())
         if not q:
             self._rr.append(sid)
+            self._skips.pop(sid, None)
         q.append((f, t))
         self._queued_rows += f["n"]
         self.count("frames_in")
@@ -365,11 +408,18 @@ class NodeServer:
         self._queued_rows -= f["n"]
         return f, t
 
+    STARVE = 4       # steps a ready session may be passed over before it goes first
+
     def _pick(self):
         """(sessions for one batched step, or a session whose frame exceeds the budget).
-        Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through."""
-        chosen, total = [], 0
-        for sid in list(self._rr):
+        Head-of-line housekeeping first: stale-rte frames die, fenced frames pass through.
+        Then the §4.2 priority classes over each session's head frame: rebuild feeds, then
+        TRUTH/SPEC frontier-first (smallest pos - cpos), then PREFILL; ties in round-robin
+        order. A session passed over STARVE steps in a row goes first, longest-waiting first
+        whatever its class (a prefill, or a frame over the budget, is never starved by a steady
+        decode load, however many decodes are waiting too)."""
+        ready = []
+        for i, sid in enumerate(list(self._rr)):
             q = self._fifo.get(sid)
             L = self._leases.get(sid)
             while q:
@@ -377,14 +427,20 @@ class NodeServer:
                 if L is None or f["rte"] != L.rte:
                     self._pop(sid)
                     self.count("drop_stale_rte")
-                elif f["fen"] or f["sep"] < L.sep_seen:
+                elif self._fenced(L, f):
                     self._pop(sid)
                     self._forward_fence(L, f)
                 else:
                     break
-            if not q:
-                continue
-            n = q[0][0]["n"]
+            if q:
+                f = q[0][0]
+                cls = 0 if f["kind"] == "R" else (2 if f["kind"] == "P" else 1)
+                w = self._skips.get(sid, 0)
+                age = -w if w >= self.STARVE else 0
+                ready.append(((age == 0, age, cls, f["pos"] - f["cpos"], i), sid, f["n"]))
+        ready.sort()
+        chosen, total = [], 0
+        for _key, sid, n in ready:
             if n > self._budget:
                 if not chosen:
                     return [], sid
@@ -393,6 +449,12 @@ class NodeServer:
                 chosen.append(sid)
                 total += n
         return chosen, None
+
+    @staticmethod
+    def _fenced(L: Lease, f: dict) -> bool:
+        """THE FENCE (§4.2 step 2), judged at dequeue: a fenced frame or one of an older sep
+        computes nothing, commits nothing and moves no frontier."""
+        return f["fen"] or f["sep"] < L.sep_seen
 
     def _step_once(self) -> None:
         chosen, big = self._pick()
@@ -403,6 +465,10 @@ class NodeServer:
             self._run_big(big)
         rest = [s for s in self._rr if s not in served and self._fifo.get(s)]
         self._rr = deque(rest + [s for s in served if self._fifo.get(s)])
+        for s in served:
+            self._skips.pop(s, None)
+        for s in rest:
+            self._skips[s] = self._skips.get(s, 0) + 1
 
     def _segment(self, L: Lease, f: dict, x: Rows | None = None, lo: int = 0, hi: int | None = None):
         n = f["n"] if hi is None else hi - lo
@@ -417,12 +483,48 @@ class NodeServer:
         tokens = "none"
         if L.role in ("tail", "solo") and (f["kind"] != "P" or f["last"]):
             tokens = f["lg"]
+            if self._judged(L, f) and tokens != "all":    # the judge reads every row's token
+                tokens = "last" if f["kind"] == "P" else "all"
         return Segment(L.sid, f["pos"] + lo, n, x, kind=kind, tokens=tokens)
+
+    @staticmethod
+    def _judged(L: Lease, f: dict) -> bool:
+        """Does the tail judge `acc` on this frame? (a tail lease, an eid, a frame it answers)"""
+        return L.front is not None and f["eid"] is not None and (f["kind"] != "P" or f["last"])
+
+    def _open_eid(self, L: Lease, eid) -> bytes:
+        """D1 seam: open the AEAD under the lease's ekey. v0: the eid rides as plaintext."""
+        return bytes(eid)
+
+    def _eid_ids(self, L: Lease, f: dict) -> list:
+        try:
+            ids, _dnxt = frame.eid_unpack(self._open_eid(L, f["eid"]), f["n"])
+        except ValueError:
+            raise _Refuse("bad") from None
+        return ids
+
+    def _check_judged(self, L: Lease, f: dict) -> None:
+        """Before anything moves: the eid opens to n ids (a solo hop's are the ids it computes),
+        a prefill is the lease's first, and a decode frame has a prefilled frontier to be judged
+        against and a cpos claiming no more than the tail has committed."""
+        if not self._judged(L, f):
+            return
+        ids = self._eid_ids(L, f)
+        if L.role == "solo" and f["cx"] == "ids" and f["x"] is not None:
+            if ids != [int(t) for t in np.frombuffer(f["x"].data, dtype="<i4")]:
+                raise _Refuse("bad")          # the ids it judges must be the ids it computes
+        cf = L.front.cfront
+        if f["kind"] == "P":
+            if cf is not None:                # one prefill per lease: a later P would reset
+                raise _Refuse("bad")          # the frontier to whatever it fed, unjudged
+        elif cf is None or f["cpos"] > cf + 1:
+            raise _Refuse("bad")
 
     def _admit_frame(self, L: Lease, f: dict) -> None:
         """Seek checks for the whole frame against the frontier its cpos WILL set, then commit.
         A refused frame changes nothing: not even the committed frontier (a gap frame's cpos
         must not raise the rollback floor)."""
+        self._check_judged(L, f)
         info = self.rt.info(L.sid)
         pos, n = f["pos"], f["n"]
         c = max(info.committed, f["cpos"])
@@ -544,12 +646,44 @@ class NodeServer:
         if f["kind"] == "P" and not f["last"]:
             return
         toks = np.zeros(0, dtype="<i4") if tokens is None else np.ascontiguousarray(tokens.data, dtype="<i4")
-        r = frame.reply(**hdr, rte=L.rte, ld=self._ld(f),
-                        toks=frame.Tensor("i32", (len(toks),), toks))
+        acc = blk = None
+        if self._judged(L, f):
+            acc, blk = self._judge(L, f, [int(t) for t in toks])
+        lg = f["lg"]
+        toks = toks if lg == "all" else toks[-1:] if lg == "last" else toks[:0]
+        r = frame.reply(**hdr, rte=L.rte, ld=self._ld(f), acc=acc, blk=blk,
+                        toks=frame.Tensor("i32", (len(toks),), np.ascontiguousarray(toks)))
         self._send(L.ret, r)
         self.count("replies")
         if self._trace is not None:
             self._trace("reply", self.peer_id, f["sid"], f["seq"], f["pos"], f["n"], self.clock.now())
+
+    def _judge(self, L: Lease, f: dict, toks: list):
+        """The tail's half of the accept rule (pspec.accept.Frontier) -> (acc, blk tensor|None).
+        Frames reach it in the session's FIFO order, and fenced or refused frames never do."""
+        fr, ids, pos = L.front, self._eid_ids(L, f), f["pos"]
+        if f["kind"] == "P":
+            fr.prefill(pos + f["n"], toks[-1])
+            L.path[pos + f["n"]] = toks[-1]
+            acc = True
+        else:
+            if fr.mfront is None and pos == fr.cfront + 1:     # re-opened, no record: trusted
+                fr.mfront = ids[0]
+                L.path[pos] = ids[0]
+            acc, k = fr.judge(pos, ids, toks)
+            for j in range(k + 1):                             # k = -1 when off the path
+                L.path[pos + j + 1] = toks[j]
+        blk = None
+        if acc and L.draft is not None:
+            try:                              # a plugin fault costs this reply its block only
+                b = [int(t) for t in L.draft(fr.cfront, fr.mfront)][:frame.MAX_BLK]
+            except Exception:                 # noqa: BLE001
+                b = []
+                self.count("draft_errors")
+            if b and min(b) >= 0 and max(b) < self.cap.vocab_size:
+                blk = frame.Tensor("i32", (len(b),), np.asarray(b, dtype="<i4"))
+        self.count("judged_acc" if acc else "judged_off")
+        return acc, blk
 
     def _forward_fence(self, L: Lease, f: dict) -> None:
         self.count("fenced")

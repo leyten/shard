@@ -14,7 +14,7 @@ rename of ARCHITECTURE-v2 §0.3), the sender-side fence (`FrameSender`, :1780-18
   * Blocks come from the tail's drafter (reply `blk`, V4) or from an entry-side drafter (a
     callable over the committed ids: M2.5's n-gram/EAGLE shape, called only when a block is used).
   * The state machine (`Session`) does no I/O and owns no thread; `run` drives one session over a
-    `Link`, and a multi-session loop (S3) can drive many sessions through one shared sender.
+    `Link`, and `run_many` (S3) drives many sessions through one shared sender.
   * The sender stamps nothing: seq/sep/cpos are fixed when the frame is built and validated.
   * Not lifted (V4 measurement or V4-only levers): the lazy-draft hints, runner-up/rescue and
     per-depth counters, topup agreement counters, fill time-integration, lever audit.
@@ -84,6 +84,16 @@ class Link(Protocol):
     def send(self, msg: dict) -> None: ...
 
     def recv(self, timeout: float) -> dict: ...
+
+
+class SessionFailed(ConnectionError):
+    """Raised by a Link's `recv` when the network refused or lost ONE session's frame (a hop's
+    `ack{seq, code}`, an undeliverable frame): `run_many` fails that session and goes on with
+    the others; `run` (one session) lets it propagate like any dead link."""
+
+    def __init__(self, sid, why):
+        super().__init__(f"pspec: session {sid}: {why}")
+        self.sid, self.why = sid, why
 
 
 class SocketLink:
@@ -310,6 +320,13 @@ class Session:
         with self.st.lock:
             return len(self.st.outstanding) if self.stop else self.st.pending
 
+    def cancel(self):
+        """Stop generating now (a client cancel): nothing more is streamed, every queued frame is
+        dropped before the wire, and the replies still owed are drained, never judged. The tokens
+        committed so far stay a prefix of the uncancelled stream. Idempotent."""
+        self.stop = True
+        self.fence()
+
     def fence(self):
         """Bump the sep: every queued frame of the current speculation is dropped before the wire."""
         with self.st.lock:
@@ -508,3 +525,94 @@ def run(link, session, timeout=600.0):
         raise RuntimeError(f"pspec: the frame sender died: {type(sender.err).__name__}: "
                            f"{sender.err}") from sender.err
     return session.result()
+
+
+def run_many(link, sessions, timeout=600.0, on_reply=None):
+    """Drive many Sessions over ONE Link and ONE FrameSender to completion (the S3 entry loop).
+    -> {sid: session.result()}.
+
+    Replies are demultiplexed on `sid`; each session sees its own replies in the order the link
+    returns them, which is all `Session.on_reply` needs (the per-session FIFO holds end to end:
+    one sender, and every hop keeps a FIFO per session). A reply for no session here, or for a
+    session that owes nothing, is a protocol error. `on_reply(session, reply)` (optional) runs
+    before each reply is consumed: the seam a caller uses to cancel a session (`cancel()`) or
+    advance its ack. A session is done when it stopped and owes nothing; one that owes nothing
+    before stopping is a bug and raises, as in `run`.
+
+    ISOLATION. A `SessionFailed` from the link, or any error judging one session's reply (a
+    bad echo, an `acc` disagreement, a hook error), fails THAT session only: it is cancelled
+    (its queued frames never ship), later replies for it are dropped, and its result carries
+    ok=False and the reason; the caller closes its lease. Any other link error (a dead link, a
+    timeout: nothing to attribute it to) ends the loop."""
+    by_sid = {}
+    for s in sessions:
+        if s.sid in by_sid:
+            raise ValueError(f"pspec: two sessions share sid {s.sid}")
+        by_sid[s.sid] = s
+    sender = FrameSender(link)
+    sender.start()
+
+    def died():
+        return RuntimeError(f"pspec: the frame sender died: {type(sender.err).__name__}: "
+                            f"{sender.err}")
+
+    try:
+        for s in sessions:
+            sender.put(s.st, s.prefill())
+        live, failed = set(by_sid), {}
+
+        def fail(sid, why):
+            failed[sid] = why
+            by_sid[sid].cancel()
+            live.discard(sid)
+
+        while True:
+            if sender.err is not None:
+                raise died() from sender.err
+            for sid in list(live):
+                s = by_sid[sid]
+                if s.owed() == 0:
+                    if not s.stop:
+                        raise RuntimeError(
+                            f"pspec: session {sid}: nothing in flight at position {len(s.ids) - 1} "
+                            f"with {len(s.out)} of {s.max_new} tokens generated")
+                    live.discard(sid)
+            if not live:
+                break
+            try:
+                rep = link.recv(timeout)
+            except SessionFailed as e:
+                if e.sid in live:
+                    fail(e.sid, e.why)
+                elif e.sid not in by_sid:
+                    raise
+                continue
+            except Exception:
+                if sender.err is not None:
+                    raise died() from sender.err
+                raise
+            if rep.get("sid") in failed:                     # a failed session's late reply
+                continue
+            s = by_sid.get(rep.get("sid"))
+            if s is None or rep["sid"] not in live:
+                raise RuntimeError(f"pspec: a reply for session {rep.get('sid')!r}, which has "
+                                   f"nothing on the wire here")
+            try:
+                if on_reply is not None:
+                    on_reply(s, rep)
+                frames = s.on_reply(rep)
+            except Exception as e:                           # noqa: BLE001 - this session only
+                fail(s.sid, f"{type(e).__name__}: {e}")
+                continue
+            for fr in frames:
+                sender.put(s.st, fr)
+    finally:
+        for s in sessions:
+            s.fence()
+        sender.stop()
+    if sender.err is not None:
+        raise died() from sender.err
+    out = {sid: s.result() for sid, s in by_sid.items()}
+    for sid, why in failed.items():
+        out[sid].update(ok=False, error=why)
+    return out
